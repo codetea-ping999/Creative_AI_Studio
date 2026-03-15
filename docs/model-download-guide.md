@@ -1,0 +1,184 @@
+# Model Download Guide
+
+このドキュメントは、ローカルモデルの配置方法と manifest の書き方を整理するものです。
+
+重要:
+
+- `diffusers_image_loader` は実ランタイムをロードします。
+- 生成に使うにはモデル一式が `local_path` に揃っている必要があります。
+- `GET /models` 自体は manifest を読むだけで、モデル本体はロードしません。
+
+## 現在の標準構成
+
+```text
+models/
+├─ audio/
+│  └─ musicgen-small/
+├─ image/
+│  ├─ sdxl/
+│  └─ anime-sdxl/
+├─ video/
+│  └─ procedural/
+├─ loras/
+│  └─ mai.safetensors
+└─ manifests/
+   ├─ audio/
+   │  └─ musicgen-small.json
+   ├─ image/
+   │  ├─ sdxl-local.json
+   │  └─ anime-sdxl-local.json
+   └─ video/
+      └─ storyboard-local.json
+```
+
+既定 image manifest は [sdxl-local.json](/Users/toyoharukohyama/Documents/Creative_AI_Studio/models/manifests/image/sdxl-local.json) です。
+既定 audio manifest は [musicgen-small.json](/Users/toyoharukohyama/Documents/Creative_AI_Studio/models/manifests/audio/musicgen-small.json) です。
+アニメ向け checkpoint 用 manifest は [anime-sdxl-local.json](/Users/toyoharukohyama/Documents/Creative_AI_Studio/models/manifests/image/anime-sdxl-local.json) です。
+既定 video manifest は [storyboard-local.json](/Users/toyoharukohyama/Documents/Creative_AI_Studio/models/manifests/video/storyboard-local.json) です。
+
+## ダウンロード先
+
+標準では SDXL のローカル配置先を `./models/image/sdxl` としています。
+MusicGen Small は `./models/audio/musicgen-small` を想定しています。
+アニメ向け checkpoint は `./models/image/anime-sdxl`、LoRA は `./models/loras/...` を想定しています。
+Storyboard video runtime は `./models/video/procedural` を想定しています。
+
+## ダウンロード方法
+
+### Hugging Face CLI を使う例
+
+事前に Hugging Face へログインします。
+
+```bash
+pip install "huggingface_hub[cli]"
+huggingface-cli login
+```
+
+モデルを配置します。
+
+```bash
+huggingface-cli download stabilityai/stable-diffusion-xl-base-1.0 \
+  --local-dir ./models/image/sdxl \
+  --local-dir-use-symlinks False
+```
+
+### Git LFS を使う例
+
+```bash
+git lfs install
+git clone https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0 ./models/image/sdxl
+```
+
+### MusicGen Small を配置する例
+
+```bash
+huggingface-cli download facebook/musicgen-small \
+  --local-dir ./models/audio/musicgen-small \
+  --local-dir-use-symlinks False
+```
+
+### Storyboard video runtime
+
+動画は現時点では heavyweight checkpoint を必須にしていません。
+`storyboard-video` は `./models/video/procedural` が存在すれば利用可能で、
+ローカルで storyboard gif を生成します。
+
+## manifest の考え方
+
+manifest は「モデルの宣言情報」です。実体ファイルの場所と API 公開 ID を分けて管理します。
+
+```json
+{
+  "id": "sdxl-local",
+  "public_id": "sdxl",
+  "display_name": "SDXL Local",
+  "media_type": "image",
+  "task_type": "text-to-image",
+  "provider": "local",
+  "runtime": "diffusers",
+  "local_path": "./models/image/sdxl",
+  "loader": "diffusers_image_loader",
+  "dtype": "float16",
+  "default_params": {
+    "width": 1024,
+    "height": 1024,
+    "steps": 30,
+    "guidance_scale": 7.5
+  },
+  "aliases": ["sdxl-local"],
+  "tags": ["image", "base"],
+  "is_default": true,
+  "enabled": true
+}
+```
+
+## 別モデルを追加する流れ
+
+1. モデル本体を `models/image/<model-name>` へ配置する
+2. `models/manifests/image/<model-name>.json` を追加する
+3. `public_id` を API/UI で使う ID にする
+4. `is_default` を切り替える
+5. `curl http://127.0.0.1:8000/models` で認識を確認する
+
+audio 用の確認:
+
+```bash
+curl "http://127.0.0.1:8000/models?media_type=audio"
+```
+
+video 用の確認:
+
+```bash
+curl "http://127.0.0.1:8000/models?media_type=video"
+```
+
+## アニメ checkpoint と LoRA
+
+推奨フロー:
+
+1. checkpoint を `models/image/anime-sdxl` に配置する
+2. LoRA を `models/loras/<name>.safetensors` か `models/loras/<name>/` に置く
+3. Web UI で `Model` を選ぶ
+4. 必要な場合だけ `LoRA Path` と `LoRA Scale` を入れる
+5. prompt は長文説明より、髪色・目の色・髪飾り・衣装のような特徴語に寄せる
+
+API 例:
+
+```json
+{
+  "prompt": "anime style, Sakurajima Mai, solo, long straight black hair, purple eyes, small bunny hair clip, beige cardigan, red necktie, school hallway",
+  "negative_prompt": "bad anatomy, red eyes, blue hair, missing hair clip, text, watermark",
+  "model_id": "anime-sdxl",
+  "params": {
+    "width": 1024,
+    "height": 1024,
+    "steps": 28,
+    "guidance_scale": 6.5,
+    "lora_path": "./models/loras/mai.safetensors",
+    "lora_scale": 0.8
+  }
+}
+```
+
+## 確認ポイント
+
+### manifest だけ確認
+
+```bash
+curl http://127.0.0.1:8000/models
+```
+
+### loader 側のパス解決を含めて確認
+
+```bash
+python3 -m unittest tests.test_model_system
+```
+
+## 現状の制約
+
+- LoRA は現状 1 リクエストにつき 1 本を想定しています
+- 未配置の checkpoint や MusicGen モデルは `/models` には出ますが `is_available: false` になります
+- `storyboard-video` は procedural runtime なので追加ダウンロード不要です
+- モデルダウンロード管理 UI はまだありません
+
+次の実装候補は [next-tasks.md](/Users/toyoharukohyama/Documents/Creative_AI_Studio/docs/next-tasks.md) にまとめています。

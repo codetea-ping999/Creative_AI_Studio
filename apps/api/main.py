@@ -1,0 +1,85 @@
+from contextlib import asynccontextmanager
+from threading import Event, Thread
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+
+from bootstrap import ApplicationServices, create_application_services
+from apps.api.routes.catalog import router as catalog_router
+from apps.api.routes.feedback import router as feedback_router
+from apps.api.routes.gallery import router as gallery_router
+from apps.api.routes.generate import router as generate_router
+from apps.api.routes.health import router as health_router
+from apps.api.routes.jobs import router as jobs_router
+from apps.api.routes.metrics import router as metrics_router
+from apps.api.routes.models import router as models_router
+from apps.api.routes.projects import router as projects_router
+
+
+def create_app(
+    services: ApplicationServices | None = None,
+    *,
+    start_job_runner: bool = True,
+) -> FastAPI:
+    resolved_services = services or create_application_services()
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        app.state.services = resolved_services
+        stop_event: Event | None = None
+        worker: Thread | None = None
+
+        if start_job_runner:
+            stop_event = Event()
+            worker = Thread(
+                target=resolved_services.job_runner.run_forever,
+                kwargs={"stop_event": stop_event},
+                daemon=True,
+                name="creative-ai-job-runner",
+            )
+            worker.start()
+
+        app.state.job_runner_stop_event = stop_event
+        app.state.job_runner_thread = worker
+
+        try:
+            yield
+        finally:
+            if stop_event is not None:
+                stop_event.set()
+            if worker is not None:
+                worker.join(timeout=2.0)
+
+    app = FastAPI(title="Creative AI Studio API", lifespan=lifespan)
+    app.state.services = resolved_services
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[
+            "http://127.0.0.1:5173",
+            "http://localhost:5173",
+        ],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    output_root = resolved_services.output_dir.parent
+    output_root.mkdir(parents=True, exist_ok=True)
+    app.mount("/outputs", StaticFiles(directory=output_root), name="outputs")
+
+    app.include_router(health_router)
+    app.include_router(jobs_router)
+    app.include_router(projects_router)
+    app.include_router(models_router)
+    app.include_router(metrics_router)
+    app.include_router(catalog_router)
+    app.include_router(gallery_router)
+    app.include_router(feedback_router)
+    app.include_router(generate_router)
+
+    return app
+
+
+app = create_app()

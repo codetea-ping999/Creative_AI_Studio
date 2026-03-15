@@ -1,0 +1,244 @@
+"""Tests for the initial job execution pipeline."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from tempfile import TemporaryDirectory
+import unittest
+from unittest.mock import patch
+
+from PIL import Image
+
+CORE_IMPORT_ERROR: Exception | None = None
+
+try:
+    from bootstrap import create_application_services
+    from core.jobs import EventBus, JobQueue, JobRunner, JobService
+    from core.schemas import GenerationRequest
+    from core.storage.repositories.job_repository import JobRepository
+    from generators.base import BaseGenerator
+    from generators.registry import GeneratorRegistry
+except ModuleNotFoundError as exc:
+    CORE_IMPORT_ERROR = exc
+
+API_IMPORT_ERROR: Exception | None = None
+
+try:
+    from fastapi.testclient import TestClient
+
+    from apps.api.main import create_app
+except ModuleNotFoundError as exc:
+    API_IMPORT_ERROR = exc
+
+
+if CORE_IMPORT_ERROR is None:
+    class _FailingImageGenerator(BaseGenerator):
+        def validate_request(self, request: GenerationRequest) -> None:
+            return None
+
+        def prepare(self, request: GenerationRequest) -> None:
+            return None
+
+        def generate(self, request: GenerationRequest):
+            raise RuntimeError("stub generation failure")
+
+        def cleanup(self, request: GenerationRequest) -> None:
+            return None
+
+    class _StubAudioGenerator(BaseGenerator):
+        def __init__(self, output_dir: Path) -> None:
+            self.output_dir = output_dir
+
+        def validate_request(self, request: GenerationRequest) -> None:
+            return None
+
+        def prepare(self, request: GenerationRequest) -> None:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        def generate(self, request: GenerationRequest):
+            output_path = self.output_dir / "stub.wav"
+            output_path.write_bytes(b"RIFFstub")
+            from core.schemas import GenerationResult
+
+            return GenerationResult(
+                job_id="audio-stub",
+                status="succeeded",
+                outputs=[str(output_path)],
+                previews=[],
+                metadata={"media_type": "audio"},
+                error_message=None,
+            )
+
+        def cleanup(self, request: GenerationRequest) -> None:
+            return None
+
+
+class _FakePipelineResult:
+    def __init__(self, image: Image.Image) -> None:
+        self.images = [image]
+
+
+class _FakePipeline:
+    def __init__(self) -> None:
+        self.loaded_loras: list[dict[str, object]] = []
+        self.adapter_calls: list[dict[str, object]] = []
+        self.unload_calls = 0
+
+    def __call__(self, **kwargs: object) -> _FakePipelineResult:
+        width = int(kwargs.get("width", 64))
+        height = int(kwargs.get("height", 64))
+        return _FakePipelineResult(Image.new("RGB", (width, height), color=(98, 88, 77)))
+
+    def load_lora_weights(self, source: str, **kwargs: object) -> None:
+        self.loaded_loras.append({"source": source, **kwargs})
+
+    def set_adapters(
+        self,
+        adapter_names: str | list[str],
+        adapter_weights: float | list[float] | None = None,
+    ) -> None:
+        self.adapter_calls.append(
+            {"adapter_names": adapter_names, "adapter_weights": adapter_weights}
+        )
+
+    def unload_lora_weights(self) -> None:
+        self.unload_calls += 1
+
+    def delete_adapters(self, adapter_names: str | list[str]) -> None:
+        return None
+
+
+def _fake_diffusers_load(self, manifest):
+    return {
+        "stub": False,
+        "loader": self.__class__.__name__,
+        "manifest_id": manifest.id,
+        "display_name": manifest.display_name,
+        "runtime": manifest.runtime,
+        "provider": manifest.provider,
+        "local_path": manifest.local_path,
+        "remote_ref": manifest.remote_ref,
+        "dtype": manifest.dtype,
+        "load_dtype": "float32",
+        "torch_dtype": "float32",
+        "weight_dtype": "float16",
+        "variant": "fp16",
+        "device": "cpu",
+        "default_params": dict(manifest.default_params),
+        "path_exists": True,
+        "pipeline": _FakePipeline(),
+    }
+
+
+@unittest.skipIf(CORE_IMPORT_ERROR is not None, f"missing dependency: {CORE_IMPORT_ERROR}")
+class JobPipelineTests(unittest.TestCase):
+    @unittest.skipIf(API_IMPORT_ERROR is not None, f"missing dependency: {API_IMPORT_ERROR}")
+    def test_generate_image_job_runs_end_to_end(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            with patch("core.models.loader.DiffusersImageLoader.load", new=_fake_diffusers_load):
+                root = Path(tmp_dir)
+                services = create_application_services(
+                    db_path=root / "jobs.db",
+                    output_dir=root / "outputs" / "images",
+                )
+                client = TestClient(create_app(services, start_job_runner=False))
+
+                create_response = client.post(
+                    "/generate/image",
+                    json={
+                        "prompt": "A cinematic skyline",
+                        "model_id": "sdxl",
+                        "params": {"steps": 10},
+                    },
+                )
+
+                self.assertEqual(create_response.status_code, 201)
+                payload = create_response.json()
+                job_id = payload["job_id"]
+                self.assertEqual(payload["status"], "queued")
+                self.assertEqual(services.job_queue.size(), 1)
+
+                processed_job = services.job_runner.run_once()
+
+                self.assertIsNotNone(processed_job)
+                assert processed_job is not None
+                self.assertEqual(processed_job.id, job_id)
+                self.assertEqual(processed_job.status, "succeeded")
+                self.assertEqual(processed_job.result.job_id, job_id)
+                self.assertTrue(Path(processed_job.result.outputs[0]).exists())
+
+                get_response = client.get(f"/jobs/{job_id}")
+                self.assertEqual(get_response.status_code, 200)
+                job_payload = get_response.json()
+                self.assertEqual(job_payload["status"], "succeeded")
+                self.assertEqual(job_payload["result"]["job_id"], job_id)
+                self.assertEqual(job_payload["progress"], 1.0)
+
+                list_response = client.get("/jobs")
+                self.assertEqual(list_response.status_code, 200)
+                self.assertEqual(len(list_response.json()), 1)
+
+    def test_runner_marks_job_failed_when_generator_raises(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            repository = JobRepository(Path(tmp_dir) / "jobs.db")
+            queue = JobQueue()
+            event_bus = EventBus()
+            service = JobService(repository, queue, event_bus)
+            registry = GeneratorRegistry({"image": _FailingImageGenerator()})
+            runner = JobRunner(repository, queue, registry, event_bus)
+
+            job = service.create_job(
+                GenerationRequest(
+                    media_type="image",
+                    prompt="Failure case",
+                    model_id="sdxl",
+                    params={},
+                )
+            )
+
+            failed_job = runner.run_once()
+
+            self.assertIsNotNone(failed_job)
+            assert failed_job is not None
+            self.assertEqual(failed_job.id, job.id)
+            self.assertEqual(failed_job.status, "failed")
+            self.assertEqual(failed_job.error_message, "stub generation failure")
+
+            persisted = repository.get(job.id)
+            self.assertIsNotNone(persisted)
+            assert persisted is not None
+            self.assertEqual(persisted.status, "failed")
+            self.assertEqual(persisted.error_message, "stub generation failure")
+
+    def test_runner_processes_audio_jobs_with_registered_generator(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            repository = JobRepository(root / "jobs.db")
+            queue = JobQueue()
+            event_bus = EventBus()
+            service = JobService(repository, queue, event_bus)
+            registry = GeneratorRegistry({"audio": _StubAudioGenerator(root / "outputs" / "audio")})
+            runner = JobRunner(repository, queue, registry, event_bus)
+
+            job = service.create_job(
+                GenerationRequest(
+                    media_type="audio",
+                    prompt="dreamy synth loop",
+                    model_id="",
+                    output_format="wav",
+                    params={"duration_seconds": 4},
+                )
+            )
+
+            completed_job = runner.run_once()
+
+            self.assertIsNotNone(completed_job)
+            assert completed_job is not None
+            self.assertEqual(completed_job.id, job.id)
+            self.assertEqual(completed_job.status, "succeeded")
+            self.assertEqual(completed_job.result.metadata["media_type"], "audio")
+            self.assertTrue(Path(completed_job.result.outputs[0]).exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

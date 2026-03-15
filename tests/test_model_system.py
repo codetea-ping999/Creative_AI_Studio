@@ -1,0 +1,554 @@
+"""Unit tests for the initial model system skeleton."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from tempfile import TemporaryDirectory
+import unittest
+from unittest.mock import patch
+
+from PIL import Image
+
+IMPORT_ERROR: Exception | None = None
+
+try:
+    from bootstrap import (
+        create_application_services,
+        create_default_audio_generator,
+        create_default_image_generator,
+        create_default_model_service,
+    )
+    from core.models import (
+        ModelRegistry,
+        ModelResolver,
+        ModelRuntimeCache,
+        create_default_loader_registry,
+    )
+    from core.schemas import GenerationRequest
+    from generators.audio import AudioGenerator
+    from generators.image import ImageGenerator
+except ModuleNotFoundError as exc:
+    IMPORT_ERROR = exc
+
+
+def _write_manifest(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+class _FakePipelineResult:
+    def __init__(self, image: Image.Image) -> None:
+        self.images = [image]
+
+
+class _FakePipeline:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+        self.loaded_loras: list[dict[str, object]] = []
+        self.adapter_calls: list[dict[str, object]] = []
+        self.unload_calls = 0
+
+    def __call__(self, **kwargs: object) -> _FakePipelineResult:
+        self.calls.append(kwargs)
+        width = int(kwargs.get("width", 64))
+        height = int(kwargs.get("height", 64))
+        return _FakePipelineResult(Image.new("RGB", (width, height), color=(12, 34, 56)))
+
+    def load_lora_weights(self, source: str, **kwargs: object) -> None:
+        self.loaded_loras.append({"source": source, **kwargs})
+
+    def set_adapters(
+        self,
+        adapter_names: str | list[str],
+        adapter_weights: float | list[float] | None = None,
+    ) -> None:
+        self.adapter_calls.append(
+            {"adapter_names": adapter_names, "adapter_weights": adapter_weights}
+        )
+
+    def unload_lora_weights(self) -> None:
+        self.unload_calls += 1
+
+    def delete_adapters(self, adapter_names: str | list[str]) -> None:
+        return None
+
+
+def _fake_diffusers_load(self, manifest):
+    return {
+        "stub": False,
+        "loader": self.__class__.__name__,
+        "manifest_id": manifest.id,
+        "display_name": manifest.display_name,
+        "runtime": manifest.runtime,
+        "provider": manifest.provider,
+        "local_path": manifest.local_path,
+        "remote_ref": manifest.remote_ref,
+        "dtype": manifest.dtype,
+        "load_dtype": "float32",
+        "torch_dtype": "float32",
+        "weight_dtype": "float16",
+        "variant": "fp16",
+        "device": "cpu",
+        "default_params": dict(manifest.default_params),
+        "path_exists": True,
+        "pipeline": _FakePipeline(),
+    }
+
+
+class _FakeMusicgenProcessor:
+    def __call__(self, *, text, padding, return_tensors):
+        import torch
+
+        return {
+            "input_ids": torch.ones((1, 4), dtype=torch.long),
+            "attention_mask": torch.ones((1, 4), dtype=torch.long),
+        }
+
+
+class _FakeAudioEncoderConfig:
+    sampling_rate = 32000
+    frame_rate = 50
+
+
+class _FakeMusicgenConfig:
+    audio_encoder = _FakeAudioEncoderConfig()
+
+
+class _FakeMusicgenModel:
+    def __init__(self) -> None:
+        self.config = _FakeMusicgenConfig()
+        self.calls: list[dict[str, object]] = []
+
+    def generate(self, **kwargs):
+        import torch
+
+        self.calls.append(kwargs)
+        return torch.zeros((1, 1, 32000), dtype=torch.float32)
+
+
+def _fake_musicgen_load(self, manifest):
+    return {
+        "stub": False,
+        "loader": self.__class__.__name__,
+        "manifest_id": manifest.id,
+        "display_name": manifest.display_name,
+        "runtime": manifest.runtime,
+        "provider": manifest.provider,
+        "local_path": manifest.local_path,
+        "remote_ref": manifest.remote_ref,
+        "dtype": manifest.dtype,
+        "load_dtype": "float32",
+        "torch_dtype": "float32",
+        "weight_dtype": "float32",
+        "device": "cpu",
+        "default_params": dict(manifest.default_params),
+        "path_exists": True,
+        "processor": _FakeMusicgenProcessor(),
+        "model": _FakeMusicgenModel(),
+        "sampling_rate": 32000,
+        "frame_rate": 50,
+    }
+
+
+@unittest.skipIf(IMPORT_ERROR is not None, f"missing dependency: {IMPORT_ERROR}")
+class ModelSystemTests(unittest.TestCase):
+    def test_registry_loads_and_filters_manifests(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            _write_manifest(
+                root / "image" / "sdxl-local.json",
+                {
+                    "id": "sdxl-local",
+                    "public_id": "sdxl",
+                    "display_name": "SDXL Local",
+                    "media_type": "image",
+                    "task_type": "text-to-image",
+                    "provider": "local",
+                    "runtime": "diffusers",
+                    "local_path": "./models/image/sdxl",
+                    "loader": "diffusers_image_loader",
+                    "aliases": ["sdxl-local"],
+                    "is_default": True,
+                },
+            )
+            _write_manifest(
+                root / "image" / "sd15-local.json",
+                {
+                    "id": "sd15-local",
+                    "public_id": "sd15",
+                    "display_name": "SD 1.5 Local",
+                    "media_type": "image",
+                    "task_type": "image-to-image",
+                    "provider": "local",
+                    "runtime": "diffusers",
+                    "local_path": "./models/image/sd15",
+                    "loader": "diffusers_image_loader",
+                    "aliases": ["sd15-local"],
+                },
+            )
+
+            registry = ModelRegistry(manifest_root=root)
+            registry.load_all()
+
+            self.assertEqual(registry.get("sdxl-local").display_name, "SDXL Local")
+            self.assertEqual(len(registry.list_by_media_type("image")), 2)
+            self.assertEqual(len(registry.list_by_task_type("text-to-image")), 1)
+            self.assertEqual(registry.get("sdxl-local").public_model_id, "sdxl")
+            self.assertEqual(registry.get_default("image").id, "sdxl-local")
+
+    def test_resolver_prefers_aliases_before_manifest_ids(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            _write_manifest(
+                root / "image" / "sdxl-local.json",
+                {
+                    "id": "stable-diffusion-xl",
+                    "public_id": "sdxl",
+                    "display_name": "SDXL Local",
+                    "media_type": "image",
+                    "task_type": "text-to-image",
+                    "provider": "local",
+                    "runtime": "diffusers",
+                    "local_path": "./models/image/sdxl",
+                    "loader": "diffusers_image_loader",
+                    "aliases": ["sdxl-local"],
+                    "is_default": True,
+                },
+            )
+            _write_manifest(
+                root / "image" / "legacy-sdxl.json",
+                {
+                    "id": "sdxl",
+                    "public_id": "legacy-sdxl",
+                    "display_name": "Legacy SDXL",
+                    "media_type": "image",
+                    "task_type": "text-to-image",
+                    "provider": "local",
+                    "runtime": "diffusers",
+                    "local_path": "./models/image/legacy-sdxl",
+                    "loader": "diffusers_image_loader",
+                },
+            )
+
+            registry = ModelRegistry(manifest_root=root)
+            resolver = ModelResolver(registry)
+
+            self.assertEqual(
+                resolver.resolve("sdxl", "image", "text-to-image").id,
+                "stable-diffusion-xl",
+            )
+            self.assertEqual(
+                resolver.resolve("sdxl-local", "image", "text-to-image").id,
+                "stable-diffusion-xl",
+            )
+            self.assertEqual(
+                resolver.resolve(None, "image", "text-to-image").id,
+                "stable-diffusion-xl",
+            )
+
+    def test_resolver_maps_public_id_and_manifest_id_to_sdxl_local(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            _write_manifest(
+                root / "image" / "sdxl-local.json",
+                {
+                    "id": "sdxl-local",
+                    "public_id": "sdxl",
+                    "display_name": "SDXL Local",
+                    "media_type": "image",
+                    "task_type": "text-to-image",
+                    "provider": "local",
+                    "runtime": "diffusers",
+                    "local_path": "./models/image/sdxl",
+                    "loader": "diffusers_image_loader",
+                    "aliases": ["sdxl-local"],
+                    "is_default": True,
+                },
+            )
+
+            registry = ModelRegistry(manifest_root=root)
+            resolver = ModelResolver(registry)
+
+            self.assertEqual(
+                resolver.resolve("sdxl", "image", "text-to-image").id,
+                "sdxl-local",
+            )
+            self.assertEqual(
+                resolver.resolve("sdxl-local", "image", "text-to-image").id,
+                "sdxl-local",
+            )
+
+    def test_runtime_cache_evicts_old_entries(self) -> None:
+        cache = ModelRuntimeCache(max_entries=1)
+        cache.put("model-a", {"id": "model-a"})
+        cache.put("model-b", {"id": "model-b"})
+
+        self.assertFalse(cache.has("model-a"))
+        self.assertTrue(cache.has("model-b"))
+        self.assertEqual(cache.loaded_ids(), ["model-b"])
+
+    def test_model_service_reuses_cached_runtime(self) -> None:
+        with patch("core.models.loader.DiffusersImageLoader.load", new=_fake_diffusers_load):
+            service = create_default_model_service()
+            first = service.get_runtime("sdxl", "image", "text-to-image")
+            second = service.get_runtime("sdxl", "image", "text-to-image")
+
+        self.assertIs(first, second)
+        self.assertEqual(first["manifest_id"], "sdxl-local")
+        self.assertEqual(service.runtime_cache.loaded_ids(), ["sdxl-local"])
+
+    def test_loader_registry_contains_initial_diffusers_loader(self) -> None:
+        registry = create_default_loader_registry()
+        loader = registry.get("diffusers_image_loader")
+
+        self.assertEqual(loader.__class__.__name__, "DiffusersImageLoader")
+
+    def test_loader_registry_contains_musicgen_loader(self) -> None:
+        registry = create_default_loader_registry()
+        loader = registry.get("transformers_musicgen_loader")
+
+        self.assertEqual(loader.__class__.__name__, "TransformersMusicgenLoader")
+
+    def test_loader_uses_float32_runtime_on_mps_for_fp16_weights(self) -> None:
+        import torch
+
+        loader = create_default_loader_registry().get("diffusers_image_loader")
+
+        self.assertEqual(
+            loader._resolve_runtime_dtype(torch.float16, "mps", torch),
+            torch.float32,
+        )
+        self.assertEqual(
+            loader._resolve_load_dtype(torch.float16, torch.float32),
+            torch.float32,
+        )
+
+    def test_application_services_resolve_environment_overrides(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_root = root / "custom-manifests"
+            output_root = root / "custom-outputs"
+            db_path = root / "custom.db"
+
+            _write_manifest(
+                manifest_root / "image" / "sdxl-local.json",
+                {
+                    "id": "sdxl-local",
+                    "public_id": "sdxl",
+                    "display_name": "SDXL Local",
+                    "media_type": "image",
+                    "task_type": "text-to-image",
+                    "provider": "local",
+                    "runtime": "diffusers",
+                    "local_path": "./models/image/sdxl",
+                    "loader": "diffusers_image_loader",
+                    "is_default": True,
+                },
+            )
+
+            with patch.dict(
+                os.environ,
+                {
+                    "MODELS_MANIFEST_ROOT": str(manifest_root),
+                    "OUTPUT_DIR": str(output_root),
+                    "DB_PATH": str(db_path),
+                    "MAX_CACHED_MODELS": "2",
+                },
+                clear=False,
+            ):
+                services = create_application_services()
+
+            self.assertEqual(services.output_dir, output_root / "images")
+            self.assertEqual(services.model_service.registry.manifest_root, manifest_root)
+            self.assertEqual(services.model_service.runtime_cache.max_entries, 2)
+            self.assertEqual(services.job_repository._db_path, db_path)
+
+    def test_image_generator_uses_model_service_runtime(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir) / "outputs"
+            with patch("core.models.loader.DiffusersImageLoader.load", new=_fake_diffusers_load):
+                service = create_default_model_service()
+                generator = ImageGenerator(service, output_dir=output_dir)
+
+                result = generator.run(
+                    GenerationRequest(
+                        media_type="image",
+                        prompt="A cinematic city skyline at dusk",
+                        model_id="",
+                        params={"steps": 12},
+                    )
+                )
+
+            self.assertEqual(result.status, "succeeded")
+            self.assertEqual(service.runtime_cache.loaded_ids(), ["sdxl-local"])
+            self.assertEqual(result.metadata["task_type"], "text-to-image")
+            self.assertEqual(result.metadata["requested_model_id"], None)
+            self.assertEqual(result.metadata["model_id"], "sdxl")
+            self.assertEqual(result.metadata["manifest_id"], "sdxl-local")
+            self.assertEqual(result.metadata["model_runtime"], "diffusers")
+            self.assertEqual(result.metadata["device"], "cpu")
+            self.assertEqual(result.metadata["default_params"]["width"], 1024)
+            self.assertEqual(result.metadata["params"]["num_inference_steps"], 12)
+            self.assertEqual(result.metadata["stub"], False)
+            self.assertIn("quality_report", result.metadata)
+            self.assertIn("semantic_report", result.metadata["quality_report"])
+            self.assertTrue(Path(result.outputs[0]).exists())
+
+    def test_image_generator_loads_lora_from_request_params(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir) / "outputs"
+            lora_path = Path(tmp_dir) / "mai.safetensors"
+            lora_path.write_bytes(b"test")
+            with patch("core.models.loader.DiffusersImageLoader.load", new=_fake_diffusers_load):
+                service = create_default_model_service()
+                generator = ImageGenerator(service, output_dir=output_dir)
+
+                result = generator.run(
+                    GenerationRequest(
+                        media_type="image",
+                        prompt="Anime portrait",
+                        model_id="sdxl",
+                        params={
+                            "lora_path": str(lora_path),
+                            "lora_scale": 0.75,
+                        },
+                    )
+                )
+                runtime_obj = service.get_runtime("sdxl", "image", "text-to-image")
+                pipeline = runtime_obj["pipeline"]
+
+            self.assertEqual(result.status, "succeeded")
+            self.assertEqual(result.metadata["lora_path"], str(lora_path))
+            self.assertEqual(result.metadata["lora_scale"], 0.75)
+            self.assertEqual(pipeline.loaded_loras[0]["weight_name"], "mai.safetensors")
+            self.assertEqual(pipeline.adapter_calls[0]["adapter_weights"], 0.75)
+
+    def test_image_generator_accepts_public_model_alias(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir) / "outputs"
+            with patch("core.models.loader.DiffusersImageLoader.load", new=_fake_diffusers_load):
+                service = create_default_model_service()
+                generator = ImageGenerator(service, output_dir=output_dir)
+
+                result = generator.run(
+                    GenerationRequest(
+                        media_type="image",
+                        prompt="Studio portrait",
+                        model_id="sdxl",
+                        params={},
+                    )
+                )
+
+            self.assertEqual(result.status, "succeeded")
+            self.assertEqual(result.metadata["requested_model_id"], "sdxl")
+            self.assertEqual(result.metadata["model_id"], "sdxl")
+            self.assertEqual(result.metadata["manifest_id"], "sdxl-local")
+
+    def test_image_generator_accepts_canonical_manifest_id(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir) / "outputs"
+            with patch("core.models.loader.DiffusersImageLoader.load", new=_fake_diffusers_load):
+                service = create_default_model_service()
+                generator = ImageGenerator(service, output_dir=output_dir)
+
+                result = generator.run(
+                    GenerationRequest(
+                        media_type="image",
+                        prompt="Studio portrait",
+                        model_id="sdxl-local",
+                        params={},
+                    )
+                )
+
+            self.assertEqual(result.status, "succeeded")
+            self.assertEqual(result.metadata["requested_model_id"], "sdxl-local")
+            self.assertEqual(result.metadata["model_id"], "sdxl")
+            self.assertEqual(result.metadata["manifest_id"], "sdxl-local")
+
+    def test_bootstrap_factory_composes_default_image_generator(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir) / "outputs"
+            with patch("core.models.loader.DiffusersImageLoader.load", new=_fake_diffusers_load):
+                generator = create_default_image_generator(output_dir=output_dir)
+
+                result = generator.run(
+                    GenerationRequest(
+                        media_type="image",
+                        prompt="An editorial portrait with dramatic rim light",
+                        model_id="",
+                        params={"steps": 8},
+                    )
+                )
+
+            self.assertEqual(result.status, "succeeded")
+            self.assertEqual(result.metadata["stub"], False)
+            self.assertEqual(result.metadata["model_id"], "sdxl")
+            self.assertEqual(result.metadata["manifest_id"], "sdxl-local")
+            self.assertEqual(result.metadata["params"]["num_inference_steps"], 8)
+            self.assertTrue(Path(result.outputs[0]).exists())
+
+    def test_bootstrap_factory_reuses_injected_model_service(self) -> None:
+        service = create_default_model_service()
+        generator = create_default_image_generator(model_service=service)
+
+        self.assertIs(generator.model_service, service)
+
+    def test_audio_generator_uses_model_service_runtime(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir) / "outputs"
+            with patch("core.models.loader.TransformersMusicgenLoader.load", new=_fake_musicgen_load):
+                service = create_default_model_service()
+                generator = AudioGenerator(service, output_dir=output_dir)
+
+                result = generator.run(
+                    GenerationRequest(
+                        media_type="audio",
+                        prompt="dreamy synth loop",
+                        model_id="musicgen-small",
+                        output_format="wav",
+                        params={
+                            "duration_seconds": 6,
+                            "guidance_scale": 3.5,
+                            "bpm": 96,
+                            "mood": "dreamy",
+                        },
+                    )
+                )
+
+            self.assertEqual(result.status, "succeeded")
+            self.assertEqual(service.runtime_cache.loaded_ids(), ["musicgen-small-local"])
+            self.assertEqual(result.metadata["requested_model_id"], "musicgen-small")
+            self.assertEqual(result.metadata["model_id"], "musicgen-small")
+            self.assertEqual(result.metadata["manifest_id"], "musicgen-small-local")
+            self.assertEqual(result.metadata["model_runtime"], "transformers")
+            self.assertEqual(result.metadata["sampling_rate"], 32000)
+            self.assertEqual(result.metadata["stub"], False)
+            self.assertIn("quality_report", result.metadata)
+            self.assertIn("semantic_report", result.metadata["quality_report"])
+            self.assertTrue(Path(result.outputs[0]).exists())
+
+    def test_bootstrap_factory_composes_default_audio_generator(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir) / "outputs"
+            with patch("core.models.loader.TransformersMusicgenLoader.load", new=_fake_musicgen_load):
+                generator = create_default_audio_generator(output_dir=output_dir)
+
+                result = generator.run(
+                    GenerationRequest(
+                        media_type="audio",
+                        prompt="gentle piano motif",
+                        model_id="musicgen-small",
+                        output_format="wav",
+                        params={"duration_seconds": 4},
+                    )
+                )
+
+            self.assertEqual(result.status, "succeeded")
+            self.assertEqual(result.metadata["model_id"], "musicgen-small")
+            self.assertTrue(Path(result.outputs[0]).exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

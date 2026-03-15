@@ -1,0 +1,22 @@
+{
+  "id": "sdxl-local",
+  "public_id": "sdxl",
+  "display_name": "SDXL Local",
+  "media_type": "image",
+  "task_type": "text-to-image",
+  "provider": "local",
+  "runtime": "diffusers",
+  "local_path": "./models/image/sdxl",
+  "loader": "diffusers_image_loader",
+  "dtype": "float16",
+  "default_params": {
+    "width": 1024,
+    "height": 1024,
+    "steps": 30,
+    "guidance_scale": 7.5
+  },
+  "aliases": ["sdxl-local"],
+  "tags": ["image", "base"],
+  "is_default": true,
+  "enabled": true
+}
