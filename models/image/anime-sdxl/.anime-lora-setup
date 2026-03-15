@@ -1,0 +1,3 @@
+This directory uses SDXL base + anime LoRA weights
+See models/manifests/image/anime-sdxl-local.json
+Available LoRAs are listed via /catalog/loras endpoint

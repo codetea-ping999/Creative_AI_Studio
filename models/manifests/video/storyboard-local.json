@@ -1,0 +1,29 @@
+{
+  "id": "storyboard-local",
+  "public_id": "storyboard-video",
+  "display_name": "Storyboard Video Local",
+  "media_type": "video",
+  "task_type": "text-to-video",
+  "provider": "local",
+  "runtime": "procedural",
+  "local_path": "./models/video/procedural",
+  "loader": "procedural_video_loader",
+  "default_params": {
+    "width": 576,
+    "height": 320,
+    "fps": 8,
+    "duration_seconds": 4,
+    "camera_motion": "push-in",
+    "visual_style": "storyboard"
+  },
+  "aliases": [
+    "storyboard-local"
+  ],
+  "tags": [
+    "video",
+    "storyboard",
+    "local"
+  ],
+  "is_default": true,
+  "enabled": true
+}

@@ -1,0 +1,21 @@
+{
+  "id": "anime-sdxl-local",
+  "public_id": "anime-sdxl",
+  "display_name": "Anime SDXL Local",
+  "media_type": "image",
+  "task_type": "text-to-image",
+  "provider": "local",
+  "runtime": "diffusers",
+  "local_path": "./models/image/anime-sdxl",
+  "loader": "diffusers_image_loader",
+  "dtype": "float16",
+  "default_params": {
+    "width": 1024,
+    "height": 1024,
+    "steps": 28,
+    "guidance_scale": 6.5
+  },
+  "aliases": ["anime-local"],
+  "tags": ["image", "anime", "checkpoint"],
+  "enabled": true
+}

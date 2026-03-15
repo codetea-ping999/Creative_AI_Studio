@@ -1,0 +1,22 @@
+{
+  "id": "musicgen-small-local",
+  "public_id": "musicgen-small",
+  "display_name": "MusicGen Small Local",
+  "media_type": "audio",
+  "task_type": "text-to-music",
+  "provider": "local",
+  "runtime": "transformers",
+  "local_path": "./models/audio/musicgen-small",
+  "loader": "transformers_musicgen_loader",
+  "dtype": "float32",
+  "default_params": {
+    "duration_seconds": 8,
+    "guidance_scale": 3.0,
+    "temperature": 1.0,
+    "top_k": 250
+  },
+  "aliases": ["musicgen-small-local"],
+  "tags": ["audio", "music", "base"],
+  "is_default": true,
+  "enabled": true
+}
