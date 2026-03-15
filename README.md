@@ -10,6 +10,13 @@
 - モデル差し替え可能な設計にする
 - Codex で並行開発しやすい責務分離を行う
 
+## Repository Basics
+
+- Git 管理前提の作業ルートは、この `README.md` があるディレクトリです
+- 新規作業は `git clone https://github.com/codetea-ping999/Creative_AI_Studio.git` で取得したリポジトリ直下で行ってください
+- `.env`、`venv/`、`data/*.db`、`outputs/`、`apps/web/node_modules/` はローカル専用で Git には含めません
+- 実モデル本体は Git 管理対象外です。`models/manifests/` と軽量な補助ファイルだけをリポジトリに含め、重い checkpoint や weight は各開発環境で配置します
+
 ## Current Status
 
 ### ✅ 実装済み機能
@@ -187,6 +194,19 @@ chmod +x setup.sh
 - ✅ 環境設定ファイルの作成
 - ✅ image / audio / video 出力ディレクトリの作成
 
+セットアップ後の一括検証は次の 1 コマンドで実行できます。
+
+```bash
+./venv/bin/python scripts/verify_local_stack.py --start-api
+```
+
+この検証は以下をまとめて実行します。
+
+- `scripts/check_local_setup.py --skip-runtime-files`
+- `apps/web` の `npm run build`
+- `pytest -q`
+- 一時起動した API に対する `/health` と `/models` の smoke check
+
 ### 手動セットアップ
 
 スクリプトが使用できない場合は、以下の手順を実行してください：
@@ -254,6 +274,16 @@ cd apps/web
 npm install
 cd ../..
 ```
+
+#### ステップ 6: ローカルモデルを配置
+
+モデル本体は Git に含まれていないため、生成機能を使う場合は別途配置が必要です。
+
+- image: `./models/image/sdxl`
+- audio: `./models/audio/musicgen-small`
+- video: `./models/video/procedural`
+
+詳細は [docs/model-download-guide.md](docs/model-download-guide.md) を参照してください。
 
 ## 起動手順
 

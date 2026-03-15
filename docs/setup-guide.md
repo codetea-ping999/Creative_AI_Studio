@@ -9,10 +9,20 @@ Creative AI Studio のローカル開発環境セットアップ手順です。
 - Python 3.9 以上
 - Node.js 18 以上
 - `npm`
+- Git で clone したリポジトリ直下を作業ルートとして使うこと
+
+## Git とローカル生成物の扱い
+
+- 以後のコマンドは `README.md` があるリポジトリ直下で実行します
+- `.env`、`apps/web/.env`、`venv/`、`data/*.db`、`outputs/`、`apps/web/node_modules/` はローカル専用です
+- `models/` 配下のうち、重い checkpoint や weight は Git 管理対象外です
+- リポジトリには manifest と軽量な補助ファイルのみを保持し、実モデル本体は各環境でダウンロードしてください
 
 ## 最短セットアップ
 
 ```bash
+git clone https://github.com/codetea-ping999/Creative_AI_Studio.git
+cd Creative_AI_Studio
 ./setup.sh
 ```
 
@@ -74,6 +84,15 @@ npm run dev
 Web UI は `apps/web/.env` を Vite の標準ルールで読み込みます。
 
 ## 動作確認
+
+### 一括検証
+
+```bash
+./venv/bin/python scripts/verify_local_stack.py --start-api
+```
+
+このコマンドは setup check、web build、pytest、`/health` と `/models` の API smoke check をまとめて行います。
+実モデルの存在まで確認したい場合は `--check-runtime-files` を追加してください。
 
 ### セットアップ検証
 
@@ -139,6 +158,7 @@ curl -X POST http://127.0.0.1:8000/generate/audio \
 - `GET /models` は manifest を読むだけで、モデル本体のロードや推論は行いません。
 - 初回生成時は diffusers runtime のロードで待ち時間が出ます。
 - 初回の音楽生成時も MusicGen runtime のロードで待ち時間が出ます。
+- API smoke check だけ既存サーバーに向けたい場合は `./venv/bin/python scripts/verify_local_stack.py --skip-setup-check --skip-web-build --skip-tests --api-base-url http://127.0.0.1:8000` を使えます。
 
 ## 関連ドキュメント
 

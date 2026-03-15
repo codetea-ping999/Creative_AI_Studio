@@ -36,12 +36,5 @@ jobs:
         working-directory: apps/web
         run: npm ci
 
-      - name: Build web app
-        working-directory: apps/web
-        run: npm run build
-
-      - name: Run setup validation
-        run: python scripts/check_local_setup.py --skip-runtime-files
-
-      - name: Run tests
-        run: pytest -q
+      - name: Run verification suite
+        run: python scripts/verify_local_stack.py --start-api
