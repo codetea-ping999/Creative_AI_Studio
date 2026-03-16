@@ -66,6 +66,11 @@ def _manifest_is_available(manifest: ModelManifest) -> bool:
         return (local_path / "model_index.json").exists()
     if manifest.runtime == "transformers":
         return (local_path / "config.json").exists()
+    if manifest.runtime == "learned":
+        return any(
+            (local_path / candidate).exists()
+            for candidate in ("runtime.py", "adapter.py", "model_index.json", "config.json")
+        )
 
     return True
 

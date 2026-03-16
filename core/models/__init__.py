@@ -4,6 +4,7 @@ from .cache import ModelRuntimeCache
 from .loader import (
     BaseModelLoader,
     DiffusersImageLoader,
+    LearnedVideoLoader,
     LoaderRegistry,
     TransformersMusicgenLoader,
     create_default_loader_registry,
@@ -16,6 +17,7 @@ from .service import ModelService
 __all__ = [
     "BaseModelLoader",
     "DiffusersImageLoader",
+    "LearnedVideoLoader",
     "LoaderRegistry",
     "ModelManifest",
     "ModelRegistry",
