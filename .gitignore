@@ -16,3 +16,15 @@ data/*.db
 data/projects/
 data/feedback/
 data/model-download-*.log
+
+models/audio/musicgen-small/*.bin
+models/audio/musicgen-small/*.json
+models/audio/musicgen-small/*.model
+models/audio/musicgen-small/*.safetensors
+models/image/sdxl/scheduler/
+models/image/sdxl/text_encoder/
+models/image/sdxl/text_encoder_2/
+models/image/sdxl/tokenizer/
+models/image/sdxl/tokenizer_2/
+models/image/sdxl/unet/
+models/image/sdxl/vae/
