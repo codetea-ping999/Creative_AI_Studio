@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 import wave
 
@@ -144,6 +145,7 @@ class AudioGenerator(BaseGenerator):
                 "channels": int(audio_tensor.shape[0] if audio_tensor.ndim > 1 else 1),
                 "default_params": dict(manifest.default_params),
                 "quality_report": quality_report,
+                **_extract_lineage_metadata(request.params),
                 "params": {
                     "duration_seconds": duration_seconds,
                     "max_new_tokens": max_new_tokens,
@@ -217,6 +219,21 @@ class AudioGenerator(BaseGenerator):
             wav_file.setsampwidth(2)
             wav_file.setframerate(sampling_rate)
             wav_file.writeframes(pcm)
+
+
+def _extract_lineage_metadata(params: dict[str, Any]) -> dict[str, Any]:
+    lineage_keys = (
+        "source_asset_id",
+        "source_job_id",
+        "reference_asset_path",
+        "reuse_action",
+    )
+    lineage_payload: dict[str, Any] = {}
+    for key in lineage_keys:
+        value = params.get(key)
+        if value is not None:
+            lineage_payload[key] = value
+    return lineage_payload
 
 
 __all__ = ["AudioGenerator"]

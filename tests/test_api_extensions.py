@@ -165,16 +165,19 @@ class ApiExtensionTests(unittest.TestCase):
 
             summary_response = client.get(f"/feedback/summary?job_id={job_id}")
             self.assertEqual(summary_response.status_code, 200)
-            self.assertEqual(
-                summary_response.json(),
-                {
-                    "total_feedback": 1,
-                    "average_quality_rating": 4.0,
-                    "average_semantic_rating": 5.0,
-                    "comment_count": 1,
-                    "latest_feedback_at": feedback_response.json()["created_at"],
-                },
-            )
+            summary_payload = summary_response.json()
+            self.assertEqual(summary_payload["total_feedback"], 1)
+            self.assertEqual(summary_payload["average_quality_rating"], 4.0)
+            self.assertEqual(summary_payload["average_semantic_rating"], 5.0)
+            self.assertEqual(summary_payload["average_creative_rating"], None)
+            self.assertEqual(summary_payload["comment_count"], 1)
+            self.assertEqual(summary_payload["export_ready_rate"], 0.0)
+            self.assertEqual(summary_payload["reuse_intent_rate"], 0.0)
+            self.assertEqual(summary_payload["issue_tag_counts"], {})
+            self.assertEqual(summary_payload["human_quality_score"], 80.0)
+            self.assertEqual(summary_payload["human_semantic_alignment_score"], 100.0)
+            self.assertEqual(summary_payload["human_creative_alignment_score"], None)
+            self.assertEqual(summary_payload["latest_feedback_at"], feedback_response.json()["created_at"])
 
     def test_feedback_requires_known_job_and_gallery_supports_project_filter(self) -> None:
         with TemporaryDirectory() as tmp_dir:
