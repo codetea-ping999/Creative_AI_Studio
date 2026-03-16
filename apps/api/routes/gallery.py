@@ -1,54 +1,64 @@
-"""Gallery endpoints for browsing generated outputs."""
+"""Gallery endpoints for browsing and reusing generated outputs."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from apps.api.dependencies import get_services
 from bootstrap import ApplicationServices
-from core.jobs import JobService
+from core.assets import Asset
+from core.quality import calibrate_quality_report
+from core.schemas import GenerationRequest
 
 router = APIRouter(prefix="/gallery", tags=["gallery"])
 
 
-@dataclass(slots=True)
-class GalleryItem:
-    """A single generated output for display."""
-
-    job_id: str
-    project_id: str | None
-    media_type: str
-    prompt: str
-    model_id: str
-    output_path: str
-    preview_path: str | None
-    created_at: datetime
-    quality_score: float | None = None
-    quality_level: str | None = None
-    success: bool = True
-
-
 class GalleryItemResponse(BaseModel):
-    """Gallery item as returned by the API."""
+    """Gallery item summary used by the web UI and export flows."""
 
     model_config = ConfigDict(extra="forbid")
 
+    asset_id: str = Field(min_length=1)
     job_id: str = Field(min_length=1)
     project_id: str | None = None
+    project_name: str | None = None
     media_type: str = Field(min_length=1)
     prompt: str
     model_id: str = Field(min_length=1)
     output_path: str = Field(min_length=1)
     preview_path: str | None = None
     created_at: datetime
+    updated_at: datetime
     quality_score: float | None = None
     quality_level: str | None = None
+    semantic_alignment_score: float | None = None
+    creative_alignment_score: float | None = None
+    quality_score_calibrated: float | None = None
+    semantic_alignment_score_calibrated: float | None = None
+    creative_alignment_score_calibrated: float | None = None
+    feedback_count: int = 0
+    average_feedback_quality: float | None = None
+    reuse_count: int = 0
+    export_count: int = 0
     success: bool = True
+
+
+class GalleryAssetDetailResponse(GalleryItemResponse):
+    """Detailed gallery asset payload with metadata and feedback."""
+
+    quality_report: dict[str, Any] = Field(default_factory=dict)
+    request_snapshot: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    feedback_summary: dict[str, Any] = Field(default_factory=dict)
+    export_paths: list[str] = Field(default_factory=list)
+    parent_asset_id: str | None = None
+    lineage: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
 
 
 class GalleryStatsResponse(BaseModel):
@@ -60,85 +70,206 @@ class GalleryStatsResponse(BaseModel):
     total_by_media_type: dict[str, int] = Field(default_factory=dict)
     total_by_project: dict[str, int] = Field(default_factory=dict)
     average_quality_score: float | None = None
+    total_reuse_count: int = Field(ge=0)
+    total_export_count: int = Field(ge=0)
 
 
-def _build_gallery_items(
+class ReuseAssetRequest(BaseModel):
+    """Reuse an existing asset as the basis for a new generation request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: str = Field(default="rerun", min_length=1)
+    prompt: str | None = None
+    negative_prompt: str | None = None
+    model_id: str | None = None
+    seed: int | None = None
+    output_format: str | None = None
+    project_id: str | None = None
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+class ReuseAssetResponse(BaseModel):
+    """Response returned when a reused asset spawns a new job."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    asset_id: str = Field(min_length=1)
+    job_id: str = Field(min_length=1)
+    status: str = Field(min_length=1)
+    project_id: str | None = None
+
+
+class ExportAssetRequest(BaseModel):
+    """Request shape for exporting a gallery asset to a reusable location."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    destination_dir: str | None = None
+    destination_name: str | None = None
+    include_metadata: bool = True
+
+
+class ExportAssetResponse(BaseModel):
+    """Export result details."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    asset_id: str = Field(min_length=1)
+    export_path: str = Field(min_length=1)
+    metadata_path: str | None = None
+
+
+class BindAssetProjectRequest(BaseModel):
+    """Bind an asset and its source job to a project."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: str | None = None
+
+
+def _sync_assets(services: ApplicationServices) -> None:
+    services.asset_repository.sync_jobs(services.job_service.list_jobs())
+
+
+def _serialize_gallery_item(
+    asset: Asset,
     services: ApplicationServices,
-    media_type: str | None = None,
-    project_id: str | None = None,
-    query_text: str | None = None,
-    limit: int = 50,
-) -> list[GalleryItem]:
-    """Build gallery items from job records and output files."""
+) -> GalleryItemResponse:
+    source_job = services.job_repository.get(asset.job_id)
+    if source_job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Source job not found")
 
-    jobs = services.job_service.list_jobs()
-    normalized_query = query_text.strip().lower() if query_text else None
+    feedback_summary = services.feedback_repository.summarize(asset_id=asset.id)
+    quality_report = _extract_quality_report(asset, feedback_summary)
+    project = services.project_repository.get(asset.project_id) if asset.project_id else None
 
-    items = []
-    for job in jobs:
-        # Filter by media type if specified
-        if media_type and job.media_type != media_type:
-            continue
-        if project_id and job.project_id != project_id:
-            continue
+    return GalleryItemResponse(
+        asset_id=asset.id,
+        job_id=asset.job_id,
+        project_id=asset.project_id,
+        project_name=project.name if project is not None else None,
+        media_type=asset.media_type,
+        prompt=asset.prompt,
+        model_id=asset.model_id or source_job.request.model_id or "default",
+        output_path=asset.path,
+        preview_path=asset.preview_path,
+        created_at=asset.created_at,
+        updated_at=asset.updated_at,
+        quality_score=_number_or_none(quality_report.get("quality_score")),
+        quality_level=_string_or_none(quality_report.get("quality_level")),
+        semantic_alignment_score=_number_or_none(quality_report.get("semantic_alignment_score")),
+        creative_alignment_score=_number_or_none(quality_report.get("creative_alignment_score")),
+        quality_score_calibrated=_number_or_none(quality_report.get("quality_score_calibrated")),
+        semantic_alignment_score_calibrated=_number_or_none(
+            quality_report.get("semantic_alignment_score_calibrated")
+        ),
+        creative_alignment_score_calibrated=_number_or_none(
+            quality_report.get("creative_alignment_score_calibrated")
+        ),
+        feedback_count=int(feedback_summary.get("total_feedback", 0)),
+        average_feedback_quality=_number_or_none(feedback_summary.get("average_quality_rating")),
+        reuse_count=int(asset.metadata.get("reuse_count", 0)),
+        export_count=len(asset.export_paths),
+        success=Path(asset.path).exists(),
+    )
 
-        # Only include succeeded jobs with output
-        if job.status != "succeeded" or job.result is None:
-            continue
 
-        output_path = next((output for output in job.result.outputs if output), None)
-        if not output_path:
-            continue
+def _serialize_gallery_detail(
+    asset: Asset,
+    services: ApplicationServices,
+) -> GalleryAssetDetailResponse:
+    source_job = services.job_repository.get(asset.job_id)
+    if source_job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Source job not found")
 
-        if normalized_query:
-            search_blob = " ".join(
-                [
-                    job.request.prompt,
-                    job.request.model_id,
-                    output_path,
-                    job.project_id or "",
-                ]
-            ).lower()
-            if normalized_query not in search_blob:
-                continue
+    feedback_summary = services.feedback_repository.summarize(asset_id=asset.id)
+    quality_report = _extract_quality_report(asset, feedback_summary)
+    summary = _serialize_gallery_item(asset, services)
+    return GalleryAssetDetailResponse(
+        **summary.model_dump(),
+        quality_report=quality_report,
+        request_snapshot=source_job.request.model_dump(mode="json"),
+        metadata=dict(asset.metadata),
+        feedback_summary=feedback_summary,
+        export_paths=list(asset.export_paths),
+        parent_asset_id=asset.parent_asset_id,
+        lineage=list(asset.lineage),
+        tags=list(asset.tags),
+    )
 
-        # Verify output file exists.
-        output_file = Path(output_path)
-        if not output_file.exists():
-            continue
 
-        quality_report = job.result.metadata.get("quality_report")
-        quality_score = None
-        quality_level = None
-        if isinstance(quality_report, dict):
-            raw_score = quality_report.get("quality_score")
-            raw_level = quality_report.get("quality_level")
-            if isinstance(raw_score, (int, float)):
-                quality_score = float(raw_score)
-            if isinstance(raw_level, str):
-                quality_level = raw_level
+def _extract_quality_report(
+    asset: Asset,
+    feedback_summary: dict[str, Any],
+) -> dict[str, Any]:
+    quality_report = asset.metadata.get("quality_report")
+    if not isinstance(quality_report, dict):
+        quality_report = {}
+    return calibrate_quality_report(dict(quality_report), feedback_summary)
 
-        # Build item
-        item = GalleryItem(
-            job_id=job.id,
-            project_id=job.project_id,
-            media_type=job.media_type,
-            prompt=job.request.prompt,
-            model_id=job.request.model_id or "default",
-            output_path=str(output_path),
-            preview_path=next((preview for preview in job.result.previews if preview), None),
-            created_at=job.created_at,
-            quality_score=quality_score,
-            quality_level=quality_level,
-            success=True,
-        )
-        items.append(item)
 
-    # Sort by creation date, newest first
-    items.sort(key=lambda x: x.created_at, reverse=True)
+def _rebind_source_job_project(
+    services: ApplicationServices,
+    *,
+    job_id: str,
+    project_id: str | None,
+) -> None:
+    source_job = services.job_repository.get(job_id)
+    if source_job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Source job not found")
 
-    # Limit results
-    return items[:limit]
+    current_project_id = source_job.project_id
+    if current_project_id and current_project_id != project_id:
+        services.project_repository.remove_job(current_project_id, job_id)
+    if project_id and project_id != current_project_id:
+        if services.project_repository.get(project_id) is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+        services.project_repository.add_job(project_id, job_id)
+    services.job_repository.update_project(job_id, project_id)
+    services.asset_repository.bind_job_assets(job_id, project_id)
+
+
+def _build_reuse_request(
+    source_asset: Asset,
+    services: ApplicationServices,
+    req: ReuseAssetRequest,
+) -> tuple[GenerationRequest, str | None]:
+    source_job = services.job_repository.get(source_asset.job_id)
+    if source_job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Source job not found")
+
+    project_id = req.project_id if req.project_id is not None else source_asset.project_id
+    if project_id is not None and services.project_repository.get(project_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+
+    next_params = {
+        **dict(source_job.request.params),
+        **dict(req.params),
+        "source_asset_id": source_asset.id,
+        "source_job_id": source_asset.job_id,
+        "reference_asset_path": source_asset.path,
+        "reuse_action": req.action,
+    }
+    generation_request = source_job.request.model_copy(
+        update={
+            "prompt": req.prompt if req.prompt is not None else source_job.request.prompt,
+            "negative_prompt": (
+                req.negative_prompt
+                if req.negative_prompt is not None
+                else source_job.request.negative_prompt
+            ),
+            "model_id": req.model_id if req.model_id is not None else source_job.request.model_id,
+            "seed": req.seed if req.seed is not None else source_job.request.seed,
+            "output_format": (
+                req.output_format
+                if req.output_format is not None
+                else source_job.request.output_format
+            ),
+            "params": next_params,
+        }
+    )
+    return generation_request, project_id
 
 
 @router.get("", response_model=list[GalleryItemResponse])
@@ -149,64 +280,174 @@ def list_gallery(
     limit: int = Query(50, ge=1, le=200),
     services: ApplicationServices = Depends(get_services),
 ) -> list[GalleryItemResponse]:
-    """List gallery items, optionally filtered by media type."""
-
-    items = _build_gallery_items(
-        services,
+    _sync_assets(services)
+    items = services.asset_repository.list_all(
         media_type=media_type,
         project_id=project_id,
         query_text=q,
         limit=limit,
     )
-    return [
-        GalleryItemResponse(
-            job_id=item.job_id,
-            project_id=item.project_id,
-            media_type=item.media_type,
-            prompt=item.prompt,
-            model_id=item.model_id,
-            output_path=item.output_path,
-            preview_path=item.preview_path,
-            created_at=item.created_at,
-            quality_score=item.quality_score,
-            quality_level=item.quality_level,
-            success=item.success,
-        )
-        for item in items
-    ]
+    return [_serialize_gallery_item(item, services) for item in items]
+
+
+@router.get("/job/{job_id}", response_model=GalleryAssetDetailResponse)
+def get_gallery_item_by_job(
+    job_id: str,
+    services: ApplicationServices = Depends(get_services),
+) -> GalleryAssetDetailResponse:
+    _sync_assets(services)
+    asset = services.asset_repository.get_primary_by_job(job_id)
+    if asset is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Gallery asset not found")
+    return _serialize_gallery_detail(asset, services)
 
 
 @router.get("/stats", response_model=GalleryStatsResponse)
 def get_gallery_stats(
     services: ApplicationServices = Depends(get_services),
 ) -> GalleryStatsResponse:
-    """Get gallery statistics."""
+    _sync_assets(services)
+    items = services.asset_repository.list_all()
 
-    items = _build_gallery_items(services, limit=10000)
-
-    total_items = len(items)
     total_by_media_type: dict[str, int] = {}
     total_by_project: dict[str, int] = {}
     quality_scores: list[float] = []
+    total_reuse_count = 0
+    total_export_count = 0
 
-    for item in items:
-        # Count by media type
-        total_by_media_type[item.media_type] = total_by_media_type.get(item.media_type, 0) + 1
-        project_key = item.project_id or "unassigned"
+    for asset in items:
+        total_by_media_type[asset.media_type] = total_by_media_type.get(asset.media_type, 0) + 1
+        project_key = asset.project_id or "unassigned"
         total_by_project[project_key] = total_by_project.get(project_key, 0) + 1
+        quality_report = asset.metadata.get("quality_report")
+        if isinstance(quality_report, dict):
+            score = quality_report.get("quality_score")
+            if isinstance(score, (int, float)):
+                quality_scores.append(float(score))
+        total_reuse_count += int(asset.metadata.get("reuse_count", 0))
+        total_export_count += len(asset.export_paths)
 
-        # Collect quality scores
-        if item.quality_score is not None:
-            quality_scores.append(item.quality_score)
-
-    average_quality = sum(quality_scores) / len(quality_scores) if quality_scores else None
-
+    average_quality = round(sum(quality_scores) / len(quality_scores), 1) if quality_scores else None
     return GalleryStatsResponse(
-        total_items=total_items,
+        total_items=len(items),
         total_by_media_type=total_by_media_type,
         total_by_project=total_by_project,
         average_quality_score=average_quality,
+        total_reuse_count=total_reuse_count,
+        total_export_count=total_export_count,
     )
 
 
-__all__ = ["router", "GalleryItemResponse", "GalleryStatsResponse"]
+@router.get("/{asset_id}", response_model=GalleryAssetDetailResponse)
+def get_gallery_asset(
+    asset_id: str,
+    services: ApplicationServices = Depends(get_services),
+) -> GalleryAssetDetailResponse:
+    _sync_assets(services)
+    asset = services.asset_repository.get(asset_id)
+    if asset is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Gallery asset not found")
+    return _serialize_gallery_detail(asset, services)
+
+
+@router.post(
+    "/{asset_id}/reuse",
+    response_model=ReuseAssetResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def reuse_gallery_asset(
+    asset_id: str,
+    req: ReuseAssetRequest,
+    services: ApplicationServices = Depends(get_services),
+) -> ReuseAssetResponse:
+    _sync_assets(services)
+    source_asset = services.asset_repository.get(asset_id)
+    if source_asset is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Gallery asset not found")
+
+    generation_request, project_id = _build_reuse_request(source_asset, services, req)
+    job = services.job_service.create_job(generation_request, project_id=project_id)
+    if project_id is not None:
+        services.project_repository.add_job(project_id, job.id)
+    services.asset_repository.mark_reused(
+        asset_id,
+        action=req.action,
+        derived_job_id=job.id,
+        project_id=project_id,
+    )
+    return ReuseAssetResponse(
+        asset_id=asset_id,
+        job_id=job.id,
+        status=job.status,
+        project_id=project_id,
+    )
+
+
+@router.post("/{asset_id}/export", response_model=ExportAssetResponse)
+def export_gallery_asset(
+    asset_id: str,
+    req: ExportAssetRequest,
+    services: ApplicationServices = Depends(get_services),
+) -> ExportAssetResponse:
+    _sync_assets(services)
+    asset = services.asset_repository.get(asset_id)
+    if asset is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Gallery asset not found")
+
+    destination_dir = (
+        Path(req.destination_dir)
+        if req.destination_dir
+        else services.output_dir.parent / "exports" / asset.media_type
+    )
+    exported = services.asset_repository.export_asset(
+        asset_id,
+        export_root=destination_dir,
+        destination_name=req.destination_name,
+        include_metadata=req.include_metadata,
+    )
+    return ExportAssetResponse(
+        asset_id=asset_id,
+        export_path=exported["export_path"],
+        metadata_path=exported["metadata_path"] or None,
+    )
+
+
+@router.patch("/{asset_id}/project", response_model=GalleryAssetDetailResponse)
+def bind_gallery_asset_to_project(
+    asset_id: str,
+    req: BindAssetProjectRequest,
+    services: ApplicationServices = Depends(get_services),
+) -> GalleryAssetDetailResponse:
+    _sync_assets(services)
+    asset = services.asset_repository.get(asset_id)
+    if asset is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Gallery asset not found")
+
+    _rebind_source_job_project(services, job_id=asset.job_id, project_id=req.project_id)
+    rebound_asset = services.asset_repository.bind_project(asset_id, req.project_id)
+    if rebound_asset is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Gallery asset not found")
+    return _serialize_gallery_detail(rebound_asset, services)
+
+
+def _number_or_none(value: object) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def _string_or_none(value: object) -> str | None:
+    return str(value) if isinstance(value, str) else None
+
+
+__all__ = [
+    "BindAssetProjectRequest",
+    "ExportAssetRequest",
+    "ExportAssetResponse",
+    "GalleryAssetDetailResponse",
+    "GalleryItemResponse",
+    "GalleryStatsResponse",
+    "ReuseAssetRequest",
+    "ReuseAssetResponse",
+    "router",
+]

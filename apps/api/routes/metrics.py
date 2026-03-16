@@ -9,8 +9,9 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, ConfigDict, Field
 
-from apps.api.dependencies import get_job_service
-from core.jobs import JobRecord, JobService
+from apps.api.dependencies import get_services
+from bootstrap import ApplicationServices
+from core.jobs import JobRecord
 from core.jobs.statuses import (
     JOB_STATUS_FAILED,
     JOB_STATUS_POSTPROCESSING,
@@ -44,7 +45,15 @@ class MediaMetrics(BaseModel):
     average_quality_score: float | None = None
     average_business_readiness_score: float | None = None
     average_semantic_alignment_score: float | None = None
+    average_creative_alignment_score: float | None = None
     latest_quality_level: str | None = None
+    semantic_scored_jobs: int = 0
+    semantic_unavailable_jobs: int = 0
+    feedback_total: int = 0
+    feedback_coverage_rate: float = 0.0
+    average_human_quality_rating: float | None = None
+    average_human_semantic_rating: float | None = None
+    average_human_creative_rating: float | None = None
 
 
 class MetricsSummaryResponse(BaseModel):
@@ -61,24 +70,33 @@ class MetricsSummaryResponse(BaseModel):
     average_quality_score: float | None = None
     average_business_readiness_score: float | None = None
     average_semantic_alignment_score: float | None = None
+    average_creative_alignment_score: float | None = None
     latest_quality_level: str | None = None
+    semantic_scored_jobs: int = 0
+    semantic_unavailable_jobs: int = 0
     recent_window_size: int = 0
     recent_success_rate: float = 0.0
     recent_average_quality_score: float | None = None
+    feedback_total: int = 0
+    feedback_coverage_rate: float = 0.0
+    average_human_quality_rating: float | None = None
+    average_human_semantic_rating: float | None = None
+    average_human_creative_rating: float | None = None
     by_media: dict[str, MediaMetrics] = Field(default_factory=dict)
 
 
 @router.get("/summary", response_model=MetricsSummaryResponse)
 def get_metrics_summary(
-    job_service: JobService = Depends(get_job_service),
+    services: ApplicationServices = Depends(get_services),
     window_size: int = Query(default=20, ge=1, le=200),
 ) -> MetricsSummaryResponse:
-    jobs = job_service.list_jobs()
+    jobs = services.job_service.list_jobs()
     recent_jobs = jobs[:window_size]
-    summary = _summarize_jobs(jobs)
+    feedback_by_job = _group_feedback_by_job(services.feedback_repository.list_all())
+    summary = _summarize_jobs(jobs, feedback_by_job)
     summary["recent_window_size"] = len(recent_jobs)
     summary["recent_success_rate"] = _ratio(
-        sum(1 for job in recent_jobs if job.status == "succeeded"),
+        sum(1 for job in recent_jobs if job.status == JOB_STATUS_SUCCEEDED),
         len(recent_jobs),
     )
     summary["recent_average_quality_score"] = _average(
@@ -87,25 +105,29 @@ def get_metrics_summary(
     return MetricsSummaryResponse.model_validate(summary)
 
 
-def _summarize_jobs(jobs: list[JobRecord]) -> dict[str, object]:
+def _summarize_jobs(
+    jobs: list[JobRecord],
+    feedback_by_job: dict[str, list[object]],
+) -> dict[str, object]:
     by_media_jobs: dict[str, list[JobRecord]] = defaultdict(list)
     for job in jobs:
         by_media_jobs[job.media_type].append(job)
 
-    summary = _build_metrics(jobs)
+    summary = _build_metrics(jobs, feedback_by_job)
     summary["by_media"] = {
-        media_type: MediaMetrics.model_validate(_build_metrics(media_jobs))
+        media_type: MediaMetrics.model_validate(_build_metrics(media_jobs, feedback_by_job))
         for media_type, media_jobs in sorted(by_media_jobs.items())
     }
     return summary
 
 
-def _summarize_media(jobs: list[JobRecord]) -> dict[str, object]:
-    return _build_metrics(jobs)
-
-
-def _build_metrics(jobs: list[JobRecord]) -> dict[str, object]:
+def _build_metrics(
+    jobs: list[JobRecord],
+    feedback_by_job: dict[str, list[object]],
+) -> dict[str, object]:
     succeeded_jobs = [job for job in jobs if job.status == JOB_STATUS_SUCCEEDED]
+    feedbacks = [feedback for job in jobs for feedback in feedback_by_job.get(job.id, [])]
+    semantic_statuses = [_semantic_status(job) for job in jobs]
     return {
         "total_jobs": len(jobs),
         "succeeded_jobs": len(succeeded_jobs),
@@ -125,6 +147,9 @@ def _build_metrics(jobs: list[JobRecord]) -> dict[str, object]:
         "average_semantic_alignment_score": _average(
             _quality_metric(job, "semantic_alignment_score") for job in jobs
         ),
+        "average_creative_alignment_score": _average(
+            _quality_metric(job, "creative_alignment_score") for job in jobs
+        ),
         "latest_quality_level": next(
             (
                 level
@@ -133,7 +158,34 @@ def _build_metrics(jobs: list[JobRecord]) -> dict[str, object]:
             ),
             None,
         ),
+        "semantic_scored_jobs": sum(1 for status_value in semantic_statuses if status_value == "scored"),
+        "semantic_unavailable_jobs": sum(
+            1 for status_value in semantic_statuses if status_value == "unavailable"
+        ),
+        "feedback_total": len(feedbacks),
+        "feedback_coverage_rate": _ratio(
+            len({feedback.job_id for feedback in feedbacks}),
+            len(jobs),
+        ),
+        "average_human_quality_rating": _average(
+            getattr(feedback, "quality_rating", None) for feedback in feedbacks
+        ),
+        "average_human_semantic_rating": _average(
+            getattr(feedback, "semantic_rating", None) for feedback in feedbacks
+        ),
+        "average_human_creative_rating": _average(
+            getattr(feedback, "creative_rating", None) for feedback in feedbacks
+        ),
     }
+
+
+def _group_feedback_by_job(feedbacks: list[object]) -> dict[str, list[object]]:
+    grouped: dict[str, list[object]] = defaultdict(list)
+    for feedback in feedbacks:
+        job_id = getattr(feedback, "job_id", None)
+        if isinstance(job_id, str):
+            grouped[job_id].append(feedback)
+    return grouped
 
 
 def _quality_report(job: JobRecord) -> dict[str, object] | None:
@@ -159,6 +211,17 @@ def _quality_level(job: JobRecord) -> str | None:
     return str(level) if isinstance(level, str) else None
 
 
+def _semantic_status(job: JobRecord) -> str | None:
+    quality = _quality_report(job)
+    if quality is None:
+        return None
+    semantic_report = quality.get("semantic_report")
+    if not isinstance(semantic_report, dict):
+        return None
+    status_value = semantic_report.get("status")
+    return str(status_value) if isinstance(status_value, str) else None
+
+
 def _is_saved(job: JobRecord) -> bool:
     if job.status != JOB_STATUS_SUCCEEDED or job.result is None or not job.result.outputs:
         return False
@@ -171,7 +234,7 @@ def _ratio(numerator: int, denominator: int) -> float:
     return round((numerator / denominator) * 100, 1)
 
 
-def _average(values: Iterable[float | None]) -> float | None:
+def _average(values: Iterable[float | int | None]) -> float | None:
     normalized = [float(value) for value in values if isinstance(value, (int, float))]
     if not normalized:
         return None

@@ -12,6 +12,7 @@ from generators.registry import GeneratorRegistry
 from .events import EventBus
 
 if TYPE_CHECKING:
+    from core.assets import AssetRepository
     from core.storage.repositories.job_repository import JobRepository
 from .schemas import JobRecord
 from .statuses import (
@@ -36,11 +37,13 @@ class JobRunner:
         job_queue: object,
         generator_registry: GeneratorRegistry,
         event_bus: EventBus | None = None,
+        asset_repository: AssetRepository | None = None,
     ) -> None:
         self.job_repository = job_repository
         self.job_queue = job_queue
         self.generator_registry = generator_registry
         self.event_bus = event_bus
+        self.asset_repository = asset_repository
 
     def run_once(self) -> JobRecord | None:
         job_id = self.job_queue.dequeue()
@@ -100,6 +103,8 @@ class JobRunner:
                 error_message=None,
             )
             if final_job is not None:
+                if self.asset_repository is not None:
+                    self.asset_repository.sync_job(final_job)
                 self._publish(
                     "job_succeeded",
                     {

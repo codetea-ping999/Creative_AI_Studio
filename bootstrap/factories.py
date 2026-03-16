@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 
+from core.assets import AssetRepository
 from core.jobs import EventBus, JobQueue, JobRunner, JobService
 from core.models import (
     ModelRuntimeCache,
@@ -37,6 +38,7 @@ class ApplicationServices:
     job_runner: JobRunner
     project_repository: ProjectRepository
     feedback_repository: FeedbackRepository
+    asset_repository: AssetRepository
 
 
 def _resolve_manifest_root(manifest_root: str | Path | None) -> str | Path | None:
@@ -257,10 +259,17 @@ def create_application_services(
         max_cached_models=resolved_max_cached_models,
     )
     job_repository = JobRepository(resolved_db_path)
+    asset_repository = AssetRepository(resolved_db_path.parent / "assets")
     job_queue = JobQueue()
     event_bus = EventBus()
-    job_service = JobService(job_repository, job_queue, event_bus)
-    job_runner = JobRunner(job_repository, job_queue, generator_registry, event_bus)
+    job_service = JobService(job_repository, job_queue, event_bus, asset_repository=asset_repository)
+    job_runner = JobRunner(
+        job_repository,
+        job_queue,
+        generator_registry,
+        event_bus,
+        asset_repository=asset_repository,
+    )
     project_repository = ProjectRepository(resolved_db_path.parent / "projects")
     feedback_repository = FeedbackRepository(resolved_db_path.parent / "feedback")
     return ApplicationServices(
@@ -274,6 +283,7 @@ def create_application_services(
         job_runner=job_runner,
         project_repository=project_repository,
         feedback_repository=feedback_repository,
+        asset_repository=asset_repository,
     )
 
 __all__ = [

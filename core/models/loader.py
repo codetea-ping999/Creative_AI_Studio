@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import importlib.util
 import os
 from pathlib import Path
 from typing import Any
@@ -275,6 +276,96 @@ class ProceduralVideoLoader(BaseModelLoader):
         return str(local_path)
 
 
+class LearnedVideoLoader(BaseModelLoader):
+    """Load a learned text-to-video runtime through a local adapter entrypoint."""
+
+    def load(self, manifest: ModelManifest) -> dict[str, Any]:
+        local_path = self._resolve_local_path(manifest)
+        entrypoint = self._resolve_entrypoint(manifest, local_path)
+        fallback_runtime = str(
+            manifest.default_params.get("fallback_runtime", "procedural_storyboard")
+        )
+        load_error: str | None = None
+        runtime_payload: dict[str, Any] = {}
+
+        if entrypoint is not None:
+            try:
+                runtime_payload = self._load_entrypoint(entrypoint, manifest)
+            except Exception as exc:  # pragma: no cover - depends on local adapter implementation
+                load_error = str(exc)
+        else:
+            load_error = (
+                "No learned video adapter entrypoint found. "
+                "Add runtime.py or set default_params.entrypoint in the manifest."
+            )
+
+        return {
+            "stub": False,
+            "loader": self.__class__.__name__,
+            "manifest_id": manifest.id,
+            "display_name": manifest.display_name,
+            "runtime": manifest.runtime,
+            "provider": manifest.provider,
+            "local_path": local_path,
+            "remote_ref": manifest.remote_ref,
+            "dtype": manifest.dtype,
+            "device": "cpu",
+            "default_params": dict(manifest.default_params),
+            "path_exists": True,
+            "runtime_adapter": "learned_text_to_video",
+            "fallback_runtime": fallback_runtime,
+            "load_error": load_error,
+            **runtime_payload,
+        }
+
+    def _resolve_local_path(self, manifest: ModelManifest) -> str:
+        if not manifest.local_path:
+            raise ValueError(f"Manifest {manifest.id!r} is missing local_path.")
+
+        local_path = (_REPO_ROOT / manifest.local_path).resolve()
+        if not local_path.exists():
+            raise FileNotFoundError(
+                f"Model path does not exist for manifest {manifest.id!r}: {local_path}"
+            )
+        return str(local_path)
+
+    def _resolve_entrypoint(self, manifest: ModelManifest, local_path: str) -> Path | None:
+        root = Path(local_path)
+        configured_entrypoint = manifest.default_params.get("entrypoint")
+        if isinstance(configured_entrypoint, str) and configured_entrypoint.strip():
+            candidate = root / configured_entrypoint
+            return candidate if candidate.exists() else None
+
+        for candidate_name in ("runtime.py", "adapter.py"):
+            candidate = root / candidate_name
+            if candidate.exists():
+                return candidate
+        return None
+
+    def _load_entrypoint(self, entrypoint: Path, manifest: ModelManifest) -> dict[str, Any]:
+        spec = importlib.util.spec_from_file_location(
+            f"creative_ai_video_runtime_{manifest.id}",
+            entrypoint,
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Unable to load learned video runtime entrypoint: {entrypoint}")
+
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        load_runtime = getattr(module, "load_runtime", None)
+        if not callable(load_runtime):
+            raise RuntimeError(
+                f"Learned video runtime entrypoint must expose load_runtime(): {entrypoint}"
+            )
+
+        payload = load_runtime(manifest.model_dump(mode="json"))
+        if payload is None:
+            return {}
+        if not isinstance(payload, dict):
+            raise RuntimeError("load_runtime() must return a dict payload")
+        return payload
+
+
 class LoaderRegistry:
     """Lookup table for named loader instances."""
 
@@ -298,12 +389,14 @@ def create_default_loader_registry() -> LoaderRegistry:
     registry.register("diffusers_image_loader", DiffusersImageLoader())
     registry.register("transformers_musicgen_loader", TransformersMusicgenLoader())
     registry.register("procedural_video_loader", ProceduralVideoLoader())
+    registry.register("learned_video_loader", LearnedVideoLoader())
     return registry
 
 
 __all__ = [
     "BaseModelLoader",
     "DiffusersImageLoader",
+    "LearnedVideoLoader",
     "LoaderRegistry",
     "ProceduralVideoLoader",
     "TransformersMusicgenLoader",

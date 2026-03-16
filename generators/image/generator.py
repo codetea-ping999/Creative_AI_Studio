@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from core.models import ModelService
@@ -124,6 +125,7 @@ class ImageGenerator(BaseGenerator):
                 "output_format": "png",
                 "default_params": dict(manifest.default_params),
                 "quality_report": quality_report,
+                **_extract_lineage_metadata(request.params),
                 "params": {
                     "width": width,
                     "height": height,
@@ -218,6 +220,21 @@ class ImageGenerator(BaseGenerator):
         runtime_obj.pop("active_lora_path", None)
         runtime_obj.pop("active_lora_adapter", None)
         runtime_obj.pop("active_lora_scale", None)
+
+
+def _extract_lineage_metadata(params: dict[str, Any]) -> dict[str, Any]:
+    lineage_keys = (
+        "source_asset_id",
+        "source_job_id",
+        "reference_asset_path",
+        "reuse_action",
+    )
+    lineage_payload: dict[str, Any] = {}
+    for key in lineage_keys:
+        value = params.get(key)
+        if value is not None:
+            lineage_payload[key] = value
+    return lineage_payload
 
 
 __all__ = ["ImageGenerator"]

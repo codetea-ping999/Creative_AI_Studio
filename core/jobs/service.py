@@ -12,6 +12,7 @@ from core.schemas import GenerationRequest, GenerationResult
 from .events import EventBus
 
 if TYPE_CHECKING:
+    from core.assets import AssetRepository
     from core.storage.repositories.job_repository import JobRepository
 from .schemas import JobRecord
 from .statuses import (
@@ -44,10 +45,12 @@ class JobService:
         job_repository: JobRepository,
         job_queue: object,
         event_bus: EventBus | None = None,
+        asset_repository: AssetRepository | None = None,
     ) -> None:
         self.job_repository = job_repository
         self.job_queue = job_queue
         self.event_bus = event_bus
+        self.asset_repository = asset_repository
 
     def create_job(
         self,
@@ -157,6 +160,8 @@ class JobService:
             error_message=None,
         )
         if job is not None:
+            if self.asset_repository is not None:
+                self.asset_repository.sync_job(job)
             self._publish(
                 "job_succeeded",
                 {
