@@ -14,7 +14,7 @@ from core.quality import (
 from core.schemas import GenerationRequest, GenerationResult
 from generators.base import BaseGenerator
 
-from .runtime import VideoRuntimeRouter
+from .runtime import SUPPORTED_VIDEO_OUTPUT_FORMATS, VideoRuntimeRouter
 
 
 class VideoGenerator(BaseGenerator):
@@ -37,8 +37,8 @@ class VideoGenerator(BaseGenerator):
             raise ValueError("VideoGenerator only supports video requests.")
         if not request.prompt.strip():
             raise ValueError("Video prompt must not be empty.")
-        if request.output_format and request.output_format.lower() not in {"gif", "mp4", "webm"}:
-            raise ValueError("VideoGenerator currently supports gif/mp4/webm output hints only.")
+        if request.output_format and request.output_format.lower() not in SUPPORTED_VIDEO_OUTPUT_FORMATS:
+            raise ValueError("VideoGenerator currently supports gif output only.")
 
     def prepare(self, request: GenerationRequest) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)

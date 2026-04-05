@@ -324,9 +324,14 @@ def remove_job_from_project(
 ) -> ProjectResponse:
     _sync_assets(services)
     repo = _get_project_repo(services)
+    project = _project_or_404(project_id, services)
+    job = services.job_repository.get(job_id)
+    if job is None or job.project_id != project.id or job_id not in project.job_ids:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found in project")
+
     project = repo.remove_job(project_id, job_id)
     if project is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found in project")
 
     services.job_repository.update_project(job_id, None)
     services.asset_repository.bind_job_assets(job_id, None)

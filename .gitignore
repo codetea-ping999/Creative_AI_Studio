@@ -21,6 +21,8 @@ models/audio/musicgen-small/*.bin
 models/audio/musicgen-small/*.json
 models/audio/musicgen-small/*.model
 models/audio/musicgen-small/*.safetensors
+models/audio/musicgen-medium/
+models/image/ssd-1b/
 models/image/sdxl/scheduler/
 models/image/sdxl/text_encoder/
 models/image/sdxl/text_encoder_2/

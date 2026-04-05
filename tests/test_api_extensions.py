@@ -263,6 +263,290 @@ class ApiExtensionTests(unittest.TestCase):
             self.assertEqual(source_project["job_count"], 1)
             self.assertEqual(target_project["job_count"], 1)
 
+    def test_remove_job_rejects_foreign_project_and_preserves_bindings(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            services = create_application_services(
+                db_path=root / "jobs.db",
+                output_dir=root / "outputs" / "images",
+            )
+            client = TestClient(create_app(services, start_job_runner=False))
+
+            source_project_id = client.post("/projects", json={"name": "Source"}).json()["id"]
+            other_project_id = client.post("/projects", json={"name": "Other"}).json()["id"]
+
+            create_response = client.post(
+                "/generate/video",
+                json={
+                    "prompt": "nighttime city storyboard",
+                    "model_id": "storyboard-video",
+                    "project_id": source_project_id,
+                    "output_format": "gif",
+                    "params": {"duration_seconds": 2, "fps": 6},
+                },
+            )
+            self.assertEqual(create_response.status_code, 201)
+            job_id = create_response.json()["job_id"]
+
+            services.job_runner.run_once()
+            asset = services.asset_repository.get_primary_by_job(job_id)
+
+            self.assertIsNotNone(asset)
+            assert asset is not None
+
+            remove_response = client.delete(f"/projects/{other_project_id}/jobs/{job_id}")
+            self.assertEqual(remove_response.status_code, 404)
+            self.assertEqual(remove_response.json()["detail"], "Job not found in project")
+
+            job_payload = client.get(f"/jobs/{job_id}").json()
+            self.assertEqual(job_payload["project_id"], source_project_id)
+
+            asset_payload = client.get(f"/gallery/{asset.id}").json()
+            self.assertEqual(asset_payload["project_id"], source_project_id)
+
+            source_project = client.get(f"/projects/{source_project_id}/jobs").json()
+            other_project = client.get(f"/projects/{other_project_id}/jobs").json()
+            self.assertEqual(source_project["job_count"], 1)
+            self.assertEqual(source_project["jobs"][0]["id"], job_id)
+            self.assertEqual(other_project["job_count"], 0)
+
+    def test_remove_job_from_project_clears_job_and_asset_bindings(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            services = create_application_services(
+                db_path=root / "jobs.db",
+                output_dir=root / "outputs" / "images",
+            )
+            client = TestClient(create_app(services, start_job_runner=False))
+
+            project_id = client.post("/projects", json={"name": "Bound Project"}).json()["id"]
+            create_response = client.post(
+                "/generate/video",
+                json={
+                    "prompt": "graphic opening scene",
+                    "model_id": "storyboard-video",
+                    "project_id": project_id,
+                    "output_format": "gif",
+                    "params": {"duration_seconds": 2, "fps": 6},
+                },
+            )
+            self.assertEqual(create_response.status_code, 201)
+            job_id = create_response.json()["job_id"]
+
+            services.job_runner.run_once()
+            asset = services.asset_repository.get_primary_by_job(job_id)
+
+            self.assertIsNotNone(asset)
+            assert asset is not None
+
+            remove_response = client.delete(f"/projects/{project_id}/jobs/{job_id}")
+            self.assertEqual(remove_response.status_code, 200)
+            self.assertEqual(remove_response.json()["job_count"], 0)
+
+            job_payload = client.get(f"/jobs/{job_id}").json()
+            self.assertEqual(job_payload["project_id"], None)
+
+            asset_payload = client.get(f"/gallery/{asset.id}").json()
+            self.assertEqual(asset_payload["project_id"], None)
+
+            project_assets = client.get(f"/projects/{project_id}/assets").json()
+            self.assertEqual(project_assets, [])
+
+    def test_sync_job_is_idempotent_for_existing_assets(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            services = create_application_services(
+                db_path=root / "jobs.db",
+                output_dir=root / "outputs" / "images",
+            )
+            client = TestClient(create_app(services, start_job_runner=False))
+
+            create_response = client.post(
+                "/generate/video",
+                json={
+                    "prompt": "abstract motion board",
+                    "model_id": "storyboard-video",
+                    "output_format": "gif",
+                    "params": {"duration_seconds": 2, "fps": 6},
+                },
+            )
+            self.assertEqual(create_response.status_code, 201)
+            job_id = create_response.json()["job_id"]
+
+            services.job_runner.run_once()
+            asset = services.asset_repository.get_primary_by_job(job_id)
+            job = services.job_repository.get(job_id)
+
+            self.assertIsNotNone(asset)
+            self.assertIsNotNone(job)
+            assert asset is not None
+            assert job is not None
+
+            updated_at_before = asset.updated_at.isoformat()
+
+            first_sync = services.asset_repository.sync_job(job)
+            second_sync = services.asset_repository.sync_job(job)
+            asset_after = services.asset_repository.get(asset.id)
+
+            self.assertEqual(first_sync[0].id, asset.id)
+            self.assertEqual(second_sync[0].id, asset.id)
+            self.assertIsNotNone(asset_after)
+            assert asset_after is not None
+            self.assertEqual(asset_after.updated_at.isoformat(), updated_at_before)
+
+    def test_gallery_and_project_reads_do_not_mutate_asset_timestamps_or_order(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            services = create_application_services(
+                db_path=root / "jobs.db",
+                output_dir=root / "outputs" / "images",
+            )
+            client = TestClient(create_app(services, start_job_runner=False))
+
+            project_id = client.post("/projects", json={"name": "Read Only"}).json()["id"]
+            for prompt in ("first storyboard frame", "second storyboard frame"):
+                create_response = client.post(
+                    "/generate/video",
+                    json={
+                        "prompt": prompt,
+                        "model_id": "storyboard-video",
+                        "project_id": project_id,
+                        "output_format": "gif",
+                        "params": {"duration_seconds": 2, "fps": 6},
+                    },
+                )
+                self.assertEqual(create_response.status_code, 201)
+                services.job_runner.run_once()
+
+            assets_before = services.asset_repository.list_all(project_id=project_id)
+            order_before = [asset.id for asset in assets_before]
+            updated_before = {
+                asset.id: asset.updated_at.isoformat()
+                for asset in assets_before
+            }
+
+            gallery_response = client.get(f"/gallery?project_id={project_id}&media_type=video")
+            project_assets_response = client.get(f"/projects/{project_id}/assets")
+
+            self.assertEqual(gallery_response.status_code, 200)
+            self.assertEqual(project_assets_response.status_code, 200)
+            self.assertEqual(
+                [item["asset_id"] for item in gallery_response.json()],
+                order_before,
+            )
+            self.assertEqual(
+                [item["asset_id"] for item in project_assets_response.json()],
+                order_before,
+            )
+
+            assets_after = services.asset_repository.list_all(project_id=project_id)
+            order_after = [asset.id for asset in assets_after]
+            updated_after = {
+                asset.id: asset.updated_at.isoformat()
+                for asset in assets_after
+            }
+
+            self.assertEqual(order_after, order_before)
+            self.assertEqual(updated_after, updated_before)
+
+    def test_gallery_asset_reuse_export_and_project_binding_workflows(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            services = create_application_services(
+                db_path=root / "jobs.db",
+                output_dir=root / "outputs" / "images",
+            )
+            client = TestClient(create_app(services, start_job_runner=False))
+
+            source_project_id = client.post("/projects", json={"name": "Source Project"}).json()["id"]
+            target_project_id = client.post("/projects", json={"name": "Target Project"}).json()["id"]
+
+            create_response = client.post(
+                "/generate/video",
+                json={
+                    "prompt": "graphic storyboard for a launch trailer",
+                    "model_id": "storyboard-video",
+                    "project_id": source_project_id,
+                    "output_format": "gif",
+                    "params": {"duration_seconds": 2, "fps": 6, "visual_style": "animatic"},
+                },
+            )
+            self.assertEqual(create_response.status_code, 201)
+            source_job_id = create_response.json()["job_id"]
+
+            processed_job = services.job_runner.run_once()
+            self.assertIsNotNone(processed_job)
+
+            gallery_items = client.get("/gallery?media_type=video").json()
+            self.assertEqual(len(gallery_items), 1)
+            source_asset_id = gallery_items[0]["asset_id"]
+            self.assertEqual(gallery_items[0]["project_id"], source_project_id)
+
+            detail_response = client.get(f"/gallery/{source_asset_id}")
+            self.assertEqual(detail_response.status_code, 200)
+            detail_payload = detail_response.json()
+            self.assertEqual(detail_payload["request_snapshot"]["prompt"], "graphic storyboard for a launch trailer")
+            self.assertEqual(detail_payload["project_id"], source_project_id)
+
+            reuse_response = client.post(
+                f"/gallery/{source_asset_id}/reuse",
+                json={
+                    "action": "variation",
+                    "prompt": "graphic storyboard for a launch trailer, brighter color pass",
+                    "project_id": target_project_id,
+                    "params": {"duration_seconds": 3, "camera_motion": "orbit"},
+                },
+            )
+            self.assertEqual(reuse_response.status_code, 201)
+            reuse_payload = reuse_response.json()
+            self.assertEqual(reuse_payload["project_id"], target_project_id)
+
+            reused_job = client.get(f"/jobs/{reuse_payload['job_id']}").json()
+            self.assertEqual(reused_job["project_id"], target_project_id)
+            self.assertEqual(
+                reused_job["request"]["params"]["source_asset_id"],
+                source_asset_id,
+            )
+            self.assertEqual(
+                reused_job["request"]["params"]["reference_asset_path"],
+                detail_payload["output_path"],
+            )
+
+            original_after_reuse = client.get(f"/gallery/{source_asset_id}").json()
+            self.assertEqual(original_after_reuse["project_id"], source_project_id)
+            self.assertEqual(original_after_reuse["reuse_count"], 1)
+
+            services.job_runner.run_once()
+            target_gallery = client.get(f"/gallery?project_id={target_project_id}&media_type=video").json()
+            self.assertEqual(len(target_gallery), 1)
+            self.assertEqual(target_gallery[0]["project_id"], target_project_id)
+
+            export_response = client.post(
+                f"/gallery/{source_asset_id}/export",
+                json={
+                    "destination_dir": str(root / "exports" / "video"),
+                    "destination_name": "launch-trailer-source.gif",
+                    "include_metadata": True,
+                },
+            )
+            self.assertEqual(export_response.status_code, 200)
+            export_payload = export_response.json()
+            self.assertTrue(Path(export_payload["export_path"]).exists())
+            self.assertTrue(Path(export_payload["metadata_path"]).exists())
+
+            rebound_response = client.patch(
+                f"/gallery/{source_asset_id}/project",
+                json={"project_id": target_project_id},
+            )
+            self.assertEqual(rebound_response.status_code, 200)
+            rebound_payload = rebound_response.json()
+            self.assertEqual(rebound_payload["project_id"], target_project_id)
+
+            source_project_jobs = client.get(f"/projects/{source_project_id}/jobs").json()
+            target_project_jobs = client.get(f"/projects/{target_project_id}/jobs").json()
+            self.assertEqual(source_project_jobs["job_count"], 0)
+            self.assertEqual(target_project_jobs["job_count"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

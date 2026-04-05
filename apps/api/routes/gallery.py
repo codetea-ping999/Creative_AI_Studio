@@ -373,7 +373,6 @@ def reuse_gallery_asset(
         asset_id,
         action=req.action,
         derived_job_id=job.id,
-        project_id=project_id,
     )
     return ReuseAssetResponse(
         asset_id=asset_id,

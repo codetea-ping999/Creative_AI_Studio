@@ -9,11 +9,11 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from PIL import Image
-
 IMPORT_ERROR: Exception | None = None
 
 try:
+    from PIL import Image
+
     from bootstrap import (
         create_application_services,
         create_default_audio_generator,
@@ -29,6 +29,7 @@ try:
     from core.schemas import GenerationRequest
     from generators.audio import AudioGenerator
     from generators.image import ImageGenerator
+    from generators.video import VideoGenerator
 except ModuleNotFoundError as exc:
     IMPORT_ERROR = exc
 
@@ -280,6 +281,31 @@ class ModelSystemTests(unittest.TestCase):
                 "sdxl-local",
             )
 
+    def test_registry_ignores_equivalent_duplicate_manifest_files(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            payload = {
+                "id": "learned-video-local",
+                "public_id": "learned-video",
+                "display_name": "Learned Video Local",
+                "media_type": "video",
+                "task_type": "text-to-video",
+                "provider": "local",
+                "runtime": "learned",
+                "local_path": "./models/video/learned-runtime",
+                "loader": "learned_video_loader",
+                "aliases": ["learned-video-local"],
+            }
+            _write_manifest(root / "video" / "learned-local.json", payload)
+            _write_manifest(root / "video" / "learned-local 2.json", payload)
+
+            registry = ModelRegistry(manifest_root=root)
+            registry.load_all()
+
+            manifests = registry.list_by_media_type("video")
+            self.assertEqual(len(manifests), 1)
+            self.assertEqual(manifests[0].id, "learned-video-local")
+
     def test_runtime_cache_evicts_old_entries(self) -> None:
         cache = ModelRuntimeCache(max_entries=1)
         cache.put("model-a", {"id": "model-a"})
@@ -310,6 +336,21 @@ class ModelSystemTests(unittest.TestCase):
         loader = registry.get("transformers_musicgen_loader")
 
         self.assertEqual(loader.__class__.__name__, "TransformersMusicgenLoader")
+
+    def test_musicgen_loader_normalizes_musicgen_config_class(self) -> None:
+        from transformers import MusicgenConfig, MusicgenForConditionalGeneration
+
+        loader = create_default_loader_registry().get("transformers_musicgen_loader")
+        original_config_class = MusicgenForConditionalGeneration.config_class
+        try:
+            MusicgenForConditionalGeneration.config_class = object
+            loader._normalize_musicgen_config_class(
+                MusicgenForConditionalGeneration,
+                MusicgenConfig,
+            )
+            self.assertIs(MusicgenForConditionalGeneration.config_class, MusicgenConfig)
+        finally:
+            MusicgenForConditionalGeneration.config_class = original_config_class
 
     def test_loader_uses_float32_runtime_on_mps_for_fp16_weights(self) -> None:
         import torch
@@ -548,6 +589,42 @@ class ModelSystemTests(unittest.TestCase):
             self.assertEqual(result.status, "succeeded")
             self.assertEqual(result.metadata["model_id"], "musicgen-small")
             self.assertTrue(Path(result.outputs[0]).exists())
+
+    def test_video_generator_rejects_unsupported_output_format(self) -> None:
+        service = create_default_model_service()
+        generator = VideoGenerator(service)
+
+        with self.assertRaisesRegex(ValueError, "gif output only"):
+            generator.validate_request(
+                GenerationRequest(
+                    media_type="video",
+                    prompt="procedural storyboard",
+                    model_id="storyboard-video",
+                    output_format="mp4",
+                    params={},
+                )
+            )
+
+    def test_video_generator_keeps_gif_output_behavior(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir) / "outputs"
+            service = create_default_model_service()
+            generator = VideoGenerator(service, output_dir=output_dir)
+
+            result = generator.run(
+                GenerationRequest(
+                    media_type="video",
+                    prompt="procedural storyboard",
+                    model_id="storyboard-video",
+                    output_format="gif",
+                    params={"duration_seconds": 2, "fps": 6},
+                )
+            )
+
+            self.assertEqual(result.status, "succeeded")
+            self.assertEqual(result.metadata["output_format"], "gif")
+            self.assertTrue(Path(result.outputs[0]).exists())
+            self.assertEqual(Path(result.outputs[0]).suffix, ".gif")
 
 
 if __name__ == "__main__":

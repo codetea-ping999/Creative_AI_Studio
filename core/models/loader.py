@@ -141,12 +141,19 @@ class TransformersMusicgenLoader(BaseModelLoader):
     def load(self, manifest: ModelManifest) -> dict[str, Any]:
         try:
             import torch
-            from transformers import AutoProcessor, MusicgenForConditionalGeneration
+            from transformers import AutoProcessor, MusicgenConfig, MusicgenForConditionalGeneration
         except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
             raise RuntimeError(
                 "Transformers audio runtime dependencies are missing. "
                 "Install torch, transformers, accelerate, and safetensors."
             ) from exc
+
+        # transformers can expose the decoder config class on the combined
+        # MusicGen model, which breaks loading full local checkpoints.
+        self._normalize_musicgen_config_class(
+            MusicgenForConditionalGeneration,
+            MusicgenConfig,
+        )
 
         local_path = self._resolve_local_path(manifest)
         device = self._resolve_device(torch)
@@ -187,6 +194,15 @@ class TransformersMusicgenLoader(BaseModelLoader):
             "sampling_rate": int(model.config.audio_encoder.sampling_rate),
             "frame_rate": int(model.config.audio_encoder.frame_rate),
         }
+
+    def _normalize_musicgen_config_class(
+        self,
+        model_cls: Any,
+        config_cls: Any,
+    ) -> None:
+        if getattr(model_cls, "config_class", None) is config_cls:
+            return
+        model_cls.config_class = config_cls
 
     def _resolve_local_path(self, manifest: ModelManifest) -> str:
         if not manifest.local_path:

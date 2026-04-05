@@ -18,12 +18,12 @@
 | Done | semantic judge scaffold | optional な local CLIP / CLAP judge の土台を追加 |
 | Done | video storyboard flow | `/generate/video`、procedural runtime、Studio UI の基本導線を追加 |
 | Done | gallery / project / feedback baseline | gallery filter、project job binding、feedback summary を追加 |
+| Done | gallery asset workflow | asset detail、reuse、export、project bind を API / Studio UI に接続 |
 
 ## 次に進めるべきタスク
 
 | 優先度 | 状態 | タスク | 目的 |
 | --- | --- | --- | --- |
-| P1 | Todo | gallery export / reuse | gallery から再生成・書き出し・素材転用をしやすくする |
 | P1 | Todo | semantic quality judge の実運用化 | local model 配置、cache 戦略、judge UX を整備する |
 | P2 | Todo | Project 単位の整理強化 | project metadata、asset export、検索を追加する |
 | P2 | Todo | learned text-to-video runtime | procedural runtime を実モデルベース video へ置き換える |
@@ -34,7 +34,7 @@
 
 ## 直近の推奨着手順
 
-1. gallery から export / reuse / re-run を行える導線を追加する
-2. VLM / audio encoder を使った semantic judge を quality report に追加する
-3. Project / Asset 単位の保存構造を強化して studio らしい管理単位を作る
-4. procedural video を learned runtime に差し替えられる loader 構成を整える
+1. VLM / audio encoder を使った semantic judge を quality report に追加する
+2. Project / Asset 単位の保存構造を強化して studio らしい管理単位を作る
+3. procedural video を learned runtime に差し替えられる loader 構成を整える
+4. API smoke を asset workflow まで広げて運用検証を固める
