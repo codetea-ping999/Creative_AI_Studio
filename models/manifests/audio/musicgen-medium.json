@@ -1,12 +1,13 @@
 {
-  "id": "musicgen-small-local",
-  "public_id": "musicgen-small",
-  "display_name": "MusicGen Small Local",
+  "id": "musicgen-medium-local",
+  "public_id": "musicgen-medium",
+  "display_name": "MusicGen Medium Local",
   "media_type": "audio",
   "task_type": "text-to-music",
   "provider": "local",
   "runtime": "transformers",
-  "local_path": "./models/audio/musicgen-small",
+  "local_path": "./models/audio/musicgen-medium",
+  "remote_ref": "facebook/musicgen-medium",
   "loader": "transformers_musicgen_loader",
   "dtype": "float32",
   "default_params": {
@@ -15,8 +16,8 @@
     "temperature": 1.0,
     "top_k": 250
   },
-  "aliases": ["musicgen-small-local"],
-  "tags": ["audio", "music", "base"],
-  "is_default": false,
+  "aliases": ["musicgen-medium-local"],
+  "tags": ["audio", "music", "quality"],
+  "is_default": true,
   "enabled": true
 }

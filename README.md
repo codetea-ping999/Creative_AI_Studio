@@ -27,21 +27,25 @@
 - **Image Generator**: ローカル SDXL と optional LoRA を使った画像生成
 - **Audio Generator**: ローカル MusicGen runtime を使った text-to-music フロー
 - **Video Generator**: ローカル procedural runtime による storyboard gif 生成
-- **Project / Feedback / Gallery**: project grouping、feedback 集計、gallery filter を含む基本 API
+- **Project / Feedback / Gallery**: project grouping、feedback 集計、asset detail、reuse、export、project bind を含む asset workflow
 - **Quality Evaluation**: image / audio / video 出力に対するローカル heuristic quality report と運用メトリクス集計
 - **Semantic Judge Scaffold**: optional な local CLIP / CLAP による prompt alignment 採点
 - **Operational Quality**: `pytest`、`scripts/check_local_setup.py`、GitHub Actions CI による基本検証
+- **Studio Asset Actions**: Web UI から asset detail の確認、composer への再投入、reuse rerun、export、project bind が可能
 
 ### 🚧 進行中 / 計画中機能
 
-- gallery export / reuse の強化
 - semantic judge を含む品質評価の高度化
 - anime checkpoint の実配置とプリセット拡充
 - 実モデルベースの text-to-video runtime 接続
 
+## 企画メモ
+
+- ローカルAIを「プロンプト＋調整」で運用するための実行プラン: [docs/local-ai-creative-studio-plan.md](docs/local-ai-creative-studio-plan.md)
+
 ## アーキテクチャ詳細
 
-詳しくは [docs/architecture.md](docs/architecture.md) を参照してください。
+全体の読み順は [docs/README.md](docs/README.md)、コードの入口は [docs/codebase-guide.md](docs/codebase-guide.md)、モデル解決の仕組みは [docs/model-system.md](docs/model-system.md) を参照してください。
 
 ### レイヤー構成
 
@@ -101,10 +105,14 @@ creative-ai-studio/
 ├─ models/
 ├─ outputs/
 ├─ docs/
-│  ├─ architecture.md
-│  ├─ domain-model.md
 │  ├─ api-contract.md
+│  ├─ codebase-guide.md
 │  ├─ initial_issues.md
+│  ├─ local-ai-creative-studio-plan.md
+│  ├─ model-download-guide.md
+│  ├─ model-system.md
+│  ├─ next-tasks.md
+│  ├─ setup-guide.md
 │  ├─ codex/
 │  │  ├─ task-template.md
 │  │  ├─ development-board-template.md
@@ -124,14 +132,19 @@ creative-ai-studio/
 
 ## ドキュメント
 
-- [Architecture](docs/architecture.md) - システムアーキテクチャの詳細
-- [Domain Model](docs/domain-model.md) - ドメイン設計
+- [Documentation Guide](docs/README.md) - まず読む順番とドキュメントの使い分け
+- [Codebase Guide](docs/codebase-guide.md) - コードを勉強しながら読むための入口
 - [API Contract](docs/api-contract.md) - APIスペック
 - [Setup Guide](docs/setup-guide.md) - セットアップと起動確認
-- [Configuration](docs/configuration.md) - API / Web UI の設定方法
+- [Model System](docs/model-system.md) - manifest、resolver、runtime cache の構成
 - [Model Download Guide](docs/model-download-guide.md) - モデル配置と manifest 管理
 - [Next Tasks](docs/next-tasks.md) - 次に進めるべきタスク
 - [Initial Issues](docs/initial_issues.md) - 初期段階での課題
+
+補足:
+
+- `README_v0.2.md`、`IMPLEMENTATION_SUMMARY.md`、`REPAIR_COMPLETE.md`、`COMPLETION_CHECKLIST.md` は履歴資料です
+- 現在の構造理解や学習には、まず `docs/README.md` と `docs/codebase-guide.md` から読むのを推奨します
 
 ## トラブルシューティング
 
@@ -413,7 +426,7 @@ cp apps/web/.env.example apps/web/.env
 
 - API / bootstrap の設定は `./.env`
 - Web UI の設定は `apps/web/.env`
-- 詳細は [docs/configuration.md](/Users/toyoharukohyama/Documents/Creative_AI_Studio/docs/configuration.md) を参照
+- モデルと runtime の詳細は [docs/model-system.md](/Users/toyoharukohyama/Documents/Creative_AI_Studio/docs/model-system.md) を参照
 
 | 変数名 | デフォルト値 | 説明 |
 |--------|-------------|------|

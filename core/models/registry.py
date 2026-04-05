@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from .manifest import ModelManifest
@@ -19,14 +20,22 @@ class ModelRegistry:
 
     def load_all(self) -> None:
         manifests: dict[str, ModelManifest] = {}
+        manifest_sources: dict[str, Path] = {}
         if self.manifest_root.exists():
             for path in sorted(self.manifest_root.rglob("*.json")):
                 manifest = ModelManifest.model_validate_json(
                     path.read_text(encoding="utf-8")
                 )
                 if manifest.id in manifests:
-                    raise ValueError(f"Duplicate model manifest id: {manifest.id}")
+                    if self._is_duplicate_equivalent(manifests[manifest.id], manifest):
+                        continue
+                    original_path = manifest_sources[manifest.id]
+                    raise ValueError(
+                        f"Duplicate model manifest id: {manifest.id} "
+                        f"({original_path} vs {path})"
+                    )
                 manifests[manifest.id] = manifest
+                manifest_sources[manifest.id] = path
 
         self._manifests = manifests
         self._loaded = True
@@ -88,6 +97,16 @@ class ModelRegistry:
     def _ensure_loaded(self) -> None:
         if not self._loaded:
             self.load_all()
+
+    def _is_duplicate_equivalent(
+        self,
+        left: ModelManifest,
+        right: ModelManifest,
+    ) -> bool:
+        return json.dumps(left.model_dump(mode="json"), sort_keys=True) == json.dumps(
+            right.model_dump(mode="json"),
+            sort_keys=True,
+        )
 
 
 __all__ = ["ModelRegistry"]

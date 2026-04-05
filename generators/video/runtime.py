@@ -14,6 +14,8 @@ from PIL import Image, ImageDraw, ImageFont
 from core.models import ModelManifest
 from core.schemas import GenerationRequest
 
+SUPPORTED_VIDEO_OUTPUT_FORMATS = frozenset({"gif"})
+
 
 class BaseVideoRuntime(ABC):
     """A runtime adapter that turns a generation request into a saved video asset."""
@@ -361,5 +363,6 @@ __all__ = [
     "BaseVideoRuntime",
     "LearnedVideoRuntime",
     "ProceduralStoryboardRuntime",
+    "SUPPORTED_VIDEO_OUTPUT_FORMATS",
     "VideoRuntimeRouter",
 ]

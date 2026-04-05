@@ -140,8 +140,13 @@ class AssetRepository:
                 tags=tags,
                 metadata=metadata,
                 created_at=existing.created_at if existing is not None else job.created_at,
-                updated_at=_now(),
+                updated_at=existing.updated_at if existing is not None else _now(),
             )
+            if existing is not None and self._asset_state(existing) == self._asset_state(asset):
+                assets.append(existing)
+                continue
+
+            asset.updated_at = _now()
             self._save_asset(asset)
             assets.append(asset)
         return assets
@@ -213,6 +218,8 @@ class AssetRepository:
         asset = self.get(asset_id)
         if asset is None:
             return None
+        if asset.project_id == project_id:
+            return asset
         asset.project_id = project_id
         asset.updated_at = _now()
         self._save_asset(asset)
@@ -221,6 +228,9 @@ class AssetRepository:
     def bind_job_assets(self, job_id: str, project_id: str | None) -> list[Asset]:
         updated: list[Asset] = []
         for asset in self.get_by_job(job_id):
+            if asset.project_id == project_id:
+                updated.append(asset)
+                continue
             asset.project_id = project_id
             asset.updated_at = _now()
             self._save_asset(asset)
@@ -233,7 +243,6 @@ class AssetRepository:
         *,
         action: str,
         derived_job_id: str | None = None,
-        project_id: str | None = None,
     ) -> Asset | None:
         asset = self.get(asset_id)
         if asset is None:
@@ -246,8 +255,6 @@ class AssetRepository:
         asset.metadata["reuse_count"] = int(asset.metadata.get("reuse_count", 0)) + 1
         asset.metadata["last_reuse_action"] = action
         asset.metadata["derived_job_ids"] = derived_job_ids
-        if project_id is not None:
-            asset.project_id = project_id
         asset.updated_at = _now()
         self._save_asset(asset)
         return asset
@@ -256,10 +263,19 @@ class AssetRepository:
         asset = self.get(asset_id)
         if asset is None:
             return None
+        changed = False
         if export_path not in asset.export_paths:
             asset.export_paths.append(export_path)
-        asset.metadata["export_count"] = len(asset.export_paths)
-        asset.metadata["last_export_path"] = export_path
+            changed = True
+        export_count = len(asset.export_paths)
+        if asset.metadata.get("export_count") != export_count:
+            asset.metadata["export_count"] = export_count
+            changed = True
+        if asset.metadata.get("last_export_path") != export_path:
+            asset.metadata["last_export_path"] = export_path
+            changed = True
+        if not changed:
+            return asset
         asset.updated_at = _now()
         self._save_asset(asset)
         return asset
@@ -371,6 +387,26 @@ class AssetRepository:
             json.dumps(asset.to_dict(), ensure_ascii=True, indent=2, sort_keys=True),
             encoding="utf-8",
         )
+
+    def _asset_state(self, asset: Asset) -> dict[str, Any]:
+        return {
+            "id": asset.id,
+            "job_id": asset.job_id,
+            "project_id": asset.project_id,
+            "media_type": asset.media_type,
+            "kind": asset.kind,
+            "title": asset.title,
+            "prompt": asset.prompt,
+            "model_id": asset.model_id,
+            "path": asset.path,
+            "preview_path": asset.preview_path,
+            "parent_asset_id": asset.parent_asset_id,
+            "lineage": list(asset.lineage),
+            "export_paths": list(asset.export_paths),
+            "tags": list(asset.tags),
+            "metadata": dict(asset.metadata),
+            "created_at": asset.created_at,
+        }
 
 
 def _summarize_prompt(prompt: str, *, fallback: str) -> str:

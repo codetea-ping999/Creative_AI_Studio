@@ -9,8 +9,11 @@ from tempfile import TemporaryDirectory
 from datetime import datetime
 
 try:
+    from core.assets import AssetRepository
+    from core.jobs import JobRecord
     from core.projects import Project, ProjectRepository
     from core.feedback import Feedback, FeedbackRepository
+    from core.schemas import GenerationRequest, GenerationResult
 except ModuleNotFoundError as exc:
     import sys
     print(f"Import error: {exc}")
@@ -54,6 +57,92 @@ class ProjectRepositoryTests(unittest.TestCase):
         project = self.repo.create("To Delete", "")
         self.assertTrue(self.repo.delete(project.id))
         self.assertIsNone(self.repo.get(project.id))
+
+    def test_remove_job_returns_none_when_project_does_not_include_it(self):
+        source = self.repo.create("Source", "")
+        other = self.repo.create("Other", "")
+        self.repo.add_job(source.id, "job123")
+
+        removed = self.repo.remove_job(other.id, "job123")
+
+        self.assertIsNone(removed)
+        self.assertEqual(self.repo.get(source.id).job_ids, ["job123"])
+        self.assertEqual(self.repo.get(other.id).job_ids, [])
+
+
+class AssetRepositoryTests(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = TemporaryDirectory()
+        self.asset_dir = Path(self.tmpdir.name) / "assets"
+        self.output_dir = Path(self.tmpdir.name) / "outputs"
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.repo = AssetRepository(self.asset_dir)
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def test_sync_job_is_idempotent_when_asset_state_is_unchanged(self):
+        job = self._make_job("job-1", self.output_dir / "job-1.gif")
+
+        first_asset = self.repo.sync_job(job)[0]
+        second_asset = self.repo.sync_job(job)[0]
+        reloaded_asset = self.repo.get(first_asset.id)
+
+        self.assertEqual(second_asset.id, first_asset.id)
+        self.assertIsNotNone(reloaded_asset)
+        self.assertEqual(second_asset.updated_at, first_asset.updated_at)
+        self.assertEqual(reloaded_asset.updated_at, first_asset.updated_at)
+
+    def test_sync_jobs_preserves_asset_order_when_nothing_changed(self):
+        first_job = self._make_job("job-1", self.output_dir / "job-1.gif")
+        second_job = self._make_job("job-2", self.output_dir / "job-2.gif")
+
+        self.repo.sync_job(first_job)
+        self.repo.sync_job(second_job)
+
+        order_before = [asset.id for asset in self.repo.list_all()]
+        updated_before = {asset.id: asset.updated_at for asset in self.repo.list_all()}
+
+        self.repo.sync_jobs([second_job, first_job])
+
+        assets_after = self.repo.list_all()
+        order_after = [asset.id for asset in assets_after]
+        updated_after = {asset.id: asset.updated_at for asset in assets_after}
+
+        self.assertEqual(order_after, order_before)
+        self.assertEqual(updated_after, updated_before)
+
+    def _make_job(self, job_id: str, output_path: Path) -> JobRecord:
+        output_path.write_bytes(b"GIF89a")
+        now = datetime.now()
+        return JobRecord(
+            id=job_id,
+            project_id="project-1",
+            media_type="video",
+            status="succeeded",
+            request=GenerationRequest(
+                media_type="video",
+                prompt=f"Prompt for {job_id}",
+                model_id="storyboard-video",
+                output_format="gif",
+                params={"fps": 6},
+            ),
+            result=GenerationResult(
+                job_id=job_id,
+                status="succeeded",
+                outputs=[str(output_path)],
+                previews=[str(output_path)],
+                metadata={
+                    "output_format": "gif",
+                    "quality_report": {"quality_score": 75.0},
+                },
+                error_message=None,
+            ),
+            progress=1.0,
+            error_message=None,
+            created_at=now,
+            updated_at=now,
+        )
 
 
 class FeedbackRepositoryTests(unittest.TestCase):

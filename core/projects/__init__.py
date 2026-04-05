@@ -180,10 +180,12 @@ class ProjectRepository:
         if project is None:
             return None
 
-        if job_id in project.job_ids:
-            project.job_ids.remove(job_id)
-            project.updated_at = datetime.now()
-            self._save_project(project)
+        if job_id not in project.job_ids:
+            return None
+
+        project.job_ids.remove(job_id)
+        project.updated_at = datetime.now()
+        self._save_project(project)
 
         return project
 

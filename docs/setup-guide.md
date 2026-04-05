@@ -61,7 +61,7 @@ cp .env.example .env
 cp apps/web/.env.example apps/web/.env
 ```
 
-詳細は [configuration.md](/Users/toyoharukohyama/Documents/Creative_AI_Studio/docs/configuration.md) を参照してください。
+ランタイム設定と manifest の考え方は [model-system.md](/Users/toyoharukohyama/Documents/Creative_AI_Studio/docs/model-system.md) を参照してください。
 
 ## 起動
 
@@ -162,6 +162,6 @@ curl -X POST http://127.0.0.1:8000/generate/audio \
 
 ## 関連ドキュメント
 
-- [configuration.md](/Users/toyoharukohyama/Documents/Creative_AI_Studio/docs/configuration.md)
+- [model-system.md](/Users/toyoharukohyama/Documents/Creative_AI_Studio/docs/model-system.md)
 - [model-download-guide.md](/Users/toyoharukohyama/Documents/Creative_AI_Studio/docs/model-download-guide.md)
 - [api-contract.md](/Users/toyoharukohyama/Documents/Creative_AI_Studio/docs/api-contract.md)
