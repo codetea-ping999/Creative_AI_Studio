@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
@@ -65,10 +69,28 @@ class _StubRegistry:
         ]
 
 
+@contextmanager
+def _patched_model_registry() -> Iterator[None]:
+    with TemporaryDirectory() as tmp_dir:
+        repo_root = Path(tmp_dir)
+        sdxl_root = repo_root / "models" / "image" / "sdxl"
+        musicgen_root = repo_root / "models" / "audio" / "musicgen-small"
+        sdxl_root.mkdir(parents=True)
+        musicgen_root.mkdir(parents=True)
+        (sdxl_root / "model_index.json").write_text("{}", encoding="utf-8")
+        (musicgen_root / "config.json").write_text("{}", encoding="utf-8")
+
+        with (
+            patch("apps.api.routes.models.ModelRegistry", _StubRegistry),
+            patch("apps.api.routes.models._REPO_ROOT", repo_root),
+        ):
+            yield
+
+
 @unittest.skipIf(IMPORT_ERROR is not None, f"missing dependency: {IMPORT_ERROR}")
 class ModelsApiTests(unittest.TestCase):
     def test_models_endpoint_returns_ui_safe_manifest_metadata(self) -> None:
-        with patch("apps.api.routes.models.ModelRegistry", _StubRegistry):
+        with _patched_model_registry():
             client = TestClient(create_app())
 
             response = client.get("/models")
@@ -107,7 +129,7 @@ class ModelsApiTests(unittest.TestCase):
         )
 
     def test_models_endpoint_filters_by_media_type(self) -> None:
-        with patch("apps.api.routes.models.ModelRegistry", _StubRegistry):
+        with _patched_model_registry():
             client = TestClient(create_app())
 
             response = client.get("/models?media_type=video")
@@ -116,7 +138,7 @@ class ModelsApiTests(unittest.TestCase):
         self.assertEqual(response.json(), {"models": []})
 
     def test_models_endpoint_returns_audio_models_when_filtered(self) -> None:
-        with patch("apps.api.routes.models.ModelRegistry", _StubRegistry):
+        with _patched_model_registry():
             client = TestClient(create_app())
 
             response = client.get("/models?media_type=audio")
