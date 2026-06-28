@@ -36,5 +36,8 @@ jobs:
         working-directory: apps/web
         run: npm ci
 
+      - name: Prepare local runtime directories
+        run: mkdir -p data data/projects data/feedback outputs/images outputs/audio outputs/videos
+
       - name: Run verification suite
         run: python scripts/verify_local_stack.py --start-api

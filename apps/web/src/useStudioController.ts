@@ -736,8 +736,10 @@ export function useStudioController() {
         setSelectedAssetProjectId(nextProjectId);
       });
 
+      let activeProjectIdForRefresh = selectedProjectId || null;
       if (nextProjectId && nextProjectId !== selectedProjectId) {
-        switchSelectedProject(nextProjectId);
+        const didSwitchProject = switchSelectedProject(nextProjectId);
+        activeProjectIdForRefresh = didSwitchProject ? nextProjectId : selectedProjectId || null;
       }
 
       setAssetMessage(
@@ -748,7 +750,7 @@ export function useStudioController() {
 
       await Promise.all([
         refreshStudio(payload.media_type, { preferredAssetId: payload.asset_id }),
-        refreshProjectViews(nextProjectId || null),
+        refreshProjectViews(activeProjectIdForRefresh),
       ]);
     } catch (error) {
       setErrorMessage(getErrorMessage(error, "素材のプロジェクト割り当て更新に失敗しました。"));
@@ -795,9 +797,13 @@ export function useStudioController() {
       startTransition(() => {
         setCreateProjectForm(createEmptyProjectFormValues());
       });
-      switchSelectedProject(payload.id);
-      setProjectMessage(`「${payload.name}」を作成しました。このプロジェクトで生成できます。`);
-      await refreshProjectViews(payload.id);
+      const didSwitchProject = switchSelectedProject(payload.id);
+      setProjectMessage(
+        didSwitchProject
+          ? `「${payload.name}」を作成しました。このプロジェクトで生成できます。`
+          : `「${payload.name}」を作成しました。現在のプロジェクト選択は維持されています。`,
+      );
+      await refreshProjectViews(didSwitchProject ? payload.id : selectedProjectId || null);
     } catch (error) {
       setErrorMessage(getErrorMessage(error, "プロジェクトの作成に失敗しました。"));
     } finally {
