@@ -165,7 +165,7 @@ class AssetRepository:
         asset_path = self.asset_dir / f"{asset_id}.json"
         if not asset_path.exists():
             return None
-        return self._load_asset(asset_path)
+        return self._try_load_asset(asset_path)
 
     def get_by_job(self, job_id: str) -> list[Asset]:
         return [
@@ -189,7 +189,9 @@ class AssetRepository:
         normalized_query = query_text.strip().lower() if query_text else None
         assets: list[Asset] = []
         for asset_path in sorted(self.asset_dir.glob("*.json")):
-            asset = self._load_asset(asset_path)
+            asset = self._try_load_asset(asset_path)
+            if asset is None:
+                continue
             if media_type and asset.media_type != media_type:
                 continue
             if project_id and asset.project_id != project_id:
@@ -380,6 +382,12 @@ class AssetRepository:
             created_at=datetime.fromisoformat(data["created_at"]),
             updated_at=datetime.fromisoformat(data["updated_at"]),
         )
+
+    def _try_load_asset(self, asset_path: Path) -> Asset | None:
+        try:
+            return self._load_asset(asset_path)
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            return None
 
     def _save_asset(self, asset: Asset) -> None:
         asset_path = self.asset_dir / f"{asset.id}.json"

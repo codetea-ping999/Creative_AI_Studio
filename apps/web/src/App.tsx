@@ -1,4 +1,4 @@
-import { startTransition, useEffect, useState } from "react";
+import { startTransition, useCallback, useEffect, useState, type FormEvent } from "react";
 import {
   PromptForm,
   type LoraOption,
@@ -162,6 +162,13 @@ type ProjectResponse = {
   status: string;
   asset_count: number;
   job_count: number;
+};
+
+type FeedbackResponse = {
+  id: string;
+  quality_rating: number;
+  semantic_rating: number | null;
+  creative_rating: number | null;
 };
 
 type RefreshStudioOptions = {
@@ -506,11 +513,20 @@ function buildReusePayload(
 
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE_URL}${path}`, init);
+  const responseText = await response.text();
   if (!response.ok) {
-    const body = await response.text();
-    throw new Error(body || `${response.status} ${response.statusText}`);
+    let detail = responseText;
+    try {
+      const parsed = JSON.parse(responseText) as { detail?: unknown };
+      if (typeof parsed.detail === "string") {
+        detail = parsed.detail;
+      }
+    } catch {
+      // Keep the raw response text when the API does not return JSON.
+    }
+    throw new Error(detail || `${response.status} ${response.statusText}`);
   }
-  return (await response.json()) as T;
+  return responseText ? (JSON.parse(responseText) as T) : (undefined as T);
 }
 
 function App() {
@@ -532,6 +548,8 @@ function App() {
   });
   const [projects, setProjects] = useState<ProjectResponse[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState("");
+  const [newProjectName, setNewProjectName] = useState("");
+  const [newProjectDescription, setNewProjectDescription] = useState("");
   const [galleryItems, setGalleryItems] = useState<GalleryItemResponse[]>([]);
   const [galleryStats, setGalleryStats] = useState<GalleryStatsResponse | null>(null);
   const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null);
@@ -543,12 +561,37 @@ function App() {
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isAssetBusy, setIsAssetBusy] = useState(false);
+  const [isProjectBusy, setIsProjectBusy] = useState(false);
+  const [isFeedbackBusy, setIsFeedbackBusy] = useState(false);
+  const [feedbackQuality, setFeedbackQuality] = useState("4");
+  const [feedbackSemantic, setFeedbackSemantic] = useState("4");
+  const [feedbackCreative, setFeedbackCreative] = useState("4");
+  const [feedbackReuseIntent, setFeedbackReuseIntent] = useState(false);
+  const [feedbackExportReady, setFeedbackExportReady] = useState(false);
+  const [feedbackIssueTags, setFeedbackIssueTags] = useState("");
+  const [feedbackComments, setFeedbackComments] = useState("");
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [assetMessage, setAssetMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   const activeModels = modelOptionsByMedia[mediaType];
   const activeMetrics = metrics?.by_media[mediaType] ?? null;
+  const handleDraftChange = useCallback(
+    (nextDraft: Partial<PromptFormSubmitValues>) => {
+      setDrafts((current) => {
+        const currentDraft = current[mediaType];
+        if (JSON.stringify(currentDraft) === JSON.stringify(nextDraft)) {
+          return current;
+        }
+
+        return {
+          ...current,
+          [mediaType]: nextDraft,
+        };
+      });
+    },
+    [mediaType],
+  );
 
   useEffect(() => {
     document.documentElement.dataset.theme = themeMode;
@@ -759,6 +802,95 @@ function App() {
       setIsSubmitting(false);
       setErrorMessage(error instanceof Error ? error.message : "Failed to submit generation.");
       setStatusMessage(null);
+    }
+  }
+
+  async function handleCreateProject(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    const trimmedName = newProjectName.trim();
+    if (!trimmedName) {
+      setErrorMessage("Project name is required.");
+      return;
+    }
+
+    setIsProjectBusy(true);
+    setErrorMessage(null);
+    setAssetMessage(null);
+
+    try {
+      const project = await requestJson<ProjectResponse>("/projects", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          name: trimmedName,
+          description: newProjectDescription.trim(),
+        }),
+      });
+      startTransition(() => {
+        setProjects((current) => [project, ...current.filter((item) => item.id !== project.id)]);
+        setSelectedProjectId(project.id);
+        setNewProjectName("");
+        setNewProjectDescription("");
+      });
+      setAssetMessage(`Created project ${project.name}.`);
+      await refreshStudio(mediaType);
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "Failed to create project.");
+    } finally {
+      setIsProjectBusy(false);
+    }
+  }
+
+  async function handleFeedbackSubmit(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    if (!selectedAssetDetail) {
+      return;
+    }
+
+    const qualityRating = Number.parseInt(feedbackQuality, 10);
+    const semanticRating = Number.parseInt(feedbackSemantic, 10);
+    const creativeRating = Number.parseInt(feedbackCreative, 10);
+
+    setIsFeedbackBusy(true);
+    setErrorMessage(null);
+
+    try {
+      const feedback = await requestJson<FeedbackResponse>("/feedback", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          job_id: selectedAssetDetail.job_id,
+          asset_id: selectedAssetDetail.asset_id,
+          project_id: selectedAssetDetail.project_id,
+          quality_rating: qualityRating,
+          semantic_rating: Number.isFinite(semanticRating) ? semanticRating : null,
+          creative_rating: Number.isFinite(creativeRating) ? creativeRating : null,
+          reuse_intent: feedbackReuseIntent,
+          export_ready: feedbackExportReady,
+          issue_tags: feedbackIssueTags
+            .split(",")
+            .map((tag) => tag.trim())
+            .filter(Boolean),
+          comments: feedbackComments.trim(),
+          metadata: {
+            source: "web-ui",
+          },
+        }),
+      });
+      setFeedbackComments("");
+      setFeedbackIssueTags("");
+      setAssetMessage(`Saved feedback ${feedback.id}.`);
+      await refreshStudio(selectedAssetDetail.media_type, {
+        preferredAssetId: selectedAssetDetail.asset_id,
+      });
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "Failed to submit feedback.");
+    } finally {
+      setIsFeedbackBusy(false);
     }
   }
 
@@ -995,8 +1127,37 @@ function App() {
           <p className="section-footnote">
             {projects.length > 0
               ? `${projects.length} projects can receive new jobs or reused assets.`
-              : "Create a project through the API to start grouping jobs and assets."}
+              : "Create a project to start grouping jobs and assets."}
           </p>
+          <form className="project-create-form" onSubmit={(event) => void handleCreateProject(event)}>
+            <label className="field-group field-group--full">
+              <span>New project name</span>
+              <input
+                type="text"
+                value={newProjectName}
+                onChange={(event) => setNewProjectName(event.target.value)}
+                placeholder="Campaign explorations"
+                disabled={isProjectBusy}
+              />
+            </label>
+            <label className="field-group field-group--full">
+              <span>Description</span>
+              <textarea
+                rows={3}
+                value={newProjectDescription}
+                onChange={(event) => setNewProjectDescription(event.target.value)}
+                placeholder="Optional production note"
+                disabled={isProjectBusy}
+              />
+            </label>
+            <button
+              type="submit"
+              className="secondary-button secondary-button--block"
+              disabled={isProjectBusy || !newProjectName.trim()}
+            >
+              {isProjectBusy ? "Creating..." : "Create and select project"}
+            </button>
+          </form>
         </section>
 
         <section className="section-card">
@@ -1047,12 +1208,7 @@ function App() {
             disabled={isSubmitting}
             canSubmit={!isSubmitting}
             statusMessage={statusMessage}
-            onDraftChange={(nextDraft) =>
-              setDrafts((current) => ({
-                ...current,
-                [mediaType]: nextDraft,
-              }))
-            }
+            onDraftChange={handleDraftChange}
             onSubmit={(values) => {
               void handleSubmit(values);
             }}
@@ -1328,6 +1484,102 @@ function App() {
                     </div>
                   </div>
                 </div>
+
+                <form className="form-section" onSubmit={(event) => void handleFeedbackSubmit(event)}>
+                  <div className="form-section__header">
+                    <div>
+                      <p className="eyebrow">Human Feedback</p>
+                      <h3>Record review signal for calibration and reuse decisions</h3>
+                    </div>
+                  </div>
+                  <div className="field-grid field-grid--controls">
+                    <label className="field-group">
+                      <span>Quality</span>
+                      <select
+                        value={feedbackQuality}
+                        onChange={(event) => setFeedbackQuality(event.target.value)}
+                        disabled={isFeedbackBusy}
+                      >
+                        {[1, 2, 3, 4, 5].map((rating) => (
+                          <option key={rating} value={rating}>
+                            {rating}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="field-group">
+                      <span>Semantic</span>
+                      <select
+                        value={feedbackSemantic}
+                        onChange={(event) => setFeedbackSemantic(event.target.value)}
+                        disabled={isFeedbackBusy}
+                      >
+                        {[1, 2, 3, 4, 5].map((rating) => (
+                          <option key={rating} value={rating}>
+                            {rating}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="field-group">
+                      <span>Creative</span>
+                      <select
+                        value={feedbackCreative}
+                        onChange={(event) => setFeedbackCreative(event.target.value)}
+                        disabled={isFeedbackBusy}
+                      >
+                        {[1, 2, 3, 4, 5].map((rating) => (
+                          <option key={rating} value={rating}>
+                            {rating}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  </div>
+                  <div className="feedback-toggles">
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={feedbackReuseIntent}
+                        onChange={(event) => setFeedbackReuseIntent(event.target.checked)}
+                        disabled={isFeedbackBusy}
+                      />
+                      Reuse candidate
+                    </label>
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={feedbackExportReady}
+                        onChange={(event) => setFeedbackExportReady(event.target.checked)}
+                        disabled={isFeedbackBusy}
+                      />
+                      Export ready
+                    </label>
+                  </div>
+                  <label className="field-group field-group--full">
+                    <span>Issue tags</span>
+                    <input
+                      type="text"
+                      value={feedbackIssueTags}
+                      onChange={(event) => setFeedbackIssueTags(event.target.value)}
+                      placeholder="composition, lighting"
+                      disabled={isFeedbackBusy}
+                    />
+                  </label>
+                  <label className="field-group field-group--full">
+                    <span>Comments</span>
+                    <textarea
+                      rows={3}
+                      value={feedbackComments}
+                      onChange={(event) => setFeedbackComments(event.target.value)}
+                      placeholder="What should change before production use?"
+                      disabled={isFeedbackBusy}
+                    />
+                  </label>
+                  <button type="submit" className="dock-submit" disabled={isFeedbackBusy}>
+                    {isFeedbackBusy ? "Saving..." : "Save feedback"}
+                  </button>
+                </form>
 
                 <pre>{JSON.stringify(selectedAssetDetail.request_snapshot, null, 2)}</pre>
               </div>

@@ -13,6 +13,7 @@ apps/web/vite.config.d.ts
 
 outputs/
 data/*.db
+data/assets/
 data/projects/
 data/feedback/
 data/model-download-*.log

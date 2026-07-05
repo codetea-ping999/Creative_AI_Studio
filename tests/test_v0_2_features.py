@@ -112,6 +112,29 @@ class AssetRepositoryTests(unittest.TestCase):
         self.assertEqual(order_after, order_before)
         self.assertEqual(updated_after, updated_before)
 
+    def test_invalid_asset_json_is_skipped_and_can_be_resynced(self):
+        job = self._make_job("job-1", self.output_dir / "job-1.gif")
+        asset = self.repo.sync_job(job)[0]
+        asset_path = self.asset_dir / f"{asset.id}.json"
+        asset_path.write_text("", encoding="utf-8")
+
+        self.assertIsNone(self.repo.get(asset.id))
+        self.assertEqual(self.repo.list_all(), [])
+
+        resynced = self.repo.sync_job(job)[0]
+
+        self.assertEqual(resynced.id, asset.id)
+        self.assertIsNotNone(self.repo.get(asset.id))
+
+    def test_list_all_skips_unrelated_invalid_asset_json(self):
+        job = self._make_job("job-1", self.output_dir / "job-1.gif")
+        asset = self.repo.sync_job(job)[0]
+        (self.asset_dir / "broken.json").write_text("{", encoding="utf-8")
+
+        assets = self.repo.list_all()
+
+        self.assertEqual([item.id for item in assets], [asset.id])
+
     def _make_job(self, job_id: str, output_path: Path) -> JobRecord:
         output_path.write_bytes(b"GIF89a")
         now = datetime.now()
