@@ -129,7 +129,7 @@ class ProjectRepository:
         project_file = self.project_dir / f"{project_id}.json"
         if not project_file.exists():
             return None
-        return self._load_project(project_file)
+        return self._try_load_project(project_file)
 
     def list_all(
         self,
@@ -142,7 +142,9 @@ class ProjectRepository:
         normalized_tag = tag.strip().lower() if tag else None
         projects: list[Project] = []
         for project_file in sorted(self.project_dir.glob("*.json")):
-            project = self._load_project(project_file)
+            project = self._try_load_project(project_file)
+            if project is None:
+                continue
             if status and project.status != status:
                 continue
             if normalized_tag and normalized_tag not in {entry.lower() for entry in project.tags}:
@@ -210,6 +212,12 @@ class ProjectRepository:
             updated_at=datetime.fromisoformat(data["updated_at"]),
             job_ids=list(data.get("job_ids", [])),
         )
+
+    def _try_load_project(self, project_file: Path) -> Project | None:
+        try:
+            return self._load_project(project_file)
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            return None
 
     def _save_project(self, project: Project) -> None:
         project_file = self.project_dir / f"{project.id}.json"

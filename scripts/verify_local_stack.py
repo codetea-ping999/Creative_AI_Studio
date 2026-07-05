@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from urllib.error import URLError
 from urllib.parse import urljoin, urlparse
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -93,6 +93,26 @@ def fetch_json(url: str) -> object:
         return json.load(response)
 
 
+def request_json(
+    url: str,
+    *,
+    method: str = "GET",
+    payload: object | None = None,
+    timeout: float = 2.0,
+) -> object:
+    data = None
+    headers: dict[str, str] = {}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = Request(url, data=data, headers=headers, method=method)
+    with urlopen(request, timeout=timeout) as response:  # noqa: S310 - local verification target
+        response_body = response.read()
+    if not response_body:
+        return None
+    return json.loads(response_body.decode("utf-8"))
+
+
 def wait_for_json(url: str, *, timeout: float) -> object:
     deadline = time.time() + timeout
     last_error: Exception | None = None
@@ -106,8 +126,9 @@ def wait_for_json(url: str, *, timeout: float) -> object:
 
 
 def run_api_smoke_checks(base_url: str, *, timeout: float) -> None:
-    health_url = urljoin(f"{base_url.rstrip('/')}/", "health")
-    models_url = urljoin(f"{base_url.rstrip('/')}/", "models")
+    base = f"{base_url.rstrip('/')}/"
+    health_url = urljoin(base, "health")
+    models_url = urljoin(base, "models")
 
     health_payload = wait_for_json(health_url, timeout=timeout)
     if health_payload != {"status": "ok"}:
@@ -120,6 +141,89 @@ def run_api_smoke_checks(base_url: str, *, timeout: float) -> None:
     if not isinstance(models_payload["models"], list):
         raise VerificationError(f"/models payload must include a list: {models_payload!r}")
     print(f"[OK] API models check: {models_url} ({len(models_payload['models'])} models)")
+
+    project_id = _create_smoke_project(base)
+    job_id = _create_smoke_video_job(base, project_id)
+    _wait_for_smoke_job(base, job_id, timeout=timeout)
+    _check_smoke_gallery(base, job_id)
+    _check_smoke_project_jobs(base, project_id, job_id)
+
+
+def _create_smoke_project(base_url: str) -> str:
+    payload = request_json(
+        urljoin(base_url, "projects"),
+        method="POST",
+        payload={
+            "name": f"verify-smoke-{int(time.time())}",
+            "description": "Created by scripts/verify_local_stack.py",
+        },
+    )
+    if not isinstance(payload, dict) or not isinstance(payload.get("id"), str):
+        raise VerificationError(f"Unexpected /projects create payload: {payload!r}")
+    project_id = payload["id"]
+    print(f"[OK] API project create check: {project_id}")
+    return project_id
+
+
+def _create_smoke_video_job(base_url: str, project_id: str) -> str:
+    payload = request_json(
+        urljoin(base_url, "generate/video"),
+        method="POST",
+        payload={
+            "prompt": "verification storyboard card",
+            "model_id": "storyboard-video",
+            "project_id": project_id,
+            "output_format": "gif",
+            "params": {
+                "duration_seconds": 1,
+                "fps": 4,
+                "width": 256,
+                "height": 144,
+            },
+        },
+        timeout=5.0,
+    )
+    if not isinstance(payload, dict) or not isinstance(payload.get("job_id"), str):
+        raise VerificationError(f"Unexpected /generate/video payload: {payload!r}")
+    job_id = payload["job_id"]
+    print(f"[OK] API video job create check: {job_id}")
+    return job_id
+
+
+def _wait_for_smoke_job(base_url: str, job_id: str, *, timeout: float) -> None:
+    job_url = urljoin(base_url, f"jobs/{job_id}")
+    deadline = time.time() + timeout
+    last_payload: object = None
+    while time.time() < deadline:
+        last_payload = fetch_json(job_url)
+        if not isinstance(last_payload, dict):
+            raise VerificationError(f"Unexpected job payload: {last_payload!r}")
+        status = last_payload.get("status")
+        if status == "succeeded":
+            print(f"[OK] API video job completed: {job_id}")
+            return
+        if status in {"failed", "cancelled"}:
+            raise VerificationError(f"Smoke job ended with {status}: {last_payload!r}")
+        time.sleep(0.5)
+    raise VerificationError(f"Timed out waiting for smoke job {job_id}: {last_payload!r}")
+
+
+def _check_smoke_gallery(base_url: str, job_id: str) -> None:
+    payload = fetch_json(urljoin(base_url, "gallery?media_type=video"))
+    if not isinstance(payload, list):
+        raise VerificationError(f"Unexpected /gallery payload: {payload!r}")
+    if not any(isinstance(item, dict) and item.get("job_id") == job_id for item in payload):
+        raise VerificationError(f"Smoke job is missing from /gallery: {job_id}")
+    print(f"[OK] API gallery check includes smoke job: {job_id}")
+
+
+def _check_smoke_project_jobs(base_url: str, project_id: str, job_id: str) -> None:
+    payload = fetch_json(urljoin(base_url, f"projects/{project_id}/jobs"))
+    if not isinstance(payload, dict) or not isinstance(payload.get("jobs"), list):
+        raise VerificationError(f"Unexpected project jobs payload: {payload!r}")
+    if not any(isinstance(item, dict) and item.get("id") == job_id for item in payload["jobs"]):
+        raise VerificationError(f"Smoke job is missing from project jobs: {job_id}")
+    print(f"[OK] API project jobs check includes smoke job: {job_id}")
 
 
 def build_api_command(base_url: str) -> tuple[list[str], dict[str, str]]:

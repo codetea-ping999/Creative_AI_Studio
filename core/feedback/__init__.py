@@ -114,7 +114,7 @@ class FeedbackRepository:
         feedback_file = self.feedback_dir / f"{feedback_id}.json"
         if not feedback_file.exists():
             return None
-        return self._load_feedback(feedback_file)
+        return self._try_load_feedback(feedback_file)
 
     def list_by_job(self, job_id: str) -> list[Feedback]:
         return [
@@ -139,8 +139,9 @@ class FeedbackRepository:
 
     def list_all(self) -> list[Feedback]:
         feedbacks = [
-            self._load_feedback(feedback_file)
+            feedback
             for feedback_file in sorted(self.feedback_dir.glob("*.json"))
+            if (feedback := self._try_load_feedback(feedback_file)) is not None
         ]
         feedbacks.sort(key=lambda item: item.created_at, reverse=True)
         return feedbacks
@@ -223,6 +224,12 @@ class FeedbackRepository:
             metadata=dict(data.get("metadata", {})),
             created_at=datetime.fromisoformat(data["created_at"]),
         )
+
+    def _try_load_feedback(self, feedback_file: Path) -> Feedback | None:
+        try:
+            return self._load_feedback(feedback_file)
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            return None
 
     def _save_feedback(self, feedback: Feedback) -> None:
         feedback_file = self.feedback_dir / f"{feedback.id}.json"

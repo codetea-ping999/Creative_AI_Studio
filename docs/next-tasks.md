@@ -19,22 +19,24 @@
 | Done | video storyboard flow | `/generate/video`、procedural runtime、Studio UI の基本導線を追加 |
 | Done | gallery / project / feedback baseline | gallery filter、project job binding、feedback summary を追加 |
 | Done | gallery asset workflow | asset detail、reuse、export、project bind を API / Studio UI に接続 |
+| Done | repository JSON hardening | asset / project / feedback の破損 JSON を一覧取得から隔離 |
+| Done | manifest validation hardening | duplicate manifest id / public id / alias を setup check で検出 |
+| Done | expanded API smoke | `/health` / `/models` に加え project / video generate / gallery / project jobs を検証 |
+| Done | frontend test path | `npm --prefix apps/web test` と PromptForm smoke test を追加 |
+| Done | package task runner | root `Makefile` から verify / verify-lite / api-smoke を実行可能に整理 |
+| Done | semantic judge operational docs | local judge model 配置、cache、video frame backend の設定を明文化 |
 
 ## 次に進めるべきタスク
 
 | 優先度 | 状態 | タスク | 目的 |
 | --- | --- | --- | --- |
-| P1 | Todo | semantic quality judge の実運用化 | local model 配置、cache 戦略、judge UX を整備する |
 | P2 | Todo | Project 単位の整理強化 | project metadata、asset export、検索を追加する |
 | P2 | Todo | learned text-to-video runtime | procedural runtime を実モデルベース video へ置き換える |
 | P2 | Todo | human feedback loop | 採点結果に対する user feedback を保存して quality judge を補正する |
-| P2 | Todo | video/audio semantic judge | media ごとに judge model を追加し creative blend を改善する |
-| P2 | Todo | API smoke の拡張 | `/health` と `/models` に加えて代表的な create/list フローも自動検証する |
-| P3 | Todo | package task runner | `make verify` や npm script で root からより短い検証導線を提供する |
+| P2 | Todo | semantic judge calibration dataset | local judge score と human feedback の相関を蓄積して閾値を調整する |
 
 ## 直近の推奨着手順
 
-1. VLM / audio encoder を使った semantic judge を quality report に追加する
-2. Project / Asset 単位の保存構造を強化して studio らしい管理単位を作る
-3. procedural video を learned runtime に差し替えられる loader 構成を整える
-4. API smoke を asset workflow まで広げて運用検証を固める
+1. Project / Asset 単位の保存構造を強化して studio らしい管理単位を作る
+2. procedural video を learned runtime に差し替えられる loader 構成を整える
+3. semantic judge と human feedback の相関を見て閾値を調整する

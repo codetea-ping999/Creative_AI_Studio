@@ -83,6 +83,37 @@ huggingface-cli download facebook/musicgen-small \
 `storyboard-video` は `./models/video/procedural` が存在すれば利用可能で、
 ローカルで storyboard gif を生成します。
 
+### Semantic judge model
+
+semantic judge は生成モデルとは別の評価用 model です。
+既定では image / video frame に CLIP、audio に CLAP を使います。
+`QUALITY_SEMANTIC_LOCAL_ONLY=true` の運用では、事前に local path へ配置してから path override を設定してください。
+
+```bash
+huggingface-cli download openai/clip-vit-base-patch32 \
+  --local-dir ./models/judges/clip-vit-base-patch32 \
+  --local-dir-use-symlinks False
+
+huggingface-cli download laion/clap-htsat-unfused \
+  --local-dir ./models/judges/clap-htsat-unfused \
+  --local-dir-use-symlinks False
+```
+
+`.env` の例:
+
+```dotenv
+QUALITY_ENABLE_SEMANTIC_JUDGE=true
+QUALITY_SEMANTIC_LOCAL_ONLY=true
+QUALITY_SEMANTIC_CACHE_DIR=./data/semantic-cache
+QUALITY_SEMANTIC_IMAGE_MODEL_PATH=./models/judges/clip-vit-base-patch32
+QUALITY_SEMANTIC_AUDIO_MODEL_PATH=./models/judges/clap-htsat-unfused
+QUALITY_SEMANTIC_VIDEO_MODEL_PATH=./models/judges/clip-vit-base-patch32
+QUALITY_SEMANTIC_VIDEO_BACKEND=image_frames
+QUALITY_SEMANTIC_VIDEO_SAMPLE_FRAMES=3
+```
+
+video は現状 `image_frames` backend です。gif から数 frame を抽出し、image judge の平均として semantic alignment を算出します。
+
 ## manifest の考え方
 
 manifest は「モデルの宣言情報」です。実体ファイルの場所と API 公開 ID を分けて管理します。
@@ -180,5 +211,6 @@ python3 -m unittest tests.test_model_system
 - 未配置の checkpoint や MusicGen モデルは `/models` には出ますが `is_available: false` になります
 - `storyboard-video` は procedural runtime なので追加ダウンロード不要です
 - モデルダウンロード管理 UI はまだありません
+- semantic judge model は生成 model とは別管理で、初回 scoring 時に必要です
 
 次の実装候補は [next-tasks.md](/Users/toyoharukohyama/Documents/Creative_AI_Studio/docs/next-tasks.md) にまとめています。

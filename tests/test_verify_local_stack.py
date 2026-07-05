@@ -9,6 +9,8 @@ import socketserver
 import threading
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from urllib.parse import urlparse
 
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "verify_local_stack.py"
@@ -18,17 +20,47 @@ MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(MODULE)
 
+SETUP_SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "check_local_setup.py"
+SETUP_SPEC = importlib.util.spec_from_file_location("check_local_setup", SETUP_SCRIPT_PATH)
+assert SETUP_SPEC is not None
+SETUP_MODULE = importlib.util.module_from_spec(SETUP_SPEC)
+assert SETUP_SPEC.loader is not None
+SETUP_SPEC.loader.exec_module(SETUP_MODULE)
+
 
 class _JsonHandler(http.server.BaseHTTPRequestHandler):
     health_payload: object = {"status": "ok"}
     models_payload: object = {"models": []}
+    job_payload: object = {"id": "job_smoke", "status": "succeeded"}
 
     def do_GET(self) -> None:  # noqa: N802
-        if self.path == "/health":
+        parsed = urlparse(self.path)
+        if parsed.path == "/health":
             self._write_json(self.health_payload)
             return
-        if self.path == "/models":
+        if parsed.path == "/models":
             self._write_json(self.models_payload)
+            return
+        if parsed.path == "/jobs/job_smoke":
+            self._write_json(self.job_payload)
+            return
+        if parsed.path == "/gallery":
+            self._write_json([{"job_id": "job_smoke"}])
+            return
+        if parsed.path == "/projects/project_smoke/jobs":
+            self._write_json({"jobs": [{"id": "job_smoke"}]})
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        if parsed.path == "/projects":
+            self._write_json({"id": "project_smoke"}, status_code=201)
+            return
+        if parsed.path == "/generate/video":
+            self._write_json({"job_id": "job_smoke", "status": "queued"}, status_code=201)
             return
 
         self.send_response(404)
@@ -37,9 +69,9 @@ class _JsonHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:  # noqa: A003
         return
 
-    def _write_json(self, payload: object) -> None:
+    def _write_json(self, payload: object, *, status_code: int = 200) -> None:
         body = json.dumps(payload).encode("utf-8")
-        self.send_response(200)
+        self.send_response(status_code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -85,6 +117,47 @@ class VerifyLocalStackTests(unittest.TestCase):
         self.assertEqual(command[-4:], ["--host", "127.0.0.1", "--port", "8123"])
         self.assertEqual(env["API_HOST"], "127.0.0.1")
         self.assertEqual(env["API_PORT"], "8123")
+
+    def test_check_manifest_files_rejects_duplicate_ids(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            manifest_root = Path(tmp_dir)
+            first = manifest_root / "first.json"
+            second = manifest_root / "second.json"
+            payload = {
+                "id": "duplicate-local",
+                "public_id": "duplicate",
+                "display_name": "Duplicate",
+            }
+            first.write_text(json.dumps(payload), encoding="utf-8")
+            second.write_text(json.dumps(payload), encoding="utf-8")
+
+            self.assertFalse(SETUP_MODULE._check_manifest_files(manifest_root))
+
+    def test_check_manifest_files_rejects_duplicate_public_aliases(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            manifest_root = Path(tmp_dir)
+            (manifest_root / "first.json").write_text(
+                json.dumps(
+                    {
+                        "id": "first-local",
+                        "public_id": "first",
+                        "aliases": ["shared"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (manifest_root / "second.json").write_text(
+                json.dumps(
+                    {
+                        "id": "second-local",
+                        "public_id": "second",
+                        "aliases": ["shared"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertFalse(SETUP_MODULE._check_manifest_files(manifest_root))
 
 
 if __name__ == "__main__":

@@ -134,14 +134,26 @@ audio output root の解決:
 | --- | --- | --- |
 | `QUALITY_ENABLE_SEMANTIC_JUDGE` | `false` | semantic judge の有効化 |
 | `QUALITY_SEMANTIC_LOCAL_ONLY` | `true` | local file のみ許可 |
+| `QUALITY_SEMANTIC_CACHE_DIR` | `data/semantic-cache` | semantic score cache の保存先 |
 | `QUALITY_SEMANTIC_IMAGE_MODEL` | `openai/clip-vit-base-patch32` | image judge model |
 | `QUALITY_SEMANTIC_AUDIO_MODEL` | `laion/clap-htsat-unfused` | audio judge model |
+| `QUALITY_SEMANTIC_VIDEO_MODEL` | `openai/clip-vit-base-patch32` | video frame judge model |
+| `QUALITY_SEMANTIC_IMAGE_MODEL_PATH` | unset | local image judge path override |
+| `QUALITY_SEMANTIC_AUDIO_MODEL_PATH` | unset | local audio judge path override |
+| `QUALITY_SEMANTIC_VIDEO_MODEL_PATH` | unset | local video judge path override |
+| `QUALITY_SEMANTIC_ENABLE_IMAGE` | `true` | image semantic scoring の有効化 |
+| `QUALITY_SEMANTIC_ENABLE_AUDIO` | `true` | audio semantic scoring の有効化 |
+| `QUALITY_SEMANTIC_ENABLE_VIDEO` | `true` | video semantic scoring の有効化 |
+| `QUALITY_SEMANTIC_VIDEO_BACKEND` | `image_frames` | video semantic backend |
+| `QUALITY_SEMANTIC_VIDEO_SAMPLE_FRAMES` | `3` | video から採点する frame 数 |
 
 ### 実装上の意味
 
 - `QUALITY_ENABLE_SEMANTIC_JUDGE=false` の間は judge は動きません
 - `QUALITY_SEMANTIC_LOCAL_ONLY=true` なら local に model が無い場合 `unavailable` 扱いです
-- 既定では heuristic quality report のみを主に使います
+- `QUALITY_SEMANTIC_*_MODEL_PATH` を設定すると Hugging Face ID より local path を優先します
+- video は既定で gif の sample frame を image judge に通します
+- 採点結果は output path、file stat、prompt、model ref を含む key で cache されます
 
 ## ログ関連
 
@@ -213,8 +225,12 @@ OUTPUT_AUDIO_DIR=./outputs/audio
 LORA_ROOT=./models/loras
 QUALITY_ENABLE_SEMANTIC_JUDGE=false
 QUALITY_SEMANTIC_LOCAL_ONLY=true
+QUALITY_SEMANTIC_CACHE_DIR=./data/semantic-cache
 QUALITY_SEMANTIC_IMAGE_MODEL=openai/clip-vit-base-patch32
 QUALITY_SEMANTIC_AUDIO_MODEL=laion/clap-htsat-unfused
+QUALITY_SEMANTIC_VIDEO_MODEL=openai/clip-vit-base-patch32
+QUALITY_SEMANTIC_VIDEO_BACKEND=image_frames
+QUALITY_SEMANTIC_VIDEO_SAMPLE_FRAMES=3
 LOG_LEVEL=INFO
 MAX_CACHED_MODELS=1
 ```
@@ -259,11 +275,13 @@ MAX_CACHED_MODELS=1
 
 - `QUALITY_ENABLE_SEMANTIC_JUDGE=false`
 - または local only で judge model が存在しない
+- local path override が空、または存在しない
 
 対処:
 
-- relevant な環境変数を確認する
-- local model 配置を確認する
+- `QUALITY_ENABLE_SEMANTIC_JUDGE=true` にする
+- local model 配置を [model-download-guide.md](./model-download-guide.md) で確認する
+- local path を固定したい場合は `QUALITY_SEMANTIC_IMAGE_MODEL_PATH` や `QUALITY_SEMANTIC_AUDIO_MODEL_PATH` を設定する
 
 ## 読むべきコード
 

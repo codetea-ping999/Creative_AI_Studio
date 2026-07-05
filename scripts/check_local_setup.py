@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,8 +20,8 @@ def _check_path(path: Path, label: str, *, required: bool = True) -> bool:
     return exists or not required
 
 
-def _check_manifest_files() -> bool:
-    manifest_root = ROOT / "models" / "manifests"
+def _check_manifest_files(manifest_root: Path | None = None) -> bool:
+    manifest_root = manifest_root or ROOT / "models" / "manifests"
     if not _check_path(manifest_root, "Model manifest root"):
         return False
 
@@ -31,6 +32,8 @@ def _check_manifest_files() -> bool:
 
     print(f"[OK] Found {len(manifest_files)} manifest file(s)")
     success = True
+    manifest_ids: dict[str, Path] = {}
+    public_identifiers: dict[str, Path] = {}
     for manifest_path in manifest_files:
         try:
             payload = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -40,9 +43,52 @@ def _check_manifest_files() -> bool:
             continue
 
         manifest_id = payload.get("id", "<missing id>")
-        public_id = payload.get("public_id", manifest_id)
-        print(f"[OK] Manifest: {manifest_path.relative_to(ROOT)} id={manifest_id} public_id={public_id}")
+        public_id = payload.get("public_id") or manifest_id
+        relative_path = _relative_to_root(manifest_path)
+        print(f"[OK] Manifest: {relative_path} id={manifest_id} public_id={public_id}")
+
+        if not isinstance(manifest_id, str) or not manifest_id:
+            print(f"[FAIL] Manifest is missing a valid id: {relative_path}")
+            success = False
+        elif manifest_id in manifest_ids:
+            print(
+                "[FAIL] Duplicate manifest id "
+                f"{manifest_id!r}: {_relative_to_root(manifest_ids[manifest_id])} vs {relative_path}"
+            )
+            success = False
+        else:
+            manifest_ids[manifest_id] = manifest_path
+
+        identifiers = _public_identifiers(payload, fallback_id=manifest_id)
+        for identifier in identifiers:
+            existing_path = public_identifiers.get(identifier)
+            if existing_path is not None:
+                print(
+                    "[FAIL] Duplicate public model id or alias "
+                    f"{identifier!r}: {_relative_to_root(existing_path)} vs {relative_path}"
+                )
+                success = False
+                continue
+            public_identifiers[identifier] = manifest_path
     return success
+
+
+def _public_identifiers(payload: dict[str, Any], *, fallback_id: object) -> list[str]:
+    identifiers: list[str] = []
+    public_id = payload.get("public_id") or fallback_id
+    if isinstance(public_id, str) and public_id:
+        identifiers.append(public_id)
+    aliases = payload.get("aliases", [])
+    if isinstance(aliases, list):
+        identifiers.extend(alias for alias in aliases if isinstance(alias, str) and alias)
+    return identifiers
+
+
+def _relative_to_root(path: Path) -> str:
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
 
 
 def _check_sdxl_runtime_files() -> bool:

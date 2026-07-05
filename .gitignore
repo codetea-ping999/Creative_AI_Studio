@@ -16,8 +16,10 @@ data/*.db
 data/assets/
 data/projects/
 data/feedback/
+data/semantic-cache/
 data/model-download-*.log
 
+models/judges/
 models/audio/musicgen-small/*.bin
 models/audio/musicgen-small/*.json
 models/audio/musicgen-small/*.model

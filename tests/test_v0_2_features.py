@@ -58,6 +58,20 @@ class ProjectRepositoryTests(unittest.TestCase):
         self.assertTrue(self.repo.delete(project.id))
         self.assertIsNone(self.repo.get(project.id))
 
+    def test_invalid_project_json_is_skipped(self):
+        project = self.repo.create("Valid", "")
+        (Path(self.tmpdir.name) / "broken.json").write_text("{", encoding="utf-8")
+
+        projects = self.repo.list_all()
+
+        self.assertEqual([item.id for item in projects], [project.id])
+
+    def test_get_invalid_project_json_returns_none(self):
+        project_file = Path(self.tmpdir.name) / "project-broken.json"
+        project_file.write_text("", encoding="utf-8")
+
+        self.assertIsNone(self.repo.get("project-broken"))
+
     def test_remove_job_returns_none_when_project_does_not_include_it(self):
         source = self.repo.create("Source", "")
         other = self.repo.create("Other", "")
@@ -206,6 +220,20 @@ class FeedbackRepositoryTests(unittest.TestCase):
         feedback = self.repo.create("job123", quality_rating=4)
         self.assertTrue(self.repo.delete(feedback.id))
         self.assertIsNone(self.repo.get(feedback.id))
+
+    def test_invalid_feedback_json_is_skipped(self):
+        feedback = self.repo.create("job123", quality_rating=4)
+        (Path(self.tmpdir.name) / "broken.json").write_text("{", encoding="utf-8")
+
+        feedbacks = self.repo.list_all()
+
+        self.assertEqual([item.id for item in feedbacks], [feedback.id])
+
+    def test_get_invalid_feedback_json_returns_none(self):
+        feedback_file = Path(self.tmpdir.name) / "feedback-broken.json"
+        feedback_file.write_text("", encoding="utf-8")
+
+        self.assertIsNone(self.repo.get("feedback-broken"))
 
 
 if __name__ == "__main__":
