@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -546,6 +547,33 @@ class ApiExtensionTests(unittest.TestCase):
             target_project_jobs = client.get(f"/projects/{target_project_id}/jobs").json()
             self.assertEqual(source_project_jobs["job_count"], 0)
             self.assertEqual(target_project_jobs["job_count"], 2)
+
+            feedback_response = client.post(
+                "/feedback",
+                json={
+                    "job_id": source_job_id,
+                    "asset_id": source_asset_id,
+                    "project_id": target_project_id,
+                    "quality_rating": 5,
+                    "semantic_rating": 4,
+                    "creative_rating": 4,
+                    "comments": "ready for export",
+                },
+            )
+            self.assertEqual(feedback_response.status_code, 201)
+
+            project_export_response = client.post(
+                f"/projects/{target_project_id}/export",
+                json={"destination_dir": str(root / "exports" / "project-bundle")},
+            )
+            self.assertEqual(project_export_response.status_code, 200)
+            project_manifest_path = Path(project_export_response.json()["manifest_path"])
+            self.assertTrue(project_manifest_path.exists())
+            project_manifest = json.loads(project_manifest_path.read_text(encoding="utf-8"))
+            self.assertIn("quality_summary", project_manifest["project"])
+            self.assertIn("feedback_summary", project_manifest["project"])
+            self.assertEqual(project_manifest["project"]["feedback_summary"]["total_feedback"], 1)
+            self.assertEqual(project_manifest["project"]["asset_count"], 2)
 
 
 if __name__ == "__main__":

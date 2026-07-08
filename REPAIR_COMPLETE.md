@@ -1,5 +1,7 @@
 ## 🎉 Creative AI Studio v0.2 リポジトリ修復完了
 
+> Note: This is a historical repair report, not the current product/API contract. For current setup and implementation guidance, start with `README.md` and `docs/README.md`.
+
 ### ✨ 実施した修復・実装
 
 #### 1. **モデルセットアップの完成** ✅

@@ -590,11 +590,11 @@ class ModelSystemTests(unittest.TestCase):
             self.assertEqual(result.metadata["model_id"], "musicgen-small")
             self.assertTrue(Path(result.outputs[0]).exists())
 
-    def test_video_generator_rejects_unsupported_output_format(self) -> None:
+    def test_procedural_video_generator_rejects_mp4_output_format(self) -> None:
         service = create_default_model_service()
         generator = VideoGenerator(service)
 
-        with self.assertRaisesRegex(ValueError, "gif output only"):
+        with self.assertRaisesRegex(ValueError, "supports gif output only"):
             generator.validate_request(
                 GenerationRequest(
                     media_type="video",
@@ -604,6 +604,68 @@ class ModelSystemTests(unittest.TestCase):
                     params={},
                 )
             )
+
+    def test_learned_video_generator_accepts_mp4_output_format(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_root = root / "manifests"
+            runtime_root = root / "runtime" / "learned-video"
+            runtime_root.mkdir(parents=True)
+            (runtime_root / "runtime.py").write_text(
+                "\n".join(
+                    [
+                        "from pathlib import Path",
+                        "",
+                        "def load_runtime(manifest):",
+                        "    output_path = Path(__file__).with_name('learned-output.mp4')",
+                        "    def renderer(**kwargs):",
+                        "        output_path.write_bytes(b'0' * 131072)",
+                        "        return {",
+                        "            'output_path': str(output_path),",
+                        "            'output_format': 'mp4',",
+                        "            'metadata': {'adapter_contract': 'test'},",
+                        "        }",
+                        "    return {'runtime_adapter': 'learned_text_to_video', 'renderer': renderer}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            _write_manifest(
+                manifest_root / "video" / "learned.json",
+                {
+                    "id": "learned-video-local",
+                    "public_id": "learned-video",
+                    "display_name": "Learned Video",
+                    "media_type": "video",
+                    "task_type": "text-to-video",
+                    "provider": "local",
+                    "runtime": "learned",
+                    "local_path": str(runtime_root),
+                    "loader": "learned_video_loader",
+                    "default_params": {"entrypoint": "runtime.py"},
+                    "aliases": ["learned-video-local"],
+                    "enabled": True,
+                },
+            )
+            service = create_default_model_service(manifest_root=manifest_root)
+            generator = VideoGenerator(service, output_dir=root / "outputs" / "videos")
+
+            result = generator.run(
+                GenerationRequest(
+                    media_type="video",
+                    prompt="learned runtime smoke",
+                    model_id="learned-video",
+                    output_format="mp4",
+                    params={"duration_seconds": 1},
+                )
+            )
+
+            self.assertEqual(result.status, "succeeded")
+            self.assertEqual(result.metadata["output_format"], "mp4")
+            self.assertEqual(result.metadata["runtime_adapter"], "learned_text_to_video")
+            self.assertEqual(result.metadata["adapter_contract"], "test")
+            self.assertTrue(Path(result.outputs[0]).exists())
+            self.assertEqual(Path(result.outputs[0]).suffix, ".mp4")
 
     def test_video_generator_keeps_gif_output_behavior(self) -> None:
         with TemporaryDirectory() as tmp_dir:

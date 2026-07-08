@@ -43,9 +43,12 @@ class MediaMetrics(BaseModel):
     success_rate: float = 0.0
     save_success_rate: float = 0.0
     average_quality_score: float | None = None
+    average_quality_score_calibrated: float | None = None
     average_business_readiness_score: float | None = None
     average_semantic_alignment_score: float | None = None
+    average_semantic_alignment_score_calibrated: float | None = None
     average_creative_alignment_score: float | None = None
+    average_creative_alignment_score_calibrated: float | None = None
     latest_quality_level: str | None = None
     semantic_scored_jobs: int = 0
     semantic_unavailable_jobs: int = 0
@@ -68,9 +71,12 @@ class MetricsSummaryResponse(BaseModel):
     success_rate: float = 0.0
     save_success_rate: float = 0.0
     average_quality_score: float | None = None
+    average_quality_score_calibrated: float | None = None
     average_business_readiness_score: float | None = None
     average_semantic_alignment_score: float | None = None
+    average_semantic_alignment_score_calibrated: float | None = None
     average_creative_alignment_score: float | None = None
+    average_creative_alignment_score_calibrated: float | None = None
     latest_quality_level: str | None = None
     semantic_scored_jobs: int = 0
     semantic_unavailable_jobs: int = 0
@@ -141,14 +147,34 @@ def _build_metrics(
         "average_quality_score": _average(
             _quality_metric(job, "quality_score") for job in jobs
         ),
+        "average_quality_score_calibrated": _average(
+            _calibrated_quality_metric(job, feedback_by_job, "quality_score_calibrated")
+            for job in jobs
+        ),
         "average_business_readiness_score": _average(
             _quality_metric(job, "business_readiness_score") for job in jobs
         ),
         "average_semantic_alignment_score": _average(
             _quality_metric(job, "semantic_alignment_score") for job in jobs
         ),
+        "average_semantic_alignment_score_calibrated": _average(
+            _calibrated_quality_metric(
+                job,
+                feedback_by_job,
+                "semantic_alignment_score_calibrated",
+            )
+            for job in jobs
+        ),
         "average_creative_alignment_score": _average(
             _quality_metric(job, "creative_alignment_score") for job in jobs
+        ),
+        "average_creative_alignment_score_calibrated": _average(
+            _calibrated_quality_metric(
+                job,
+                feedback_by_job,
+                "creative_alignment_score_calibrated",
+            )
+            for job in jobs
         ),
         "latest_quality_level": next(
             (
@@ -200,6 +226,40 @@ def _quality_metric(job: JobRecord, key: str) -> float | None:
     if quality is None:
         return None
     score = quality.get(key)
+    return float(score) if isinstance(score, (int, float)) else None
+
+
+def _calibrated_quality_metric(
+    job: JobRecord,
+    feedback_by_job: dict[str, list[object]],
+    key: str,
+) -> float | None:
+    from core.feedback import rating_to_score
+    from core.quality import calibrate_quality_report
+
+    quality = _quality_report(job)
+    if quality is None:
+        return None
+    feedbacks = feedback_by_job.get(job.id, [])
+    if not feedbacks:
+        return _quality_metric(job, key.removesuffix("_calibrated"))
+
+    human_summary = {
+        "total_feedback": len(feedbacks),
+        "human_quality_score": _average(
+            rating_to_score(getattr(feedback, "quality_rating", None))
+            for feedback in feedbacks
+        ),
+        "human_semantic_alignment_score": _average(
+            rating_to_score(getattr(feedback, "semantic_rating", None))
+            for feedback in feedbacks
+        ),
+        "human_creative_alignment_score": _average(
+            rating_to_score(getattr(feedback, "creative_rating", None))
+            for feedback in feedbacks
+        ),
+    }
+    score = calibrate_quality_report(dict(quality), human_summary).get(key)
     return float(score) if isinstance(score, (int, float)) else None
 
 

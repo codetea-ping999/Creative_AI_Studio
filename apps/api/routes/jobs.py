@@ -77,6 +77,17 @@ def list_jobs(job_service: JobService = Depends(get_job_service)) -> list[JobRec
     return job_service.list_jobs()
 
 
+@router.post("/{job_id}/cancel", response_model=JobRecord)
+def cancel_job(
+    job_id: str,
+    job_service: JobService = Depends(get_job_service),
+) -> JobRecord:
+    job = job_service.cancel_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
+    return job
+
+
 @router.post("/{job_id}/rerun", response_model=CreateJobResponse, status_code=status.HTTP_201_CREATED)
 def rerun_job(
     job_id: str,

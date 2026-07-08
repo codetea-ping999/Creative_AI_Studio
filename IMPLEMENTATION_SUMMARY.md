@@ -1,5 +1,7 @@
 # 修復完了サマリー
 
+> Note: This is a historical implementation summary, not the current product/API contract. For current setup and implementation guidance, start with `README.md` and `docs/README.md`.
+
 ## 📋 実施内容
 
 Creative AI Studio リポジトリの包括的な修復・実装を完了しました。

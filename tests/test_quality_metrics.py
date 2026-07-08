@@ -225,6 +225,12 @@ class QualityMetricsTests(unittest.TestCase):
             services.job_service.mark_failed(failed_job.id, "stub failure")
             services.job_service.update_status(running_job.id, "running", progress=0.5)
             services.job_service.cancel_job(cancelled_job.id)
+            services.feedback_repository.create(
+                succeeded_job.id,
+                5,
+                semantic_rating=4,
+                creative_rating=4,
+            )
 
             client = TestClient(create_app(services, start_job_runner=False))
             response = client.get("/metrics/summary?window_size=2")
@@ -238,8 +244,10 @@ class QualityMetricsTests(unittest.TestCase):
             self.assertEqual(payload["success_rate"], 25.0)
             self.assertEqual(payload["save_success_rate"], 100.0)
             self.assertEqual(payload["average_quality_score"], 91.0)
+            self.assertEqual(payload["average_quality_score_calibrated"], 92.1)
             self.assertEqual(payload["average_business_readiness_score"], 83.0)
             self.assertEqual(payload["average_semantic_alignment_score"], 77.0)
+            self.assertEqual(payload["average_semantic_alignment_score_calibrated"], 77.4)
             self.assertEqual(payload["latest_quality_level"], "excellent")
             self.assertEqual(payload["recent_window_size"], 2)
             self.assertEqual(payload["recent_success_rate"], 0.0)
@@ -249,6 +257,10 @@ class QualityMetricsTests(unittest.TestCase):
             self.assertEqual(payload["by_media"]["image"]["succeeded_jobs"], 1)
             self.assertEqual(payload["by_media"]["image"]["running_jobs"], 1)
             self.assertEqual(payload["by_media"]["image"]["average_quality_score"], 91.0)
+            self.assertEqual(
+                payload["by_media"]["image"]["average_quality_score_calibrated"],
+                92.1,
+            )
 
             self.assertEqual(payload["by_media"]["audio"]["total_jobs"], 2)
             self.assertEqual(payload["by_media"]["audio"]["failed_jobs"], 1)

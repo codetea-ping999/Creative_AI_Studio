@@ -1,5 +1,7 @@
 # Creative AI Studio v0.2 - 修復・実装完了
 
+> Note: This is a historical v0.2 repair report, not the current product/API contract. For current setup and implementation guidance, start with `README.md` and `docs/README.md`.
+
 **実施日**: 2025年3月15日  
 **ステータス**: ✅ 完了  
 **テスト**: ✅ 39/39 成功

@@ -14,7 +14,9 @@ from PIL import Image, ImageDraw, ImageFont
 from core.models import ModelManifest
 from core.schemas import GenerationRequest
 
-SUPPORTED_VIDEO_OUTPUT_FORMATS = frozenset({"gif"})
+PROCEDURAL_VIDEO_OUTPUT_FORMATS = frozenset({"gif"})
+LEARNED_VIDEO_OUTPUT_FORMATS = frozenset({"gif", "mp4", "webm", "mov"})
+SUPPORTED_VIDEO_OUTPUT_FORMATS = PROCEDURAL_VIDEO_OUTPUT_FORMATS | LEARNED_VIDEO_OUTPUT_FORMATS
 
 
 class BaseVideoRuntime(ABC):

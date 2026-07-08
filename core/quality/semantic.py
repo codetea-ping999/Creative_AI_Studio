@@ -379,10 +379,21 @@ class _VideoFrameBackend:
             cached["cache_hit"] = True
             return cached
 
-        sampled_frames = _sample_video_frames(
-            resolved_output_path,
-            sample_frames=self.config.video_sample_frames,
-        )
+        try:
+            sampled_frames = _sample_video_frames(
+                resolved_output_path,
+                sample_frames=self.config.video_sample_frames,
+            )
+        except OSError:
+            return {
+                "status": "unavailable",
+                "media_type": "video",
+                "mode": "image_frames",
+                "backend": "video_frame_fallback",
+                "model_id": self.config.image_model_path or self.config.image_model_id,
+                "reason": "Video frames are not readable by the image frame backend",
+                "cache_hit": False,
+            }
         if not sampled_frames:
             return {
                 "status": "unavailable",

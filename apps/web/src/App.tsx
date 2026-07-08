@@ -50,6 +50,65 @@ type GenerationRequestSnapshot = {
   params: Record<string, unknown>;
 };
 
+// ユーザーフレンドリーなデザイン用の追加スタイル
+const appStyles = {
+  container: {
+    maxWidth: '1200px',
+    margin: '0 auto',
+    padding: '24px',
+    fontFamily: '"Space Grotesk", "Avenir Next", "Helvetica Neue", sans-serif',
+  },
+  header: {
+    textAlign: 'center' as const,
+    marginBottom: '32px',
+    paddingBottom: '24px',
+    borderBottom: '1px solid var(--border-soft)',
+  },
+  title: {
+    fontSize: '2rem',
+    fontWeight: '700',
+    color: 'var(--text-primary)',
+    margin: '0 0 8px',
+  },
+  subtitle: {
+    fontSize: '1.1rem',
+    color: 'var(--text-soft)',
+    margin: '0',
+  },
+  tabContainer: {
+    display: 'flex',
+    justifyContent: 'center',
+    marginBottom: '32px',
+    gap: '8px',
+  },
+  tabButton: {
+    padding: '12px 24px',
+    borderRadius: 'var(--radius-md)',
+    border: 'none',
+    backgroundColor: 'var(--surface-base)',
+    color: 'var(--text-primary)',
+    fontSize: '1rem',
+    fontWeight: '500',
+    cursor: 'pointer',
+    transition: 'var(--transition-fast)',
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  tabButtonActive: {
+    backgroundColor: 'var(--accent)',
+    color: 'white',
+  },
+  tabButtonHover: {
+    backgroundColor: 'var(--surface-soft)',
+  },
+  contentContainer: {
+    display: 'flex',
+    flexDirection: 'column' as const,
+    gap: '24px',
+  },
+};
+
 type ModelSummary = {
   id: string;
   display_name: string;
@@ -160,8 +219,11 @@ type ProjectResponse = {
   name: string;
   description: string;
   status: string;
+  tags: string[];
+  pinned_asset_ids: string[];
   asset_count: number;
   job_count: number;
+  cover_asset_path: string | null;
 };
 
 type FeedbackResponse = {
@@ -265,19 +327,40 @@ function normalizeLoraOption(item: LoraCatalogResponse["items"][number]): LoraOp
   };
 }
 
-function createOutputUrl(pathValue: string | null | undefined): string | null {
+export function createOutputUrl(pathValue: string | null | undefined): string | null {
   if (!pathValue) {
     return null;
   }
 
   const normalized = pathValue.replace(/\\/g, "/");
-  const marker = "/outputs/";
-  const markerIndex = normalized.lastIndexOf(marker);
-  if (markerIndex < 0) {
-    return null;
+  if (/^https?:\/\//i.test(normalized)) {
+    return normalized;
   }
 
-  return `${API_BASE_URL}${normalized.slice(markerIndex)}`;
+  const relativePath = normalized.replace(/^\.?\//, "");
+  if (relativePath.startsWith("outputs/")) {
+    return `${API_BASE_URL}/${relativePath}`;
+  }
+
+  const outputMarker = "/outputs/";
+  const outputMarkerIndex = normalized.lastIndexOf(outputMarker);
+  if (outputMarkerIndex >= 0) {
+    return `${API_BASE_URL}${normalized.slice(outputMarkerIndex)}`;
+  }
+
+  for (const mountChild of ["images", "audio", "videos", "exports"]) {
+    if (relativePath.startsWith(`${mountChild}/`)) {
+      return `${API_BASE_URL}/outputs/${relativePath}`;
+    }
+
+    const childMarker = `/${mountChild}/`;
+    const childMarkerIndex = normalized.lastIndexOf(childMarker);
+    if (childMarkerIndex >= 0) {
+      return `${API_BASE_URL}/outputs${normalized.slice(childMarkerIndex)}`;
+    }
+  }
+
+  return null;
 }
 
 function formatDate(value: string | null | undefined): string {
@@ -305,8 +388,8 @@ function isAudioAsset(pathValue: string | null | undefined): boolean {
   return Boolean(pathValue && /\.(wav|mp3|ogg|m4a)$/i.test(pathValue));
 }
 
-function isVideoAsset(pathValue: string | null | undefined): boolean {
-  return Boolean(pathValue && /\.(mp4|webm|mov)$/i.test(pathValue));
+export function isVideoAsset(pathValue: string | null | undefined): boolean {
+  return Boolean(pathValue && /\.(gif|mp4|webm|mov)$/i.test(pathValue));
 }
 
 function asNumber(value: unknown): number | null {
@@ -398,7 +481,7 @@ function createDraftFromRequestSnapshot(
   };
 }
 
-function buildGeneratePayload(
+export function buildGeneratePayload(
   values: PromptFormSubmitValues,
   projectId: string | null,
 ): Record<string, unknown> {
@@ -453,7 +536,7 @@ function buildGeneratePayload(
   };
 }
 
-function buildReusePayload(
+export function buildReusePayload(
   values: PromptFormSubmitValues,
   projectId: string | null,
 ): Record<string, unknown> {
@@ -518,15 +601,41 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
     let detail = responseText;
     try {
       const parsed = JSON.parse(responseText) as { detail?: unknown };
-      if (typeof parsed.detail === "string") {
-        detail = parsed.detail;
-      }
+      detail = formatApiErrorDetail(parsed.detail) || detail;
     } catch {
       // Keep the raw response text when the API does not return JSON.
     }
     throw new Error(detail || `${response.status} ${response.statusText}`);
   }
   return responseText ? (JSON.parse(responseText) as T) : (undefined as T);
+}
+
+export function formatApiErrorDetail(detail: unknown): string {
+  if (typeof detail === "string") {
+    return detail;
+  }
+  if (!Array.isArray(detail)) {
+    return "";
+  }
+
+  const messages = detail
+    .map((item) => {
+      if (!item || typeof item !== "object") {
+        return "";
+      }
+      const payload = item as { loc?: unknown; msg?: unknown };
+      const loc = Array.isArray(payload.loc)
+        ? payload.loc.map((part) => String(part)).join(".")
+        : "";
+      const msg = typeof payload.msg === "string" ? payload.msg : "";
+      if (!loc) {
+        return msg;
+      }
+      return msg ? `${loc}: ${msg}` : loc;
+    })
+    .filter(Boolean);
+
+  return messages.join("; ");
 }
 
 function App() {
@@ -550,6 +659,9 @@ function App() {
   const [selectedProjectId, setSelectedProjectId] = useState("");
   const [newProjectName, setNewProjectName] = useState("");
   const [newProjectDescription, setNewProjectDescription] = useState("");
+  const [projectStatusDraft, setProjectStatusDraft] = useState("active");
+  const [projectTagsDraft, setProjectTagsDraft] = useState("");
+  const [gallerySearch, setGallerySearch] = useState("");
   const [galleryItems, setGalleryItems] = useState<GalleryItemResponse[]>([]);
   const [galleryStats, setGalleryStats] = useState<GalleryStatsResponse | null>(null);
   const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null);
@@ -576,6 +688,8 @@ function App() {
 
   const activeModels = modelOptionsByMedia[mediaType];
   const activeMetrics = metrics?.by_media[mediaType] ?? null;
+  const selectedProject =
+    projects.find((project) => project.id === selectedProjectId) ?? null;
   const handleDraftChange = useCallback(
     (nextDraft: Partial<PromptFormSubmitValues>) => {
       setDrafts((current) => {
@@ -608,6 +722,10 @@ function App() {
   }, [mediaType]);
 
   useEffect(() => {
+    void refreshStudio(mediaType);
+  }, [selectedProjectId, gallerySearch]);
+
+  useEffect(() => {
     if (!activeJobId) {
       return undefined;
     }
@@ -617,6 +735,11 @@ function App() {
     }, 2000);
     return () => window.clearInterval(timer);
   }, [activeJobId]);
+
+  useEffect(() => {
+    setProjectStatusDraft(selectedProject?.status ?? "active");
+    setProjectTagsDraft(selectedProject?.tags.join(", ") ?? "");
+  }, [selectedProject]);
 
   async function loadProjects(): Promise<void> {
     try {
@@ -700,10 +823,18 @@ function App() {
     options: RefreshStudioOptions = {},
   ): Promise<void> {
     try {
+      const galleryQuery = new URLSearchParams({
+        media_type: targetMediaType,
+        limit: "8",
+      });
+      if (selectedProjectId) {
+        galleryQuery.set("project_id", selectedProjectId);
+      }
+      if (gallerySearch.trim()) {
+        galleryQuery.set("q", gallerySearch.trim());
+      }
       const [galleryPayload, metricsPayload, galleryStatsPayload] = await Promise.all([
-        requestJson<GalleryItemResponse[]>(
-          `/gallery?media_type=${encodeURIComponent(targetMediaType)}&limit=8`,
-        ),
+        requestJson<GalleryItemResponse[]>(`/gallery?${galleryQuery.toString()}`),
         requestJson<MetricsSummaryResponse>("/metrics/summary"),
         requestJson<GalleryStatsResponse>("/gallery/stats"),
       ]);
@@ -780,6 +911,31 @@ function App() {
     }
   }
 
+  async function handleCancelLatestJob(): Promise<void> {
+    if (!latestJob || terminalStatuses.has(latestJob.status)) {
+      return;
+    }
+
+    setErrorMessage(null);
+    setStatusMessage("Cancelling job...");
+
+    try {
+      const payload = await requestJson<JobResponse>(`/jobs/${latestJob.id}/cancel`, {
+        method: "POST",
+      });
+      startTransition(() => {
+        setLatestJob(payload);
+      });
+      setActiveJobId(null);
+      setIsSubmitting(false);
+      setStatusMessage(`Job ${payload.id} cancelled.`);
+      await refreshStudio(payload.media_type);
+      await loadProjects();
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "Failed to cancel job.");
+    }
+  }
+
   async function handleSubmit(values: PromptFormSubmitValues): Promise<void> {
     setIsSubmitting(true);
     setErrorMessage(null);
@@ -838,6 +994,75 @@ function App() {
       await refreshStudio(mediaType);
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : "Failed to create project.");
+    } finally {
+      setIsProjectBusy(false);
+    }
+  }
+
+  async function handleUpdateSelectedProject(): Promise<void> {
+    if (!selectedProject) {
+      return;
+    }
+
+    setIsProjectBusy(true);
+    setErrorMessage(null);
+    setAssetMessage(null);
+
+    try {
+      const project = await requestJson<ProjectResponse>(`/projects/${selectedProject.id}`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          status: projectStatusDraft.trim() || "active",
+          tags: projectTagsDraft
+            .split(",")
+            .map((tag) => tag.trim())
+            .filter(Boolean),
+        }),
+      });
+      startTransition(() => {
+        setProjects((current) =>
+          current.map((item) => (item.id === project.id ? project : item)),
+        );
+      });
+      setAssetMessage(`Updated project ${project.name}.`);
+      await refreshStudio(mediaType);
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "Failed to update project.");
+    } finally {
+      setIsProjectBusy(false);
+    }
+  }
+
+  async function handlePinSelectedAssetToProject(): Promise<void> {
+    if (!selectedProject || !selectedAssetDetail) {
+      return;
+    }
+
+    const pinnedAssetIds = Array.from(
+      new Set([...selectedProject.pinned_asset_ids, selectedAssetDetail.asset_id]),
+    );
+
+    setIsProjectBusy(true);
+    setErrorMessage(null);
+    try {
+      const project = await requestJson<ProjectResponse>(`/projects/${selectedProject.id}`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ pinned_asset_ids: pinnedAssetIds }),
+      });
+      startTransition(() => {
+        setProjects((current) =>
+          current.map((item) => (item.id === project.id ? project : item)),
+        );
+      });
+      setAssetMessage(`Pinned ${selectedAssetDetail.asset_id} to ${project.name}.`);
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "Failed to pin asset.");
     } finally {
       setIsProjectBusy(false);
     }
@@ -1039,7 +1264,7 @@ function App() {
   }
 
   return (
-    <div className="app-shell app-shell--studio">
+    <div className="app-shell app-shell--studio" style={appStyles.container}>
       <aside className="studio-sidebar">
         <section className="section-card section-card--nav">
           <div className="sidebar-brand">
@@ -1057,6 +1282,7 @@ function App() {
                 type="button"
                 className={`theme-switch__button ${themeMode === "light" ? "is-active" : ""}`}
                 onClick={() => setThemeMode("light")}
+                style={themeMode === "light" ? {...appStyles.tabButton, ...appStyles.tabButtonActive} : appStyles.tabButton}
               >
                 Light
               </button>
@@ -1064,6 +1290,7 @@ function App() {
                 type="button"
                 className={`theme-switch__button ${themeMode === "dark" ? "is-active" : ""}`}
                 onClick={() => setThemeMode("dark")}
+                style={themeMode === "dark" ? {...appStyles.tabButton, ...appStyles.tabButtonActive} : appStyles.tabButton}
               >
                 Dark
               </button>
@@ -1085,6 +1312,11 @@ function App() {
                 type="button"
                 className={`surface-nav__item ${mediaType === option ? "is-active" : ""}`}
                 onClick={() => setMediaType(option)}
+                style={{
+                  ...appStyles.tabButton,
+                  ...(mediaType === option ? appStyles.tabButtonActive : {}),
+                  ...appStyles.tabButtonHover,
+                }}
               >
                 <div className="surface-nav__topline">
                   <span className="surface-pill">{mediaTypeLabels[option]}</span>
@@ -1115,6 +1347,7 @@ function App() {
             <select
               value={selectedProjectId}
               onChange={(event) => setSelectedProjectId(event.target.value)}
+              style={{...appStyles.tabButton, ...appStyles.tabButtonHover}}
             >
               <option value="">No project</option>
               {projects.map((project) => (
@@ -1138,6 +1371,7 @@ function App() {
                 onChange={(event) => setNewProjectName(event.target.value)}
                 placeholder="Campaign explorations"
                 disabled={isProjectBusy}
+                style={{...appStyles.tabButton, ...appStyles.tabButtonHover}}
               />
             </label>
             <label className="field-group field-group--full">
@@ -1148,16 +1382,82 @@ function App() {
                 onChange={(event) => setNewProjectDescription(event.target.value)}
                 placeholder="Optional production note"
                 disabled={isProjectBusy}
+                style={{...appStyles.tabButton, ...appStyles.tabButtonHover}}
               />
             </label>
             <button
               type="submit"
               className="secondary-button secondary-button--block"
               disabled={isProjectBusy || !newProjectName.trim()}
+              style={appStyles.tabButton}
             >
               {isProjectBusy ? "Creating..." : "Create and select project"}
             </button>
           </form>
+          {selectedProject ? (
+            <div className="form-section">
+              <div className="form-section__header">
+                <div>
+                  <p className="eyebrow">Project Metadata</p>
+                  <h3>{selectedProject.name}</h3>
+                </div>
+              </div>
+              <label className="field-group field-group--full">
+                <span>Status</span>
+                <input
+                  type="text"
+                  value={projectStatusDraft}
+                  onChange={(event) => setProjectStatusDraft(event.target.value)}
+                  disabled={isProjectBusy}
+                  style={{...appStyles.tabButton, ...appStyles.tabButtonHover}}
+                />
+              </label>
+              <label className="field-group field-group--full">
+                <span>Tags</span>
+                <input
+                  type="text"
+                  value={projectTagsDraft}
+                  onChange={(event) => setProjectTagsDraft(event.target.value)}
+                  placeholder="draft, review, delivery"
+                  disabled={isProjectBusy}
+                  style={{...appStyles.tabButton, ...appStyles.tabButtonHover}}
+                />
+              </label>
+              <div className="asset-actions">
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() => {
+                    void handleUpdateSelectedProject();
+                  }}
+                  disabled={isProjectBusy}
+                  style={appStyles.tabButton}
+                >
+                  Update project
+                </button>
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() => {
+                    void handlePinSelectedAssetToProject();
+                  }}
+                  disabled={
+                    isProjectBusy ||
+                    !selectedAssetDetail ||
+                    selectedAssetDetail.project_id !== selectedProject.id ||
+                    selectedProject.pinned_asset_ids.includes(selectedAssetDetail.asset_id)
+                  }
+                  style={appStyles.tabButton}
+                >
+                  Pin selected asset
+                </button>
+              </div>
+              <p className="section-footnote">
+                {selectedProject.pinned_asset_ids.length} pinned assets | status{" "}
+                {selectedProject.status}
+              </p>
+            </div>
+          ) : null}
         </section>
 
         <section className="section-card">
@@ -1184,7 +1484,7 @@ function App() {
         </section>
       </aside>
 
-      <main className="studio-main">
+      <main className="studio-main" style={appStyles.contentContainer}>
         {errorMessage ? <p className="error-banner">{errorMessage}</p> : null}
 
         <section className="section-card section-card--stage">
@@ -1231,6 +1531,18 @@ function App() {
                   </span>
                   <span className="history-score">{formatPercent(latestJob.progress * 100)}</span>
                 </div>
+                {!terminalStatuses.has(latestJob.status) ? (
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() => {
+                      void handleCancelLatestJob();
+                    }}
+                    style={appStyles.tabButton}
+                  >
+                    Cancel job
+                  </button>
+                ) : null}
                 <StagePreview
                   mediaType={latestJob.media_type}
                   outputPath={latestJob.result?.previews[0] ?? latestJob.result?.outputs[0] ?? null}
@@ -1272,8 +1584,21 @@ function App() {
                 <p className="eyebrow">Gallery</p>
                 <h2>Recent {mediaTypeLabels[mediaType].toLowerCase()} assets</h2>
               </div>
-              <p className="section-footnote">{galleryItems.length} items loaded</p>
+              <p className="section-footnote">
+                {galleryItems.length} items loaded
+                {selectedProject ? ` | ${selectedProject.name}` : ""}
+              </p>
             </div>
+            <label className="field-group field-group--full">
+              <span>Search current gallery</span>
+              <input
+                type="search"
+                value={gallerySearch}
+                onChange={(event) => setGallerySearch(event.target.value)}
+                placeholder="prompt, model, project, metadata"
+                style={{...appStyles.tabButton, ...appStyles.tabButtonHover}}
+              />
+            </label>
             <div className="gallery-list">
               {galleryItems.length > 0 ? (
                 galleryItems.map((item) => (
@@ -1284,6 +1609,7 @@ function App() {
                     onClick={() => {
                       void loadAssetDetail(item.asset_id);
                     }}
+                    style={appStyles.tabButton}
                   >
                     <OutputThumbnail mediaType={item.media_type} outputPath={item.preview_path} />
                     <div className="gallery-item__body">
@@ -1335,6 +1661,7 @@ function App() {
                       void handleAssetReuse();
                     }}
                     disabled={isAssetBusy}
+                    style={appStyles.tabButton}
                   >
                     Reuse and rerun
                   </button>
@@ -1343,6 +1670,7 @@ function App() {
                     className="secondary-button"
                     onClick={loadSelectedAssetIntoComposer}
                     disabled={isAssetBusy}
+                    style={appStyles.tabButton}
                   >
                     Load into composer
                   </button>
@@ -1353,6 +1681,7 @@ function App() {
                       void handleAssetExport();
                     }}
                     disabled={isAssetBusy}
+                    style={appStyles.tabButton}
                   >
                     Export asset
                   </button>
@@ -1370,6 +1699,7 @@ function App() {
                       value={selectedAssetProjectId}
                       onChange={(event) => setSelectedAssetProjectId(event.target.value)}
                       disabled={isAssetBusy}
+                      style={{...appStyles.tabButton, ...appStyles.tabButtonHover}}
                     >
                       <option value="">Unassigned</option>
                       {projects.map((project) => (
@@ -1386,6 +1716,7 @@ function App() {
                       void handleAssetProjectBinding();
                     }}
                     disabled={isAssetBusy}
+                    style={appStyles.tabButton}
                   >
                     Update asset project
                   </button>
@@ -1499,6 +1830,7 @@ function App() {
                         value={feedbackQuality}
                         onChange={(event) => setFeedbackQuality(event.target.value)}
                         disabled={isFeedbackBusy}
+                        style={{...appStyles.tabButton, ...appStyles.tabButtonHover}}
                       >
                         {[1, 2, 3, 4, 5].map((rating) => (
                           <option key={rating} value={rating}>
@@ -1513,6 +1845,7 @@ function App() {
                         value={feedbackSemantic}
                         onChange={(event) => setFeedbackSemantic(event.target.value)}
                         disabled={isFeedbackBusy}
+                        style={{...appStyles.tabButton, ...appStyles.tabButtonHover}}
                       >
                         {[1, 2, 3, 4, 5].map((rating) => (
                           <option key={rating} value={rating}>
@@ -1527,6 +1860,7 @@ function App() {
                         value={feedbackCreative}
                         onChange={(event) => setFeedbackCreative(event.target.value)}
                         disabled={isFeedbackBusy}
+                        style={{...appStyles.tabButton, ...appStyles.tabButtonHover}}
                       >
                         {[1, 2, 3, 4, 5].map((rating) => (
                           <option key={rating} value={rating}>
@@ -1564,6 +1898,7 @@ function App() {
                       onChange={(event) => setFeedbackIssueTags(event.target.value)}
                       placeholder="composition, lighting"
                       disabled={isFeedbackBusy}
+                      style={{...appStyles.tabButton, ...appStyles.tabButtonHover}}
                     />
                   </label>
                   <label className="field-group field-group--full">
@@ -1574,9 +1909,10 @@ function App() {
                       onChange={(event) => setFeedbackComments(event.target.value)}
                       placeholder="What should change before production use?"
                       disabled={isFeedbackBusy}
+                      style={{...appStyles.tabButton, ...appStyles.tabButtonHover}}
                     />
                   </label>
-                  <button type="submit" className="dock-submit" disabled={isFeedbackBusy}>
+                  <button type="submit" className="dock-submit" disabled={isFeedbackBusy} style={appStyles.tabButton}>
                     {isFeedbackBusy ? "Saving..." : "Save feedback"}
                   </button>
                 </form>

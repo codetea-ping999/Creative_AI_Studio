@@ -239,6 +239,57 @@ class JobPipelineTests(unittest.TestCase):
             self.assertEqual(completed_job.result.metadata["media_type"], "audio")
             self.assertTrue(Path(completed_job.result.outputs[0]).exists())
 
+    @unittest.skipIf(API_IMPORT_ERROR is not None, f"missing dependency: {API_IMPORT_ERROR}")
+    def test_cancel_endpoint_marks_queued_job_and_runner_skips_it(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            repository = JobRepository(root / "jobs.db")
+            queue = JobQueue()
+            event_bus = EventBus()
+            service = JobService(repository, queue, event_bus)
+            registry = GeneratorRegistry({"audio": _StubAudioGenerator(root / "outputs" / "audio")})
+            runner = JobRunner(repository, queue, registry, event_bus)
+
+            from bootstrap import ApplicationServices, create_default_model_service
+            from core.assets import AssetRepository
+            from core.feedback import FeedbackRepository
+            from core.projects import ProjectRepository
+
+            asset_repository = AssetRepository(root / "assets")
+            services = ApplicationServices(
+                output_dir=root / "outputs" / "images",
+                model_service=create_default_model_service(),
+                generator_registry=registry,
+                job_repository=repository,
+                job_queue=queue,
+                event_bus=event_bus,
+                job_service=service,
+                job_runner=runner,
+                project_repository=ProjectRepository(root / "projects"),
+                feedback_repository=FeedbackRepository(root / "feedback"),
+                asset_repository=asset_repository,
+            )
+            client = TestClient(create_app(services, start_job_runner=False))
+            job = service.create_job(
+                GenerationRequest(
+                    media_type="audio",
+                    prompt="cancel this queued job",
+                    model_id="",
+                    output_format="wav",
+                    params={},
+                )
+            )
+
+            response = client.post(f"/jobs/{job.id}/cancel")
+            skipped_job = runner.run_once()
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["status"], "cancelled")
+            self.assertIsNotNone(skipped_job)
+            assert skipped_job is not None
+            self.assertEqual(skipped_job.status, "cancelled")
+            self.assertFalse((root / "outputs" / "audio" / "stub.wav").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

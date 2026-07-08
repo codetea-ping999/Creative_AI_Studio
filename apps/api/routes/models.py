@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, ConfigDict, Field
 
-from core.models import ModelManifest, ModelRegistry
+from apps.api.dependencies import get_services
+from bootstrap import ApplicationServices
+from core.models import ModelManifest
 from core.schemas.generation import MediaType
 
 router = APIRouter(prefix="/models", tags=["models"])
@@ -67,6 +69,8 @@ def _manifest_is_available(manifest: ModelManifest) -> bool:
     if manifest.runtime == "transformers":
         return (local_path / "config.json").exists()
     if manifest.runtime == "learned":
+        if manifest.default_params.get("runtime_status") == "scaffold":
+            return False
         return any(
             (local_path / candidate).exists()
             for candidate in ("runtime.py", "adapter.py", "model_index.json", "config.json")
@@ -80,16 +84,13 @@ def _manifest_is_available(manifest: ModelManifest) -> bool:
     response_model=ModelsResponse,
     summary="List enabled public models",
 )
-def list_models(media_type: MediaType | None = Query(default=None)) -> ModelsResponse:
-    """Return enabled model metadata without touching loaders or runtimes."""
+def list_models(
+    media_type: MediaType | None = Query(default=None),
+    services: ApplicationServices = Depends(get_services),
+) -> ModelsResponse:
+    """Return enabled model metadata from the configured service graph."""
 
-    registry = ModelRegistry()
-    registry.load_all()
-    manifests = registry.list_all(enabled_only=True)
-    if media_type is not None:
-        manifests = [
-            manifest for manifest in manifests if manifest.media_type == media_type
-        ]
+    manifests = services.model_service.list_models(media_type=media_type)
 
     return ModelsResponse(
         models=[_serialize_manifest(manifest) for manifest in manifests]

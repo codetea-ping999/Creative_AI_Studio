@@ -1,7 +1,7 @@
 # API Contract
 
-Creative AI Studio の現行 API 定義です。
-このドキュメントは `apps/api/routes/` の実装に合わせて整理しています。
+Creative AI Studio の現行フロントエンド連携契約です。  
+この文書は `apps/api/routes/` の実装と `apps/web/src/studioClient.ts` の利用経路に合わせて整理しています。
 
 ## Base URL
 
@@ -9,65 +9,89 @@ Creative AI Studio の現行 API 定義です。
 http://127.0.0.1:8000
 ```
 
-## 共通ルール
+## Frontend-Facing Endpoints
 
-- 生成の実行単位はすべて `Job` です
-- `POST /generate/*` は media type ごとの便利 endpoint です
-- `POST /jobs` は media 共通の低レベル入口です
-- 成功した job は `Asset` として `gallery` から参照・再利用できます
-- 出力ファイル本体は `/outputs/*` で静的配信されます
-
-## エンドポイント一覧
-
-| 分類 | メソッド | パス | 用途 |
+| 分類 | メソッド | パス | Web UI の主用途 |
 | --- | --- | --- | --- |
-| System | `GET` | `/health` | API 生存確認 |
-| Models | `GET` | `/models` | 利用可能モデル一覧 |
-| Catalog | `GET` | `/catalog/loras` | LoRA 一覧 |
-| Metrics | `GET` | `/metrics/summary` | 成功率、品質、feedback 集計 |
-| Jobs | `POST` | `/jobs` | 共通 job 作成 |
-| Jobs | `GET` | `/jobs` | job 一覧 |
-| Jobs | `GET` | `/jobs/{job_id}` | job 詳細 |
-| Jobs | `POST` | `/jobs/{job_id}/rerun` | 既存 job の再実行 |
-| Generate | `POST` | `/generate/image` | 画像生成 job 作成 |
-| Generate | `POST` | `/generate/audio` | 音声生成 job 作成 |
-| Generate | `POST` | `/generate/video` | 動画生成 job 作成 |
-| Gallery | `GET` | `/gallery` | asset 一覧 |
-| Gallery | `GET` | `/gallery/stats` | gallery 集計 |
-| Gallery | `GET` | `/gallery/job/{job_id}` | job から asset 詳細取得 |
-| Gallery | `GET` | `/gallery/{asset_id}` | asset 詳細取得 |
-| Gallery | `POST` | `/gallery/{asset_id}/reuse` | asset を元に新しい job を作成 |
-| Gallery | `POST` | `/gallery/{asset_id}/export` | asset を export |
-| Gallery | `PATCH` | `/gallery/{asset_id}/project` | asset と source job を project に bind |
-| Projects | `POST` | `/projects` | project 作成 |
-| Projects | `GET` | `/projects` | project 一覧 |
-| Projects | `GET` | `/projects/{project_id}` | project 詳細 |
-| Projects | `GET` | `/projects/{project_id}/assets` | project 配下 asset 一覧 |
-| Projects | `GET` | `/projects/{project_id}/jobs` | project 配下 job と asset のサマリ |
-| Projects | `PATCH` | `/projects/{project_id}` | project 更新 |
-| Projects | `POST` | `/projects/{project_id}/jobs/{job_id}` | job を project に追加 |
-| Projects | `DELETE` | `/projects/{project_id}/jobs/{job_id}` | job を project から外す |
-| Projects | `POST` | `/projects/{project_id}/assets/{asset_id}` | asset 起点で project に追加 |
-| Projects | `POST` | `/projects/{project_id}/export` | project bundle を export |
-| Projects | `DELETE` | `/projects/{project_id}` | project 削除 |
-| Feedback | `POST` | `/feedback` | feedback 作成 |
-| Feedback | `GET` | `/feedback` | feedback 一覧 |
-| Feedback | `GET` | `/feedback/job/{job_id}` | job 単位 feedback |
-| Feedback | `GET` | `/feedback/asset/{asset_id}` | asset 単位 feedback |
-| Feedback | `GET` | `/feedback/summary` | feedback 集計 |
-| Feedback | `DELETE` | `/feedback/{feedback_id}` | feedback 削除 |
+| System | `GET` | `/health` | dev stack 疎通確認 |
+| System | `GET` | `/openapi.json` | 開発時の契約確認 |
+| Models | `GET` | `/models` | メディア別モデル一覧 |
+| Catalog | `GET` | `/catalog/loras` | LoRA 候補一覧 |
+| Projects | `GET` | `/projects` | プロジェクト一覧 / filter |
+| Projects | `POST` | `/projects` | プロジェクト作成 |
+| Projects | `GET` | `/projects/{project_id}` | プロジェクト詳細 |
+| Projects | `PATCH` | `/projects/{project_id}` | プロジェクト更新 |
+| Projects | `GET` | `/projects/{project_id}/jobs` | Studio 中央の project context |
+| Gallery | `GET` | `/gallery` | 素材一覧 |
+| Gallery | `GET` | `/gallery/job/{job_id}` | 最新 job から素材 detail を引く |
+| Gallery | `GET` | `/gallery/{asset_id}` | 右インスペクタ用素材 detail |
+| Gallery | `POST` | `/gallery/{asset_id}/reuse` | 派生生成 |
+| Gallery | `POST` | `/gallery/{asset_id}/export` | 素材 export |
+| Gallery | `PATCH` | `/gallery/{asset_id}/project` | 素材と source job の project 再割当て |
+| Jobs | `GET` | `/jobs/{job_id}` | polling / 最新状態取得 |
+| Jobs | `POST` | `/jobs/{job_id}/cancel` | queued / running job の cancel 要求 |
+| Generate | `POST` | `/generate/image` | 画像生成開始 |
+| Generate | `POST` | `/generate/audio` | 音声生成開始 |
+| Generate | `POST` | `/generate/video` | 動画生成開始 |
+| Metrics | `GET` | `/metrics/summary` | Studio 全体の運用サマリ |
+| Feedback | `POST` | `/feedback` | 人手評価保存 |
+| Feedback | `GET` | `/feedback` | 一覧取得 |
+| Feedback | `GET` | `/feedback/summary` | 評価集計取得 |
 
-## 共通スキーマ
+## Common Behavior
 
-### GenerationRequest
+- 生成単位は `Job`。
+- `/generate/*` は UI 用の media-specific endpoint。
+- 成功 job は `Asset` として `gallery` から参照される。
+- 出力ファイル本体は `/outputs/*` で静的配信される。
+- datetime は FastAPI / Pydantic の ISO 8601 JSON 形式。
 
-`POST /jobs` の基準になる共通入力です。
+## Error Responses
+
+### 404
+
+存在しない `job_id` / `project_id` / `asset_id` などを指定した場合、現行実装は FastAPI の標準 `detail` 形式を返します。
+
+```json
+{
+  "detail": "Project not found"
+}
+```
+
+補足:
+
+- `detail` は route ごとに `"Job not found"`、`"Gallery asset not found"` など文字列が異なります。
+- dev stack 検証では、この 404 が出る場合に「別プロセスを見ている」のか「契約が壊れた」のかをログで判別できるようにしています。
+
+### 422
+
+入力不足や型不一致は FastAPI / Pydantic の標準 validation error を返します。
+
+```json
+{
+  "detail": [
+    {
+      "loc": ["body", "prompt"],
+      "msg": "Field required",
+      "type": "missing"
+    }
+  ]
+}
+```
+
+Web 側は `detail` 配列から `body.prompt: Field required` のような構造化エラーメッセージを組み立てます。
+
+## Shared Types
+
+### GenerationRequest Snapshot
+
+`Job.request` と `GalleryAssetDetailResponse.request_snapshot` の共通形です。
 
 ```json
 {
   "media_type": "image",
-  "prompt": "editorial portrait, rim light",
-  "negative_prompt": "blurry, low quality",
+  "prompt": "editorial portrait",
+  "negative_prompt": "blurry",
   "model_id": "sdxl",
   "seed": 42,
   "output_format": "png",
@@ -79,60 +103,43 @@ http://127.0.0.1:8000
 }
 ```
 
-主なフィールド:
+### JobResponse
 
-- `media_type`: `image | audio | video`
-- `prompt`: 必須
-- `negative_prompt`: image / video で主に利用
-- `model_id`: `GET /models` の public id
-- `seed`: 任意
-- `output_format`: 任意
-- `params`: media 固有パラメータ
+`GET /jobs/{job_id}` の返却形です。
 
-### JobRecord
-
-`GET /jobs` と `GET /jobs/{job_id}` で返る基本単位です。
-
-主なフィールド:
-
-- `id`
-- `project_id`
-- `media_type`
-- `status`
-- `request`
-- `result`
-- `progress`
-- `error_message`
-- `created_at`
-- `updated_at`
+```json
+{
+  "id": "job_123",
+  "media_type": "video",
+  "project_id": "project_123",
+  "status": "running",
+  "progress": 0.5,
+  "error_message": null,
+  "request": {},
+  "result": null,
+  "created_at": "2026-04-19T09:00:00Z",
+  "updated_at": "2026-04-19T09:00:03Z"
+}
+```
 
 状態は次を取ります。
 
 ```text
-queued
-preparing
-running
-postprocessing
-succeeded
-failed
-cancelled
+queued | preparing | running | postprocessing | succeeded | failed | cancelled
 ```
 
-## System / Models / Catalog / Metrics
+### POST /jobs/{job_id}/cancel
 
-### GET /health
+queued / running job を `cancelled` に更新します。  
+すでに terminal status の job に対しては現行状態の `JobResponse` を返します。
 
-疎通確認用です。
+Response は `JobResponse`。
 
-```json
-{
-  "status": "ok"
-}
-```
+## Models
 
 ### GET /models
 
-有効な model manifest を UI 向けに整形して返します。
+メディア別の enabled manifest を UI 向けに返します。
 
 Query:
 
@@ -140,9 +147,12 @@ Query:
 
 Behavior:
 
-- runtime はロードしません
+- runtime 自体は load しません
 - `enabled=true` の manifest のみ返します
-- `is_available` は local path の存在と runtime ごとの最低限ファイルを見ます
+- `is_available` は local path と runtime ごとの最低限ファイルを見ます
+- `learned` runtime は `default_params.runtime_status=scaffold` の間 `is_available=false` です
+
+完全レスポンス:
 
 ```json
 {
@@ -157,8 +167,7 @@ Behavior:
       "default_params": {
         "width": 1024,
         "height": 1024,
-        "steps": 30,
-        "guidance_scale": 7.5
+        "steps": 30
       },
       "tags": ["image", "base"],
       "is_default": true,
@@ -168,252 +177,106 @@ Behavior:
 }
 ```
 
-### GET /catalog/loras
+UI の最小利用項目:
 
-ローカル配置済み LoRA ファイルを返します。
+- `id`
+- `display_name`
+- `default_params`
+- `tags`
+- `is_available`
+- `is_default`
 
-Behavior:
+## Projects
 
-- `LORA_ROOT` があればそれを優先します
-- なければ `./models/loras` を走査します
-- 拡張子は `.safetensors`, `.pt`, `.bin`, `.ckpt` を対象にします
+### GET /projects
 
-```json
-{
-  "root": "/abs/path/to/models/loras",
-  "items": [
-    {
-      "id": "models/loras/mai_style.safetensors",
-      "display_name": "Mai Style",
-      "path": "/abs/path/to/models/loras/mai_style.safetensors",
-      "relative_path": "models/loras/mai_style.safetensors"
-    }
-  ]
-}
-```
-
-### GET /metrics/summary
-
-job 成功率、保存成功率、品質スコア、semantic score、feedback 集計を返します。
+一覧取得です。
 
 Query:
 
-- `window_size`: 任意、既定値 `20`
+- `q`: 部分一致検索
+- `status`: status filter
+- `tag`: tag filter
 
-主なフィールド:
+完全レスポンス要素:
 
-- `total_jobs`
-- `succeeded_jobs`
-- `failed_jobs`
-- `running_jobs`
-- `success_rate`
-- `save_success_rate`
-- `average_quality_score`
-- `average_business_readiness_score`
-- `average_semantic_alignment_score`
-- `average_creative_alignment_score`
-- `feedback_total`
-- `feedback_coverage_rate`
-- `by_media`
+```json
+{
+  "id": "project_123",
+  "name": "Spring Launch",
+  "description": "campaign motion work",
+  "status": "active",
+  "tags": ["campaign", "spring"],
+  "metadata": {
+    "client": "internal"
+  },
+  "pinned_asset_ids": [],
+  "created_at": "2026-04-19T09:00:00Z",
+  "updated_at": "2026-04-19T09:00:00Z",
+  "job_ids": [],
+  "job_count": 0,
+  "asset_count": 0,
+  "cover_asset_path": null
+}
+```
 
-## Jobs
-
-### POST /jobs
-
-共通 job 作成 endpoint です。
-通常の UI では `/generate/*` の方を使います。
+### POST /projects
 
 Request:
 
 ```json
 {
-  "media_type": "image",
-  "prompt": "futuristic city",
-  "model_id": "sdxl",
-  "params": {
-    "width": 1024,
-    "height": 1024,
-    "guidance_scale": 6.5
+  "name": "Spring Launch",
+  "description": "campaign motion work",
+  "status": "active",
+  "tags": ["campaign", "spring"],
+  "metadata": {
+    "client": "internal"
   }
 }
 ```
 
-Response:
+Response は `ProjectResponse`。
+
+### PATCH /projects/{project_id}
+
+差分更新です。  
+`name` / `description` / `status` / `tags` / `metadata` / `pinned_asset_ids` を更新できます。
+
+### GET /projects/{project_id}/jobs
+
+Studio 中央面で使う project context です。
+
+完全レスポンス:
 
 ```json
 {
-  "job_id": "job_123",
-  "status": "queued"
-}
-```
-
-### GET /jobs
-
-job 一覧です。
-現在は `created_at DESC` で返ります。
-
-### GET /jobs/{job_id}
-
-単一 job の状態と結果を返します。  
-Web UI は submit 後、この endpoint を poll します。
-
-```json
-{
-  "id": "job_123",
-  "project_id": null,
-  "media_type": "image",
-  "status": "running",
-  "request": {
-    "media_type": "image",
-    "prompt": "futuristic city",
-    "negative_prompt": null,
-    "model_id": "sdxl",
-    "seed": null,
-    "output_format": "png",
-    "params": {
-      "width": 1024,
-      "height": 1024
-    }
+  "project": {},
+  "jobs": [],
+  "assets": [],
+  "job_count": 0,
+  "asset_count": 0,
+  "media_breakdown": {
+    "image": 1,
+    "video": 2
   },
-  "result": null,
-  "progress": 0.42,
-  "error_message": null,
-  "created_at": "2026-03-15T00:00:00+00:00",
-  "updated_at": "2026-03-15T00:00:01+00:00"
+  "average_quality_score": 74.3,
+  "average_creative_alignment_score": 69.1
 }
 ```
 
-### POST /jobs/{job_id}/rerun
+UI の最小利用項目:
 
-既存 job の request を複製し、新しい job を作成します。
-
-上書き可能:
-
-- `prompt`
-- `negative_prompt`
-- `model_id`
-- `seed`
-- `output_format`
-- `project_id`
-- `params`
-
-```json
-{
-  "prompt": "foggy harbor storyboard, sunrise variation",
-  "project_id": "project_456",
-  "params": {
-    "duration_seconds": 3,
-    "visual_style": "animatic"
-  }
-}
-```
-
-## Generate
-
-`/generate/*` は media type ごとの入力差分を吸収する便利 endpoint です。
-
-### POST /generate/image
-
-主なフィールド:
-
-- `prompt`
-- `negative_prompt`
-- `model_id`
-- `seed`
-- `output_format`
-- `project_id`
-- `params.width`
-- `params.height`
-- `params.steps`
-- `params.guidance_scale`
-
-```json
-{
-  "prompt": "editorial portrait, dramatic rim light",
-  "model_id": "sdxl",
-  "negative_prompt": "blurry, low quality",
-  "seed": 42,
-  "output_format": "png",
-  "project_id": null,
-  "params": {
-    "width": 1024,
-    "height": 1024,
-    "steps": 30,
-    "guidance_scale": 7.5
-  }
-}
-```
-
-### POST /generate/audio
-
-主なフィールド:
-
-- `prompt`
-- `model_id`
-- `seed`
-- `output_format`
-- `project_id`
-- `params.duration_seconds`
-- `params.bpm`
-- `params.mood`
-
-```json
-{
-  "prompt": "dreamy ambient synth loop",
-  "model_id": "musicgen-small",
-  "seed": 42,
-  "output_format": "wav",
-  "project_id": null,
-  "params": {
-    "duration_seconds": 8,
-    "bpm": 96,
-    "mood": "dreamy"
-  }
-}
-```
-
-### POST /generate/video
-
-主なフィールド:
-
-- `prompt`
-- `negative_prompt`
-- `model_id`
-- `seed`
-- `output_format`
-- `project_id`
-- `params.duration_seconds`
-- `params.camera_motion`
-- `params.visual_style`
-
-```json
-{
-  "prompt": "cinematic storyboard, neon city drive",
-  "negative_prompt": "flat composition",
-  "model_id": "storyboard-video",
-  "seed": 7,
-  "output_format": "gif",
-  "project_id": null,
-  "params": {
-    "duration_seconds": 4,
-    "camera_motion": "push-in",
-    "visual_style": "storyboard"
-  }
-}
-```
-
-いずれもレスポンスは共通です。
-
-```json
-{
-  "job_id": "job_123",
-  "status": "queued"
-}
-```
+- `project`
+- `jobs`
+- `assets`
+- `job_count`
+- `asset_count`
+- `media_breakdown`
+- `average_quality_score`
+- `average_creative_alignment_score`
 
 ## Gallery
-
-gallery は成功済み job から同期された asset を扱います。
 
 ### GET /gallery
 
@@ -421,90 +284,86 @@ gallery は成功済み job から同期された asset を扱います。
 
 Query:
 
-- `media_type`: 任意
-- `project_id`: 任意
-- `q`: タイトル、prompt、model id、path、metadata に対する簡易全文検索
-- `limit`: 既定値 `50`, 最大 `200`
-
-主なレスポンスフィールド:
-
-- `asset_id`
-- `job_id`
-- `project_id`
-- `project_name`
 - `media_type`
-- `prompt`
-- `model_id`
-- `output_path`
-- `preview_path`
-- `quality_score`
-- `feedback_count`
-- `reuse_count`
-- `export_count`
+- `project_id`
+- `q`
+- `limit` 既定 `50`
 
-### GET /gallery/stats
-
-gallery 全体の集計を返します。
+一覧要素:
 
 ```json
 {
-  "total_items": 12,
-  "total_by_media_type": {
-    "image": 8,
-    "audio": 2,
-    "video": 2
-  },
-  "total_by_project": {
-    "unassigned": 4,
-    "project_abc": 8
-  },
-  "average_quality_score": 76.4,
-  "total_reuse_count": 5,
-  "total_export_count": 3
+  "asset_id": "asset_123",
+  "job_id": "job_123",
+  "project_id": "project_123",
+  "project_name": "Spring Launch",
+  "media_type": "image",
+  "prompt": "editorial portrait",
+  "model_id": "sdxl",
+  "output_path": "/abs/path/to/outputs/images/sample.png",
+  "preview_path": "/abs/path/to/outputs/images/sample.png",
+  "created_at": "2026-04-19T09:00:00Z",
+  "updated_at": "2026-04-19T09:00:00Z",
+  "quality_score": 73.0,
+  "quality_level": "good",
+  "semantic_alignment_score": null,
+  "creative_alignment_score": 61.0,
+  "quality_score_calibrated": 79.0,
+  "semantic_alignment_score_calibrated": null,
+  "creative_alignment_score_calibrated": 64.0,
+  "feedback_count": 1,
+  "average_feedback_quality": 4.0,
+  "reuse_count": 0,
+  "export_count": 1,
+  "success": true
 }
 ```
 
 ### GET /gallery/job/{job_id}
 
-source job から primary asset を引いて詳細を返します。
+最新 job から asset detail を引く用途です。  
+返却形は `GET /gallery/{asset_id}` と同じ `GalleryAssetDetailResponse`。
 
 ### GET /gallery/{asset_id}
 
-個別 asset の詳細を返します。
+右インスペクタで使う detail です。
 
-追加で含まれる主なフィールド:
+追加項目:
 
-- `quality_report`
-- `request_snapshot`
-- `metadata`
-- `feedback_summary`
-- `export_paths`
-- `parent_asset_id`
-- `lineage`
-- `tags`
+```json
+{
+  "quality_report": {},
+  "request_snapshot": {},
+  "metadata": {},
+  "feedback_summary": {},
+  "export_paths": [],
+  "parent_asset_id": null,
+  "lineage": [],
+  "tags": []
+}
+```
 
 ### POST /gallery/{asset_id}/reuse
 
-asset を元に新しい job を作成します。
+派生生成を開始します。
 
 Request:
 
 ```json
 {
-  "action": "rerun",
-  "prompt": "same composition, stronger backlight",
+  "action": "variation",
+  "prompt": "refine this look",
+  "negative_prompt": null,
+  "model_id": "sdxl",
+  "seed": null,
+  "output_format": "png",
   "project_id": "project_123",
   "params": {
-    "strength": 0.65
+    "width": 1024,
+    "height": 1024
   }
 }
 ```
-
-Behavior:
-
-- source job の request を土台にします
-- `params` に `source_asset_id`, `source_job_id`, `reference_asset_path`, `reuse_action` を注入します
-- reuse 元 asset の `reuse_count` を更新します
 
 Response:
 
@@ -519,23 +378,17 @@ Response:
 
 ### POST /gallery/{asset_id}/export
 
-asset ファイルを export します。
-
-Request:
+Response:
 
 ```json
 {
-  "destination_dir": "/tmp/creative-ai-exports",
-  "destination_name": "hero-visual",
-  "include_metadata": true
+  "asset_id": "asset_123",
+  "export_path": "/abs/path/to/exports/image/sample.png",
+  "metadata_path": "/abs/path/to/exports/image/sample.json"
 }
 ```
 
-既定では `outputs/exports/{media_type}` 配下へ出力します。
-
 ### PATCH /gallery/{asset_id}/project
-
-asset と、その source job に紐づく asset 群を project に bind します。
 
 Request:
 
@@ -545,129 +398,157 @@ Request:
 }
 ```
 
-`project_id: null` を送ると unbind できます。
+Response は再バインド後の `GalleryAssetDetailResponse`。
 
-## Projects
+## Generate
 
-project は job と asset の grouping 単位です。
-
-### POST /projects
-
-Request:
+### POST /generate/image
 
 ```json
 {
-  "name": "Spring Campaign",
-  "description": "KV, music loop, storyboard",
-  "status": "active",
-  "tags": ["campaign", "spring"],
-  "metadata": {
-    "client": "internal"
+  "prompt": "editorial portrait",
+  "negative_prompt": "blurry",
+  "model_id": "sdxl",
+  "seed": 42,
+  "project_id": "project_123",
+  "output_format": "png",
+  "params": {
+    "width": 1024,
+    "height": 1024,
+    "steps": 30,
+    "guidance_scale": 7.5
   }
 }
 ```
 
-### GET /projects
-
-一覧取得です。
-
-Query:
-
-- `q`: 名前、説明、tag、metadata への簡易検索
-- `status`: status 絞り込み
-- `tag`: tag 絞り込み
-
-### GET /projects/{project_id}
-
-project 単体の基本情報です。
-
-主なフィールド:
-
-- `id`
-- `name`
-- `description`
-- `status`
-- `tags`
-- `metadata`
-- `pinned_asset_ids`
-- `job_ids`
-- `job_count`
-- `asset_count`
-- `cover_asset_path`
-
-### GET /projects/{project_id}/assets
-
-project に属する asset 一覧です。
-
-### GET /projects/{project_id}/jobs
-
-project 本体、job 一覧、asset 一覧、media breakdown、平均 quality をまとめて返します。
-
-### PATCH /projects/{project_id}
-
-更新可能:
-
-- `name`
-- `description`
-- `status`
-- `tags`
-- `metadata`
-- `pinned_asset_ids`
-
-### POST /projects/{project_id}/jobs/{job_id}
-
-job を project に追加します。
-
-Behavior:
-
-- job が別 project にいた場合は先に外します
-- job の `project_id` を更新します
-- job 配下の asset も同じ project に bind します
-
-### DELETE /projects/{project_id}/jobs/{job_id}
-
-project から job を外します。
-
-Behavior:
-
-- job の `project_id` を `null` に戻します
-- job 配下の asset も unbind します
-
-### POST /projects/{project_id}/assets/{asset_id}
-
-asset 起点で project へ追加します。
-
-Behavior:
-
-- 実際には asset の source job を project に参加させます
-- その job に紐づく asset も bind されます
-
-### POST /projects/{project_id}/export
-
-project bundle を export します。
-
-Request:
+### POST /generate/audio
 
 ```json
 {
-  "destination_dir": "/tmp/project-bundles"
+  "prompt": "dreamy synth loop",
+  "model_id": "musicgen-small",
+  "seed": 42,
+  "project_id": "project_123",
+  "output_format": "wav",
+  "params": {
+    "duration_seconds": 8,
+    "guidance_scale": 3,
+    "bpm": 96,
+    "mood": "dreamy"
+  }
 }
 ```
 
-既定では `outputs/exports/projects/{project_id}` 配下に出力します。
+### POST /generate/video
 
-### DELETE /projects/{project_id}
+```json
+{
+  "prompt": "cinematic storyboard",
+  "negative_prompt": "blurry motion",
+  "model_id": "storyboard-video",
+  "seed": 42,
+  "project_id": "project_123",
+  "output_format": "gif",
+  "params": {
+    "width": 576,
+    "height": 320,
+    "duration_seconds": 4,
+    "camera_motion": "push-in",
+    "visual_style": "storyboard"
+  }
+}
+```
 
-project を削除します。
+共通 response:
 
-Behavior:
+```json
+{
+  "job_id": "job_123",
+  "status": "queued"
+}
+```
 
-- job と asset の project binding は解除します
-- job 自体や asset 自体は削除しません
+## Metrics
+
+### GET /metrics/summary
+
+運用サマリです。  
+`window_size` query の既定値は `20`。
+
+完全レスポンス:
+
+```json
+{
+  "total_jobs": 12,
+  "succeeded_jobs": 10,
+  "failed_jobs": 1,
+  "running_jobs": 1,
+  "success_rate": 83.3,
+  "save_success_rate": 100.0,
+  "average_quality_score": 74.2,
+  "average_quality_score_calibrated": 76.8,
+  "average_business_readiness_score": 71.1,
+  "average_semantic_alignment_score": null,
+  "average_semantic_alignment_score_calibrated": null,
+  "average_creative_alignment_score": 66.5,
+  "average_creative_alignment_score_calibrated": 69.2,
+  "latest_quality_level": "good",
+  "semantic_scored_jobs": 0,
+  "semantic_unavailable_jobs": 0,
+  "recent_window_size": 12,
+  "recent_success_rate": 83.3,
+  "recent_average_quality_score": 74.2,
+  "feedback_total": 4,
+  "feedback_coverage_rate": 33.3,
+  "average_human_quality_rating": 4.0,
+  "average_human_semantic_rating": null,
+  "average_human_creative_rating": 3.5,
+  "by_media": {
+    "image": {
+      "total_jobs": 6,
+      "succeeded_jobs": 5,
+      "failed_jobs": 1,
+      "running_jobs": 0,
+      "success_rate": 83.3,
+      "save_success_rate": 100.0,
+      "average_quality_score": 78.4,
+      "average_quality_score_calibrated": 80.1,
+      "average_business_readiness_score": 76.2,
+      "average_semantic_alignment_score": null,
+      "average_semantic_alignment_score_calibrated": null,
+      "average_creative_alignment_score": 63.5,
+      "average_creative_alignment_score_calibrated": 66.0,
+      "latest_quality_level": "good",
+      "semantic_scored_jobs": 0,
+      "semantic_unavailable_jobs": 0,
+      "feedback_total": 3,
+      "feedback_coverage_rate": 50.0,
+      "average_human_quality_rating": 4.3,
+      "average_human_semantic_rating": null,
+      "average_human_creative_rating": 3.7
+    }
+  }
+}
+```
+
+UI の最小利用項目:
+
+- `total_jobs`
+- `succeeded_jobs`
+- `failed_jobs`
+- `running_jobs`
+- `success_rate`
+- `average_quality_score`
+- `average_quality_score_calibrated`
+- `average_semantic_alignment_score`
+- `average_semantic_alignment_score_calibrated`
+- `average_creative_alignment_score`
+- `average_creative_alignment_score_calibrated`
+- `feedback_total`
+- `feedback_coverage_rate`
+- `by_media`
 
 ## Feedback
-
-feedback は human 評価の保存と集計に使います。
 
 ### POST /feedback
 
@@ -678,45 +559,48 @@ Request:
   "job_id": "job_123",
   "asset_id": "asset_123",
   "project_id": "project_123",
-  "quality_rating": 5,
-  "semantic_rating": 4,
-  "creative_rating": 4,
+  "quality_rating": 4,
+  "semantic_rating": 5,
+  "creative_rating": 3,
   "reuse_intent": true,
-  "export_ready": true,
-  "issue_tags": ["hands", "contrast"],
-  "comments": "ほぼ使えるが、手だけ少し修正したい",
+  "export_ready": false,
+  "issue_tags": ["prompt_mismatch"],
+  "comments": "usable but needs refinement",
   "metadata": {
-    "reviewer": "self"
+    "semantic_status": "disabled",
+    "semantic_backend": null
   }
 }
 ```
 
-制約:
+Response:
 
-- `quality_rating` は必須、`1..5`
-- `semantic_rating` と `creative_rating` は任意、`1..5`
-- 指定した `job_id`, `asset_id`, `project_id` は存在確認を行います
+```json
+{
+  "id": "feedback_123",
+  "job_id": "job_123",
+  "asset_id": "asset_123",
+  "project_id": "project_123",
+  "quality_rating": 4,
+  "semantic_rating": 5,
+  "creative_rating": 3,
+  "reuse_intent": true,
+  "export_ready": false,
+  "issue_tags": ["prompt_mismatch"],
+  "comments": "usable but needs refinement",
+  "metadata": {},
+  "created_at": "2026-04-19T09:00:00Z"
+}
+```
 
 ### GET /feedback
 
-一覧取得です。
-
 Query:
 
-- `asset_id`: 指定時は asset 単位一覧
-- `project_id`: 指定時は project 単位一覧
-
-### GET /feedback/job/{job_id}
-
-job 単位の feedback 一覧です。
-
-### GET /feedback/asset/{asset_id}
-
-asset 単位の feedback 一覧です。
+- `asset_id`
+- `project_id`
 
 ### GET /feedback/summary
-
-feedback 集計を返します。
 
 Query:
 
@@ -724,55 +608,23 @@ Query:
 - `asset_id`
 - `project_id`
 
-主なレスポンスフィールド:
+Response:
 
-- `total_feedback`
-- `average_quality_rating`
-- `average_semantic_rating`
-- `average_creative_rating`
-- `comment_count`
-- `export_ready_rate`
-- `reuse_intent_rate`
-- `issue_tag_counts`
-- `human_quality_score`
-- `human_semantic_alignment_score`
-- `human_creative_alignment_score`
-- `latest_feedback_at`
-
-### DELETE /feedback/{feedback_id}
-
-feedback を削除します。
-
-## Static Outputs
-
-### GET /outputs/*
-
-FastAPI で `outputs/` 直下を static mount しています。
-
-例:
-
-- `/outputs/images/...`
-- `/outputs/audio/...`
-- `/outputs/videos/...`
-
-gallery や job result の `output_path`, `preview_path` はこの配信を前提に UI で扱います。
-
-## 代表的な利用フロー
-
-### 1. 画像生成
-
-1. `POST /generate/image`
-2. `GET /jobs/{job_id}` を polling
-3. `GET /gallery/job/{job_id}` で asset 詳細を取得
-
-### 2. asset を再利用して再生成
-
-1. `GET /gallery`
-2. `POST /gallery/{asset_id}/reuse`
-3. `GET /jobs/{job_id}` を polling
-
-### 3. project にまとめて export
-
-1. `POST /projects`
-2. `POST /projects/{project_id}/jobs/{job_id}` または `POST /projects/{project_id}/assets/{asset_id}`
-3. `POST /projects/{project_id}/export`
+```json
+{
+  "total_feedback": 1,
+  "average_quality_rating": 4.0,
+  "average_semantic_rating": 5.0,
+  "average_creative_rating": 3.0,
+  "comment_count": 1,
+  "export_ready_rate": 0.0,
+  "reuse_intent_rate": 100.0,
+  "issue_tag_counts": {
+    "prompt_mismatch": 1
+  },
+  "human_quality_score": 80.0,
+  "human_semantic_alignment_score": 100.0,
+  "human_creative_alignment_score": 60.0,
+  "latest_feedback_at": "2026-04-19T09:00:00Z"
+}
+```

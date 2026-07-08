@@ -218,13 +218,16 @@ def evaluate_audio_output(output_path: str | Path) -> dict[str, object]:
 
 
 def evaluate_video_output(output_path: str | Path) -> dict[str, object]:
-    """Return a lightweight technical quality report for a local gif asset."""
+    """Return a lightweight technical quality report for a local video asset."""
 
     path = Path(output_path)
-    with Image.open(path) as gif:
-        frames = [frame.convert("RGB") for frame in ImageSequence.Iterator(gif)]
-        width, height = gif.size
-        duration_ms = int(gif.info.get("duration", 100))
+    try:
+        with Image.open(path) as gif:
+            frames = [frame.convert("RGB") for frame in ImageSequence.Iterator(gif)]
+            width, height = gif.size
+            duration_ms = int(gif.info.get("duration", 100))
+    except OSError:
+        return _evaluate_saved_video_file(path)
 
     if not frames:
         raise ValueError(f"Video output is empty: {path}")
@@ -316,6 +319,50 @@ def evaluate_video_output(output_path: str | Path) -> dict[str, object]:
         "notes": [
             "motion smoothness is estimated from frame deltas",
             "score reflects local storyboard preview quality only",
+        ],
+    }
+
+
+def _evaluate_saved_video_file(path: Path) -> dict[str, object]:
+    """Score a saved learned-runtime video when frame inspection is unavailable."""
+
+    if not path.exists():
+        raise FileNotFoundError(f"Video output does not exist: {path}")
+
+    file_size_bytes = path.stat().st_size
+    extension = path.suffix.lower().lstrip(".") or "unknown"
+    format_score = 1.0 if extension in {"mp4", "webm", "mov"} else 0.55
+    size_score = _score_band(file_size_bytes / 1024, floor=64, target=1024, ceiling=8192)
+    technical_quality_score = round(
+        max(0.0, min(100.0, format_score * 42 + size_score * 58)),
+        1,
+    )
+    business_readiness_score = round(
+        max(0.0, min(100.0, technical_quality_score * 0.82 + format_score * 18)),
+        1,
+    )
+
+    checks = ["saved video file exists but frame inspection is unavailable"]
+    if file_size_bytes < 64 * 1024:
+        checks.append("video file is small for production review")
+    if extension not in {"mp4", "webm", "mov"}:
+        checks.append("video format is not a standard learned-runtime delivery format")
+
+    return {
+        "method": "heuristic_local_v1",
+        "quality_score": technical_quality_score,
+        "quality_level": _quality_level(technical_quality_score),
+        "business_readiness_score": business_readiness_score,
+        "business_readiness_level": _quality_level(business_readiness_score),
+        "checks": checks,
+        "metrics": {
+            "file_size_bytes": file_size_bytes,
+            "output_format": extension,
+            "frame_inspection": "unavailable",
+        },
+        "notes": [
+            "frame-level video metrics were not available for this file",
+            "score reflects saved-file readiness only",
         ],
     }
 

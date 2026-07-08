@@ -14,7 +14,11 @@ from core.quality import (
 from core.schemas import GenerationRequest, GenerationResult
 from generators.base import BaseGenerator
 
-from .runtime import SUPPORTED_VIDEO_OUTPUT_FORMATS, VideoRuntimeRouter
+from .runtime import (
+    LEARNED_VIDEO_OUTPUT_FORMATS,
+    PROCEDURAL_VIDEO_OUTPUT_FORMATS,
+    VideoRuntimeRouter,
+)
 
 
 class VideoGenerator(BaseGenerator):
@@ -37,8 +41,23 @@ class VideoGenerator(BaseGenerator):
             raise ValueError("VideoGenerator only supports video requests.")
         if not request.prompt.strip():
             raise ValueError("Video prompt must not be empty.")
-        if request.output_format and request.output_format.lower() not in SUPPORTED_VIDEO_OUTPUT_FORMATS:
-            raise ValueError("VideoGenerator currently supports gif output only.")
+        if request.output_format:
+            manifest = self.model_service.get_manifest(
+                request.model_id.strip() or None,
+                media_type="video",
+                task_type=self.task_type,
+            )
+            output_format = request.output_format.lower()
+            supported_formats = (
+                LEARNED_VIDEO_OUTPUT_FORMATS
+                if manifest.runtime == "learned"
+                else PROCEDURAL_VIDEO_OUTPUT_FORMATS
+            )
+            if output_format not in supported_formats:
+                supported = ", ".join(sorted(supported_formats))
+                raise ValueError(
+                    f"Video model {manifest.public_model_id!r} supports {supported} output only."
+                )
 
     def prepare(self, request: GenerationRequest) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)

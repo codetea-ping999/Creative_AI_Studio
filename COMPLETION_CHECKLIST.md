@@ -1,5 +1,7 @@
 # ✅ Creative AI Studio v0.2 - 完了チェックリスト
 
+> Note: This is a historical v0.2 checklist, not the current product/API contract. For current setup and implementation guidance, start with `README.md` and `docs/README.md`.
+
 ## 📋 実施内容確認
 
 ### モデル & インフラ

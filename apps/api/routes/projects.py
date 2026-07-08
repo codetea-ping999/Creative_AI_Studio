@@ -377,11 +377,21 @@ def export_project(
         if req.destination_dir
         else services.output_dir.parent / "exports" / "projects" / project.id
     )
+    feedback_summary = services.feedback_repository.summarize(project_id=project.id)
+    latest_feedback_at = feedback_summary.get("latest_feedback_at")
+    if isinstance(latest_feedback_at, datetime):
+        feedback_summary["latest_feedback_at"] = latest_feedback_at.isoformat()
+    project_manifest = {
+        **project.to_dict(),
+        "asset_count": len(assets),
+        "feedback_summary": feedback_summary,
+        "quality_summary": _summarize_asset_quality(assets),
+    }
     exported = services.asset_repository.export_project_bundle(
         project_id=project.id,
         export_root=destination,
         assets=assets,
-        project_manifest=project.to_dict(),
+        project_manifest=project_manifest,
     )
     return ExportProjectResponse(
         project_id=project.id,
@@ -407,6 +417,40 @@ def _number_or_none(value: object) -> float | None:
     if isinstance(value, (int, float)):
         return float(value)
     return None
+
+
+def _summarize_asset_quality(assets: list[Asset]) -> dict[str, Any]:
+    quality_scores: list[float] = []
+    semantic_scores: list[float] = []
+    creative_scores: list[float] = []
+    media_breakdown: dict[str, int] = {}
+    for asset in assets:
+        media_breakdown[asset.media_type] = media_breakdown.get(asset.media_type, 0) + 1
+        quality_report = asset.metadata.get("quality_report")
+        if not isinstance(quality_report, dict):
+            continue
+        for key, target in (
+            ("quality_score", quality_scores),
+            ("semantic_alignment_score", semantic_scores),
+            ("creative_alignment_score", creative_scores),
+        ):
+            value = quality_report.get(key)
+            if isinstance(value, (int, float)):
+                target.append(float(value))
+
+    return {
+        "asset_count": len(assets),
+        "media_breakdown": media_breakdown,
+        "average_quality_score": _average_or_none(quality_scores),
+        "average_semantic_alignment_score": _average_or_none(semantic_scores),
+        "average_creative_alignment_score": _average_or_none(creative_scores),
+    }
+
+
+def _average_or_none(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return round(sum(values) / len(values), 1)
 
 
 __all__ = [
