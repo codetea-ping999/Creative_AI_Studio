@@ -38,3 +38,4 @@ models/image/sdxl/tokenizer/
 models/image/sdxl/tokenizer_2/
 models/image/sdxl/unet/
 models/image/sdxl/vae/
+models/image/anime-sdxl/
