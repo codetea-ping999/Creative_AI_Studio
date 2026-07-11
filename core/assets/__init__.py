@@ -11,6 +11,7 @@ import shutil
 from typing import Any
 
 from core.jobs import JobRecord
+from core.storage.json_files import write_json_atomic
 
 
 def _now() -> datetime:
@@ -307,10 +308,7 @@ class AssetRepository:
         metadata_path = ""
         if include_metadata:
             metadata_path = str(export_root_path / f"{export_path.stem}.metadata.json")
-            Path(metadata_path).write_text(
-                json.dumps(asset.to_dict(), ensure_ascii=True, indent=2, sort_keys=True),
-                encoding="utf-8",
-            )
+            write_json_atomic(metadata_path, asset.to_dict())
 
         self.record_export(asset_id, str(export_path))
         return {
@@ -351,10 +349,7 @@ class AssetRepository:
             "project": project_manifest,
             "assets": manifest_assets,
         }
-        manifest_path.write_text(
-            json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+        write_json_atomic(manifest_path, payload)
         return {
             "project_id": project_id,
             "bundle_root": str(bundle_root),
@@ -391,10 +386,7 @@ class AssetRepository:
 
     def _save_asset(self, asset: Asset) -> None:
         asset_path = self.asset_dir / f"{asset.id}.json"
-        asset_path.write_text(
-            json.dumps(asset.to_dict(), ensure_ascii=True, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+        write_json_atomic(asset_path, asset.to_dict())
 
     def _asset_state(self, asset: Asset) -> dict[str, Any]:
         return {

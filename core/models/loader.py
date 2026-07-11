@@ -298,9 +298,6 @@ class LearnedVideoLoader(BaseModelLoader):
     def load(self, manifest: ModelManifest) -> dict[str, Any]:
         local_path = self._resolve_local_path(manifest)
         entrypoint = self._resolve_entrypoint(manifest, local_path)
-        fallback_runtime = str(
-            manifest.default_params.get("fallback_runtime", "procedural_storyboard")
-        )
         load_error: str | None = None
         runtime_payload: dict[str, Any] = {}
 
@@ -329,7 +326,6 @@ class LearnedVideoLoader(BaseModelLoader):
             "default_params": dict(manifest.default_params),
             "path_exists": True,
             "runtime_adapter": "learned_text_to_video",
-            "fallback_runtime": fallback_runtime,
             "load_error": load_error,
             **runtime_payload,
         }

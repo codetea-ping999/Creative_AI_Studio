@@ -12,6 +12,13 @@ from pydantic import BaseModel, ConfigDict, Field
 from apps.api.dependencies import get_services
 from bootstrap import ApplicationServices
 from core.jobs import JobRecord
+from core.quality import (
+    build_calibration_records,
+    build_calibration_report,
+    count_calibration_eligible_jobs,
+    count_calibration_eligible_segments,
+)
+from core.schemas import MediaType
 from core.jobs.statuses import (
     JOB_STATUS_FAILED,
     JOB_STATUS_POSTPROCESSING,
@@ -91,6 +98,33 @@ class MetricsSummaryResponse(BaseModel):
     by_media: dict[str, MediaMetrics] = Field(default_factory=dict)
 
 
+class CalibrationAgreementMetrics(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    paired_count: int = 0
+    pearson_correlation: float | None = None
+    mae: float | None = None
+    mean_bias: float | None = None
+
+
+class CalibrationSegmentResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sample_count: int = 0
+    eligible_job_count: int = 0
+    coverage_rate: float = 0.0
+    minimum_sample_count: int = 0
+    recommendation_status: str
+    metrics: dict[str, CalibrationAgreementMetrics] = Field(default_factory=dict)
+
+
+class CalibrationReportResponse(CalibrationSegmentResponse):
+    segment_minimum_sample_count: int = 10
+    by_media: dict[str, CalibrationSegmentResponse] = Field(default_factory=dict)
+    by_model: dict[str, CalibrationSegmentResponse] = Field(default_factory=dict)
+    automatic_updates_applied: bool = False
+
+
 @router.get("/summary", response_model=MetricsSummaryResponse)
 def get_metrics_summary(
     services: ApplicationServices = Depends(get_services),
@@ -109,6 +143,31 @@ def get_metrics_summary(
         _quality_metric(job, "quality_score") for job in recent_jobs
     )
     return MetricsSummaryResponse.model_validate(summary)
+
+
+@router.get("/calibration", response_model=CalibrationReportResponse)
+def get_calibration_report(
+    services: ApplicationServices = Depends(get_services),
+    media_type: MediaType | None = Query(default=None),
+    model_id: str | None = Query(default=None, min_length=1),
+) -> CalibrationReportResponse:
+    jobs = [
+        job
+        for job in services.job_service.list_jobs()
+        if (media_type is None or job.media_type == media_type)
+        and (model_id is None or job.request.model_id == model_id)
+    ]
+    records = build_calibration_records(
+        jobs,
+        services.asset_repository.list_all(),
+        services.feedback_repository.list_all(),
+    )
+    report = build_calibration_report(
+        records,
+        eligible_job_count=count_calibration_eligible_jobs(jobs),
+        eligible_segments=count_calibration_eligible_segments(jobs),
+    )
+    return CalibrationReportResponse.model_validate(report)
 
 
 def _summarize_jobs(
@@ -301,4 +360,9 @@ def _average(values: Iterable[float | int | None]) -> float | None:
     return round(sum(normalized) / len(normalized), 1)
 
 
-__all__ = ["MediaMetrics", "MetricsSummaryResponse", "router"]
+__all__ = [
+    "CalibrationReportResponse",
+    "MediaMetrics",
+    "MetricsSummaryResponse",
+    "router",
+]

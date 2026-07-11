@@ -111,6 +111,44 @@ def _check_sdxl_runtime_files() -> bool:
     return success
 
 
+def _check_cogvideox_runtime_files() -> bool:
+    model_root = ROOT / "models" / "video" / "cogvideox-2b"
+    if not model_root.exists():
+        print(f"[WARN] Optional CogVideoX-2B model directory is missing: {model_root}")
+        return True
+    component_configs = [
+        model_root / "scheduler" / "scheduler_config.json",
+        model_root / "text_encoder" / "config.json",
+        model_root / "tokenizer" / "tokenizer_config.json",
+        model_root / "transformer" / "config.json",
+        model_root / "vae" / "config.json",
+    ]
+    if not (model_root / "model_index.json").exists():
+        print(f"[WARN] Optional CogVideoX model_index.json is missing: {model_root}")
+        return True
+    missing_configs = [path for path in component_configs if not path.exists()]
+    missing_weights = [
+        component
+        for component in ("text_encoder", "transformer", "vae")
+        if not any((model_root / component).glob("*.safetensors"))
+    ]
+    if missing_configs or missing_weights:
+        details = [str(path.relative_to(ROOT)) for path in missing_configs]
+        details.extend(f"models/video/cogvideox-2b/{name}/*.safetensors" for name in missing_weights)
+        print("[WARN] Optional CogVideoX-2B weights are incomplete: " + ", ".join(details))
+        return True
+    success = all(
+        _check_path(path, f"Runtime file {path.relative_to(ROOT)}")
+        for path in [model_root / "model_index.json", *component_configs]
+    )
+    for component in ("text_encoder", "transformer", "vae"):
+        component_root = model_root / component
+        if not any(component_root.glob("*.safetensors")):
+            print(f"[FAIL] Runtime weights missing: {component_root.relative_to(ROOT)}/*.safetensors")
+            success = False
+    return success
+
+
 def main() -> int:
     print("Creative AI Studio local setup check")
     print(f"Repository: {ROOT}")
@@ -133,6 +171,7 @@ def main() -> int:
         print("[WARN] Runtime file checks skipped by --skip-runtime-files")
     else:
         checks.append(_check_sdxl_runtime_files())
+        checks.append(_check_cogvideox_runtime_files())
 
     if all(checks):
         print("[OK] Local setup looks ready.")

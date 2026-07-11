@@ -10,16 +10,21 @@ apps/web/dist/
 apps/web/*.tsbuildinfo
 apps/web/tsconfig.node.tsbuildinfo
 apps/web/vite.config.d.ts
+artifacts/
 
 outputs/
+output/
 data/*.db
 data/assets/
 data/projects/
 data/feedback/
 data/semantic-cache/
+data/calibration/
 data/model-download-*.log
 
 models/judges/
+models/video/cogvideox-2b/*
+!models/video/cogvideox-2b/model_index.json
 models/audio/musicgen-small/*.bin
 models/audio/musicgen-small/*.json
 models/audio/musicgen-small/*.model

@@ -153,6 +153,8 @@ audio output root の解決:
 - `QUALITY_SEMANTIC_LOCAL_ONLY=true` なら local に model が無い場合 `unavailable` 扱いです
 - `QUALITY_SEMANTIC_*_MODEL_PATH` を設定すると Hugging Face ID より local path を優先します
 - video は既定で gif の sample frame を image judge に通します
+- learned videoのMP4も同じ`image_frames` backendでsample frameを採点します
+- CogVideoX-2B pipeline pathと推論既定値は`models/manifests/video/learned-local.json`で管理します
 - 採点結果は output path、file stat、prompt、model ref を含む key で cache されます
 
 ## ログ関連

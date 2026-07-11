@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 import uuid
 
+from core.storage.json_files import write_json_atomic
+
 
 def _normalize_score(value: float | None) -> float | None:
     if value is None:
@@ -233,10 +235,7 @@ class FeedbackRepository:
 
     def _save_feedback(self, feedback: Feedback) -> None:
         feedback_file = self.feedback_dir / f"{feedback.id}.json"
-        feedback_file.write_text(
-            json.dumps(feedback.to_dict(), ensure_ascii=True, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+        write_json_atomic(feedback_file, feedback.to_dict())
 
     def _validate_rating(self, rating: int | None, field_name: str) -> None:
         if rating is None:

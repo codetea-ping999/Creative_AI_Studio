@@ -25,18 +25,22 @@
 | Done | frontend test path | `npm --prefix apps/web test` と PromptForm smoke test を追加 |
 | Done | package task runner | root `Makefile` から verify / verify-lite / api-smoke を実行可能に整理 |
 | Done | semantic judge operational docs | local judge model 配置、cache、video frame backend の設定を明文化 |
+| Done | Project / Asset 整理強化 | project metadata、tags、pin、検索、asset/project export を API / UI に接続 |
+| Done | atomic JSON persistence | asset / project / feedback / export manifest を replace-on-success 保存へ統一 |
+| Done | learned video pilot adapter | CogVideoX-2B adapter、MP4契約、model readiness表示を追加 |
+| Done | feedback calibration dataset | JSONL export、相関レポート、`/metrics/calibration` を追加 |
 
 ## 次に進めるべきタスク
 
 | 優先度 | 状態 | タスク | 目的 |
 | --- | --- | --- | --- |
-| P2 | Todo | Project 単位の整理強化 | project metadata、asset export、検索を追加する |
-| P2 | Todo | learned text-to-video runtime | procedural runtime を実モデルベース video へ置き換える |
-| P2 | Todo | human feedback loop | 採点結果に対する user feedback を保存して quality judge を補正する |
-| P2 | Todo | semantic judge calibration dataset | local judge score と human feedback の相関を蓄積して閾値を調整する |
+| P1 | Todo | CogVideoX-2B local smoke | weight配置後に `make cogvideox-smoke` で実MP4を生成しGallery再生を確認する |
+| P2 | Todo | calibration sample収集 | 全体20件、media/model segment各10件以上のhuman feedbackを蓄積する |
+| P2 | Todo | calibration review | 相関・MAE・biasを人手レビューし、補正重み変更を別変更として承認する |
+| P2 | Todo | running job cooperative cancellation | CogVideoX推論step callbackから安全にcancelできる実行contextを設計する |
 
 ## 直近の推奨着手順
 
-1. Project / Asset 単位の保存構造を強化して studio らしい管理単位を作る
-2. procedural video を learned runtime に差し替えられる loader 構成を整える
-3. semantic judge と human feedback の相関を見て閾値を調整する
+1. CogVideoX-2B weightを `models/video/cogvideox-2b` に配置して実MP4 smokeを通す
+2. 制作時のhuman feedbackを蓄積し、`make calibration-report` で相関を確認する
+3. 十分なsample数を満たした後、補正重み変更を独立レビューする

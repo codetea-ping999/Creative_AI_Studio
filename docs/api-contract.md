@@ -34,6 +34,7 @@ http://127.0.0.1:8000
 | Generate | `POST` | `/generate/audio` | 音声生成開始 |
 | Generate | `POST` | `/generate/video` | 動画生成開始 |
 | Metrics | `GET` | `/metrics/summary` | Studio 全体の運用サマリ |
+| Metrics | `GET` | `/metrics/calibration` | 自動scoreとhuman feedbackの相関レポート |
 | Feedback | `POST` | `/feedback` | 人手評価保存 |
 | Feedback | `GET` | `/feedback` | 一覧取得 |
 | Feedback | `GET` | `/feedback/summary` | 評価集計取得 |
@@ -150,7 +151,9 @@ Behavior:
 - runtime 自体は load しません
 - `enabled=true` の manifest のみ返します
 - `is_available` は local path と runtime ごとの最低限ファイルを見ます
-- `learned` runtime は `default_params.runtime_status=scaffold` の間 `is_available=false` です
+- `runtime_status` は `ready | missing_files | scaffold` のいずれかです
+- `availability_message` はUIへ表示可能なローカルfile readiness理由です
+- learned runtime はadapter entrypoint、`model_index.json`、component設定、weight一式が揃った場合だけ`is_available=true`です
 
 完全レスポンス:
 
@@ -171,7 +174,9 @@ Behavior:
       },
       "tags": ["image", "base"],
       "is_default": true,
-      "is_available": true
+      "is_available": true,
+      "runtime_status": "ready",
+      "availability_message": "Diffusers model files are ready."
     }
   ]
 }
@@ -185,6 +190,8 @@ UI の最小利用項目:
 - `tags`
 - `is_available`
 - `is_default`
+- `runtime_status`
+- `availability_message`
 
 ## Projects
 
@@ -459,6 +466,10 @@ Response は再バインド後の `GalleryAssetDetailResponse`。
 }
 ```
 
+CogVideoX-2B learned runtimeは`model_id=learned-video`、`output_format=mp4`を使います。
+既定値は720x480、49 frames、8 fps、20 inference stepsです。weight未配置時は
+`GET /models`が`is_available=false`を返し、procedural runtimeへ自動fallbackしません。
+
 共通 response:
 
 ```json
@@ -547,6 +558,38 @@ UI の最小利用項目:
 - `feedback_total`
 - `feedback_coverage_rate`
 - `by_media`
+
+### GET /metrics/calibration
+
+自動quality scoreとhuman feedbackの一致度を返します。queryは任意の
+`media_type=image|audio|video`と`model_id`です。レスポンスには全体と
+media/model別の`sample_count`、`coverage_rate`、Pearson相関、MAE、mean biasを含みます。
+
+- 全体20件未満、segment 10件未満では`recommendation_status=insufficient_data`
+- 十分な件数では`review_recommended`
+- `automatic_updates_applied`は常に`false`で、採点重みを自動変更しません
+
+```json
+{
+  "sample_count": 12,
+  "eligible_job_count": 20,
+  "coverage_rate": 60.0,
+  "minimum_sample_count": 20,
+  "recommendation_status": "insufficient_data",
+  "metrics": {
+    "quality": {
+      "paired_count": 12,
+      "pearson_correlation": 0.72,
+      "mae": 8.4,
+      "mean_bias": -2.1
+    }
+  },
+  "segment_minimum_sample_count": 10,
+  "by_media": {},
+  "by_model": {},
+  "automatic_updates_applied": false
+}
+```
 
 ## Feedback
 

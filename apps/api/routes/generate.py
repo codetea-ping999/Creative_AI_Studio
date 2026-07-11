@@ -12,7 +12,7 @@ from apps.api.routes.jobs import CreateJobResponse
 from bootstrap import ApplicationServices
 from core.jobs import JobRecord
 from core.projects import ProjectRepository
-from core.schemas import GenerationRequest
+from core.schemas import GenerationRequest, MediaType
 
 router = APIRouter(prefix="/generate", tags=["generate"])
 
@@ -40,6 +40,12 @@ class BaseGenerateRequest(BaseModel):
     output_format: str | None = None
     project_id: str | None = None
     params: dict[str, object] = Field(default_factory=dict)
+
+    def to_generation_request(self, media_type: MediaType) -> GenerationRequest:
+        """Normalize a convenience request into the shared job request schema."""
+
+        payload = self.model_dump(exclude={"project_id"})
+        return GenerationRequest(media_type=media_type, **payload)
 
 
 class GenerateImageRequest(BaseGenerateRequest):
@@ -82,6 +88,19 @@ def _create_project_bound_job(
     return ProjectBoundJob(job=job, project_id=resolved_project_id)
 
 
+def _enqueue_generation(
+    services: ApplicationServices,
+    media_type: MediaType,
+    request: BaseGenerateRequest,
+) -> CreateJobResponse:
+    bound_job = _create_project_bound_job(
+        services,
+        request.to_generation_request(media_type),
+        request.project_id,
+    )
+    return CreateJobResponse(job_id=bound_job.job.id, status=bound_job.job.status)
+
+
 @router.post(
     "/image",
     response_model=CreateJobResponse,
@@ -91,17 +110,7 @@ def generate_image(
     request: GenerateImageRequest,
     services: ApplicationServices = Depends(get_services),
 ) -> CreateJobResponse:
-    generation_request = GenerationRequest(
-        media_type="image",
-        prompt=request.prompt,
-        negative_prompt=request.negative_prompt,
-        model_id=request.model_id,
-        seed=request.seed,
-        output_format=request.output_format,
-        params=request.params,
-    )
-    bound_job = _create_project_bound_job(services, generation_request, request.project_id)
-    return CreateJobResponse(job_id=bound_job.job.id, status=bound_job.job.status)
+    return _enqueue_generation(services, "image", request)
 
 
 @router.post(
@@ -113,16 +122,7 @@ def generate_audio(
     request: GenerateAudioRequest,
     services: ApplicationServices = Depends(get_services),
 ) -> CreateJobResponse:
-    generation_request = GenerationRequest(
-        media_type="audio",
-        prompt=request.prompt,
-        model_id=request.model_id,
-        seed=request.seed,
-        output_format=request.output_format,
-        params=request.params,
-    )
-    bound_job = _create_project_bound_job(services, generation_request, request.project_id)
-    return CreateJobResponse(job_id=bound_job.job.id, status=bound_job.job.status)
+    return _enqueue_generation(services, "audio", request)
 
 
 @router.post(
@@ -134,17 +134,7 @@ def generate_video(
     request: GenerateVideoRequest,
     services: ApplicationServices = Depends(get_services),
 ) -> CreateJobResponse:
-    generation_request = GenerationRequest(
-        media_type="video",
-        prompt=request.prompt,
-        negative_prompt=request.negative_prompt,
-        model_id=request.model_id,
-        seed=request.seed,
-        output_format=request.output_format,
-        params=request.params,
-    )
-    bound_job = _create_project_bound_job(services, generation_request, request.project_id)
-    return CreateJobResponse(job_id=bound_job.job.id, status=bound_job.job.status)
+    return _enqueue_generation(services, "video", request)
 
 
 __all__ = [

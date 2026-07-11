@@ -1,247 +1,33 @@
 import { useEffect, useState, type FormEvent } from "react";
+import {
+  audioPresets,
+  defaultPromptFormValues,
+  imageFormatPresets,
+  imagePresets,
+  videoPresets,
+} from "./promptFormConfig";
+import type {
+  AudioPreset,
+  ControlMode,
+  ImagePreset,
+  MediaType,
+  ModelInstallGuide,
+  ModelOption,
+  PromptFormProps,
+  PromptFormState,
+  PromptFormSubmitValues,
+  VideoPreset,
+} from "./promptFormTypes";
 
-export type MediaType = "image" | "audio" | "video";
+export type {
+  LoraOption,
+  MediaType,
+  ModelOption,
+  PromptFormProps,
+  PromptFormSubmitValues,
+} from "./promptFormTypes";
 
-export type ModelOption = {
-  id: string;
-  displayName: string;
-  defaultParams: Record<string, unknown>;
-  tags: string[];
-  isAvailable: boolean;
-  isDefault: boolean;
-};
-
-export type LoraOption = {
-  id: string;
-  displayName: string;
-  path: string;
-  relativePath: string;
-};
-
-type PromptFormState = {
-  modelId: string;
-  prompt: string;
-  negativePrompt: string;
-  width: string;
-  height: string;
-  steps: string;
-  guidanceScale: string;
-  loraPath: string;
-  loraScale: string;
-  seed: string;
-  durationSeconds: string;
-  bpm: string;
-  mood: string;
-  cameraMotion: string;
-  visualStyle: string;
-};
-
-export type PromptFormSubmitValues = {
-  mediaType: MediaType;
-  modelId: string;
-  prompt: string;
-  negativePrompt: string;
-  width: number;
-  height: number;
-  steps: number;
-  guidanceScale: number;
-  loraPath: string;
-  loraScale: number;
-  seed: number | null;
-  durationSeconds: number;
-  bpm: number;
-  mood: string;
-  cameraMotion: string;
-  visualStyle: string;
-};
-
-export type PromptFormProps = {
-  formId?: string;
-  mediaType?: MediaType;
-  modelOptions?: ModelOption[];
-  loraOptions?: LoraOption[];
-  initialValues?: Partial<PromptFormSubmitValues>;
-  submitLabel?: string;
-  disabled?: boolean;
-  canSubmit?: boolean;
-  statusMessage?: string | null;
-  onSubmit?: (values: PromptFormSubmitValues) => void;
-  onDraftChange?: (values: Partial<PromptFormSubmitValues>) => void;
-};
-
-type ImagePreset = {
-  name: string;
-  prompt: string;
-  negativePrompt: string;
-};
-
-type AudioPreset = {
-  name: string;
-  prompt: string;
-  mood: string;
-  bpm: number;
-  durationSeconds: number;
-};
-
-type VideoPreset = {
-  name: string;
-  prompt: string;
-  negativePrompt: string;
-  width: number;
-  height: number;
-  durationSeconds: number;
-  cameraMotion: string;
-  visualStyle: string;
-};
-
-type ControlMode = "quick" | "advanced";
-
-type ModelInstallGuide = {
-  label: string;
-  url: string;
-  note: string;
-};
-
-const defaultValues: PromptFormSubmitValues = {
-  mediaType: "image",
-  modelId: "sdxl",
-  prompt: "",
-  negativePrompt: "",
-  width: 1024,
-  height: 1024,
-  steps: 30,
-  guidanceScale: 7.5,
-  loraPath: "",
-  loraScale: 0.8,
-  seed: null,
-  durationSeconds: 8,
-  bpm: 96,
-  mood: "dreamy",
-  cameraMotion: "push-in",
-  visualStyle: "storyboard",
-};
-
-// ユーザーフレンドリーなデザイン用の追加スタイル
-const formStyles = {
-  container: {
-    padding: '24px',
-    borderRadius: 'var(--radius-xl)',
-    backgroundColor: 'var(--surface-raised)',
-    boxShadow: 'var(--shadow-card)',
-    marginBottom: '24px',
-  },
-  header: {
-    display: 'flex',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: '20px',
-    paddingBottom: '16px',
-    borderBottom: '1px solid var(--border-soft)',
-  },
-  title: {
-    fontSize: '1.5rem',
-    fontWeight: '600',
-    color: 'var(--text-primary)',
-    margin: 0,
-  },
-  subtitle: {
-    fontSize: '0.9rem',
-    color: 'var(--text-soft)',
-    margin: '8px 0 0',
-  },
-  formGroup: {
-    marginBottom: '20px',
-  },
-  formRow: {
-    display: 'flex',
-    gap: '16px',
-    marginBottom: '16px',
-    flexWrap: 'wrap' as const,
-  },
-  formColumn: {
-    flex: '1',
-    minWidth: '200px',
-  },
-  label: {
-    display: 'block',
-    fontSize: '0.9rem',
-    fontWeight: '500',
-    color: 'var(--text-primary)',
-    marginBottom: '8px',
-  },
-  input: {
-    width: '100%',
-    padding: '12px 16px',
-    borderRadius: 'var(--radius-md)',
-    border: '1px solid var(--border-soft)',
-    backgroundColor: 'var(--surface-base)',
-    color: 'var(--text-primary)',
-    fontSize: '1rem',
-    transition: 'var(--transition-fast)',
-  },
-  inputFocus: {
-    outline: 'none',
-    borderColor: 'var(--accent)',
-    boxShadow: '0 0 0 3px rgba(11, 95, 144, 0.2)',
-  },
-  select: {
-    width: '100%',
-    padding: '12px 16px',
-    borderRadius: 'var(--radius-md)',
-    border: '1px solid var(--border-soft)',
-    backgroundColor: 'var(--surface-base)',
-    color: 'var(--text-primary)',
-    fontSize: '1rem',
-    transition: 'var(--transition-fast)',
-    appearance: 'none' as const,
-  },
-  button: {
-    padding: '12px 24px',
-    borderRadius: 'var(--radius-md)',
-    border: 'none',
-    backgroundColor: 'var(--accent)',
-    color: 'white',
-    fontSize: '1rem',
-    fontWeight: '500',
-    cursor: 'pointer',
-    transition: 'var(--transition-fast)',
-    display: 'inline-flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  buttonHover: {
-    backgroundColor: 'var(--accent-strong)',
-    transform: 'translateY(-2px)',
-    boxShadow: '0 4px 12px rgba(11, 95, 144, 0.3)',
-  },
-  buttonDisabled: {
-    opacity: '0.6',
-    cursor: 'not-allowed',
-    transform: 'none',
-    boxShadow: 'none',
-  },
-  statusMessage: {
-    padding: '12px',
-    borderRadius: 'var(--radius-md)',
-    marginBottom: '16px',
-    fontSize: '0.9rem',
-  },
-  success: {
-    backgroundColor: 'rgba(12, 126, 116, 0.15)',
-    color: 'var(--success)',
-    border: '1px solid rgba(12, 126, 116, 0.3)',
-  },
-  error: {
-    backgroundColor: 'rgba(178, 77, 76, 0.15)',
-    color: 'var(--danger)',
-    border: '1px solid rgba(178, 77, 76, 0.3)',
-  },
-  warning: {
-    backgroundColor: 'rgba(154, 107, 22, 0.15)',
-    color: 'var(--warning)',
-    border: '1px solid rgba(154, 107, 22, 0.3)',
-  },
-};
+const defaultValues = defaultPromptFormValues;
 
 function createInitialState(
   initialValues?: Partial<PromptFormSubmitValues>,
@@ -250,6 +36,7 @@ function createInitialState(
 
   return {
     modelId: merged.modelId,
+    outputFormat: merged.outputFormat,
     prompt: merged.prompt,
     negativePrompt: merged.negativePrompt,
     width: String(merged.width),
@@ -293,6 +80,7 @@ function serializeDraft(
   return {
     mediaType,
     modelId: formValues.modelId,
+    outputFormat: formValues.outputFormat,
     prompt: formValues.prompt,
     negativePrompt: formValues.negativePrompt,
     width: parseRequiredInteger(formValues.width, defaultValues.width),
@@ -377,6 +165,14 @@ function getInstallGuide(
     }
   }
 
+  if (mediaType === "video" && normalizedId.includes("learned-video")) {
+    return {
+      label: "CogVideoX-2B",
+      url: "https://huggingface.co/THUDM/CogVideoX-2b",
+      note: "Diffusers形式のweightを `models/video/cogvideox-2b` に配置します。",
+    };
+  }
+
   return null;
 }
 
@@ -399,6 +195,7 @@ export function PromptForm({
   const [controlMode, setControlMode] = useState<ControlMode>("quick");
   const availableModelCount = modelOptions.filter((option) => option.isAvailable).length;
   const unavailableModelCount = modelOptions.length - availableModelCount;
+  const unavailableModels = modelOptions.filter((option) => !option.isAvailable);
   const imageFormatValue = resolveImageFormatPreset(
     parseRequiredInteger(formValues.width, defaultValues.width),
     parseRequiredInteger(formValues.height, defaultValues.height),
@@ -470,6 +267,12 @@ export function PromptForm({
     setFormValues((current) => ({
       ...current,
       modelId,
+      outputFormat:
+        typeof selectedModel?.defaultParams.output_format === "string"
+          ? selectedModel.defaultParams.output_format
+          : mediaType === "video"
+            ? "gif"
+            : current.outputFormat,
       width:
         typeof selectedModel?.defaultParams.width === "number"
           ? String(selectedModel.defaultParams.width)
@@ -507,6 +310,7 @@ export function PromptForm({
     onSubmit?.({
       mediaType,
       modelId: formValues.modelId,
+      outputFormat: formValues.outputFormat,
       prompt: formValues.prompt,
       negativePrompt: formValues.negativePrompt,
       width: parseRequiredInteger(formValues.width, defaultValues.width),
@@ -531,11 +335,11 @@ export function PromptForm({
   };
 
   const renderPromptSection = () => (
-    <section className="form-section" style={formStyles.formGroup}>
-      <div className="form-section__header" style={formStyles.header}>
+    <section className="form-section">
+      <div className="form-section__header">
         <div>
-          <h3 style={formStyles.title}>Prompt</h3>
-          <p style={formStyles.subtitle}>
+          <h3>Prompt</h3>
+          <p>
             {mediaType === "image"
               ? "Fix the subject before tuning the render"
               : mediaType === "audio"
@@ -548,8 +352,8 @@ export function PromptForm({
         </span>
       </div>
 
-      <label className="field-group field-group--full" style={formStyles.formGroup}>
-        <span style={formStyles.label}>Prompt</span>
+      <label className="field-group field-group--full">
+        <span>Prompt</span>
         <textarea
           name="prompt"
           rows={controlMode === "quick" ? 4 : 5}
@@ -563,14 +367,13 @@ export function PromptForm({
           value={formValues.prompt}
           onChange={(event) => setFieldValue("prompt", event.target.value)}
           disabled={disabled}
-          style={{...formStyles.input, ...formStyles.inputFocus}}
         />
       </label>
 
       {(controlMode === "advanced" || mediaType === "video") &&
       (mediaType === "image" || mediaType === "video") ? (
-        <label className="field-group field-group--full" style={formStyles.formGroup}>
-          <span style={formStyles.label}>Negative Prompt</span>
+        <label className="field-group field-group--full">
+          <span>Negative Prompt</span>
           <textarea
             name="negativePrompt"
             rows={4}
@@ -578,7 +381,6 @@ export function PromptForm({
             value={formValues.negativePrompt}
             onChange={(event) => setFieldValue("negativePrompt", event.target.value)}
             disabled={disabled}
-            style={{...formStyles.input, ...formStyles.inputFocus}}
           />
         </label>
       ) : null}
@@ -588,17 +390,17 @@ export function PromptForm({
   const renderQuickControls = () => {
     if (mediaType === "image") {
       return (
-        <section className="form-section" style={formStyles.formGroup}>
-          <div className="form-section__header" style={formStyles.header}>
+        <section className="form-section">
+          <div className="form-section__header">
             <div>
-              <h3 style={formStyles.title}>Quick Controls</h3>
-              <p style={formStyles.subtitle}>Choose format and style with minimal decisions</p>
+              <h3>Quick Controls</h3>
+              <p>Choose format and style with minimal decisions</p>
             </div>
           </div>
 
           <div className="field-grid field-grid--balanced">
-            <label className="field-group" style={formStyles.formGroup}>
-              <span style={formStyles.label}>Format</span>
+            <label className="field-group">
+              <span>Format</span>
               <select
                 name="imageFormat"
                 value={imageFormatValue}
@@ -613,7 +415,6 @@ export function PromptForm({
                   setFieldValue("height", String(nextPreset.height));
                 }}
                 disabled={disabled}
-                style={{...formStyles.select, ...formStyles.inputFocus}}
               >
                 {imageFormatPresets.map((preset) => (
                   <option key={preset.value} value={preset.value}>
@@ -625,8 +426,8 @@ export function PromptForm({
             </label>
 
             {loraOptions.length > 0 ? (
-              <label className="field-group" style={formStyles.formGroup}>
-                <span style={formStyles.label}>Style Preset</span>
+              <label className="field-group">
+                <span>Style Preset</span>
                 <select
                   name="loraPreset"
                   value={
@@ -636,7 +437,6 @@ export function PromptForm({
                   }
                   onChange={(event) => setFieldValue("loraPath", event.target.value)}
                   disabled={disabled}
-                  style={{...formStyles.select, ...formStyles.inputFocus}}
                 >
                   <option value="">Base model only</option>
                   {loraOptions.map((option) => (
@@ -654,17 +454,17 @@ export function PromptForm({
 
     if (mediaType === "audio") {
       return (
-        <section className="form-section" style={formStyles.formGroup}>
-          <div className="form-section__header" style={formStyles.header}>
+        <section className="form-section">
+          <div className="form-section__header">
             <div>
-              <h3 style={formStyles.title}>Quick Controls</h3>
-              <p style={formStyles.subtitle}>Set duration, bpm, and mood for immediate playback</p>
+              <h3>Quick Controls</h3>
+              <p>Set duration, bpm, and mood for immediate playback</p>
             </div>
           </div>
 
           <div className="field-grid field-grid--controls">
-            <label className="field-group" style={formStyles.formGroup}>
-              <span style={formStyles.label}>Duration (sec)</span>
+            <label className="field-group">
+              <span>Duration (sec)</span>
               <input
                 type="number"
                 inputMode="numeric"
@@ -674,11 +474,10 @@ export function PromptForm({
                 value={formValues.durationSeconds}
                 onChange={(event) => setFieldValue("durationSeconds", event.target.value)}
                 disabled={disabled}
-                style={{...formStyles.input, ...formStyles.inputFocus}}
               />
             </label>
-            <label className="field-group" style={formStyles.formGroup}>
-              <span style={formStyles.label}>BPM</span>
+            <label className="field-group">
+              <span>BPM</span>
               <input
                 type="number"
                 inputMode="numeric"
@@ -689,17 +488,15 @@ export function PromptForm({
                 value={formValues.bpm}
                 onChange={(event) => setFieldValue("bpm", event.target.value)}
                 disabled={disabled}
-                style={{...formStyles.input, ...formStyles.inputFocus}}
               />
             </label>
-            <label className="field-group" style={formStyles.formGroup}>
-              <span style={formStyles.label}>Mood</span>
+            <label className="field-group">
+              <span>Mood</span>
               <select
                 name="mood"
                 value={formValues.mood}
                 onChange={(event) => setFieldValue("mood", event.target.value)}
                 disabled={disabled}
-                style={{...formStyles.select, ...formStyles.inputFocus}}
               >
                 <option value="dreamy">Dreamy</option>
                 <option value="bright">Bright</option>
@@ -714,17 +511,17 @@ export function PromptForm({
     }
 
     return (
-      <section className="form-section" style={formStyles.formGroup}>
-        <div className="form-section__header" style={formStyles.header}>
+      <section className="form-section">
+        <div className="form-section__header">
           <div>
-            <h3 style={formStyles.title}>Quick Controls</h3>
-            <p style={formStyles.subtitle}>Set reel length, camera motion, and board style first</p>
+            <h3>Quick Controls</h3>
+            <p>Set reel length, camera motion, and board style first</p>
           </div>
         </div>
 
         <div className="field-grid field-grid--controls">
-          <label className="field-group" style={formStyles.formGroup}>
-            <span style={formStyles.label}>Duration (sec)</span>
+          <label className="field-group">
+            <span>Duration (sec)</span>
             <input
               type="number"
               inputMode="numeric"
@@ -734,17 +531,15 @@ export function PromptForm({
               value={formValues.durationSeconds}
               onChange={(event) => setFieldValue("durationSeconds", event.target.value)}
               disabled={disabled}
-              style={{...formStyles.input, ...formStyles.inputFocus}}
             />
           </label>
-          <label className="field-group" style={formStyles.formGroup}>
-            <span style={formStyles.label}>Camera Motion</span>
+          <label className="field-group">
+            <span>Camera Motion</span>
             <select
               name="cameraMotion"
               value={formValues.cameraMotion}
               onChange={(event) => setFieldValue("cameraMotion", event.target.value)}
               disabled={disabled}
-              style={{...formStyles.select, ...formStyles.inputFocus}}
             >
               <option value="push-in">Push In</option>
               <option value="orbit">Orbit</option>
@@ -752,14 +547,13 @@ export function PromptForm({
               <option value="lateral">Lateral</option>
             </select>
           </label>
-          <label className="field-group" style={formStyles.formGroup}>
-            <span style={formStyles.label}>Board Style</span>
+          <label className="field-group">
+            <span>Board Style</span>
             <select
               name="visualStyle"
               value={formValues.visualStyle}
               onChange={(event) => setFieldValue("visualStyle", event.target.value)}
               disabled={disabled}
-              style={{...formStyles.select, ...formStyles.inputFocus}}
             >
               <option value="storyboard">Storyboard</option>
               <option value="editorial-board">Editorial Board</option>
@@ -775,17 +569,17 @@ export function PromptForm({
   const renderAdvancedControls = () => {
     if (mediaType === "image") {
       return (
-        <section className="form-section" style={formStyles.formGroup}>
-          <div className="form-section__header" style={formStyles.header}>
+        <section className="form-section">
+          <div className="form-section__header">
             <div>
-              <h3 style={formStyles.title}>Advanced Controls</h3>
-              <p style={formStyles.subtitle}>Fine tune render size, diffusion, seed, and LoRA intensity</p>
+              <h3>Advanced Controls</h3>
+              <p>Fine tune render size, diffusion, seed, and LoRA intensity</p>
             </div>
           </div>
 
           <div className="field-grid field-grid--controls">
-            <label className="field-group" style={formStyles.formGroup}>
-              <span style={formStyles.label}>Width</span>
+            <label className="field-group">
+              <span>Width</span>
               <input
                 type="number"
                 inputMode="numeric"
@@ -795,11 +589,10 @@ export function PromptForm({
                 value={formValues.width}
                 onChange={(event) => setFieldValue("width", event.target.value)}
                 disabled={disabled}
-                style={{...formStyles.input, ...formStyles.inputFocus}}
               />
             </label>
-            <label className="field-group" style={formStyles.formGroup}>
-              <span style={formStyles.label}>Height</span>
+            <label className="field-group">
+              <span>Height</span>
               <input
                 type="number"
                 inputMode="numeric"
@@ -809,11 +602,10 @@ export function PromptForm({
                 value={formValues.height}
                 onChange={(event) => setFieldValue("height", event.target.value)}
                 disabled={disabled}
-                style={{...formStyles.input, ...formStyles.inputFocus}}
               />
             </label>
-            <label className="field-group" style={formStyles.formGroup}>
-              <span style={formStyles.label}>Steps</span>
+            <label className="field-group">
+              <span>Steps</span>
               <input
                 type="number"
                 inputMode="numeric"
@@ -823,11 +615,10 @@ export function PromptForm({
                 value={formValues.steps}
                 onChange={(event) => setFieldValue("steps", event.target.value)}
                 disabled={disabled}
-                style={{...formStyles.input, ...formStyles.inputFocus}}
               />
             </label>
-            <label className="field-group" style={formStyles.formGroup}>
-              <span style={formStyles.label}>Guidance Scale</span>
+            <label className="field-group">
+              <span>Guidance Scale</span>
               <input
                 type="number"
                 inputMode="decimal"
@@ -837,11 +628,10 @@ export function PromptForm({
                 value={formValues.guidanceScale}
                 onChange={(event) => setFieldValue("guidanceScale", event.target.value)}
                 disabled={disabled}
-                style={{...formStyles.input, ...formStyles.inputFocus}}
               />
             </label>
-            <label className="field-group" style={formStyles.formGroup}>
-              <span style={formStyles.label}>Seed</span>
+            <label className="field-group">
+              <span>Seed</span>
               <input
                 type="number"
                 inputMode="numeric"
@@ -851,11 +641,10 @@ export function PromptForm({
                 value={formValues.seed}
                 onChange={(event) => setFieldValue("seed", event.target.value)}
                 disabled={disabled}
-                style={{...formStyles.input, ...formStyles.inputFocus}}
               />
             </label>
-            <label className="field-group" style={formStyles.formGroup}>
-              <span style={formStyles.label}>LoRA Scale</span>
+            <label className="field-group">
+              <span>LoRA Scale</span>
               <input
                 type="number"
                 inputMode="decimal"
@@ -865,13 +654,12 @@ export function PromptForm({
                 value={formValues.loraScale}
                 onChange={(event) => setFieldValue("loraScale", event.target.value)}
                 disabled={disabled}
-                style={{...formStyles.input, ...formStyles.inputFocus}}
               />
             </label>
           </div>
 
-          <label className="field-group field-group--full" style={formStyles.formGroup}>
-            <span style={formStyles.label}>LoRA Path</span>
+          <label className="field-group field-group--full">
+            <span>LoRA Path</span>
             <input
               type="text"
               name="loraPath"
@@ -879,7 +667,6 @@ export function PromptForm({
               value={formValues.loraPath}
               onChange={(event) => setFieldValue("loraPath", event.target.value)}
               disabled={disabled}
-              style={{...formStyles.input, ...formStyles.inputFocus}}
             />
           </label>
         </section>
@@ -888,17 +675,17 @@ export function PromptForm({
 
     if (mediaType === "audio") {
       return (
-        <section className="form-section" style={formStyles.formGroup}>
-          <div className="form-section__header" style={formStyles.header}>
+        <section className="form-section">
+          <div className="form-section__header">
             <div>
-              <h3 style={formStyles.title}>Advanced Controls</h3>
-              <p style={formStyles.subtitle}>Expose guidance and seed only when you need repeatability</p>
+              <h3>Advanced Controls</h3>
+              <p>Expose guidance and seed only when you need repeatability</p>
             </div>
           </div>
 
           <div className="field-grid field-grid--balanced">
-            <label className="field-group" style={formStyles.formGroup}>
-              <span style={formStyles.label}>Guidance Scale</span>
+            <label className="field-group">
+              <span>Guidance Scale</span>
               <input
                 type="number"
                 inputMode="decimal"
@@ -908,11 +695,10 @@ export function PromptForm({
                 value={formValues.guidanceScale}
                 onChange={(event) => setFieldValue("guidanceScale", event.target.value)}
                 disabled={disabled}
-                style={{...formStyles.input, ...formStyles.inputFocus}}
               />
             </label>
-            <label className="field-group" style={formStyles.formGroup}>
-              <span style={formStyles.label}>Seed</span>
+            <label className="field-group">
+              <span>Seed</span>
               <input
                 type="number"
                 inputMode="numeric"
@@ -922,7 +708,6 @@ export function PromptForm({
                 value={formValues.seed}
                 onChange={(event) => setFieldValue("seed", event.target.value)}
                 disabled={disabled}
-                style={{...formStyles.input, ...formStyles.inputFocus}}
               />
             </label>
           </div>
@@ -931,17 +716,17 @@ export function PromptForm({
     }
 
     return (
-      <section className="form-section" style={formStyles.formGroup}>
-        <div className="form-section__header" style={formStyles.header}>
+      <section className="form-section">
+        <div className="form-section__header">
           <div>
-            <h3 style={formStyles.title}>Advanced Controls</h3>
-            <p style={formStyles.subtitle}>Use custom frame size, negative prompt, and seed for precise reels</p>
+            <h3>Advanced Controls</h3>
+            <p>Use custom frame size, negative prompt, and seed for precise reels</p>
           </div>
         </div>
 
         <div className="field-grid field-grid--controls">
-          <label className="field-group" style={formStyles.formGroup}>
-            <span style={formStyles.label}>Width</span>
+          <label className="field-group">
+            <span>Width</span>
             <input
               type="number"
               inputMode="numeric"
@@ -951,11 +736,10 @@ export function PromptForm({
               value={formValues.width}
               onChange={(event) => setFieldValue("width", event.target.value)}
               disabled={disabled}
-              style={{...formStyles.input, ...formStyles.inputFocus}}
             />
           </label>
-          <label className="field-group" style={formStyles.formGroup}>
-            <span style={formStyles.label}>Height</span>
+          <label className="field-group">
+            <span>Height</span>
             <input
               type="number"
               inputMode="numeric"
@@ -965,11 +749,10 @@ export function PromptForm({
               value={formValues.height}
               onChange={(event) => setFieldValue("height", event.target.value)}
               disabled={disabled}
-              style={{...formStyles.input, ...formStyles.inputFocus}}
             />
           </label>
-          <label className="field-group" style={formStyles.formGroup}>
-            <span style={formStyles.label}>Seed</span>
+          <label className="field-group">
+            <span>Seed</span>
             <input
               type="number"
               inputMode="numeric"
@@ -979,7 +762,6 @@ export function PromptForm({
               value={formValues.seed}
               onChange={(event) => setFieldValue("seed", event.target.value)}
               disabled={disabled}
-              style={{...formStyles.input, ...formStyles.inputFocus}}
             />
           </label>
         </div>
@@ -988,7 +770,7 @@ export function PromptForm({
   };
 
   return (
-    <form id={formId} className="prompt-form" onSubmit={handleSubmit} style={formStyles.container}>
+    <form id={formId} className="prompt-form" onSubmit={handleSubmit}>
       <div className="form-toolbar">
         <div>
           <p className="eyebrow">
@@ -1017,7 +799,6 @@ export function PromptForm({
                     className="secondary-button"
                     onClick={() => applyImagePreset(preset)}
                     disabled={disabled}
-                    style={formStyles.button}
                   >
                     {preset.name}
                   </button>
@@ -1030,7 +811,6 @@ export function PromptForm({
                       className="secondary-button"
                       onClick={() => applyAudioPreset(preset)}
                       disabled={disabled}
-                      style={formStyles.button}
                     >
                       {preset.name}
                     </button>
@@ -1042,7 +822,6 @@ export function PromptForm({
                       className="secondary-button"
                       onClick={() => applyVideoPreset(preset)}
                       disabled={disabled}
-                      style={formStyles.button}
                     >
                       {preset.name}
                     </button>
@@ -1059,10 +838,6 @@ export function PromptForm({
               }`}
               onClick={() => setControlMode("quick")}
               disabled={disabled}
-              style={{
-                ...formStyles.button,
-                ...(controlMode === "quick" ? formStyles.buttonHover : {}),
-              }}
             >
               Quick
             </button>
@@ -1075,10 +850,6 @@ export function PromptForm({
               }`}
               onClick={() => setControlMode("advanced")}
               disabled={disabled}
-              style={{
-                ...formStyles.button,
-                ...(controlMode === "advanced" ? formStyles.buttonHover : {}),
-              }}
             >
               Advanced
             </button>
@@ -1087,23 +858,27 @@ export function PromptForm({
       </div>
 
       {statusMessage ? (
-        <p className="form-status" style={{...formStyles.statusMessage, ...formStyles.success}}>
+        <p
+          className="form-status"
+          role="status"
+          aria-live="polite"
+        >
           {statusMessage}
         </p>
       ) : null}
 
       <div className="form-grid">
         <section className="form-section">
-          <div className="form-section__header" style={formStyles.header}>
+          <div className="form-section__header">
             <div>
-              <h3 style={formStyles.title}>
+              <h3>
                 {mediaType === "image"
                   ? "Pick the model and style source"
                   : mediaType === "audio"
                     ? "Pick the model and playback base"
                     : "Pick the video runtime and storyboard base"}
               </h3>
-              <p style={formStyles.subtitle}>
+              <p>
                 {mediaType === "image"
                   ? "Select a model to generate your content"
                   : mediaType === "audio"
@@ -1127,14 +902,13 @@ export function PromptForm({
 
           <div className="field-grid field-grid--balanced">
             {modelOptions.length > 0 ? (
-              <label className="field-group field-group--full" style={formStyles.formGroup}>
-                <span style={formStyles.label}>Model</span>
+              <label className="field-group field-group--full">
+                <span>Model</span>
                 <select
                   name="modelId"
                   value={formValues.modelId}
                   onChange={(event) => handleModelChange(event.target.value)}
                   disabled={disabled}
-                  style={{...formStyles.select, ...formStyles.inputFocus}}
                 >
                   {modelOptions.map((option) => (
                     <option
@@ -1151,8 +925,8 @@ export function PromptForm({
             ) : null}
 
             {controlMode === "advanced" && mediaType === "image" && loraOptions.length > 0 ? (
-              <label className="field-group field-group--full" style={formStyles.formGroup}>
-                <span style={formStyles.label}>LoRA Catalog</span>
+              <label className="field-group field-group--full">
+                <span>LoRA Catalog</span>
                 <select
                   name="loraPreset"
                   value={
@@ -1162,7 +936,6 @@ export function PromptForm({
                   }
                   onChange={(event) => setFieldValue("loraPath", event.target.value)}
                   disabled={disabled}
-                  style={{...formStyles.select, ...formStyles.inputFocus}}
                 >
                   <option value="">None</option>
                   {loraOptions.map((option) => (
@@ -1177,6 +950,17 @@ export function PromptForm({
               </label>
             ) : null}
           </div>
+
+          {unavailableModels.length > 0 ? (
+            <div className="model-availability-list" role="status" aria-live="polite">
+              {unavailableModels.map((option) => (
+                <p key={option.id}>
+                  <strong>{option.displayName}:</strong>{" "}
+                  {option.availabilityMessage || "Required local model files are missing."}
+                </p>
+              ))}
+            </div>
+          ) : null}
 
           {missingModelGuides.length > 0 ? (
             <div className="download-guide-list" aria-label="Model download guides">
@@ -1203,10 +987,6 @@ export function PromptForm({
         <button 
           type="submit" 
           disabled={disabled || !canSubmit}
-          style={{
-            ...formStyles.button,
-            ...(disabled || !canSubmit ? formStyles.buttonDisabled : {}),
-          }}
         >
           {submitLabel}
         </button>

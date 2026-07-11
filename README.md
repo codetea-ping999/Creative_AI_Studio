@@ -22,22 +22,24 @@
 ### ✅ 実装済み機能
 
 - **Core Infrastructure**: ジョブキューシステム、イベントバス、モデルレジストリ、ストレージレイヤー
-- **API (FastAPI)**: `/health`, `/models`, `/jobs`, `/generate/image`, `/generate/audio`, `/generate/video`, `/gallery`, `/projects`, `/feedback`, `/metrics/summary`, `/catalog/loras`
+- **API (FastAPI)**: `/health`, `/models`, `/jobs`, `/generate/image`, `/generate/audio`, `/generate/video`, `/gallery`, `/projects`, `/feedback`, `/metrics/summary`, `/metrics/calibration`, `/catalog/loras`
 - **Web UI (React + TypeScript)**: Composer / Stage / Session History を持つ Studio UI、image / video / song surface 切り替え、モデル選択ガード、LoRA カタログ選択、品質スコア表示、音楽再生
 - **Image Generator**: ローカル SDXL と optional LoRA を使った画像生成
 - **Audio Generator**: ローカル MusicGen runtime を使った text-to-music フロー
-- **Video Generator**: ローカル procedural runtime による storyboard gif 生成
+- **Video Generator**: procedural storyboard GIF と optional なローカル CogVideoX-2B MP4生成
 - **Project / Feedback / Gallery**: project grouping、feedback 集計、asset detail、reuse、export、project bind を含む asset workflow
 - **Quality Evaluation**: image / audio / video 出力に対するローカル heuristic quality report と運用メトリクス集計
 - **Semantic Judge Scaffold**: optional な local CLIP / CLAP による prompt alignment 採点
 - **Operational Quality**: `pytest`、`scripts/check_local_setup.py`、GitHub Actions CI による基本検証
 - **Studio Asset Actions**: Web UI から asset detail の確認、composer への再投入、reuse rerun、export、project bind が可能
+- **Calibration Dataset**: feedbackと自動quality scoreを結合するJSONL/相関レポートをローカル生成可能
 
 ### 🚧 進行中 / 計画中機能
 
 - semantic judge を含む品質評価の高度化
 - anime checkpoint の実配置とプリセット拡充
-- 実モデルベースの text-to-video runtime 接続
+- CogVideoX-2B weightの実配置とM1 MaxでのMP4 smoke
+- human feedback sample蓄積後のcalibration review
 
 ## 企画メモ
 

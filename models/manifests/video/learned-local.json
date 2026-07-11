@@ -1,7 +1,7 @@
 {
   "id": "learned-video-local",
   "public_id": "learned-video",
-  "display_name": "Learned Video Local",
+  "display_name": "CogVideoX-2B Local",
   "media_type": "video",
   "task_type": "text-to-video",
   "provider": "local",
@@ -10,12 +10,18 @@
   "loader": "learned_video_loader",
   "default_params": {
     "entrypoint": "runtime.py",
-    "fallback_runtime": "procedural_storyboard",
-    "runtime_status": "scaffold",
-    "width": 576,
-    "height": 320,
-    "fps": 12,
-    "duration_seconds": 4
+    "runtime_status": "pilot",
+    "pipeline_path": "./models/video/cogvideox-2b",
+    "pipeline_id": "THUDM/CogVideoX-2b",
+    "output_format": "mp4",
+    "width": 720,
+    "height": 480,
+    "fps": 8,
+    "num_frames": 49,
+    "num_inference_steps": 20,
+    "guidance_scale": 6.0,
+    "device": "auto",
+    "dtype": "float16"
   },
   "aliases": [
     "learned-video-local"
@@ -24,7 +30,7 @@
     "video",
     "learned",
     "experimental",
-    "fallback"
+    "cogvideox-2b"
   ],
   "enabled": true
 }

@@ -15,7 +15,7 @@ from core.models import ModelManifest
 from core.schemas import GenerationRequest
 
 PROCEDURAL_VIDEO_OUTPUT_FORMATS = frozenset({"gif"})
-LEARNED_VIDEO_OUTPUT_FORMATS = frozenset({"gif", "mp4", "webm", "mov"})
+LEARNED_VIDEO_OUTPUT_FORMATS = frozenset({"mp4"})
 SUPPORTED_VIDEO_OUTPUT_FORMATS = PROCEDURAL_VIDEO_OUTPUT_FORMATS | LEARNED_VIDEO_OUTPUT_FORMATS
 
 
@@ -219,9 +219,6 @@ class ProceduralStoryboardRuntime(BaseVideoRuntime):
 class LearnedVideoRuntime(BaseVideoRuntime):
     """Adapter for learned text-to-video runtimes provided by local entrypoints."""
 
-    def __init__(self, fallback_runtime: BaseVideoRuntime) -> None:
-        self.fallback_runtime = fallback_runtime
-
     def render(
         self,
         *,
@@ -234,22 +231,8 @@ class LearnedVideoRuntime(BaseVideoRuntime):
         renderer = runtime_obj.get("renderer")
         pipeline = runtime_obj.get("pipeline")
         load_error = runtime_obj.get("load_error")
-        fallback_runtime = str(runtime_obj.get("fallback_runtime", "procedural_storyboard"))
-
-        if load_error and fallback_runtime == "procedural_storyboard":
-            fallback_result = self.fallback_runtime.render(
-                request=request,
-                manifest=manifest,
-                runtime_obj=runtime_obj,
-                output_dir=output_dir,
-                effective_params=effective_params,
-            )
-            fallback_result["runtime_metadata"]["runtime_fallback"] = {
-                "from": "learned_text_to_video",
-                "to": "procedural_storyboard",
-                "reason": str(load_error),
-            }
-            return fallback_result
+        if load_error:
+            raise RuntimeError(f"Learned video runtime is unavailable: {load_error}")
 
         callable_runtime = renderer if callable(renderer) else pipeline if callable(pipeline) else None
         if callable_runtime is None:
@@ -262,6 +245,8 @@ class LearnedVideoRuntime(BaseVideoRuntime):
             "prompt": request.prompt,
             "negative_prompt": request.negative_prompt,
             "seed": request.seed,
+            "output_dir": output_dir,
+            "output_format": request.output_format or effective_params.get("output_format", "mp4"),
             **effective_params,
         }
         generated = callable_runtime(**generation_kwargs)
@@ -352,7 +337,7 @@ class VideoRuntimeRouter:
 
     def __init__(self) -> None:
         self.procedural_runtime = ProceduralStoryboardRuntime()
-        self.learned_runtime = LearnedVideoRuntime(self.procedural_runtime)
+        self.learned_runtime = LearnedVideoRuntime()
 
     def resolve(self, runtime_obj: dict[str, Any]) -> BaseVideoRuntime:
         runtime_adapter = str(runtime_obj.get("runtime_adapter", "procedural_storyboard"))

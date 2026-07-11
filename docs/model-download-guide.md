@@ -18,7 +18,9 @@ models/
 │  ├─ sdxl/
 │  └─ anime-sdxl/
 ├─ video/
-│  └─ procedural/
+│  ├─ procedural/
+│  ├─ learned-runtime/
+│  └─ cogvideox-2b/
 ├─ loras/
 │  └─ mai.safetensors
 └─ manifests/
@@ -42,6 +44,7 @@ models/
 MusicGen Small は `./models/audio/musicgen-small` を想定しています。
 アニメ向け checkpoint は `./models/image/anime-sdxl`、LoRA は `./models/loras/...` を想定しています。
 Storyboard video runtime は `./models/video/procedural` を想定しています。
+CogVideoX-2B weightは `./models/video/cogvideox-2b` を想定しています。
 
 ## ダウンロード方法
 
@@ -82,6 +85,29 @@ huggingface-cli download facebook/musicgen-small \
 動画は現時点では heavyweight checkpoint を必須にしていません。
 `storyboard-video` は `./models/video/procedural` が存在すれば利用可能で、
 ローカルで storyboard gif を生成します。
+
+### CogVideoX-2B learned video runtime
+
+CogVideoXはoptionalです。Diffusers形式のweightを次の場所へ配置します。
+
+```bash
+huggingface-cli download THUDM/CogVideoX-2b \
+  --local-dir ./models/video/cogvideox-2b \
+  --local-dir-use-symlinks False
+```
+
+`model_index.json`はリポジトリに含まれますが、それだけではavailableになりません。
+`scheduler`、`text_encoder`、`tokenizer`、`transformer`、`vae`の設定と
+各weightが揃うと`GET /models?media_type=video`が`runtime_status=ready`、
+`is_available=true`を返します。生成確認は明示的に実行します。
+
+```bash
+make cogvideox-smoke
+```
+
+標準条件は720x480、49 frames、8 fps、20 steps、MP4です。MPSを優先し、
+未対応operationが発生した場合だけ同じpipelineをCPUへ移して1回再試行します。
+running jobの協調cancelはpilot対象外で、queued jobだけが確実にcancelされます。
 
 ### Semantic judge model
 
@@ -210,6 +236,7 @@ python3 -m unittest tests.test_model_system
 - LoRA は現状 1 リクエストにつき 1 本を想定しています
 - 未配置の checkpoint や MusicGen モデルは `/models` には出ますが `is_available: false` になります
 - `storyboard-video` は procedural runtime なので追加ダウンロード不要です
+- `learned-video` はadapterと`model_index.json`だけではavailableにならず、CogVideoX-2Bのcomponent設定とweight一式が必要です
 - モデルダウンロード管理 UI はまだありません
 - semantic judge model は生成 model とは別管理で、初回 scoring 時に必要です
 

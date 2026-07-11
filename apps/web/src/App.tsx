@@ -6,640 +6,40 @@ import {
   type ModelOption,
   type PromptFormSubmitValues,
 } from "./components/PromptForm";
-
-type JobStatus =
-  | "queued"
-  | "preparing"
-  | "running"
-  | "postprocessing"
-  | "succeeded"
-  | "failed"
-  | "cancelled";
+import { OutputThumbnail, StagePreview } from "./components/MediaPreview";
+import { buildGeneratePayload, buildReusePayload } from "./lib/payloads";
+import {
+  createDraftFromRequestSnapshot,
+  defaultSubmitValues,
+  extractJobQualityScore,
+  formatDate,
+  formatPercent,
+  formatScore,
+  mediaTypeLabels,
+  mergeDraftWithDefaults,
+  normalizeLoraOption,
+  normalizeModelOption,
+  terminalStatuses,
+  type CreateJobResponse,
+  type ExportAssetResponse,
+  type FeedbackResponse,
+  type GalleryAssetDetailResponse,
+  type GalleryItemResponse,
+  type GalleryStatsResponse,
+  type JobResponse,
+  type LoraCatalogResponse,
+  type MetricsSummaryResponse,
+  type ModelsResponse,
+  type ProjectResponse,
+  type RefreshStudioOptions,
+  type ReuseAssetResponse,
+} from "./studio";
+import { requestJson } from "./studioClient";
 
 type ThemeMode = "light" | "dark";
 
-type CreateJobResponse = {
-  job_id: string;
-  status: JobStatus;
-};
-
-type JobResponse = {
-  id: string;
-  media_type: MediaType;
-  project_id: string | null;
-  status: JobStatus;
-  progress: number;
-  error_message: string | null;
-  request: GenerationRequestSnapshot;
-  result: {
-    outputs: string[];
-    previews: string[];
-    metadata: Record<string, unknown>;
-  } | null;
-  created_at: string;
-  updated_at: string;
-};
-
-type GenerationRequestSnapshot = {
-  media_type: MediaType;
-  prompt: string;
-  negative_prompt: string | null;
-  model_id: string;
-  seed: number | null;
-  output_format: string | null;
-  params: Record<string, unknown>;
-};
-
-// ユーザーフレンドリーなデザイン用の追加スタイル
-const appStyles = {
-  container: {
-    maxWidth: '1200px',
-    margin: '0 auto',
-    padding: '24px',
-    fontFamily: '"Space Grotesk", "Avenir Next", "Helvetica Neue", sans-serif',
-  },
-  header: {
-    textAlign: 'center' as const,
-    marginBottom: '32px',
-    paddingBottom: '24px',
-    borderBottom: '1px solid var(--border-soft)',
-  },
-  title: {
-    fontSize: '2rem',
-    fontWeight: '700',
-    color: 'var(--text-primary)',
-    margin: '0 0 8px',
-  },
-  subtitle: {
-    fontSize: '1.1rem',
-    color: 'var(--text-soft)',
-    margin: '0',
-  },
-  tabContainer: {
-    display: 'flex',
-    justifyContent: 'center',
-    marginBottom: '32px',
-    gap: '8px',
-  },
-  tabButton: {
-    padding: '12px 24px',
-    borderRadius: 'var(--radius-md)',
-    border: 'none',
-    backgroundColor: 'var(--surface-base)',
-    color: 'var(--text-primary)',
-    fontSize: '1rem',
-    fontWeight: '500',
-    cursor: 'pointer',
-    transition: 'var(--transition-fast)',
-    display: 'inline-flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  tabButtonActive: {
-    backgroundColor: 'var(--accent)',
-    color: 'white',
-  },
-  tabButtonHover: {
-    backgroundColor: 'var(--surface-soft)',
-  },
-  contentContainer: {
-    display: 'flex',
-    flexDirection: 'column' as const,
-    gap: '24px',
-  },
-};
-
-type ModelSummary = {
-  id: string;
-  display_name: string;
-  default_params: Record<string, unknown>;
-  tags: string[];
-  is_available: boolean;
-  is_default: boolean;
-};
-
-type ModelsResponse = {
-  models: ModelSummary[];
-};
-
-type LoraCatalogResponse = {
-  items: Array<{
-    id: string;
-    display_name: string;
-    path: string;
-    relative_path: string;
-  }>;
-};
-
-type GalleryItemResponse = {
-  asset_id: string;
-  job_id: string;
-  project_id: string | null;
-  project_name: string | null;
-  media_type: MediaType;
-  prompt: string;
-  model_id: string;
-  output_path: string;
-  preview_path: string | null;
-  created_at: string;
-  updated_at: string;
-  quality_score: number | null;
-  quality_level: string | null;
-  semantic_alignment_score: number | null;
-  creative_alignment_score: number | null;
-  quality_score_calibrated: number | null;
-  semantic_alignment_score_calibrated: number | null;
-  creative_alignment_score_calibrated: number | null;
-  feedback_count: number;
-  average_feedback_quality: number | null;
-  reuse_count: number;
-  export_count: number;
-  success: boolean;
-};
-
-type GalleryAssetDetailResponse = GalleryItemResponse & {
-  quality_report: Record<string, unknown>;
-  request_snapshot: GenerationRequestSnapshot;
-  metadata: Record<string, unknown>;
-  feedback_summary: Record<string, unknown>;
-  export_paths: string[];
-  parent_asset_id: string | null;
-  lineage: string[];
-  tags: string[];
-};
-
-type GalleryStatsResponse = {
-  total_items: number;
-  total_by_media_type: Record<string, number>;
-  total_by_project: Record<string, number>;
-  average_quality_score: number | null;
-  total_reuse_count: number;
-  total_export_count: number;
-};
-
-type ReuseAssetResponse = {
-  asset_id: string;
-  job_id: string;
-  status: JobStatus;
-  project_id: string | null;
-};
-
-type ExportAssetResponse = {
-  asset_id: string;
-  export_path: string;
-  metadata_path: string | null;
-};
-
-type MetricsSummaryResponse = {
-  total_jobs: number;
-  succeeded_jobs: number;
-  failed_jobs: number;
-  running_jobs: number;
-  success_rate: number;
-  average_quality_score: number | null;
-  average_semantic_alignment_score: number | null;
-  average_creative_alignment_score: number | null;
-  feedback_total: number;
-  feedback_coverage_rate: number;
-  by_media: Partial<Record<MediaType, MediaMetrics>>;
-};
-
-type MediaMetrics = {
-  total_jobs: number;
-  success_rate: number;
-  average_quality_score: number | null;
-  average_semantic_alignment_score: number | null;
-  average_creative_alignment_score: number | null;
-  feedback_total: number;
-  feedback_coverage_rate: number;
-};
-
-type ProjectResponse = {
-  id: string;
-  name: string;
-  description: string;
-  status: string;
-  tags: string[];
-  pinned_asset_ids: string[];
-  asset_count: number;
-  job_count: number;
-  cover_asset_path: string | null;
-};
-
-type FeedbackResponse = {
-  id: string;
-  quality_rating: number;
-  semantic_rating: number | null;
-  creative_rating: number | null;
-};
-
-type RefreshStudioOptions = {
-  preferredAssetId?: string | null;
-  preferredJobId?: string | null;
-};
-
-const API_BASE_URL =
-  (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, "") ??
-  "http://127.0.0.1:8000";
-
-const terminalStatuses = new Set<JobStatus>(["succeeded", "failed", "cancelled"]);
-
-const defaultSubmitValues: Record<MediaType, PromptFormSubmitValues> = {
-  image: {
-    mediaType: "image",
-    modelId: "sdxl",
-    prompt: "",
-    negativePrompt: "",
-    width: 1024,
-    height: 1024,
-    steps: 30,
-    guidanceScale: 7.5,
-    loraPath: "",
-    loraScale: 0.8,
-    seed: null,
-    durationSeconds: 8,
-    bpm: 96,
-    mood: "dreamy",
-    cameraMotion: "push-in",
-    visualStyle: "storyboard",
-  },
-  audio: {
-    mediaType: "audio",
-    modelId: "musicgen-small",
-    prompt: "",
-    negativePrompt: "",
-    width: 1024,
-    height: 1024,
-    steps: 30,
-    guidanceScale: 3,
-    loraPath: "",
-    loraScale: 0.8,
-    seed: null,
-    durationSeconds: 8,
-    bpm: 96,
-    mood: "dreamy",
-    cameraMotion: "push-in",
-    visualStyle: "storyboard",
-  },
-  video: {
-    mediaType: "video",
-    modelId: "storyboard-video",
-    prompt: "",
-    negativePrompt: "",
-    width: 576,
-    height: 320,
-    steps: 30,
-    guidanceScale: 7.5,
-    loraPath: "",
-    loraScale: 0.8,
-    seed: null,
-    durationSeconds: 4,
-    bpm: 96,
-    mood: "dreamy",
-    cameraMotion: "push-in",
-    visualStyle: "storyboard",
-  },
-};
-
-const mediaTypeLabels: Record<MediaType, string> = {
-  image: "Image",
-  audio: "Audio",
-  video: "Video",
-};
-
-function normalizeModelOption(item: ModelSummary): ModelOption {
-  return {
-    id: item.id,
-    displayName: item.display_name,
-    defaultParams: item.default_params,
-    tags: item.tags,
-    isAvailable: item.is_available,
-    isDefault: item.is_default,
-  };
-}
-
-function normalizeLoraOption(item: LoraCatalogResponse["items"][number]): LoraOption {
-  return {
-    id: item.id,
-    displayName: item.display_name,
-    path: item.path,
-    relativePath: item.relative_path,
-  };
-}
-
-export function createOutputUrl(pathValue: string | null | undefined): string | null {
-  if (!pathValue) {
-    return null;
-  }
-
-  const normalized = pathValue.replace(/\\/g, "/");
-  if (/^https?:\/\//i.test(normalized)) {
-    return normalized;
-  }
-
-  const relativePath = normalized.replace(/^\.?\//, "");
-  if (relativePath.startsWith("outputs/")) {
-    return `${API_BASE_URL}/${relativePath}`;
-  }
-
-  const outputMarker = "/outputs/";
-  const outputMarkerIndex = normalized.lastIndexOf(outputMarker);
-  if (outputMarkerIndex >= 0) {
-    return `${API_BASE_URL}${normalized.slice(outputMarkerIndex)}`;
-  }
-
-  for (const mountChild of ["images", "audio", "videos", "exports"]) {
-    if (relativePath.startsWith(`${mountChild}/`)) {
-      return `${API_BASE_URL}/outputs/${relativePath}`;
-    }
-
-    const childMarker = `/${mountChild}/`;
-    const childMarkerIndex = normalized.lastIndexOf(childMarker);
-    if (childMarkerIndex >= 0) {
-      return `${API_BASE_URL}/outputs${normalized.slice(childMarkerIndex)}`;
-    }
-  }
-
-  return null;
-}
-
-function formatDate(value: string | null | undefined): string {
-  if (!value) {
-    return "n/a";
-  }
-
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.valueOf())) {
-    return value;
-  }
-
-  return parsed.toLocaleString();
-}
-
-function formatScore(value: number | null | undefined): string {
-  return typeof value === "number" ? value.toFixed(1) : "n/a";
-}
-
-function formatPercent(value: number | null | undefined): string {
-  return typeof value === "number" ? `${value.toFixed(1)}%` : "n/a";
-}
-
-function isAudioAsset(pathValue: string | null | undefined): boolean {
-  return Boolean(pathValue && /\.(wav|mp3|ogg|m4a)$/i.test(pathValue));
-}
-
-export function isVideoAsset(pathValue: string | null | undefined): boolean {
-  return Boolean(pathValue && /\.(gif|mp4|webm|mov)$/i.test(pathValue));
-}
-
-function asNumber(value: unknown): number | null {
-  return typeof value === "number" ? value : null;
-}
-
-function asString(value: unknown): string | null {
-  return typeof value === "string" ? value : null;
-}
-
-function extractQualityReport(
-  metadata: Record<string, unknown> | null | undefined,
-): Record<string, unknown> | null {
-  if (!metadata) {
-    return null;
-  }
-
-  const qualityReport = metadata.quality_report;
-  return qualityReport && typeof qualityReport === "object"
-    ? (qualityReport as Record<string, unknown>)
-    : null;
-}
-
-function extractJobQualityScore(job: JobResponse | null): number | null {
-  return asNumber(extractQualityReport(job?.result?.metadata)?.quality_score);
-}
-
-function mergeDraftWithDefaults(
-  mediaType: MediaType,
-  draft?: Partial<PromptFormSubmitValues>,
-): PromptFormSubmitValues {
-  return {
-    ...defaultSubmitValues[mediaType],
-    ...draft,
-    mediaType,
-  };
-}
-
-function createDraftFromRequestSnapshot(
-  request: GenerationRequestSnapshot,
-): Partial<PromptFormSubmitValues> {
-  const params = request.params ?? {};
-  if (request.media_type === "image") {
-    return {
-      mediaType: "image",
-      modelId: request.model_id,
-      prompt: request.prompt,
-      negativePrompt: request.negative_prompt ?? "",
-      width: asNumber(params.width) ?? defaultSubmitValues.image.width,
-      height: asNumber(params.height) ?? defaultSubmitValues.image.height,
-      steps: asNumber(params.steps) ?? defaultSubmitValues.image.steps,
-      guidanceScale:
-        asNumber(params.guidance_scale) ?? defaultSubmitValues.image.guidanceScale,
-      loraPath: asString(params.lora_path) ?? "",
-      loraScale: asNumber(params.lora_scale) ?? defaultSubmitValues.image.loraScale,
-      seed: request.seed,
-    };
-  }
-
-  if (request.media_type === "audio") {
-    return {
-      mediaType: "audio",
-      modelId: request.model_id,
-      prompt: request.prompt,
-      durationSeconds:
-        asNumber(params.duration_seconds) ?? defaultSubmitValues.audio.durationSeconds,
-      guidanceScale:
-        asNumber(params.guidance_scale) ?? defaultSubmitValues.audio.guidanceScale,
-      bpm: asNumber(params.bpm) ?? defaultSubmitValues.audio.bpm,
-      mood: asString(params.mood) ?? defaultSubmitValues.audio.mood,
-      seed: request.seed,
-    };
-  }
-
-  return {
-    mediaType: "video",
-    modelId: request.model_id,
-    prompt: request.prompt,
-    negativePrompt: request.negative_prompt ?? "",
-    width: asNumber(params.width) ?? defaultSubmitValues.video.width,
-    height: asNumber(params.height) ?? defaultSubmitValues.video.height,
-    durationSeconds:
-      asNumber(params.duration_seconds) ?? defaultSubmitValues.video.durationSeconds,
-    cameraMotion:
-      asString(params.camera_motion) ?? defaultSubmitValues.video.cameraMotion,
-    visualStyle:
-      asString(params.visual_style) ?? defaultSubmitValues.video.visualStyle,
-    seed: request.seed,
-  };
-}
-
-export function buildGeneratePayload(
-  values: PromptFormSubmitValues,
-  projectId: string | null,
-): Record<string, unknown> {
-  if (values.mediaType === "image") {
-    return {
-      prompt: values.prompt,
-      negative_prompt: values.negativePrompt || null,
-      model_id: values.modelId,
-      seed: values.seed,
-      project_id: projectId,
-      output_format: "png",
-      params: {
-        width: values.width,
-        height: values.height,
-        steps: values.steps,
-        guidance_scale: values.guidanceScale,
-        ...(values.loraPath ? { lora_path: values.loraPath, lora_scale: values.loraScale } : {}),
-      },
-    };
-  }
-
-  if (values.mediaType === "audio") {
-    return {
-      prompt: values.prompt,
-      model_id: values.modelId,
-      seed: values.seed,
-      project_id: projectId,
-      output_format: "wav",
-      params: {
-        duration_seconds: values.durationSeconds,
-        guidance_scale: values.guidanceScale,
-        bpm: values.bpm,
-        mood: values.mood,
-      },
-    };
-  }
-
-  return {
-    prompt: values.prompt,
-    negative_prompt: values.negativePrompt || null,
-    model_id: values.modelId,
-    seed: values.seed,
-    project_id: projectId,
-    output_format: "gif",
-    params: {
-      width: values.width,
-      height: values.height,
-      duration_seconds: values.durationSeconds,
-      camera_motion: values.cameraMotion,
-      visual_style: values.visualStyle,
-    },
-  };
-}
-
-export function buildReusePayload(
-  values: PromptFormSubmitValues,
-  projectId: string | null,
-): Record<string, unknown> {
-  if (values.mediaType === "image") {
-    return {
-      action: "variation",
-      prompt: values.prompt,
-      negative_prompt: values.negativePrompt || null,
-      model_id: values.modelId,
-      seed: values.seed,
-      output_format: "png",
-      project_id: projectId,
-      params: {
-        width: values.width,
-        height: values.height,
-        steps: values.steps,
-        guidance_scale: values.guidanceScale,
-        ...(values.loraPath ? { lora_path: values.loraPath, lora_scale: values.loraScale } : {}),
-      },
-    };
-  }
-
-  if (values.mediaType === "audio") {
-    return {
-      action: "variation",
-      prompt: values.prompt,
-      model_id: values.modelId,
-      seed: values.seed,
-      output_format: "wav",
-      project_id: projectId,
-      params: {
-        duration_seconds: values.durationSeconds,
-        guidance_scale: values.guidanceScale,
-        bpm: values.bpm,
-        mood: values.mood,
-      },
-    };
-  }
-
-  return {
-    action: "variation",
-    prompt: values.prompt,
-    negative_prompt: values.negativePrompt || null,
-    model_id: values.modelId,
-    seed: values.seed,
-    output_format: "gif",
-    project_id: projectId,
-    params: {
-      width: values.width,
-      height: values.height,
-      duration_seconds: values.durationSeconds,
-      camera_motion: values.cameraMotion,
-      visual_style: values.visualStyle,
-    },
-  };
-}
-
-async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_BASE_URL}${path}`, init);
-  const responseText = await response.text();
-  if (!response.ok) {
-    let detail = responseText;
-    try {
-      const parsed = JSON.parse(responseText) as { detail?: unknown };
-      detail = formatApiErrorDetail(parsed.detail) || detail;
-    } catch {
-      // Keep the raw response text when the API does not return JSON.
-    }
-    throw new Error(detail || `${response.status} ${response.statusText}`);
-  }
-  return responseText ? (JSON.parse(responseText) as T) : (undefined as T);
-}
-
-export function formatApiErrorDetail(detail: unknown): string {
-  if (typeof detail === "string") {
-    return detail;
-  }
-  if (!Array.isArray(detail)) {
-    return "";
-  }
-
-  const messages = detail
-    .map((item) => {
-      if (!item || typeof item !== "object") {
-        return "";
-      }
-      const payload = item as { loc?: unknown; msg?: unknown };
-      const loc = Array.isArray(payload.loc)
-        ? payload.loc.map((part) => String(part)).join(".")
-        : "";
-      const msg = typeof payload.msg === "string" ? payload.msg : "";
-      if (!loc) {
-        return msg;
-      }
-      return msg ? `${loc}: ${msg}` : loc;
-    })
-    .filter(Boolean);
-
-  return messages.join("; ");
-}
-
 function App() {
-  const [themeMode, setThemeMode] = useState<ThemeMode>("light");
+  const [themeMode, setThemeMode] = useState<ThemeMode>("dark");
   const [mediaType, setMediaType] = useState<MediaType>("image");
   const [composerRevision, setComposerRevision] = useState(0);
   const [modelOptionsByMedia, setModelOptionsByMedia] = useState<
@@ -1264,7 +664,7 @@ function App() {
   }
 
   return (
-    <div className="app-shell app-shell--studio" style={appStyles.container}>
+    <div className="app-shell app-shell--studio">
       <aside className="studio-sidebar">
         <section className="section-card section-card--nav">
           <div className="sidebar-brand">
@@ -1282,7 +682,7 @@ function App() {
                 type="button"
                 className={`theme-switch__button ${themeMode === "light" ? "is-active" : ""}`}
                 onClick={() => setThemeMode("light")}
-                style={themeMode === "light" ? {...appStyles.tabButton, ...appStyles.tabButtonActive} : appStyles.tabButton}
+                aria-pressed={themeMode === "light"}
               >
                 Light
               </button>
@@ -1290,7 +690,7 @@ function App() {
                 type="button"
                 className={`theme-switch__button ${themeMode === "dark" ? "is-active" : ""}`}
                 onClick={() => setThemeMode("dark")}
-                style={themeMode === "dark" ? {...appStyles.tabButton, ...appStyles.tabButtonActive} : appStyles.tabButton}
+                aria-pressed={themeMode === "dark"}
               >
                 Dark
               </button>
@@ -1298,7 +698,7 @@ function App() {
           </div>
         </section>
 
-        <section className="section-card">
+        <section className="section-card section-card--media">
           <div className="section-card__header">
             <div>
               <p className="eyebrow">Surface</p>
@@ -1312,11 +712,7 @@ function App() {
                 type="button"
                 className={`surface-nav__item ${mediaType === option ? "is-active" : ""}`}
                 onClick={() => setMediaType(option)}
-                style={{
-                  ...appStyles.tabButton,
-                  ...(mediaType === option ? appStyles.tabButtonActive : {}),
-                  ...appStyles.tabButtonHover,
-                }}
+                aria-pressed={mediaType === option}
               >
                 <div className="surface-nav__topline">
                   <span className="surface-pill">{mediaTypeLabels[option]}</span>
@@ -1335,7 +731,7 @@ function App() {
           </div>
         </section>
 
-        <section className="section-card section-card--snapshot">
+        <section className="section-card section-card--snapshot section-card--projects">
           <div className="section-card__header">
             <div>
               <p className="eyebrow">Project Binding</p>
@@ -1347,7 +743,6 @@ function App() {
             <select
               value={selectedProjectId}
               onChange={(event) => setSelectedProjectId(event.target.value)}
-              style={{...appStyles.tabButton, ...appStyles.tabButtonHover}}
             >
               <option value="">No project</option>
               {projects.map((project) => (
@@ -1362,38 +757,38 @@ function App() {
               ? `${projects.length} projects can receive new jobs or reused assets.`
               : "Create a project to start grouping jobs and assets."}
           </p>
-          <form className="project-create-form" onSubmit={(event) => void handleCreateProject(event)}>
-            <label className="field-group field-group--full">
-              <span>New project name</span>
-              <input
-                type="text"
-                value={newProjectName}
-                onChange={(event) => setNewProjectName(event.target.value)}
-                placeholder="Campaign explorations"
-                disabled={isProjectBusy}
-                style={{...appStyles.tabButton, ...appStyles.tabButtonHover}}
-              />
-            </label>
-            <label className="field-group field-group--full">
-              <span>Description</span>
-              <textarea
-                rows={3}
-                value={newProjectDescription}
-                onChange={(event) => setNewProjectDescription(event.target.value)}
-                placeholder="Optional production note"
-                disabled={isProjectBusy}
-                style={{...appStyles.tabButton, ...appStyles.tabButtonHover}}
-              />
-            </label>
-            <button
-              type="submit"
-              className="secondary-button secondary-button--block"
-              disabled={isProjectBusy || !newProjectName.trim()}
-              style={appStyles.tabButton}
-            >
-              {isProjectBusy ? "Creating..." : "Create and select project"}
-            </button>
-          </form>
+          <details className="project-disclosure">
+            <summary>New project</summary>
+            <form className="project-create-form" onSubmit={(event) => void handleCreateProject(event)}>
+              <label className="field-group field-group--full">
+                <span>New project name</span>
+                <input
+                  type="text"
+                  value={newProjectName}
+                  onChange={(event) => setNewProjectName(event.target.value)}
+                  placeholder="Campaign explorations"
+                  disabled={isProjectBusy}
+                />
+              </label>
+              <label className="field-group field-group--full">
+                <span>Description</span>
+                <textarea
+                  rows={3}
+                  value={newProjectDescription}
+                  onChange={(event) => setNewProjectDescription(event.target.value)}
+                  placeholder="Optional production note"
+                  disabled={isProjectBusy}
+                />
+              </label>
+              <button
+                type="submit"
+                className="secondary-button secondary-button--block"
+                disabled={isProjectBusy || !newProjectName.trim()}
+              >
+                {isProjectBusy ? "Creating..." : "Create and select project"}
+              </button>
+            </form>
+          </details>
           {selectedProject ? (
             <div className="form-section">
               <div className="form-section__header">
@@ -1409,7 +804,6 @@ function App() {
                   value={projectStatusDraft}
                   onChange={(event) => setProjectStatusDraft(event.target.value)}
                   disabled={isProjectBusy}
-                  style={{...appStyles.tabButton, ...appStyles.tabButtonHover}}
                 />
               </label>
               <label className="field-group field-group--full">
@@ -1420,7 +814,6 @@ function App() {
                   onChange={(event) => setProjectTagsDraft(event.target.value)}
                   placeholder="draft, review, delivery"
                   disabled={isProjectBusy}
-                  style={{...appStyles.tabButton, ...appStyles.tabButtonHover}}
                 />
               </label>
               <div className="asset-actions">
@@ -1431,7 +824,6 @@ function App() {
                     void handleUpdateSelectedProject();
                   }}
                   disabled={isProjectBusy}
-                  style={appStyles.tabButton}
                 >
                   Update project
                 </button>
@@ -1447,7 +839,6 @@ function App() {
                     selectedAssetDetail.project_id !== selectedProject.id ||
                     selectedProject.pinned_asset_ids.includes(selectedAssetDetail.asset_id)
                   }
-                  style={appStyles.tabButton}
                 >
                   Pin selected asset
                 </button>
@@ -1460,7 +851,7 @@ function App() {
           ) : null}
         </section>
 
-        <section className="section-card">
+        <section className="section-card section-card--activity">
           <div className="section-card__header">
             <div>
               <p className="eyebrow">Asset Workflow</p>
@@ -1484,8 +875,32 @@ function App() {
         </section>
       </aside>
 
-      <main className="studio-main" style={appStyles.contentContainer}>
-        {errorMessage ? <p className="error-banner">{errorMessage}</p> : null}
+      <main className="studio-main">
+        <header className="studio-topbar">
+          <div className="studio-topbar__identity">
+            <p className="eyebrow">Workspace / {mediaTypeLabels[mediaType]}</p>
+            <h1>{selectedProject?.name ?? "Unassigned workspace"}</h1>
+            <p>
+              Compose, review, and route local {mediaTypeLabels[mediaType].toLowerCase()} assets.
+            </p>
+          </div>
+          <dl className="studio-topbar__stats" aria-label="Workspace summary">
+            <div>
+              <dt>Assets</dt>
+              <dd>{galleryStats?.total_items ?? 0}</dd>
+            </div>
+            <div>
+              <dt>Success</dt>
+              <dd>{formatPercent(metrics?.success_rate)}</dd>
+            </div>
+            <div>
+              <dt>Models</dt>
+              <dd>{activeModels.filter((model) => model.isAvailable).length}</dd>
+            </div>
+          </dl>
+        </header>
+
+        {errorMessage ? <p className="error-banner" role="alert">{errorMessage}</p> : null}
 
         <section className="section-card section-card--stage">
           <div className="section-card__header">
@@ -1526,7 +941,7 @@ function App() {
             {latestJob ? (
               <div className="monitor-stack">
                 <div className="gallery-item__topline">
-                  <span className={`status-chip status-chip--${latestJob.status}`}>
+                  <span className={`status-chip status-chip--${latestJob.status}`} role="status">
                     {latestJob.status}
                   </span>
                   <span className="history-score">{formatPercent(latestJob.progress * 100)}</span>
@@ -1538,7 +953,6 @@ function App() {
                     onClick={() => {
                       void handleCancelLatestJob();
                     }}
-                    style={appStyles.tabButton}
                   >
                     Cancel job
                   </button>
@@ -1596,7 +1010,6 @@ function App() {
                 value={gallerySearch}
                 onChange={(event) => setGallerySearch(event.target.value)}
                 placeholder="prompt, model, project, metadata"
-                style={{...appStyles.tabButton, ...appStyles.tabButtonHover}}
               />
             </label>
             <div className="gallery-list">
@@ -1609,7 +1022,6 @@ function App() {
                     onClick={() => {
                       void loadAssetDetail(item.asset_id);
                     }}
-                    style={appStyles.tabButton}
                   >
                     <OutputThumbnail mediaType={item.media_type} outputPath={item.preview_path} />
                     <div className="gallery-item__body">
@@ -1661,7 +1073,6 @@ function App() {
                       void handleAssetReuse();
                     }}
                     disabled={isAssetBusy}
-                    style={appStyles.tabButton}
                   >
                     Reuse and rerun
                   </button>
@@ -1670,7 +1081,6 @@ function App() {
                     className="secondary-button"
                     onClick={loadSelectedAssetIntoComposer}
                     disabled={isAssetBusy}
-                    style={appStyles.tabButton}
                   >
                     Load into composer
                   </button>
@@ -1681,7 +1091,6 @@ function App() {
                       void handleAssetExport();
                     }}
                     disabled={isAssetBusy}
-                    style={appStyles.tabButton}
                   >
                     Export asset
                   </button>
@@ -1699,7 +1108,6 @@ function App() {
                       value={selectedAssetProjectId}
                       onChange={(event) => setSelectedAssetProjectId(event.target.value)}
                       disabled={isAssetBusy}
-                      style={{...appStyles.tabButton, ...appStyles.tabButtonHover}}
                     >
                       <option value="">Unassigned</option>
                       {projects.map((project) => (
@@ -1716,7 +1124,6 @@ function App() {
                       void handleAssetProjectBinding();
                     }}
                     disabled={isAssetBusy}
-                    style={appStyles.tabButton}
                   >
                     Update asset project
                   </button>
@@ -1830,7 +1237,6 @@ function App() {
                         value={feedbackQuality}
                         onChange={(event) => setFeedbackQuality(event.target.value)}
                         disabled={isFeedbackBusy}
-                        style={{...appStyles.tabButton, ...appStyles.tabButtonHover}}
                       >
                         {[1, 2, 3, 4, 5].map((rating) => (
                           <option key={rating} value={rating}>
@@ -1845,7 +1251,6 @@ function App() {
                         value={feedbackSemantic}
                         onChange={(event) => setFeedbackSemantic(event.target.value)}
                         disabled={isFeedbackBusy}
-                        style={{...appStyles.tabButton, ...appStyles.tabButtonHover}}
                       >
                         {[1, 2, 3, 4, 5].map((rating) => (
                           <option key={rating} value={rating}>
@@ -1860,7 +1265,6 @@ function App() {
                         value={feedbackCreative}
                         onChange={(event) => setFeedbackCreative(event.target.value)}
                         disabled={isFeedbackBusy}
-                        style={{...appStyles.tabButton, ...appStyles.tabButtonHover}}
                       >
                         {[1, 2, 3, 4, 5].map((rating) => (
                           <option key={rating} value={rating}>
@@ -1898,7 +1302,6 @@ function App() {
                       onChange={(event) => setFeedbackIssueTags(event.target.value)}
                       placeholder="composition, lighting"
                       disabled={isFeedbackBusy}
-                      style={{...appStyles.tabButton, ...appStyles.tabButtonHover}}
                     />
                   </label>
                   <label className="field-group field-group--full">
@@ -1909,10 +1312,9 @@ function App() {
                       onChange={(event) => setFeedbackComments(event.target.value)}
                       placeholder="What should change before production use?"
                       disabled={isFeedbackBusy}
-                      style={{...appStyles.tabButton, ...appStyles.tabButtonHover}}
                     />
                   </label>
-                  <button type="submit" className="dock-submit" disabled={isFeedbackBusy} style={appStyles.tabButton}>
+                  <button type="submit" className="dock-submit" disabled={isFeedbackBusy}>
                     {isFeedbackBusy ? "Saving..." : "Save feedback"}
                   </button>
                 </form>
@@ -1970,98 +1372,6 @@ function App() {
           </div>
         </section>
       </main>
-    </div>
-  );
-}
-
-type StagePreviewProps = {
-  mediaType: MediaType;
-  outputPath: string | null;
-  title: string;
-  subtitle: string;
-};
-
-function StagePreview({ mediaType, outputPath, title, subtitle }: StagePreviewProps) {
-  const src = createOutputUrl(outputPath);
-
-  if (!src) {
-    return (
-      <div className="stage-surface">
-        <div className="empty-stage">
-          <div>
-            <h3>Preview unavailable</h3>
-            <p>{outputPath ?? "No output path was returned by the API."}</p>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  if (mediaType === "audio" || isAudioAsset(outputPath)) {
-    return (
-      <div className="stage-surface stage-surface--audio">
-        <div className="audio-preview">
-          <div className="audio-preview__header">
-            <p className="eyebrow">Audio Preview</p>
-            <strong>{title}</strong>
-            <p className="sidebar-copy">{subtitle}</p>
-          </div>
-          <audio controls preload="metadata" src={src} />
-        </div>
-      </div>
-    );
-  }
-
-  if (isVideoAsset(outputPath)) {
-    return (
-      <div className="stage-surface stage-surface--hero">
-        <video controls muted playsInline preload="metadata" src={src} />
-      </div>
-    );
-  }
-
-  return (
-    <div className="stage-surface stage-surface--hero">
-      <img src={src} alt={title} loading="lazy" />
-    </div>
-  );
-}
-
-type OutputThumbnailProps = {
-  mediaType: MediaType;
-  outputPath: string | null;
-};
-
-function OutputThumbnail({ mediaType, outputPath }: OutputThumbnailProps) {
-  const src = createOutputUrl(outputPath);
-
-  if (!src) {
-    return (
-      <div className="gallery-item__thumb is-audio">
-        <span className="gallery-item__audio-badge">None</span>
-      </div>
-    );
-  }
-
-  if (mediaType === "audio" || isAudioAsset(outputPath)) {
-    return (
-      <div className="gallery-item__thumb is-audio">
-        <span className="gallery-item__audio-badge">Audio</span>
-      </div>
-    );
-  }
-
-  if (isVideoAsset(outputPath)) {
-    return (
-      <div className="gallery-item__thumb">
-        <video muted playsInline preload="metadata" src={src} />
-      </div>
-    );
-  }
-
-  return (
-    <div className="gallery-item__thumb">
-      <img src={src} alt="" loading="lazy" />
     </div>
   );
 }

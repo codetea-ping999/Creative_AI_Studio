@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 import uuid
 
+from core.storage.json_files import write_json_atomic
+
 
 @dataclass(slots=True)
 class Project:
@@ -221,10 +223,7 @@ class ProjectRepository:
 
     def _save_project(self, project: Project) -> None:
         project_file = self.project_dir / f"{project.id}.json"
-        project_file.write_text(
-            json.dumps(project.to_dict(), ensure_ascii=True, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+        write_json_atomic(project_file, project.to_dict())
 
 
 __all__ = ["Project", "ProjectRepository"]

@@ -14,7 +14,8 @@
     "fps": 8,
     "duration_seconds": 4,
     "camera_motion": "push-in",
-    "visual_style": "storyboard"
+    "visual_style": "storyboard",
+    "output_format": "gif"
   },
   "aliases": [
     "storyboard-local"

@@ -1,14 +1,10 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
-import {
-  buildGeneratePayload,
-  buildReusePayload,
-  createOutputUrl,
-  formatApiErrorDetail,
-  isVideoAsset,
-} from "./App";
 import { PromptForm, type ModelOption } from "./components/PromptForm";
+import { buildGeneratePayload, buildReusePayload } from "./lib/payloads";
+import { isVideoAsset } from "./studio";
+import { createOutputUrl, formatApiErrorDetail } from "./studioClient";
 
 const storyboardModel: ModelOption = {
   id: "storyboard-video",
@@ -17,6 +13,8 @@ const storyboardModel: ModelOption = {
   tags: ["video"],
   isAvailable: true,
   isDefault: true,
+  runtimeStatus: "ready",
+  availabilityMessage: "Ready",
 };
 
 describe("PromptForm", () => {
@@ -30,6 +28,7 @@ describe("PromptForm", () => {
         modelOptions={[storyboardModel]}
         initialValues={{
           modelId: "storyboard-video",
+          outputFormat: "gif",
           prompt: "verification storyboard",
           negativePrompt: "flat lighting",
           width: 320,
@@ -59,6 +58,35 @@ describe("PromptForm", () => {
       }),
     );
   });
+
+  it("announces why a learned runtime is unavailable", () => {
+    render(
+      <PromptForm
+        mediaType="video"
+        modelOptions={[
+          storyboardModel,
+          {
+            ...storyboardModel,
+            id: "learned-video",
+            displayName: "CogVideoX-2B",
+            isAvailable: false,
+            isDefault: false,
+            runtimeStatus: "missing_files",
+            availabilityMessage: "CogVideoX model_index.json is missing.",
+          },
+        ]}
+        initialValues={{ modelId: "storyboard-video", outputFormat: "gif" }}
+      />,
+    );
+
+    expect(screen.getByRole("status").textContent).toContain(
+      "CogVideoX-2B: CogVideoX model_index.json is missing.",
+    );
+    expect(
+      (screen.getByRole("option", { name: /CogVideoX-2B/ }) as HTMLOptionElement)
+        .disabled,
+    ).toBe(true);
+  });
 });
 
 describe("studio helpers", () => {
@@ -78,6 +106,7 @@ describe("studio helpers", () => {
     const values = {
       mediaType: "video" as const,
       modelId: "storyboard-video",
+      outputFormat: "gif",
       prompt: "verification storyboard",
       negativePrompt: "flat lighting",
       width: 320,
