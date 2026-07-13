@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import os
 from threading import Event, Thread
 
 from fastapi import FastAPI
@@ -15,6 +16,22 @@ from apps.api.routes.jobs import router as jobs_router
 from apps.api.routes.metrics import router as metrics_router
 from apps.api.routes.models import router as models_router
 from apps.api.routes.projects import router as projects_router
+
+
+def _local_web_origins() -> list[str]:
+    """Return the loopback dev origins configured for the local Vite server."""
+
+    configured_port = os.getenv("WEB_PORT", "5173")
+    try:
+        web_port = int(configured_port)
+    except ValueError:
+        web_port = 5173
+    if not 1 <= web_port <= 65535:
+        web_port = 5173
+    return [
+        f"http://127.0.0.1:{web_port}",
+        f"http://localhost:{web_port}",
+    ]
 
 
 def create_app(
@@ -56,10 +73,7 @@ def create_app(
 
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[
-            "http://127.0.0.1:5173",
-            "http://localhost:5173",
-        ],
+        allow_origins=_local_web_origins(),
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],

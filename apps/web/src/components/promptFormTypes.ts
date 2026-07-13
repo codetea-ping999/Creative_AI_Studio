@@ -23,6 +23,9 @@ export type PromptFormState = {
   outputFormat: string;
   prompt: string;
   negativePrompt: string;
+  imageBriefPurpose: string;
+  imageBriefSubject: string;
+  imageBriefMood: string;
   width: string;
   height: string;
   steps: string;
@@ -43,6 +46,9 @@ export type PromptFormSubmitValues = {
   outputFormat: string;
   prompt: string;
   negativePrompt: string;
+  imageBriefPurpose: string;
+  imageBriefSubject: string;
+  imageBriefMood: string;
   width: number;
   height: number;
   steps: number;

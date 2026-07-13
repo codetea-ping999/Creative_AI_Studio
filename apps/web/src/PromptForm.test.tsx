@@ -1,6 +1,6 @@
-import { render, screen } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { PromptForm, type ModelOption } from "./components/PromptForm";
 import { buildGeneratePayload, buildReusePayload } from "./lib/payloads";
 import { isVideoAsset } from "./studio";
@@ -17,7 +17,75 @@ const storyboardModel: ModelOption = {
   availabilityMessage: "Ready",
 };
 
+afterEach(() => {
+  cleanup();
+});
+
 describe("PromptForm", () => {
+  it("submits the simple image brief without requiring a separate prompt action", async () => {
+    const user = userEvent.setup();
+    const handleSubmit = vi.fn();
+
+    render(
+      <PromptForm
+        mediaType="image"
+        modelOptions={[storyboardModel]}
+        submitLabel="生成する"
+        onSubmit={handleSubmit}
+      />,
+    );
+
+    await user.type(screen.getByLabelText("1. 主役・内容"), "夕暮れの花束");
+    await user.click(screen.getByRole("button", { name: "生成する" }));
+
+    expect(handleSubmit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        prompt: "夕暮れの花束, SNS投稿, やわらかい光",
+        imageBriefSubject: "夕暮れの花束",
+      }),
+    );
+  });
+
+  it("keeps free-form purpose out of the generated prompt and preserves negatives", async () => {
+    const user = userEvent.setup();
+    const handleSubmit = vi.fn();
+
+    render(
+      <PromptForm
+        mediaType="image"
+        modelOptions={[storyboardModel]}
+        submitLabel="生成する"
+        onSubmit={handleSubmit}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "自由入力" }));
+    await user.type(screen.getByLabelText("1. 主役・内容"), "霧の森の小屋");
+    await user.type(screen.getByLabelText("避けたい要素"), "文字");
+    await user.click(screen.getByRole("button", { name: "生成する" }));
+
+    expect(handleSubmit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        prompt: "霧の森の小屋, やわらかい光",
+        negativePrompt: "文字",
+      }),
+    );
+  });
+
+  it("builds an editable simple image brief before generation", async () => {
+    const user = userEvent.setup();
+
+    render(<PromptForm mediaType="image" modelOptions={[storyboardModel]} />);
+
+    await user.type(screen.getByLabelText("1. 主役・内容"), "夕暮れの花束");
+    await user.click(screen.getByRole("button", { name: "プロンプトに反映" }));
+
+    expect((screen.getByLabelText("Prompt") as HTMLTextAreaElement).value).toContain(
+      "夕暮れの花束",
+    );
+    expect(screen.getByText("作られる内容の要約")).toBeTruthy();
+  });
+
   it("submits normalized video composer values", async () => {
     const user = userEvent.setup();
     const handleSubmit = vi.fn();
@@ -87,6 +155,41 @@ describe("PromptForm", () => {
         .disabled,
     ).toBe(true);
   });
+
+  it("switches an unavailable initial model to an available local model", async () => {
+    const user = userEvent.setup();
+    const handleSubmit = vi.fn();
+
+    render(
+      <PromptForm
+        mediaType="video"
+        modelOptions={[
+          {
+            ...storyboardModel,
+            id: "missing-video",
+            isAvailable: false,
+            isDefault: true,
+            runtimeStatus: "missing_files",
+          },
+          storyboardModel,
+        ]}
+        initialValues={{ modelId: "missing-video", outputFormat: "gif", prompt: "test scene" }}
+        submitLabel="Create video"
+        onSubmit={handleSubmit}
+      />,
+    );
+
+    await waitFor(() => {
+      expect((screen.getByLabelText("Model") as HTMLSelectElement).value).toBe(
+        "storyboard-video",
+      );
+    });
+    await user.click(screen.getByRole("button", { name: "Create video" }));
+
+    expect(handleSubmit).toHaveBeenCalledWith(
+      expect.objectContaining({ modelId: "storyboard-video" }),
+    );
+  });
 });
 
 describe("studio helpers", () => {
@@ -109,6 +212,9 @@ describe("studio helpers", () => {
       outputFormat: "gif",
       prompt: "verification storyboard",
       negativePrompt: "flat lighting",
+      imageBriefPurpose: "SNS投稿",
+      imageBriefSubject: "",
+      imageBriefMood: "やわらかい光",
       width: 320,
       height: 180,
       steps: 30,

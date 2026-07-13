@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 try:
     from fastapi.testclient import TestClient
@@ -20,6 +22,26 @@ else:
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"missing dependency: {IMPORT_ERROR}")
 class ApiExtensionTests(unittest.TestCase):
+    def test_api_cors_uses_the_configured_web_port(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            services = create_application_services(
+                db_path=root / "jobs.db",
+                output_dir=root / "outputs" / "images",
+            )
+            with patch.dict(os.environ, {"WEB_PORT": "5174"}):
+                client = TestClient(create_app(services, start_job_runner=False))
+
+            response = client.options(
+                "/health",
+                headers={
+                    "Origin": "http://127.0.0.1:5174",
+                    "Access-Control-Request-Method": "GET",
+                },
+            )
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.headers["access-control-allow-origin"], "http://127.0.0.1:5174")
+
     def test_generate_image_and_audio_accept_project_binding(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -469,6 +491,7 @@ class ApiExtensionTests(unittest.TestCase):
                     "model_id": "storyboard-video",
                     "project_id": source_project_id,
                     "output_format": "gif",
+                    "seed": 42,
                     "params": {"duration_seconds": 2, "fps": 6, "visual_style": "animatic"},
                 },
             )
@@ -495,7 +518,12 @@ class ApiExtensionTests(unittest.TestCase):
                     "action": "variation",
                     "prompt": "graphic storyboard for a launch trailer, brighter color pass",
                     "project_id": target_project_id,
-                    "params": {"duration_seconds": 3, "camera_motion": "orbit"},
+                    "params": {
+                        "duration_seconds": 3,
+                        "camera_motion": "orbit",
+                        "review_issue_tags": ["color_lighting"],
+                        "review_source": "quick-review",
+                    },
                 },
             )
             self.assertEqual(reuse_response.status_code, 201)
@@ -504,6 +532,8 @@ class ApiExtensionTests(unittest.TestCase):
 
             reused_job = client.get(f"/jobs/{reuse_payload['job_id']}").json()
             self.assertEqual(reused_job["project_id"], target_project_id)
+            self.assertEqual(reused_job["request"]["seed"], 42)
+            self.assertEqual(reused_job["request"]["params"]["reuse_action"], "variation")
             self.assertEqual(
                 reused_job["request"]["params"]["source_asset_id"],
                 source_asset_id,
@@ -512,15 +542,60 @@ class ApiExtensionTests(unittest.TestCase):
                 reused_job["request"]["params"]["reference_asset_path"],
                 detail_payload["output_path"],
             )
+            self.assertEqual(
+                reused_job["request"]["params"]["review_issue_tags"],
+                ["color_lighting"],
+            )
+            self.assertEqual(
+                reused_job["request"]["params"]["review_source"],
+                "quick-review",
+            )
+
+            with patch("apps.api.routes.gallery.secrets.randbits", return_value=987654321):
+                rerun_response = client.post(
+                    f"/gallery/{source_asset_id}/reuse",
+                    json={
+                        "action": "rerun",
+                        "project_id": target_project_id,
+                    },
+                )
+            self.assertEqual(rerun_response.status_code, 201)
+            rerun_job = client.get(f"/jobs/{rerun_response.json()['job_id']}").json()
+            self.assertEqual(rerun_job["request"]["seed"], 987654321)
+            self.assertEqual(rerun_job["request"]["params"]["reuse_action"], "rerun")
+
+            with patch("apps.api.routes.gallery.secrets.randbits", return_value=123456789):
+                default_reuse_response = client.post(f"/gallery/{source_asset_id}/reuse", json={})
+            self.assertEqual(default_reuse_response.status_code, 201)
+            default_reuse_job = client.get(
+                f"/jobs/{default_reuse_response.json()['job_id']}"
+            ).json()
+            self.assertEqual(default_reuse_job["project_id"], source_project_id)
+            self.assertEqual(default_reuse_job["request"]["seed"], 123456789)
+            self.assertEqual(default_reuse_job["request"]["params"]["reuse_action"], "rerun")
+
+            invalid_action_response = client.post(
+                f"/gallery/{source_asset_id}/reuse",
+                json={"action": "repeat"},
+            )
+            self.assertEqual(invalid_action_response.status_code, 422)
 
             original_after_reuse = client.get(f"/gallery/{source_asset_id}").json()
             self.assertEqual(original_after_reuse["project_id"], source_project_id)
-            self.assertEqual(original_after_reuse["reuse_count"], 1)
+            self.assertEqual(original_after_reuse["reuse_count"], 3)
 
             services.job_runner.run_once()
+            rerun_processed_job = services.job_runner.run_once()
+            self.assertIsNotNone(rerun_processed_job)
+            assert rerun_processed_job is not None
+            self.assertEqual(rerun_processed_job.id, rerun_response.json()["job_id"])
+            self.assertNotEqual(
+                Path(processed_job.result.outputs[0]).read_bytes(),
+                Path(rerun_processed_job.result.outputs[0]).read_bytes(),
+            )
             target_gallery = client.get(f"/gallery?project_id={target_project_id}&media_type=video").json()
-            self.assertEqual(len(target_gallery), 1)
-            self.assertEqual(target_gallery[0]["project_id"], target_project_id)
+            self.assertEqual(len(target_gallery), 2)
+            self.assertTrue(all(item["project_id"] == target_project_id for item in target_gallery))
 
             export_response = client.post(
                 f"/gallery/{source_asset_id}/export",
@@ -545,8 +620,8 @@ class ApiExtensionTests(unittest.TestCase):
 
             source_project_jobs = client.get(f"/projects/{source_project_id}/jobs").json()
             target_project_jobs = client.get(f"/projects/{target_project_id}/jobs").json()
-            self.assertEqual(source_project_jobs["job_count"], 0)
-            self.assertEqual(target_project_jobs["job_count"], 2)
+            self.assertEqual(source_project_jobs["job_count"], 1)
+            self.assertEqual(target_project_jobs["job_count"], 3)
 
             feedback_response = client.post(
                 "/feedback",
@@ -573,7 +648,7 @@ class ApiExtensionTests(unittest.TestCase):
             self.assertIn("quality_summary", project_manifest["project"])
             self.assertIn("feedback_summary", project_manifest["project"])
             self.assertEqual(project_manifest["project"]["feedback_summary"]["total_feedback"], 1)
-            self.assertEqual(project_manifest["project"]["asset_count"], 2)
+            self.assertEqual(project_manifest["project"]["asset_count"], 3)
 
 
 if __name__ == "__main__":

@@ -136,6 +136,7 @@ if [ ! -f ".env" ]; then
 # API
 API_HOST=127.0.0.1
 API_PORT=8000
+WEB_PORT=5173
 API_RELOAD=true
 
 # Database
@@ -190,16 +191,19 @@ echo ""
 
 echo "📋 次のステップ:"
 echo ""
-echo "1️⃣  API サーバーを起動する:"
+echo "1️⃣  Studio をまとめて起動する:"
+echo "   ./scripts/start_studio.sh"
+echo ""
+echo "2️⃣  API サーバーを個別に起動する:"
 echo "   ./scripts/run_api_dev.sh"
 echo ""
-echo "2️⃣  Web UI を起動する:"
+echo "3️⃣  Web UI を個別に起動する:"
 echo "   cd apps/web && npm run dev"
 echo ""
-echo "3️⃣  API Docs を確認:"
+echo "4️⃣  API Docs を確認:"
 echo "   http://localhost:8000/docs"
 echo ""
-echo "4️⃣  Web UI を表示:"
+echo "5️⃣  Web UI を表示:"
 echo "   http://localhost:5173"
 echo ""
 echo "📚 詳細は README.md を参照してください"

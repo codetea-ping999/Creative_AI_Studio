@@ -66,9 +66,21 @@ export function buildGeneratePayload(
 export function buildReusePayload(
   values: PromptFormSubmitValues,
   projectId: string | null,
+  options: {
+    action?: "variation" | "rerun";
+    params?: Record<string, unknown>;
+  } = {},
 ): Record<string, unknown> {
+  const generationPayload = buildGenerationPayload(values, projectId);
+  const generationParams = generationPayload.params;
   return {
-    action: "variation",
-    ...buildGenerationPayload(values, projectId),
+    action: options.action ?? "variation",
+    ...generationPayload,
+    params: {
+      ...(generationParams && typeof generationParams === "object"
+        ? (generationParams as Record<string, unknown>)
+        : {}),
+      ...options.params,
+    },
   };
 }

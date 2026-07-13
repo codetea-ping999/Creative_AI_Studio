@@ -17,6 +17,19 @@
 - `.env`、`venv/`、`data/*.db`、`outputs/`、`apps/web/node_modules/` はローカル専用で Git には含めません
 - 実モデル本体は Git 管理対象外です。`models/manifests/` と軽量な補助ファイルだけをリポジトリに含め、重い checkpoint や weight は各開発環境で配置します
 
+## すぐに起動
+
+依存関係と `.env` を準備した後は、次の 1 コマンドで API と Web UI を起動します。
+
+```bash
+./scripts/start_studio.sh
+```
+
+起動スクリプトはルートの `.env` にある `API_PORT` と `WEB_PORT` をそろえて
+利用し、ブラウザを開きます。失敗時は表示された API / Web ログを確認してください。
+すでに API または Vite を別の port / API URL で起動している場合は、先にそのプロセスを
+停止してから実行してください。起動スクリプトは設定不一致を検出して再起動方法を案内します。
+
 ## Current Status
 
 ### ✅ 実装済み機能
@@ -434,6 +447,7 @@ cp apps/web/.env.example apps/web/.env
 |--------|-------------|------|
 | `API_HOST` | `127.0.0.1` | API バインドアドレス |
 | `API_PORT` | `8000` | API ポート番号 |
+| `WEB_PORT` | `5173` | Studio Web UI のポート。API の CORS 設定にも使われます。 |
 | `DB_PATH` | `./data/jobs.db` | SQLite データベースファイルパス |
 | `MODELS_ROOT` | `./models` | モデル関連ファイルのルートディレクトリ |
 | `MODELS_MANIFEST_ROOT` | `./models/manifests` | manifest 探索ディレクトリ |

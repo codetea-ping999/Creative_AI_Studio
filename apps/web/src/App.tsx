@@ -9,6 +9,11 @@ import {
 import { OutputThumbnail, StagePreview } from "./components/MediaPreview";
 import { buildGeneratePayload, buildReusePayload } from "./lib/payloads";
 import {
+  buildQuickReviewPrompt,
+  getQuickReviewIssueOptions,
+  type QuickReviewIssueTag,
+} from "./lib/quickReview";
+import {
   createDraftFromRequestSnapshot,
   defaultSubmitValues,
   extractJobQualityScore,
@@ -37,6 +42,20 @@ import {
 import { requestJson } from "./studioClient";
 
 type ThemeMode = "light" | "dark";
+type ModelLoadState = "idle" | "loading" | "loaded" | "error";
+
+const mediaTypeReadinessLabels: Record<MediaType, string> = {
+  image: "画像",
+  audio: "音声",
+  video: "動画",
+};
+
+type AssetReuseOptions = {
+  action?: "rerun" | "variation";
+  issueTags?: QuickReviewIssueTag[];
+  sourceAsset?: GalleryAssetDetailResponse;
+  useSourceSnapshot?: boolean;
+};
 
 function App() {
   const [themeMode, setThemeMode] = useState<ThemeMode>("dark");
@@ -48,6 +67,11 @@ function App() {
     image: [],
     audio: [],
     video: [],
+  });
+  const [modelLoadState, setModelLoadState] = useState<Record<MediaType, ModelLoadState>>({
+    image: "idle",
+    audio: "idle",
+    video: "idle",
   });
   const [loraOptions, setLoraOptions] = useState<LoraOption[]>([]);
   const [drafts, setDrafts] = useState<Record<MediaType, Partial<PromptFormSubmitValues>>>({
@@ -85,8 +109,48 @@ function App() {
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [assetMessage, setAssetMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [readinessError, setReadinessError] = useState<string | null>(null);
+  const [apiReachable, setApiReachable] = useState<boolean | null>(null);
+  const [isQuickReviewOpen, setIsQuickReviewOpen] = useState(false);
+  const [quickReviewIssueTags, setQuickReviewIssueTags] = useState<QuickReviewIssueTag[]>([]);
 
   const activeModels = modelOptionsByMedia[mediaType];
+  const activeModelLoadState = modelLoadState[mediaType];
+  const activeDraft = drafts[mediaType] ?? defaultSubmitValues[mediaType];
+  const selectedModelAvailable = activeModels.some(
+    (model) => model.id === activeDraft.modelId && model.isAvailable,
+  );
+  const activeAvailableModelCount = activeModels.filter((model) => model.isAvailable).length;
+  const readinessState =
+    apiReachable === null
+      ? "checking"
+      : apiReachable === false
+        ? "offline"
+        : activeModelLoadState === "idle" || activeModelLoadState === "loading"
+          ? "models-loading"
+          : activeModelLoadState === "error"
+            ? "models-error"
+            : activeAvailableModelCount > 0
+              ? "ready"
+              : "models-unavailable";
+  const readinessCopy =
+    readinessState === "ready"
+      ? `${mediaTypeReadinessLabels[mediaType]}モデル ${activeAvailableModelCount} 件を利用できます。初回生成は準備に時間がかかる場合があります。`
+      : readinessState === "models-loading"
+        ? `${mediaTypeReadinessLabels[mediaType]}モデルを読み込んでいます。`
+        : readinessState === "models-unavailable"
+          ? `利用可能な${mediaTypeReadinessLabels[mediaType]}モデルがありません。モデルを配置してから再試行してください。`
+          : readinessState === "models-error"
+            ? `${mediaTypeReadinessLabels[mediaType]}モデルの一覧を読み込めません。再試行してください。`
+            : readinessState === "offline"
+              ? "API に接続できません。./scripts/start_studio.sh の起動状態を確認してください。"
+              : "API とローカルモデルを確認しています。";
+  const generationGateMessage =
+    readinessState !== "ready"
+      ? readinessCopy
+      : !selectedModelAvailable
+        ? "選択中のモデルは利用できません。利用可能なモデルを選択してください。"
+        : null;
   const activeMetrics = metrics?.by_media[mediaType] ?? null;
   const selectedProject =
     projects.find((project) => project.id === selectedProjectId) ?? null;
@@ -112,18 +176,47 @@ function App() {
   }, [themeMode]);
 
   useEffect(() => {
-    void loadProjects();
-    void loadLoras();
+    void loadReadiness();
+    const timer = window.setInterval(() => {
+      void loadReadiness();
+    }, 10_000);
+    return () => window.clearInterval(timer);
   }, []);
 
-  useEffect(() => {
-    void loadModels(mediaType);
-    void refreshStudio(mediaType);
-  }, [mediaType]);
+  async function loadReadiness(): Promise<boolean> {
+    try {
+      const payload = await requestJson<{ status: string }>("/health");
+      const isReachable = payload.status === "ok";
+      setApiReachable(isReachable);
+      return isReachable;
+    } catch {
+      setApiReachable(false);
+      return false;
+    }
+  }
 
   useEffect(() => {
+    if (!apiReachable) {
+      return;
+    }
+    void loadProjects();
+    void loadLoras();
+  }, [apiReachable]);
+
+  useEffect(() => {
+    if (!apiReachable) {
+      return;
+    }
+    void loadModels(mediaType);
     void refreshStudio(mediaType);
-  }, [selectedProjectId, gallerySearch]);
+  }, [apiReachable, mediaType]);
+
+  useEffect(() => {
+    if (!apiReachable) {
+      return;
+    }
+    void refreshStudio(mediaType);
+  }, [apiReachable, selectedProjectId, gallerySearch]);
 
   useEffect(() => {
     if (!activeJobId) {
@@ -140,6 +233,11 @@ function App() {
     setProjectStatusDraft(selectedProject?.status ?? "active");
     setProjectTagsDraft(selectedProject?.tags.join(", ") ?? "");
   }, [selectedProject]);
+
+  useEffect(() => {
+    setIsQuickReviewOpen(false);
+    setQuickReviewIssueTags([]);
+  }, [selectedAssetId]);
 
   async function loadProjects(): Promise<void> {
     try {
@@ -164,29 +262,42 @@ function App() {
   }
 
   async function loadModels(targetMediaType: MediaType): Promise<void> {
+    setModelLoadState((current) => ({
+      ...current,
+      [targetMediaType]: "loading",
+    }));
     try {
       const payload = await requestJson<ModelsResponse>(
         `/models?media_type=${encodeURIComponent(targetMediaType)}`,
       );
       const nextModels = payload.models.map(normalizeModelOption);
+      setReadinessError(null);
       startTransition(() => {
         setModelOptionsByMedia((current) => ({
           ...current,
           [targetMediaType]: nextModels,
         }));
+        setModelLoadState((current) => ({
+          ...current,
+          [targetMediaType]: "loaded",
+        }));
         setDrafts((current) => {
           const currentDraft = current[targetMediaType] ?? defaultSubmitValues[targetMediaType];
           const currentModelId =
             typeof currentDraft.modelId === "string" ? currentDraft.modelId : "";
-          if (currentModelId && nextModels.some((option) => option.id === currentModelId)) {
+          if (
+            currentModelId &&
+            nextModels.some(
+              (option) => option.id === currentModelId && option.isAvailable,
+            )
+          ) {
             return current;
           }
 
           const preferredModel =
             nextModels.find((option) => option.isAvailable && option.isDefault) ??
-            nextModels.find((option) => option.isAvailable) ??
-            nextModels[0];
-          if (!preferredModel) {
+            nextModels.find((option) => option.isAvailable);
+          if (!preferredModel && !currentModelId) {
             return current;
           }
 
@@ -195,13 +306,25 @@ function App() {
             [targetMediaType]: {
               ...currentDraft,
               mediaType: targetMediaType,
-              modelId: preferredModel.id,
+              modelId: preferredModel?.id ?? "",
             },
           };
         });
       });
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : "Failed to load models.");
+      setModelLoadState((current) => ({
+        ...current,
+        [targetMediaType]: "error",
+      }));
+      setReadinessError(error instanceof Error ? error.message : "Failed to load models.");
+    }
+  }
+
+  async function handleReadinessRetry(): Promise<void> {
+    setReadinessError(null);
+    const isReachable = await loadReadiness();
+    if (isReachable) {
+      await loadModels(mediaType);
     }
   }
 
@@ -337,6 +460,18 @@ function App() {
   }
 
   async function handleSubmit(values: PromptFormSubmitValues): Promise<void> {
+    const requestedModelAvailable = modelOptionsByMedia[values.mediaType].some(
+      (model) => model.id === values.modelId && model.isAvailable,
+    );
+    if (readinessState !== "ready" || !requestedModelAvailable) {
+      setStatusMessage(
+        readinessState !== "ready"
+          ? readinessCopy
+          : "選択中のモデルは利用できません。利用可能なモデルを選択してください。",
+      );
+      return;
+    }
+
     setIsSubmitting(true);
     setErrorMessage(null);
     setStatusMessage("Queueing generation...");
@@ -519,6 +654,78 @@ function App() {
     }
   }
 
+  async function handleQuickReview(
+    kind: "accept" | "revise" | "rerun",
+    issueTags: QuickReviewIssueTag[] = [],
+  ): Promise<void> {
+    if (!selectedAssetDetail) {
+      return;
+    }
+
+    const reviewedAsset = selectedAssetDetail;
+    const applicableIssueTags = issueTags.filter((tag) =>
+      getQuickReviewIssueOptions(reviewedAsset.media_type).some((option) => option.id === tag),
+    );
+    setIsFeedbackBusy(true);
+    setErrorMessage(null);
+    try {
+      await requestJson<FeedbackResponse>("/feedback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          job_id: reviewedAsset.job_id,
+          asset_id: reviewedAsset.asset_id,
+          project_id: reviewedAsset.project_id,
+          quality_rating: kind === "accept" ? 5 : 3,
+          semantic_rating: kind === "accept" ? 5 : 3,
+          creative_rating: kind === "accept" ? 5 : 3,
+          reuse_intent: kind !== "accept",
+          export_ready: kind === "accept",
+          issue_tags: applicableIssueTags,
+          comments: kind === "accept" ? "採用" : kind === "rerun" ? "作り直す" : "少し直す",
+          metadata: { source: "quick-review", decision: kind },
+        }),
+      });
+      if (kind === "accept") {
+        setAssetMessage("採用として保存しました。書き出しまたはプロジェクトへの保存を続けられます。");
+        await refreshStudio(reviewedAsset.media_type, {
+          preferredAssetId: reviewedAsset.asset_id,
+        });
+        setIsQuickReviewOpen(false);
+        return;
+      }
+
+      const queued = await handleAssetReuse({
+        action: kind === "rerun" ? "rerun" : "variation",
+        issueTags: applicableIssueTags,
+        sourceAsset: reviewedAsset,
+        useSourceSnapshot: true,
+      });
+      if (queued) {
+        setQuickReviewIssueTags([]);
+        setIsQuickReviewOpen(false);
+      }
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "Failed to save review.");
+    } finally {
+      setIsFeedbackBusy(false);
+    }
+  }
+
+  function openQuickReview(): void {
+    setErrorMessage(null);
+    setQuickReviewIssueTags([]);
+    setIsQuickReviewOpen(true);
+  }
+
+  function toggleQuickReviewIssueTag(issueTag: QuickReviewIssueTag): void {
+    setQuickReviewIssueTags((current) =>
+      current.includes(issueTag)
+        ? current.filter((tag) => tag !== issueTag)
+        : [...current, issueTag],
+    );
+  }
+
   function loadSelectedAssetIntoComposer(): void {
     if (!selectedAssetDetail) {
       return;
@@ -540,50 +747,80 @@ function App() {
     });
   }
 
-  async function handleAssetReuse(): Promise<void> {
-    if (!selectedAssetDetail) {
-      return;
+  async function handleAssetReuse(options: AssetReuseOptions = {}): Promise<boolean> {
+    const sourceAsset = options.sourceAsset ?? selectedAssetDetail;
+    if (!sourceAsset) {
+      return false;
     }
+
+    const {
+      action = "variation",
+      issueTags = [],
+      useSourceSnapshot = false,
+    } = options;
 
     setIsAssetBusy(true);
     setErrorMessage(null);
     setAssetMessage(null);
 
+    const snapshotValues = mergeDraftWithDefaults(
+      sourceAsset.media_type,
+      createDraftFromRequestSnapshot(sourceAsset.request_snapshot),
+    );
     const sourceValues =
-      mediaType === selectedAssetDetail.media_type
-        ? mergeDraftWithDefaults(selectedAssetDetail.media_type, drafts[selectedAssetDetail.media_type])
-        : mergeDraftWithDefaults(
-            selectedAssetDetail.media_type,
-            createDraftFromRequestSnapshot(selectedAssetDetail.request_snapshot),
-          );
+      useSourceSnapshot || mediaType !== sourceAsset.media_type
+        ? snapshotValues
+        : mergeDraftWithDefaults(sourceAsset.media_type, drafts[sourceAsset.media_type]);
+    const reuseValues = {
+      ...sourceValues,
+      prompt: buildQuickReviewPrompt(sourceValues.prompt, issueTags),
+      seed: action === "rerun" ? null : sourceValues.seed,
+    };
+    const projectId = useSourceSnapshot
+      ? sourceAsset.project_id
+      : selectedProjectId || sourceAsset.project_id || null;
 
     try {
       const payload = await requestJson<ReuseAssetResponse>(
-        `/gallery/${selectedAssetDetail.asset_id}/reuse`,
+        `/gallery/${sourceAsset.asset_id}/reuse`,
         {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
           },
           body: JSON.stringify(
-            buildReusePayload(
-              sourceValues,
-              selectedProjectId || selectedAssetDetail.project_id || null,
-            ),
+            buildReusePayload(reuseValues, projectId, {
+              action,
+              params:
+                issueTags.length > 0
+                  ? {
+                      review_issue_tags: issueTags,
+                      review_source: "quick-review",
+                    }
+                  : undefined,
+            }),
           ),
         },
       );
 
-      setMediaType(selectedAssetDetail.media_type);
+      setMediaType(sourceAsset.media_type);
       setSelectedProjectId(payload.project_id ?? "");
       setIsSubmitting(true);
       setActiveJobId(payload.job_id);
-      setStatusMessage(`Queued variation job ${payload.job_id}.`);
-      setAssetMessage(`Created a variation job from ${selectedAssetDetail.asset_id}.`);
+      setStatusMessage(
+        action === "rerun" ? `Queued rerun job ${payload.job_id}.` : `Queued variation job ${payload.job_id}.`,
+      );
+      setAssetMessage(
+        action === "rerun"
+          ? `Created a fresh rerun from ${sourceAsset.asset_id}.`
+          : `Created a reviewed variation from ${sourceAsset.asset_id}.`,
+      );
       await loadJob(payload.job_id);
       await loadProjects();
+      return true;
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : "Failed to reuse the selected asset.");
+      return false;
     } finally {
       setIsAssetBusy(false);
     }
@@ -900,13 +1137,47 @@ function App() {
           </dl>
         </header>
 
+        <p
+          className={`readiness-banner ${readinessState === "ready" ? "is-ready" : "is-warning"}`}
+          role="status"
+          aria-live="polite"
+        >
+          <span className="readiness-banner__copy">
+            <strong>
+              {readinessState === "ready"
+                ? "準備完了"
+                : readinessState === "offline"
+                  ? "接続できません"
+                  : readinessState === "models-unavailable"
+                    ? "モデルが未配置です"
+                    : readinessState === "models-error"
+                      ? "モデルを確認できません"
+                      : "準備状況を確認中"}
+            </strong>
+            <span>{readinessCopy}</span>
+          </span>
+          {readinessState !== "ready" ? (
+            <button
+              type="button"
+              className="secondary-button readiness-banner__retry"
+              onClick={() => {
+                void handleReadinessRetry();
+              }}
+              disabled={activeModelLoadState === "loading"}
+            >
+              再試行
+            </button>
+          ) : null}
+        </p>
+
         {errorMessage ? <p className="error-banner" role="alert">{errorMessage}</p> : null}
+        {readinessError ? <p className="error-banner" role="alert">{readinessError}</p> : null}
 
         <section className="section-card section-card--stage">
           <div className="section-card__header">
             <div>
-              <p className="eyebrow">Composer</p>
-              <h2>{mediaTypeLabels[mediaType]} generation</h2>
+              <p className="eyebrow">かんたん作成</p>
+              <h2>{mediaType === "image" ? "画像を作る" : `${mediaTypeLabels[mediaType]} generation`}</h2>
             </div>
             <p className="section-footnote">
               Model manifests and local availability are loaded live from the registry.
@@ -919,10 +1190,10 @@ function App() {
             modelOptions={activeModels}
             loraOptions={mediaType === "image" ? loraOptions : []}
             initialValues={drafts[mediaType]}
-            submitLabel={isSubmitting ? "Generating..." : "Queue generation"}
+            submitLabel={isSubmitting ? "生成中..." : "生成する"}
             disabled={isSubmitting}
-            canSubmit={!isSubmitting}
-            statusMessage={statusMessage}
+            canSubmit={!isSubmitting && generationGateMessage === null}
+            statusMessage={generationGateMessage ?? statusMessage}
             onDraftChange={handleDraftChange}
             onSubmit={(values) => {
               void handleSubmit(values);
@@ -1022,6 +1293,7 @@ function App() {
                     onClick={() => {
                       void loadAssetDetail(item.asset_id);
                     }}
+                    disabled={isAssetBusy || isFeedbackBusy}
                   >
                     <OutputThumbnail mediaType={item.media_type} outputPath={item.preview_path} />
                     <div className="gallery-item__body">
@@ -1065,6 +1337,87 @@ function App() {
                   title={selectedAssetDetail.prompt}
                   subtitle={selectedAssetDetail.project_name || "Unassigned"}
                 />
+                <div className="asset-actions">
+                  <button
+                    type="button"
+                    className="dock-submit"
+                    onClick={() => {
+                      void handleQuickReview("accept");
+                    }}
+                    disabled={isFeedbackBusy || isAssetBusy}
+                  >
+                    採用
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={openQuickReview}
+                    disabled={isFeedbackBusy || isAssetBusy}
+                    aria-expanded={isQuickReviewOpen}
+                  >
+                    少し直す
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() => {
+                      void handleQuickReview("rerun");
+                    }}
+                    disabled={isFeedbackBusy || isAssetBusy}
+                  >
+                    作り直す
+                  </button>
+                </div>
+                {isQuickReviewOpen ? (
+                  <fieldset className="quick-review-panel">
+                    <legend>どこを直しますか？</legend>
+                    <p>選んだ修正理由を保存し、その内容を反映した派生案を作ります。</p>
+                    <div className="quick-review-options">
+                      {getQuickReviewIssueOptions(selectedAssetDetail.media_type).map((option) => {
+                        const isSelected = quickReviewIssueTags.includes(option.id);
+                        return (
+                          <label
+                            key={option.id}
+                            className={`quick-review-option ${isSelected ? "is-selected" : ""}`}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={isSelected}
+                              onChange={() => toggleQuickReviewIssueTag(option.id)}
+                              disabled={isFeedbackBusy || isAssetBusy}
+                            />
+                            <span>{option.label}</span>
+                          </label>
+                        );
+                      })}
+                    </div>
+                    <div className="asset-actions">
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        onClick={() => {
+                          setIsQuickReviewOpen(false);
+                          setQuickReviewIssueTags([]);
+                        }}
+                        disabled={isFeedbackBusy || isAssetBusy}
+                      >
+                        キャンセル
+                      </button>
+                      <button
+                        type="button"
+                        className="dock-submit"
+                        onClick={() => {
+                          void handleQuickReview("revise", quickReviewIssueTags);
+                        }}
+                        disabled={
+                          isFeedbackBusy || isAssetBusy || quickReviewIssueTags.length === 0
+                        }
+                      >
+                        選んだ内容で再生成
+                      </button>
+                    </div>
+                  </fieldset>
+                ) : null}
                 <div className="asset-actions">
                   <button
                     type="button"

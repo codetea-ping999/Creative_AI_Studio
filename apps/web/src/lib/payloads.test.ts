@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { PromptFormSubmitValues } from "../components/promptFormTypes";
 import { buildGeneratePayload, buildReusePayload } from "./payloads";
+import { buildQuickReviewPrompt, getQuickReviewIssueOptions } from "./quickReview";
 
 const baseValues: PromptFormSubmitValues = {
   mediaType: "image",
@@ -9,6 +10,9 @@ const baseValues: PromptFormSubmitValues = {
   outputFormat: "png",
   prompt: "studio portrait",
   negativePrompt: "blurry",
+  imageBriefPurpose: "SNS投稿",
+  imageBriefSubject: "studio portrait",
+  imageBriefMood: "やわらかい光",
   width: 1024,
   height: 1024,
   steps: 30,
@@ -81,6 +85,43 @@ describe("generation payloads", () => {
       project_id: "project-1",
       output_format: "png",
     });
+  });
+
+  it("keeps a quick-review action and tags with the reused request", () => {
+    expect(
+      buildReusePayload(baseValues, "project-1", {
+        action: "rerun",
+        params: {
+          review_issue_tags: ["mood"],
+          review_source: "quick-review",
+        },
+      }),
+    ).toMatchObject({
+      action: "rerun",
+      params: {
+        review_issue_tags: ["mood"],
+        review_source: "quick-review",
+      },
+    });
+  });
+
+  it("offers only media-appropriate quick-review reasons and clear prompt instructions", () => {
+    expect(getQuickReviewIssueOptions("image").map((option) => option.id)).toEqual([
+      "composition",
+      "subject_shape",
+      "mood",
+      "color_lighting",
+      "remove_text",
+    ]);
+    expect(getQuickReviewIssueOptions("audio").map((option) => option.id)).toEqual([
+      "mood",
+      "duration_tempo",
+    ]);
+    expect(
+      buildQuickReviewPrompt("editorial product shot", ["remove_text", "color_lighting"]),
+    ).toBe(
+      "editorial product shot Keep the main subject and intent. Improve the color and lighting. Remove all visible text.",
+    );
   });
 
   it("uses the learned model MP4 contract for video generation", () => {

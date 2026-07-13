@@ -21,6 +21,10 @@ Creative AI Studio の設定方法を、実装の読み込み順とあわせて�
 - Web はルート `.env` を読みません
 - Python 本体が dotenv を自動で読む構成ではありません
 
+例外として `./scripts/start_studio.sh` はルート `.env` を読み、`API_PORT` と `WEB_PORT` から
+Vite の API URL を設定します。別設定で起動済みの API / Vite プロセスは変更できないため、
+設定を変えた後はそれらを停止してから起動し直してください。
+
 ## 実際の読み込み経路
 
 ## API 側
@@ -65,12 +69,14 @@ cp apps/web/.env.example apps/web/.env
 | --- | --- | --- | --- |
 | `API_HOST` | `127.0.0.1` | `scripts/run_api_dev.sh`, `verify_local_stack.py` | bind address |
 | `API_PORT` | `8000` | `scripts/run_api_dev.sh`, `verify_local_stack.py` | bind port |
+| `WEB_PORT` | `5173` | `scripts/start_studio.sh`, API CORS | ローカル Vite の port |
 
 ### 例
 
 ```dotenv
 API_HOST=127.0.0.1
 API_PORT=8001
+WEB_PORT=5174
 ```
 
 ## 永続化と出力先
@@ -179,13 +185,19 @@ VITE_API_BASE_URL=http://127.0.0.1:8000
 
 ## 1. ポートだけ変更する
 
-`.env`
+`.env`（一括起動を使う場合）
 
 ```dotenv
 API_PORT=8001
+WEB_PORT=5174
 ```
 
-`apps/web/.env`
+```bash
+./scripts/start_studio.sh
+```
+
+`start_studio.sh` は `VITE_API_BASE_URL` と API CORS を同じ port 設定へ自動で
+そろえます。API と Web UI を別々に起動する場合だけ、`apps/web/.env` に次を設定します。
 
 ```dotenv
 VITE_API_BASE_URL=http://127.0.0.1:8001
@@ -218,6 +230,7 @@ OUTPUT_AUDIO_DIR=/Users/yourname/CreativeOutputs/audio
 ```dotenv
 API_HOST=127.0.0.1
 API_PORT=8000
+WEB_PORT=5173
 DB_PATH=./data/jobs.db
 MODELS_ROOT=./models
 MODELS_MANIFEST_ROOT=./models/manifests
@@ -254,11 +267,12 @@ MAX_CACHED_MODELS=1
 
 原因:
 
-- ルート `.env` だけ変えて `apps/web/.env` を変えていない
+- API と Web UI を別々に起動し、ルート `.env` だけ変更して `apps/web/.env` を変えていない
 
 対処:
 
-- `VITE_API_BASE_URL` も合わせて更新する
+- `./scripts/start_studio.sh` を使う
+- または `VITE_API_BASE_URL` も合わせて更新する
 
 ## model は見えるが生成時に失敗する
 

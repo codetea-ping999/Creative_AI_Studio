@@ -39,6 +39,9 @@ function createInitialState(
     outputFormat: merged.outputFormat,
     prompt: merged.prompt,
     negativePrompt: merged.negativePrompt,
+    imageBriefPurpose: merged.imageBriefPurpose,
+    imageBriefSubject: merged.imageBriefSubject,
+    imageBriefMood: merged.imageBriefMood,
     width: String(merged.width),
     height: String(merged.height),
     steps: String(merged.steps),
@@ -83,6 +86,9 @@ function serializeDraft(
     outputFormat: formValues.outputFormat,
     prompt: formValues.prompt,
     negativePrompt: formValues.negativePrompt,
+    imageBriefPurpose: formValues.imageBriefPurpose,
+    imageBriefSubject: formValues.imageBriefSubject,
+    imageBriefMood: formValues.imageBriefMood,
     width: parseRequiredInteger(formValues.width, defaultValues.width),
     height: parseRequiredInteger(formValues.height, defaultValues.height),
     steps: parseRequiredInteger(formValues.steps, defaultValues.steps),
@@ -102,6 +108,14 @@ function serializeDraft(
     cameraMotion: formValues.cameraMotion,
     visualStyle: formValues.visualStyle,
   };
+}
+
+function buildSimpleImagePrompt(formValues: PromptFormState): string {
+  const purpose =
+    formValues.imageBriefPurpose === "自由入力" ? "" : formValues.imageBriefPurpose;
+  return [formValues.imageBriefSubject.trim(), purpose, formValues.imageBriefMood]
+    .filter(Boolean)
+    .join(", ");
 }
 
 function resolveImageFormatPreset(width: number, height: number): string {
@@ -221,6 +235,26 @@ export function PromptForm({
     onDraftChange?.(serializeDraft(mediaType, formValues));
   }, [formValues, mediaType, onDraftChange]);
 
+  useEffect(() => {
+    const selectedModel = modelOptions.find((option) => option.id === formValues.modelId);
+    if (selectedModel?.isAvailable) {
+      return;
+    }
+
+    const preferredModel =
+      modelOptions.find((option) => option.isAvailable && option.isDefault) ??
+      modelOptions.find((option) => option.isAvailable);
+    const nextModelId = preferredModel?.id ?? "";
+    if (nextModelId === formValues.modelId) {
+      return;
+    }
+
+    setFormValues((current) => ({
+      ...current,
+      modelId: nextModelId,
+    }));
+  }, [formValues.modelId, modelOptions]);
+
   const setFieldValue = <K extends keyof PromptFormState>(
     field: K,
     value: PromptFormState[K],
@@ -229,6 +263,10 @@ export function PromptForm({
       ...current,
       [field]: value,
     }));
+  };
+
+  const applySimpleBrief = () => {
+    setFieldValue("prompt", buildSimpleImagePrompt(formValues));
   };
 
   const applyImagePreset = (preset: ImagePreset) => {
@@ -307,12 +345,20 @@ export function PromptForm({
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
 
+    const simpleImagePrompt =
+      mediaType === "image" && controlMode === "quick"
+        ? buildSimpleImagePrompt(formValues)
+        : "";
+
     onSubmit?.({
       mediaType,
       modelId: formValues.modelId,
       outputFormat: formValues.outputFormat,
-      prompt: formValues.prompt,
+      prompt: formValues.prompt.trim() || simpleImagePrompt,
       negativePrompt: formValues.negativePrompt,
+      imageBriefPurpose: formValues.imageBriefPurpose,
+      imageBriefSubject: formValues.imageBriefSubject,
+      imageBriefMood: formValues.imageBriefMood,
       width: parseRequiredInteger(formValues.width, defaultValues.width),
       height: parseRequiredInteger(formValues.height, defaultValues.height),
       steps: parseRequiredInteger(formValues.steps, defaultValues.steps),
@@ -386,6 +432,90 @@ export function PromptForm({
       ) : null}
     </section>
   );
+
+  const renderSimpleImageBrief = () => {
+    if (mediaType !== "image" || controlMode !== "quick") {
+      return null;
+    }
+
+    return (
+      <section className="form-section simple-brief">
+        <div className="form-section__header">
+          <div>
+            <h3>何を作りたいですか？</h3>
+            <p>用途、主役、雰囲気を選ぶと、送信する内容を下に組み立てます。</p>
+          </div>
+        </div>
+        <div className="preset-row" role="group" aria-label="制作目的">
+          {["SNS投稿", "キャラクター", "商品イメージ", "YouTube サムネイル", "自由入力"].map((purpose) => (
+            <button
+              key={purpose}
+              type="button"
+              className={`secondary-button ${formValues.imageBriefPurpose === purpose ? "is-selected" : ""}`}
+              onClick={() => setFieldValue("imageBriefPurpose", purpose)}
+              aria-pressed={formValues.imageBriefPurpose === purpose}
+              disabled={disabled}
+            >
+              {purpose}
+            </button>
+          ))}
+        </div>
+        <div className="field-grid field-grid--balanced">
+          <label className="field-group">
+            <span>1. 主役・内容</span>
+            <input
+              type="text"
+              value={formValues.imageBriefSubject}
+              onChange={(event) => setFieldValue("imageBriefSubject", event.target.value)}
+              placeholder="例：夕暮れのカフェで本を読む人物"
+              disabled={disabled}
+            />
+          </label>
+          <label className="field-group">
+            <span>2. 雰囲気</span>
+            <select
+              value={formValues.imageBriefMood}
+              onChange={(event) => setFieldValue("imageBriefMood", event.target.value)}
+              disabled={disabled}
+            >
+              <option value="やわらかい光">やわらかい光</option>
+              <option value="明るくクリーン">明るくクリーン</option>
+              <option value="映画のような光">映画のような光</option>
+              <option value="落ち着いたトーン">落ち着いたトーン</option>
+            </select>
+          </label>
+        </div>
+        <label className="field-group field-group--full">
+          <span>避けたい要素</span>
+          <input
+            type="text"
+            value={formValues.negativePrompt}
+            onChange={(event) => setFieldValue("negativePrompt", event.target.value)}
+            placeholder="例：文字、ぼやけ、余分な人物"
+            disabled={disabled}
+          />
+        </label>
+        <div className="simple-brief__summary">
+          <div>
+            <span>作られる内容の要約</span>
+            <strong>{[
+              formValues.imageBriefSubject || "主役を入力",
+              formValues.imageBriefPurpose,
+              formValues.imageBriefMood,
+            ].join("、")}</strong>
+          </div>
+          <button
+            type="button"
+            className="secondary-button"
+            onClick={applySimpleBrief}
+            disabled={disabled || !formValues.imageBriefSubject.trim()}
+          >
+            プロンプトに反映
+          </button>
+        </div>
+      </section>
+    );
+  };
 
   const renderQuickControls = () => {
     if (mediaType === "image") {
@@ -908,8 +1038,11 @@ export function PromptForm({
                   name="modelId"
                   value={formValues.modelId}
                   onChange={(event) => handleModelChange(event.target.value)}
-                  disabled={disabled}
+                  disabled={disabled || availableModelCount === 0}
                 >
+                  {availableModelCount === 0 ? (
+                    <option value="">No available local models</option>
+                  ) : null}
                   {modelOptions.map((option) => (
                     <option
                       key={option.id}
@@ -979,6 +1112,7 @@ export function PromptForm({
           ) : null}
         </section>
 
+        {renderSimpleImageBrief()}
         {renderPromptSection()}
         {controlMode === "quick" ? renderQuickControls() : renderAdvancedControls()}
       </div>

@@ -65,6 +65,18 @@ cp apps/web/.env.example apps/web/.env
 
 ## 起動
 
+### Studio をまとめて起動（推奨）
+
+```bash
+./scripts/start_studio.sh
+```
+
+このスクリプトは API と Web UI を必要な場合だけ起動し、ブラウザで Studio を開きます。
+ルートの `.env` に設定した `API_PORT` と `WEB_PORT` を両方のプロセスへ反映するため、
+通常は `apps/web/.env` の API URL を手動で合わせる必要はありません。別設定で API または
+Vite がすでに起動している場合は、先に停止してから実行してください。設定不一致は起動時に
+検出され、再起動方法が表示されます。
+
 ### API
 
 ```bash

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+import secrets
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field
@@ -79,7 +80,7 @@ class ReuseAssetRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    action: str = Field(default="rerun", min_length=1)
+    action: Literal["variation", "rerun"] = "rerun"
     prompt: str | None = None
     negative_prompt: str | None = None
     model_id: str | None = None
@@ -260,7 +261,13 @@ def _build_reuse_request(
                 else source_job.request.negative_prompt
             ),
             "model_id": req.model_id if req.model_id is not None else source_job.request.model_id,
-            "seed": req.seed if req.seed is not None else source_job.request.seed,
+            "seed": (
+                req.seed
+                if req.seed is not None
+                else secrets.randbits(63)
+                if req.action == "rerun"
+                else source_job.request.seed
+            ),
             "output_format": (
                 req.output_format
                 if req.output_format is not None

@@ -354,6 +354,11 @@ Query:
 
 派生生成を開始します。
 
+`action` は `"rerun"`（既定）または `"variation"` を指定します。`variation` は元の
+asset の seed を引き継ぎます。`rerun` で `seed` を省略するか `null` にすると、新しいランダム
+seed で同じ request を再実行します。レビュー画面からの派生理由など、UI 固有の補足情報は
+`params` に任意の JSON 値として保存できます。
+
 Request:
 
 ```json
@@ -367,7 +372,9 @@ Request:
   "project_id": "project_123",
   "params": {
     "width": 1024,
-    "height": 1024
+    "height": 1024,
+    "review_issue_tags": ["color_lighting"],
+    "review_source": "quick-review"
   }
 }
 ```
