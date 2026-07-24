@@ -28,4 +28,4 @@ To resolve the push failure and prevent future issues, the following steps were 
 
 ## 4. Recommendations for Future
 - **Model Management**: Store large models on Hugging Face or S3.
-- **Deployment**: Use a setup script (e.g., `setup_anime_sdxl.py`) to download required models from external sources during environment initialization rather than storing them in Git.
+- **Deployment**: Use a setup script (e.g., `scripts/setup_anime_sdxl.py`) to download required models from external sources during environment initialization rather than storing them in Git.

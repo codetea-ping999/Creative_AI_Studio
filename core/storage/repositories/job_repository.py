@@ -211,6 +211,13 @@ class JobRepository:
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self._db_path)
         connection.row_factory = sqlite3.Row
+        # The API request threads and the in-process job runner thread both
+        # open short-lived connections to this database. WAL plus a busy
+        # timeout lets concurrent readers/writers coexist instead of failing
+        # with "database is locked".
+        connection.execute("PRAGMA journal_mode=WAL;")
+        connection.execute("PRAGMA busy_timeout=5000;")
+        connection.execute("PRAGMA synchronous=NORMAL;")
         return connection
 
     @contextmanager

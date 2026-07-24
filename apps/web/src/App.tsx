@@ -6,7 +6,10 @@ import {
   type ModelOption,
   type PromptFormSubmitValues,
 } from "./components/PromptForm";
-import { OutputThumbnail, StagePreview } from "./components/MediaPreview";
+import { AssetDetailPanel, type FeedbackFormValues } from "./components/AssetDetailPanel";
+import { GalleryPanel } from "./components/GalleryPanel";
+import { LatestJobPanel } from "./components/LatestJobPanel";
+import { ModelsSummaryPanel } from "./components/ModelsSummaryPanel";
 import { buildGeneratePayload, buildReusePayload } from "./lib/payloads";
 import {
   buildQuickReviewPrompt,
@@ -16,10 +19,7 @@ import {
 import {
   createDraftFromRequestSnapshot,
   defaultSubmitValues,
-  extractJobQualityScore,
-  formatDate,
   formatPercent,
-  formatScore,
   mediaTypeLabels,
   mergeDraftWithDefaults,
   normalizeLoraOption,
@@ -99,20 +99,11 @@ function App() {
   const [isAssetBusy, setIsAssetBusy] = useState(false);
   const [isProjectBusy, setIsProjectBusy] = useState(false);
   const [isFeedbackBusy, setIsFeedbackBusy] = useState(false);
-  const [feedbackQuality, setFeedbackQuality] = useState("4");
-  const [feedbackSemantic, setFeedbackSemantic] = useState("4");
-  const [feedbackCreative, setFeedbackCreative] = useState("4");
-  const [feedbackReuseIntent, setFeedbackReuseIntent] = useState(false);
-  const [feedbackExportReady, setFeedbackExportReady] = useState(false);
-  const [feedbackIssueTags, setFeedbackIssueTags] = useState("");
-  const [feedbackComments, setFeedbackComments] = useState("");
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [assetMessage, setAssetMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [readinessError, setReadinessError] = useState<string | null>(null);
   const [apiReachable, setApiReachable] = useState<boolean | null>(null);
-  const [isQuickReviewOpen, setIsQuickReviewOpen] = useState(false);
-  const [quickReviewIssueTags, setQuickReviewIssueTags] = useState<QuickReviewIssueTag[]>([]);
 
   const activeModels = modelOptionsByMedia[mediaType];
   const activeModelLoadState = modelLoadState[mediaType];
@@ -233,11 +224,6 @@ function App() {
     setProjectStatusDraft(selectedProject?.status ?? "active");
     setProjectTagsDraft(selectedProject?.tags.join(", ") ?? "");
   }, [selectedProject]);
-
-  useEffect(() => {
-    setIsQuickReviewOpen(false);
-    setQuickReviewIssueTags([]);
-  }, [selectedAssetId]);
 
   async function loadProjects(): Promise<void> {
     try {
@@ -603,15 +589,10 @@ function App() {
     }
   }
 
-  async function handleFeedbackSubmit(event: FormEvent<HTMLFormElement>): Promise<void> {
-    event.preventDefault();
+  async function handleFeedbackSubmit(values: FeedbackFormValues): Promise<boolean> {
     if (!selectedAssetDetail) {
-      return;
+      return false;
     }
-
-    const qualityRating = Number.parseInt(feedbackQuality, 10);
-    const semanticRating = Number.parseInt(feedbackSemantic, 10);
-    const creativeRating = Number.parseInt(feedbackCreative, 10);
 
     setIsFeedbackBusy(true);
     setErrorMessage(null);
@@ -626,29 +607,26 @@ function App() {
           job_id: selectedAssetDetail.job_id,
           asset_id: selectedAssetDetail.asset_id,
           project_id: selectedAssetDetail.project_id,
-          quality_rating: qualityRating,
-          semantic_rating: Number.isFinite(semanticRating) ? semanticRating : null,
-          creative_rating: Number.isFinite(creativeRating) ? creativeRating : null,
-          reuse_intent: feedbackReuseIntent,
-          export_ready: feedbackExportReady,
-          issue_tags: feedbackIssueTags
-            .split(",")
-            .map((tag) => tag.trim())
-            .filter(Boolean),
-          comments: feedbackComments.trim(),
+          quality_rating: values.qualityRating,
+          semantic_rating: values.semanticRating,
+          creative_rating: values.creativeRating,
+          reuse_intent: values.reuseIntent,
+          export_ready: values.exportReady,
+          issue_tags: values.issueTags,
+          comments: values.comments,
           metadata: {
             source: "web-ui",
           },
         }),
       });
-      setFeedbackComments("");
-      setFeedbackIssueTags("");
       setAssetMessage(`Saved feedback ${feedback.id}.`);
       await refreshStudio(selectedAssetDetail.media_type, {
         preferredAssetId: selectedAssetDetail.asset_id,
       });
+      return true;
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : "Failed to submit feedback.");
+      return false;
     } finally {
       setIsFeedbackBusy(false);
     }
@@ -657,9 +635,9 @@ function App() {
   async function handleQuickReview(
     kind: "accept" | "revise" | "rerun",
     issueTags: QuickReviewIssueTag[] = [],
-  ): Promise<void> {
+  ): Promise<boolean> {
     if (!selectedAssetDetail) {
-      return;
+      return false;
     }
 
     const reviewedAsset = selectedAssetDetail;
@@ -691,39 +669,21 @@ function App() {
         await refreshStudio(reviewedAsset.media_type, {
           preferredAssetId: reviewedAsset.asset_id,
         });
-        setIsQuickReviewOpen(false);
-        return;
+        return true;
       }
 
-      const queued = await handleAssetReuse({
+      return await handleAssetReuse({
         action: kind === "rerun" ? "rerun" : "variation",
         issueTags: applicableIssueTags,
         sourceAsset: reviewedAsset,
         useSourceSnapshot: true,
       });
-      if (queued) {
-        setQuickReviewIssueTags([]);
-        setIsQuickReviewOpen(false);
-      }
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : "Failed to save review.");
+      return false;
     } finally {
       setIsFeedbackBusy(false);
     }
-  }
-
-  function openQuickReview(): void {
-    setErrorMessage(null);
-    setQuickReviewIssueTags([]);
-    setIsQuickReviewOpen(true);
-  }
-
-  function toggleQuickReviewIssueTag(issueTag: QuickReviewIssueTag): void {
-    setQuickReviewIssueTags((current) =>
-      current.includes(issueTag)
-        ? current.filter((tag) => tag !== issueTag)
-        : [...current, issueTag],
-    );
   }
 
   function loadSelectedAssetIntoComposer(): void {
@@ -1202,122 +1162,25 @@ function App() {
         </section>
 
         <div className="workspace-grid">
-          <section className="section-card section-card--monitor">
-            <div className="section-card__header">
-              <div>
-                <p className="eyebrow">Latest Job</p>
-                <h2>Run state and output preview</h2>
-              </div>
-            </div>
-            {latestJob ? (
-              <div className="monitor-stack">
-                <div className="gallery-item__topline">
-                  <span className={`status-chip status-chip--${latestJob.status}`} role="status">
-                    {latestJob.status}
-                  </span>
-                  <span className="history-score">{formatPercent(latestJob.progress * 100)}</span>
-                </div>
-                {!terminalStatuses.has(latestJob.status) ? (
-                  <button
-                    type="button"
-                    className="secondary-button"
-                    onClick={() => {
-                      void handleCancelLatestJob();
-                    }}
-                  >
-                    Cancel job
-                  </button>
-                ) : null}
-                <StagePreview
-                  mediaType={latestJob.media_type}
-                  outputPath={latestJob.result?.previews[0] ?? latestJob.result?.outputs[0] ?? null}
-                  title={latestJob.request.prompt}
-                  subtitle={latestJob.request.model_id || "default"}
-                />
-                <div className="metadata-grid">
-                  <div className="metadata-item">
-                    <span>Prompt</span>
-                    <strong>{latestJob.request.prompt}</strong>
-                  </div>
-                  <div className="metadata-item">
-                    <span>Project</span>
-                    <strong>{latestJob.project_id ?? "Unassigned"}</strong>
-                  </div>
-                  <div className="metadata-item">
-                    <span>Quality</span>
-                    <strong>{formatScore(extractJobQualityScore(latestJob))}</strong>
-                  </div>
-                  <div className="metadata-item">
-                    <span>Updated</span>
-                    <strong>{formatDate(latestJob.updated_at)}</strong>
-                  </div>
-                </div>
-              </div>
-            ) : (
-              <div className="empty-stage">
-                <div>
-                  <h3>No job selected</h3>
-                  <p>Queue a generation or reuse an existing asset to populate the stage.</p>
-                </div>
-              </div>
-            )}
-          </section>
+          <LatestJobPanel
+            latestJob={latestJob}
+            onCancel={() => {
+              void handleCancelLatestJob();
+            }}
+          />
 
-          <section className="section-card section-card--gallery">
-            <div className="section-card__header">
-              <div>
-                <p className="eyebrow">Gallery</p>
-                <h2>Recent {mediaTypeLabels[mediaType].toLowerCase()} assets</h2>
-              </div>
-              <p className="section-footnote">
-                {galleryItems.length} items loaded
-                {selectedProject ? ` | ${selectedProject.name}` : ""}
-              </p>
-            </div>
-            <label className="field-group field-group--full">
-              <span>Search current gallery</span>
-              <input
-                type="search"
-                value={gallerySearch}
-                onChange={(event) => setGallerySearch(event.target.value)}
-                placeholder="prompt, model, project, metadata"
-              />
-            </label>
-            <div className="gallery-list">
-              {galleryItems.length > 0 ? (
-                galleryItems.map((item) => (
-                  <button
-                    key={item.asset_id}
-                    type="button"
-                    className={`gallery-item ${item.asset_id === selectedAssetId ? "is-active" : ""}`}
-                    onClick={() => {
-                      void loadAssetDetail(item.asset_id);
-                    }}
-                    disabled={isAssetBusy || isFeedbackBusy}
-                  >
-                    <OutputThumbnail mediaType={item.media_type} outputPath={item.preview_path} />
-                    <div className="gallery-item__body">
-                      <div className="gallery-item__topline">
-                        <span className="history-item__media">{item.project_name || "Unassigned"}</span>
-                        <span className="history-score">
-                          {formatScore(item.quality_score_calibrated ?? item.quality_score)}
-                        </span>
-                      </div>
-                      <strong>{item.prompt}</strong>
-                      <p>
-                        {item.model_id} | feedback {item.feedback_count} | reuse {item.reuse_count} |
-                        export {item.export_count}
-                      </p>
-                    </div>
-                  </button>
-                ))
-              ) : (
-                <div className="history-empty">
-                  Successful jobs will appear here after the runner finishes them.
-                </div>
-              )}
-            </div>
-          </section>
+          <GalleryPanel
+            mediaLabel={mediaTypeLabels[mediaType]}
+            items={galleryItems}
+            projectName={selectedProject?.name ?? null}
+            search={gallerySearch}
+            onSearchChange={setGallerySearch}
+            selectedAssetId={selectedAssetId}
+            onSelect={(assetId) => {
+              void loadAssetDetail(assetId);
+            }}
+            disabled={isAssetBusy || isFeedbackBusy}
+          />
         </div>
 
         <section className="section-card">
@@ -1329,352 +1192,28 @@ function App() {
             {assetMessage ? <p className="section-footnote">{assetMessage}</p> : null}
           </div>
           {selectedAssetDetail ? (
-            <div className="detail-grid">
-              <div className="stage-stack">
-                <StagePreview
-                  mediaType={selectedAssetDetail.media_type}
-                  outputPath={selectedAssetDetail.preview_path}
-                  title={selectedAssetDetail.prompt}
-                  subtitle={selectedAssetDetail.project_name || "Unassigned"}
-                />
-                <div className="asset-actions">
-                  <button
-                    type="button"
-                    className="dock-submit"
-                    onClick={() => {
-                      void handleQuickReview("accept");
-                    }}
-                    disabled={isFeedbackBusy || isAssetBusy}
-                  >
-                    採用
-                  </button>
-                  <button
-                    type="button"
-                    className="secondary-button"
-                    onClick={openQuickReview}
-                    disabled={isFeedbackBusy || isAssetBusy}
-                    aria-expanded={isQuickReviewOpen}
-                  >
-                    少し直す
-                  </button>
-                  <button
-                    type="button"
-                    className="secondary-button"
-                    onClick={() => {
-                      void handleQuickReview("rerun");
-                    }}
-                    disabled={isFeedbackBusy || isAssetBusy}
-                  >
-                    作り直す
-                  </button>
-                </div>
-                {isQuickReviewOpen ? (
-                  <fieldset className="quick-review-panel">
-                    <legend>どこを直しますか？</legend>
-                    <p>選んだ修正理由を保存し、その内容を反映した派生案を作ります。</p>
-                    <div className="quick-review-options">
-                      {getQuickReviewIssueOptions(selectedAssetDetail.media_type).map((option) => {
-                        const isSelected = quickReviewIssueTags.includes(option.id);
-                        return (
-                          <label
-                            key={option.id}
-                            className={`quick-review-option ${isSelected ? "is-selected" : ""}`}
-                          >
-                            <input
-                              type="checkbox"
-                              checked={isSelected}
-                              onChange={() => toggleQuickReviewIssueTag(option.id)}
-                              disabled={isFeedbackBusy || isAssetBusy}
-                            />
-                            <span>{option.label}</span>
-                          </label>
-                        );
-                      })}
-                    </div>
-                    <div className="asset-actions">
-                      <button
-                        type="button"
-                        className="secondary-button"
-                        onClick={() => {
-                          setIsQuickReviewOpen(false);
-                          setQuickReviewIssueTags([]);
-                        }}
-                        disabled={isFeedbackBusy || isAssetBusy}
-                      >
-                        キャンセル
-                      </button>
-                      <button
-                        type="button"
-                        className="dock-submit"
-                        onClick={() => {
-                          void handleQuickReview("revise", quickReviewIssueTags);
-                        }}
-                        disabled={
-                          isFeedbackBusy || isAssetBusy || quickReviewIssueTags.length === 0
-                        }
-                      >
-                        選んだ内容で再生成
-                      </button>
-                    </div>
-                  </fieldset>
-                ) : null}
-                <div className="asset-actions">
-                  <button
-                    type="button"
-                    className="dock-submit"
-                    onClick={() => {
-                      void handleAssetReuse();
-                    }}
-                    disabled={isAssetBusy}
-                  >
-                    Reuse and rerun
-                  </button>
-                  <button
-                    type="button"
-                    className="secondary-button"
-                    onClick={loadSelectedAssetIntoComposer}
-                    disabled={isAssetBusy}
-                  >
-                    Load into composer
-                  </button>
-                  <button
-                    type="button"
-                    className="secondary-button"
-                    onClick={() => {
-                      void handleAssetExport();
-                    }}
-                    disabled={isAssetBusy}
-                  >
-                    Export asset
-                  </button>
-                </div>
-                <div className="form-section">
-                  <div className="form-section__header">
-                    <div>
-                      <p className="eyebrow">Project Binding</p>
-                      <h3>Move the source job and asset between projects</h3>
-                    </div>
-                  </div>
-                  <label className="field-group field-group--full">
-                    <span>Asset project</span>
-                    <select
-                      value={selectedAssetProjectId}
-                      onChange={(event) => setSelectedAssetProjectId(event.target.value)}
-                      disabled={isAssetBusy}
-                    >
-                      <option value="">Unassigned</option>
-                      {projects.map((project) => (
-                        <option key={project.id} value={project.id}>
-                          {project.name}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <button
-                    type="button"
-                    className="secondary-button"
-                    onClick={() => {
-                      void handleAssetProjectBinding();
-                    }}
-                    disabled={isAssetBusy}
-                  >
-                    Update asset project
-                  </button>
-                </div>
-              </div>
-
-              <div className="monitor-stack">
-                <div className="metadata-grid">
-                  <div className="metadata-item">
-                    <span>Asset</span>
-                    <strong>{selectedAssetDetail.asset_id}</strong>
-                  </div>
-                  <div className="metadata-item">
-                    <span>Model</span>
-                    <strong>{selectedAssetDetail.model_id}</strong>
-                  </div>
-                  <div className="metadata-item">
-                    <span>Created</span>
-                    <strong>{formatDate(selectedAssetDetail.created_at)}</strong>
-                  </div>
-                  <div className="metadata-item">
-                    <span>Updated</span>
-                    <strong>{formatDate(selectedAssetDetail.updated_at)}</strong>
-                  </div>
-                  <div className="metadata-item">
-                    <span>Quality</span>
-                    <strong>
-                      {formatScore(
-                        selectedAssetDetail.quality_score_calibrated ??
-                          selectedAssetDetail.quality_score,
-                      )}
-                    </strong>
-                  </div>
-                  <div className="metadata-item">
-                    <span>Semantic</span>
-                    <strong>
-                      {formatScore(
-                        selectedAssetDetail.semantic_alignment_score_calibrated ??
-                          selectedAssetDetail.semantic_alignment_score,
-                      )}
-                    </strong>
-                  </div>
-                  <div className="metadata-item">
-                    <span>Creative</span>
-                    <strong>
-                      {formatScore(
-                        selectedAssetDetail.creative_alignment_score_calibrated ??
-                          selectedAssetDetail.creative_alignment_score,
-                      )}
-                    </strong>
-                  </div>
-                  <div className="metadata-item">
-                    <span>Feedback</span>
-                    <strong>{selectedAssetDetail.feedback_count}</strong>
-                  </div>
-                </div>
-
-                <div className="form-section">
-                  <div className="form-section__header">
-                    <div>
-                      <p className="eyebrow">Lineage</p>
-                      <h3>Trace reuse and export state</h3>
-                    </div>
-                  </div>
-                  <div className="asset-chip-row">
-                    <span className="form-section__mode">
-                      reuse {selectedAssetDetail.reuse_count}
-                    </span>
-                    <span className="form-section__mode">
-                      export {selectedAssetDetail.export_count}
-                    </span>
-                    <span className="form-section__mode">
-                      feedback {selectedAssetDetail.feedback_count}
-                    </span>
-                  </div>
-                  <div className="asset-list">
-                    <div className="asset-path">
-                      <span>Parent Asset</span>
-                      <code>{selectedAssetDetail.parent_asset_id ?? "none"}</code>
-                    </div>
-                    <div className="asset-path">
-                      <span>Lineage</span>
-                      <code>
-                        {selectedAssetDetail.lineage.length > 0
-                          ? selectedAssetDetail.lineage.join(", ")
-                          : "none"}
-                      </code>
-                    </div>
-                    <div className="asset-path">
-                      <span>Exports</span>
-                      <code>
-                        {selectedAssetDetail.export_paths.length > 0
-                          ? selectedAssetDetail.export_paths.join(", ")
-                          : "none"}
-                      </code>
-                    </div>
-                  </div>
-                </div>
-
-                <form className="form-section" onSubmit={(event) => void handleFeedbackSubmit(event)}>
-                  <div className="form-section__header">
-                    <div>
-                      <p className="eyebrow">Human Feedback</p>
-                      <h3>Record review signal for calibration and reuse decisions</h3>
-                    </div>
-                  </div>
-                  <div className="field-grid field-grid--controls">
-                    <label className="field-group">
-                      <span>Quality</span>
-                      <select
-                        value={feedbackQuality}
-                        onChange={(event) => setFeedbackQuality(event.target.value)}
-                        disabled={isFeedbackBusy}
-                      >
-                        {[1, 2, 3, 4, 5].map((rating) => (
-                          <option key={rating} value={rating}>
-                            {rating}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <label className="field-group">
-                      <span>Semantic</span>
-                      <select
-                        value={feedbackSemantic}
-                        onChange={(event) => setFeedbackSemantic(event.target.value)}
-                        disabled={isFeedbackBusy}
-                      >
-                        {[1, 2, 3, 4, 5].map((rating) => (
-                          <option key={rating} value={rating}>
-                            {rating}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <label className="field-group">
-                      <span>Creative</span>
-                      <select
-                        value={feedbackCreative}
-                        onChange={(event) => setFeedbackCreative(event.target.value)}
-                        disabled={isFeedbackBusy}
-                      >
-                        {[1, 2, 3, 4, 5].map((rating) => (
-                          <option key={rating} value={rating}>
-                            {rating}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                  </div>
-                  <div className="feedback-toggles">
-                    <label>
-                      <input
-                        type="checkbox"
-                        checked={feedbackReuseIntent}
-                        onChange={(event) => setFeedbackReuseIntent(event.target.checked)}
-                        disabled={isFeedbackBusy}
-                      />
-                      Reuse candidate
-                    </label>
-                    <label>
-                      <input
-                        type="checkbox"
-                        checked={feedbackExportReady}
-                        onChange={(event) => setFeedbackExportReady(event.target.checked)}
-                        disabled={isFeedbackBusy}
-                      />
-                      Export ready
-                    </label>
-                  </div>
-                  <label className="field-group field-group--full">
-                    <span>Issue tags</span>
-                    <input
-                      type="text"
-                      value={feedbackIssueTags}
-                      onChange={(event) => setFeedbackIssueTags(event.target.value)}
-                      placeholder="composition, lighting"
-                      disabled={isFeedbackBusy}
-                    />
-                  </label>
-                  <label className="field-group field-group--full">
-                    <span>Comments</span>
-                    <textarea
-                      rows={3}
-                      value={feedbackComments}
-                      onChange={(event) => setFeedbackComments(event.target.value)}
-                      placeholder="What should change before production use?"
-                      disabled={isFeedbackBusy}
-                    />
-                  </label>
-                  <button type="submit" className="dock-submit" disabled={isFeedbackBusy}>
-                    {isFeedbackBusy ? "Saving..." : "Save feedback"}
-                  </button>
-                </form>
-
-                <pre>{JSON.stringify(selectedAssetDetail.request_snapshot, null, 2)}</pre>
-              </div>
-            </div>
+            <AssetDetailPanel
+              key={selectedAssetDetail.asset_id}
+              detail={selectedAssetDetail}
+              projects={projects}
+              assetProjectId={selectedAssetProjectId}
+              onAssetProjectIdChange={setSelectedAssetProjectId}
+              isAssetBusy={isAssetBusy}
+              isFeedbackBusy={isFeedbackBusy}
+              onOpenQuickReview={() => setErrorMessage(null)}
+              onQuickReview={handleQuickReview}
+              onReuse={() => {
+                void handleAssetReuse();
+              }}
+              onLoadIntoComposer={loadSelectedAssetIntoComposer}
+              onExport={() => {
+                void handleAssetExport();
+              }}
+              onBindProject={() => {
+                void handleAssetProjectBinding();
+              }}
+              onSubmitFeedback={handleFeedbackSubmit}
+            />
           ) : (
             <div className="empty-stage">
               <div>
@@ -1685,45 +1224,12 @@ function App() {
           )}
         </section>
 
-        <section className="section-card section-card--models">
-          <div className="section-card__header">
-            <div>
-              <p className="eyebrow">Coverage</p>
-              <h2>Models and operational summary</h2>
-            </div>
-          </div>
-          <div className="workspace-grid">
-            <div className="model-shelf">
-              {activeModels.map((model) => (
-                <div key={model.id} className="metric-pill">
-                  <strong>{model.displayName}</strong>
-                  <p>
-                    {model.isAvailable ? "Installed" : "Manifest only"}
-                    {model.tags.length > 0 ? ` | ${model.tags.join(", ")}` : ""}
-                  </p>
-                </div>
-              ))}
-            </div>
-            <div className="monitor-stack">
-              <div className="metric-pill">
-                <strong>{metrics?.total_jobs ?? 0}</strong>
-                <p>Total jobs</p>
-              </div>
-              <div className="metric-pill">
-                <strong>{formatPercent(metrics?.success_rate)}</strong>
-                <p>Studio success rate</p>
-              </div>
-              <div className="metric-pill">
-                <strong>{formatScore(activeMetrics?.average_quality_score)}</strong>
-                <p>{mediaTypeLabels[mediaType]} average quality</p>
-              </div>
-              <div className="metric-pill">
-                <strong>{formatPercent(activeMetrics?.feedback_coverage_rate)}</strong>
-                <p>{mediaTypeLabels[mediaType]} feedback coverage</p>
-              </div>
-            </div>
-          </div>
-        </section>
+        <ModelsSummaryPanel
+          models={activeModels}
+          metrics={metrics}
+          activeMetrics={activeMetrics}
+          mediaLabel={mediaTypeLabels[mediaType]}
+        />
       </main>
     </div>
   );

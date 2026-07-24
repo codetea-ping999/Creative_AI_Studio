@@ -269,6 +269,7 @@ def create_application_services(
         generator_registry,
         event_bus,
         asset_repository=asset_repository,
+        job_service=job_service,
     )
     project_repository = ProjectRepository(resolved_db_path.parent / "projects")
     feedback_repository = FeedbackRepository(resolved_db_path.parent / "feedback")

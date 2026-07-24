@@ -600,7 +600,7 @@ class ApiExtensionTests(unittest.TestCase):
             export_response = client.post(
                 f"/gallery/{source_asset_id}/export",
                 json={
-                    "destination_dir": str(root / "exports" / "video"),
+                    "destination_dir": str(root / "outputs" / "exports" / "video"),
                     "destination_name": "launch-trailer-source.gif",
                     "include_metadata": True,
                 },
@@ -639,7 +639,7 @@ class ApiExtensionTests(unittest.TestCase):
 
             project_export_response = client.post(
                 f"/projects/{target_project_id}/export",
-                json={"destination_dir": str(root / "exports" / "project-bundle")},
+                json={"destination_dir": str(root / "outputs" / "exports" / "project-bundle")},
             )
             self.assertEqual(project_export_response.status_code, 200)
             project_manifest_path = Path(project_export_response.json()["manifest_path"])
