@@ -72,6 +72,37 @@ if CORE_IMPORT_ERROR is None:
         def cleanup(self, request: GenerationRequest) -> None:
             return None
 
+    class _CancelDuringGenerateGenerator(BaseGenerator):
+        """Cancels the in-flight job while generating, then returns success."""
+
+        def __init__(self, output_dir: Path, on_generate) -> None:
+            self.output_dir = output_dir
+            self._on_generate = on_generate
+
+        def validate_request(self, request: GenerationRequest) -> None:
+            return None
+
+        def prepare(self, request: GenerationRequest) -> None:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        def generate(self, request: GenerationRequest):
+            self._on_generate()
+            output_path = self.output_dir / "stub.wav"
+            output_path.write_bytes(b"RIFFstub")
+            from core.schemas import GenerationResult
+
+            return GenerationResult(
+                job_id="cancel-stub",
+                status="succeeded",
+                outputs=[str(output_path)],
+                previews=[],
+                metadata={"media_type": "audio"},
+                error_message=None,
+            )
+
+        def cleanup(self, request: GenerationRequest) -> None:
+            return None
+
 
 class _FakePipelineResult:
     def __init__(self, image: Image.Image) -> None:
@@ -289,6 +320,49 @@ class JobPipelineTests(unittest.TestCase):
             assert skipped_job is not None
             self.assertEqual(skipped_job.status, "cancelled")
             self.assertFalse((root / "outputs" / "audio" / "stub.wav").exists())
+
+    def test_runner_honors_cancellation_that_lands_during_generation(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            repository = JobRepository(root / "jobs.db")
+            queue = JobQueue()
+            event_bus = EventBus()
+            service = JobService(repository, queue, event_bus)
+
+            job = service.create_job(
+                GenerationRequest(
+                    media_type="audio",
+                    prompt="cancel me mid-flight",
+                    model_id="",
+                    output_format="wav",
+                    params={},
+                )
+            )
+
+            def _cancel_mid_run() -> None:
+                service.cancel_job(job.id)
+
+            registry = GeneratorRegistry(
+                {
+                    "audio": _CancelDuringGenerateGenerator(
+                        root / "outputs" / "audio",
+                        _cancel_mid_run,
+                    )
+                }
+            )
+            runner = JobRunner(repository, queue, registry, event_bus)
+
+            final_job = runner.run_once()
+
+            self.assertIsNotNone(final_job)
+            assert final_job is not None
+            # A cancel that lands while generating must not be clobbered by the
+            # success transition.
+            self.assertEqual(final_job.status, "cancelled")
+            persisted = repository.get(job.id)
+            assert persisted is not None
+            self.assertEqual(persisted.status, "cancelled")
+            self.assertNotEqual(persisted.status, "succeeded")
 
 
 if __name__ == "__main__":

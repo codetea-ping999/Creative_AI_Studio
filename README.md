@@ -158,7 +158,7 @@ creative-ai-studio/
 
 補足:
 
-- `README_v0.2.md`、`IMPLEMENTATION_SUMMARY.md`、`REPAIR_COMPLETE.md`、`COMPLETION_CHECKLIST.md` は履歴資料です
+- `docs/history/` に履歴資料（`README_v0.2.md`、`IMPLEMENTATION_SUMMARY.md`、`REPAIR_COMPLETE.md`、`COMPLETION_CHECKLIST.md`、`LFS_FIX_REPORT.md`）をまとめています
 - 現在の構造理解や学習には、まず `docs/README.md` と `docs/codebase-guide.md` から読むのを推奨します
 
 ## トラブルシューティング
@@ -519,13 +519,13 @@ npm run dev
 - [x] Web UI フレームワーク
 - [x] Image Generator 実ランタイム統合
 - [x] checkpoint 選択 / LoRA 入力 UI
+- [x] ジョブランナー実装（API プロセス内で自動起動）
+- [x] 履歴・ギャラリー表示
 - [ ] Web UI 完全実装
 
 補足:
 
 - 現時点の画像生成はローカル配置した SDXL 系 checkpoint を使います。Apple Silicon では安定性優先で MPS 実行時に `float32` を使います。
-- [ ] ジョブランナー実装
-- [ ] 履歴・ギャラリー表示
 
 ## 開発ガイド
 

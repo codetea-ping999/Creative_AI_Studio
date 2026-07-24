@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from apps.api.dependencies import get_services
+from apps.api.export_paths import resolve_export_dir, sanitize_export_name
 from bootstrap import ApplicationServices
 from core.assets import Asset
 from core.quality import calibrate_quality_report
@@ -127,10 +128,6 @@ class BindAssetProjectRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     project_id: str | None = None
-
-
-def _sync_assets(services: ApplicationServices) -> None:
-    services.asset_repository.sync_jobs(services.job_service.list_jobs())
 
 
 def _serialize_gallery_item(
@@ -287,7 +284,6 @@ def list_gallery(
     limit: int = Query(50, ge=1, le=200),
     services: ApplicationServices = Depends(get_services),
 ) -> list[GalleryItemResponse]:
-    _sync_assets(services)
     items = services.asset_repository.list_all(
         media_type=media_type,
         project_id=project_id,
@@ -302,7 +298,6 @@ def get_gallery_item_by_job(
     job_id: str,
     services: ApplicationServices = Depends(get_services),
 ) -> GalleryAssetDetailResponse:
-    _sync_assets(services)
     asset = services.asset_repository.get_primary_by_job(job_id)
     if asset is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Gallery asset not found")
@@ -313,7 +308,6 @@ def get_gallery_item_by_job(
 def get_gallery_stats(
     services: ApplicationServices = Depends(get_services),
 ) -> GalleryStatsResponse:
-    _sync_assets(services)
     items = services.asset_repository.list_all()
 
     total_by_media_type: dict[str, int] = {}
@@ -350,7 +344,6 @@ def get_gallery_asset(
     asset_id: str,
     services: ApplicationServices = Depends(get_services),
 ) -> GalleryAssetDetailResponse:
-    _sync_assets(services)
     asset = services.asset_repository.get(asset_id)
     if asset is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Gallery asset not found")
@@ -367,7 +360,6 @@ def reuse_gallery_asset(
     req: ReuseAssetRequest,
     services: ApplicationServices = Depends(get_services),
 ) -> ReuseAssetResponse:
-    _sync_assets(services)
     source_asset = services.asset_repository.get(asset_id)
     if source_asset is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Gallery asset not found")
@@ -395,20 +387,20 @@ def export_gallery_asset(
     req: ExportAssetRequest,
     services: ApplicationServices = Depends(get_services),
 ) -> ExportAssetResponse:
-    _sync_assets(services)
     asset = services.asset_repository.get(asset_id)
     if asset is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Gallery asset not found")
 
-    destination_dir = (
-        Path(req.destination_dir)
-        if req.destination_dir
-        else services.output_dir.parent / "exports" / asset.media_type
+    destination_dir = resolve_export_dir(
+        services,
+        req.destination_dir,
+        default_subpath=asset.media_type,
     )
+    destination_name = sanitize_export_name(req.destination_name)
     exported = services.asset_repository.export_asset(
         asset_id,
         export_root=destination_dir,
-        destination_name=req.destination_name,
+        destination_name=destination_name,
         include_metadata=req.include_metadata,
     )
     return ExportAssetResponse(
@@ -424,7 +416,6 @@ def bind_gallery_asset_to_project(
     req: BindAssetProjectRequest,
     services: ApplicationServices = Depends(get_services),
 ) -> GalleryAssetDetailResponse:
-    _sync_assets(services)
     asset = services.asset_repository.get(asset_id)
     if asset is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Gallery asset not found")

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 import uuid
 
-from core.storage.json_files import write_json_atomic
+from core.storage.json_files import ensure_utc, utc_now, write_json_atomic
 
 
 def _normalize_score(value: float | None) -> float | None:
@@ -44,7 +44,7 @@ class Feedback:
 
     def __post_init__(self) -> None:
         if self.created_at is None:
-            self.created_at = datetime.now()
+            self.created_at = utc_now()
         if self.issue_tags is None:
             self.issue_tags = []
         if self.metadata is None:
@@ -107,7 +107,7 @@ class FeedbackRepository:
             issue_tags=list(issue_tags or []),
             comments=comments,
             metadata=dict(metadata or {}),
-            created_at=datetime.now(),
+            created_at=utc_now(),
         )
         self._save_feedback(feedback)
         return feedback
@@ -224,7 +224,7 @@ class FeedbackRepository:
             issue_tags=list(data.get("issue_tags", [])),
             comments=data.get("comments", ""),
             metadata=dict(data.get("metadata", {})),
-            created_at=datetime.fromisoformat(data["created_at"]),
+            created_at=ensure_utc(datetime.fromisoformat(data["created_at"])),
         )
 
     def _try_load_feedback(self, feedback_file: Path) -> Feedback | None:

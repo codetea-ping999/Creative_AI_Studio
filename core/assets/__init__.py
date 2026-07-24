@@ -11,11 +11,11 @@ import shutil
 from typing import Any
 
 from core.jobs import JobRecord
-from core.storage.json_files import write_json_atomic
+from core.storage.json_files import ensure_utc, utc_now, write_json_atomic
 
 
 def _now() -> datetime:
-    return datetime.now()
+    return utc_now()
 
 
 def _stable_asset_id(job_id: str, output_path: str) -> str:
@@ -291,6 +291,13 @@ class AssetRepository:
         destination_name: str | None = None,
         include_metadata: bool = True,
     ) -> dict[str, str]:
+        """Copy an asset to ``export_root``.
+
+        ``export_root`` and ``destination_name`` are written to directly, so
+        callers exposing them to untrusted input must validate them first (see
+        ``apps.api.export_paths``) to avoid path traversal / arbitrary writes.
+        """
+
         asset = self.get(asset_id)
         if asset is None:
             raise LookupError(f"Unknown asset: {asset_id}")
@@ -374,8 +381,8 @@ class AssetRepository:
             export_paths=list(data.get("export_paths", [])),
             tags=list(data.get("tags", [])),
             metadata=dict(data.get("metadata", {})),
-            created_at=datetime.fromisoformat(data["created_at"]),
-            updated_at=datetime.fromisoformat(data["updated_at"]),
+            created_at=ensure_utc(datetime.fromisoformat(data["created_at"])),
+            updated_at=ensure_utc(datetime.fromisoformat(data["updated_at"])),
         )
 
     def _try_load_asset(self, asset_path: Path) -> Asset | None:

@@ -47,6 +47,14 @@ def create_app(
         stop_event: Event | None = None
         worker: Thread | None = None
 
+        # Reconcile the asset registry once at startup so jobs that succeeded in
+        # a previous process appear in the gallery. Steady-state syncing happens
+        # at job completion (JobService.mark_succeeded), so read endpoints no
+        # longer need to re-sync every request.
+        resolved_services.asset_repository.sync_jobs(
+            resolved_services.job_repository.list()
+        )
+
         if start_job_runner:
             stop_event = Event()
             worker = Thread(
