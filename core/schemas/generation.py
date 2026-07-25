@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-MediaType = Literal["image", "video", "audio"]
+MediaType = Literal["image", "video", "audio", "text"]
 GenerationStatus = Literal[
     "queued",
     "preparing",
@@ -25,6 +25,13 @@ class GenerationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     media_type: MediaType = Field(description="Target media type to generate.")
+    task_type: str | None = Field(
+        default=None,
+        description=(
+            "Optional generation task within the media type, such as text-to-speech "
+            "or assembly. None routes to the default generator for the media type."
+        ),
+    )
     prompt: str = Field(description="Primary generation prompt.")
     negative_prompt: str | None = Field(
         default=None,
