@@ -19,6 +19,9 @@
 
 ## すぐに起動
 
+前提は Python 3.10 以上と、Node.js 20.19 以上または 22.12 以上です。
+`./setup.sh` と `scripts/check_local_setup.py` は未対応バージョンを開始前に検出します。
+
 依存関係と `.env` を準備した後は、次の 1 コマンドで API と Web UI を起動します。
 
 ```bash
@@ -158,7 +161,7 @@ creative-ai-studio/
 
 補足:
 
-- `README_v0.2.md`、`IMPLEMENTATION_SUMMARY.md`、`REPAIR_COMPLETE.md`、`COMPLETION_CHECKLIST.md` は履歴資料です
+- `docs/history/` に履歴資料（`README_v0.2.md`、`IMPLEMENTATION_SUMMARY.md`、`REPAIR_COMPLETE.md`、`COMPLETION_CHECKLIST.md`、`LFS_FIX_REPORT.md`）をまとめています
 - 現在の構造理解や学習には、まず `docs/README.md` と `docs/codebase-guide.md` から読むのを推奨します
 
 ## トラブルシューティング
@@ -231,9 +234,13 @@ chmod +x setup.sh
 この検証は以下をまとめて実行します。
 
 - `scripts/check_local_setup.py --skip-runtime-files`
+- `apps/web` の `npm test`
 - `apps/web` の `npm run build`
 - `pytest -q`
 - 一時起動した API に対する `/health` と `/models` の smoke check
+
+標準検証は一時ディレクトリ内の DB・project/feedback・生成出力と、空いている
+loopback port を使います。既存の `data/`、`outputs/`、起動中の 8000 port には触れません。
 
 ### 手動セットアップ
 
@@ -241,9 +248,9 @@ chmod +x setup.sh
 
 #### 前提条件
 
-- Python 3.9 以上
-- Node.js 18 以上
-- npm または yarn
+- Python 3.10 以上
+- Node.js 20.19 以上、または 22.12 以上
+- npm
 
 #### ステップ 1: Python 環境の構築
 
@@ -519,13 +526,13 @@ npm run dev
 - [x] Web UI フレームワーク
 - [x] Image Generator 実ランタイム統合
 - [x] checkpoint 選択 / LoRA 入力 UI
+- [x] ジョブランナー実装（API プロセス内で自動起動）
+- [x] 履歴・ギャラリー表示
 - [ ] Web UI 完全実装
 
 補足:
 
 - 現時点の画像生成はローカル配置した SDXL 系 checkpoint を使います。Apple Silicon では安定性優先で MPS 実行時に `float32` を使います。
-- [ ] ジョブランナー実装
-- [ ] 履歴・ギャラリー表示
 
 ## 開発ガイド
 

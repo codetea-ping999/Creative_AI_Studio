@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from apps.api.dependencies import get_services
+from apps.api.export_paths import resolve_export_dir
 from bootstrap import ApplicationServices
 from core.assets import Asset
 from core.jobs import JobRecord
@@ -116,10 +117,6 @@ class ExportProjectResponse(BaseModel):
     manifest_path: str = Field(min_length=1)
 
 
-def _sync_assets(services: ApplicationServices) -> None:
-    services.asset_repository.sync_jobs(services.job_service.list_jobs())
-
-
 def _get_project_repo(services: ApplicationServices) -> ProjectRepository:
     return services.project_repository
 
@@ -186,7 +183,6 @@ def create_project(
         tags=req.tags,
         metadata=req.metadata,
     )
-    _sync_assets(services)
     return _serialize_project(project, services)
 
 
@@ -197,7 +193,6 @@ def list_projects(
     tag: str | None = Query(default=None, min_length=1),
     services: ApplicationServices = Depends(get_services),
 ) -> list[ProjectResponse]:
-    _sync_assets(services)
     projects = _get_project_repo(services).list_all(
         query_text=q,
         status=status_filter,
@@ -211,7 +206,6 @@ def get_project(
     project_id: str,
     services: ApplicationServices = Depends(get_services),
 ) -> ProjectResponse:
-    _sync_assets(services)
     project = _project_or_404(project_id, services)
     return _serialize_project(project, services)
 
@@ -221,7 +215,6 @@ def get_project_assets(
     project_id: str,
     services: ApplicationServices = Depends(get_services),
 ) -> list[ProjectAssetResponse]:
-    _sync_assets(services)
     _project_or_404(project_id, services)
     assets = services.asset_repository.list_all(project_id=project_id)
     return [_serialize_asset(asset, services) for asset in assets]
@@ -232,7 +225,6 @@ def get_project_jobs(
     project_id: str,
     services: ApplicationServices = Depends(get_services),
 ) -> ProjectJobsResponse:
-    _sync_assets(services)
     project = _project_or_404(project_id, services)
 
     jobs: list[JobRecord] = []
@@ -278,7 +270,6 @@ def update_project(
     req: UpdateProjectRequest,
     services: ApplicationServices = Depends(get_services),
 ) -> ProjectResponse:
-    _sync_assets(services)
     project = _get_project_repo(services).update(
         project_id,
         name=req.name,
@@ -299,7 +290,6 @@ def add_job_to_project(
     job_id: str,
     services: ApplicationServices = Depends(get_services),
 ) -> ProjectResponse:
-    _sync_assets(services)
     repo = _get_project_repo(services)
     job = services.job_repository.get(job_id)
     if job is None:
@@ -322,7 +312,6 @@ def remove_job_from_project(
     job_id: str,
     services: ApplicationServices = Depends(get_services),
 ) -> ProjectResponse:
-    _sync_assets(services)
     repo = _get_project_repo(services)
     project = _project_or_404(project_id, services)
     job = services.job_repository.get(job_id)
@@ -344,7 +333,6 @@ def add_asset_to_project(
     asset_id: str,
     services: ApplicationServices = Depends(get_services),
 ) -> ProjectResponse:
-    _sync_assets(services)
     project = _project_or_404(project_id, services)
     asset = services.asset_repository.get(asset_id)
     if asset is None:
@@ -369,13 +357,12 @@ def export_project(
     req: ExportProjectRequest,
     services: ApplicationServices = Depends(get_services),
 ) -> ExportProjectResponse:
-    _sync_assets(services)
     project = _project_or_404(project_id, services)
     assets = services.asset_repository.list_all(project_id=project_id)
-    destination = (
-        Path(req.destination_dir)
-        if req.destination_dir
-        else services.output_dir.parent / "exports" / "projects" / project.id
+    destination = resolve_export_dir(
+        services,
+        req.destination_dir,
+        default_subpath=Path("projects") / project.id,
     )
     feedback_summary = services.feedback_repository.summarize(project_id=project.id)
     latest_feedback_at = feedback_summary.get("latest_feedback_at")
@@ -405,7 +392,6 @@ def delete_project(
     project_id: str,
     services: ApplicationServices = Depends(get_services),
 ) -> None:
-    _sync_assets(services)
     project = _project_or_404(project_id, services)
     for job_id in list(project.job_ids):
         services.job_repository.update_project(job_id, None)

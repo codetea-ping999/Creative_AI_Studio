@@ -293,7 +293,13 @@ class ProceduralVideoLoader(BaseModelLoader):
 
 
 class LearnedVideoLoader(BaseModelLoader):
-    """Load a learned text-to-video runtime through a local adapter entrypoint."""
+    """Load a learned text-to-video runtime through a local adapter entrypoint.
+
+    Security note: this loader imports and executes a ``runtime.py`` / ``adapter.py``
+    found inside the model directory (arbitrary code execution). Only place model
+    packs from sources you trust under ``MODELS_ROOT``; never load third-party or
+    untrusted model bundles.
+    """
 
     def load(self, manifest: ModelManifest) -> dict[str, Any]:
         local_path = self._resolve_local_path(manifest)

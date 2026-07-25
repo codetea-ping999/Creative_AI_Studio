@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 from generators.registry import GeneratorRegistry
 
 from .events import EventBus
+from .service import JobService
 
 if TYPE_CHECKING:
     from core.assets import AssetRepository
@@ -17,12 +18,10 @@ if TYPE_CHECKING:
 from .schemas import JobRecord
 from .statuses import (
     JOB_STATUS_CANCELLED,
-    JOB_STATUS_FAILED,
     JOB_STATUS_POSTPROCESSING,
     JOB_STATUS_PREPARING,
     JOB_STATUS_QUEUED,
     JOB_STATUS_RUNNING,
-    JOB_STATUS_SUCCEEDED,
 )
 
 logger = logging.getLogger(__name__)
@@ -38,12 +37,22 @@ class JobRunner:
         generator_registry: GeneratorRegistry,
         event_bus: EventBus | None = None,
         asset_repository: AssetRepository | None = None,
+        job_service: JobService | None = None,
     ) -> None:
         self.job_repository = job_repository
         self.job_queue = job_queue
         self.generator_registry = generator_registry
         self.event_bus = event_bus
         self.asset_repository = asset_repository
+        # Terminal transitions (success/failure) are delegated to JobService so
+        # the completion path lives in exactly one place. When callers do not
+        # inject a shared service we build an equivalent one from our own deps.
+        self.job_service = job_service or JobService(
+            job_repository,
+            job_queue,
+            event_bus,
+            asset_repository=asset_repository,
+        )
 
     def run_once(self) -> JobRecord | None:
         job_id = self.job_queue.dequeue()
@@ -83,56 +92,30 @@ class JobRunner:
             return job
 
         try:
-            self._update_status(job_id, JOB_STATUS_PREPARING, progress=0.0)
+            if self._update_status(job_id, JOB_STATUS_PREPARING, progress=0.0) is None:
+                return self.job_repository.get(job_id)
             generator = self.generator_registry.get(job.media_type)
-            self._update_status(job_id, JOB_STATUS_RUNNING, progress=0.1)
+            if self._update_status(job_id, JOB_STATUS_RUNNING, progress=0.1) is None:
+                return self.job_repository.get(job_id)
+            # Generation itself is a blocking call and cannot be interrupted
+            # mid-flight. Cancellation is cooperative: we honor it at this
+            # completion boundary so an in-flight cancel is not clobbered by a
+            # succeeded/failed transition.
             result = generator.run(job.request)
-            normalized_result = result.model_copy(
-                update={
-                    "job_id": job_id,
-                    "status": JOB_STATUS_SUCCEEDED,
-                    "error_message": None,
-                }
-            )
-            self._update_status(job_id, JOB_STATUS_POSTPROCESSING, progress=0.9)
-            self.job_repository.update_result(job_id, normalized_result)
-            final_job = self.job_repository.update(
-                job_id,
-                status=JOB_STATUS_SUCCEEDED,
-                progress=1.0,
-                error_message=None,
-            )
-            if final_job is not None:
-                if self.asset_repository is not None:
-                    self.asset_repository.sync_job(final_job)
-                self._publish(
-                    "job_succeeded",
-                    {
-                        "job_id": final_job.id,
-                        "status": final_job.status,
-                        "progress": final_job.progress,
-                        "outputs": final_job.result.outputs if final_job.result else [],
-                    },
-                )
-            return final_job
         except Exception as exc:
-            failed_job = self.job_repository.update(
-                job_id,
-                status=JOB_STATUS_FAILED,
-                progress=1.0,
-                error_message=str(exc),
-            )
-            if failed_job is not None:
-                self._publish(
-                    "job_failed",
-                    {
-                        "job_id": failed_job.id,
-                        "status": failed_job.status,
-                        "progress": failed_job.progress,
-                        "error_message": failed_job.error_message,
-                    },
-                )
-            return failed_job
+            if self._is_cancelled(job_id):
+                return self.job_repository.get(job_id)
+            return self.job_service.mark_failed(job_id, str(exc))
+
+        if self._is_cancelled(job_id):
+            return self.job_repository.get(job_id)
+        if self._update_status(job_id, JOB_STATUS_POSTPROCESSING, progress=0.9) is None:
+            return self.job_repository.get(job_id)
+        return self.job_service.mark_succeeded(job_id, result)
+
+    def _is_cancelled(self, job_id: str) -> bool:
+        current = self.job_repository.get(job_id)
+        return current is not None and current.status == JOB_STATUS_CANCELLED
 
     def _update_status(
         self,
@@ -141,7 +124,20 @@ class JobRunner:
         *,
         progress: float | None = None,
     ) -> JobRecord | None:
-        job = self.job_repository.update_status(job_id, status, progress=progress)
+        expected_statuses = {
+            JOB_STATUS_PREPARING: (JOB_STATUS_QUEUED,),
+            JOB_STATUS_RUNNING: (JOB_STATUS_PREPARING,),
+            JOB_STATUS_POSTPROCESSING: (JOB_STATUS_RUNNING,),
+        }.get(status)
+        if expected_statuses is None:
+            job = self.job_repository.update_status(job_id, status, progress=progress)
+        else:
+            job = self.job_repository.update_if_status(
+                job_id,
+                expected_statuses,
+                status=status,
+                progress=progress,
+            )
         if job is not None:
             self._publish(
                 self._event_name_for_status(status),
@@ -158,16 +154,14 @@ class JobRunner:
             self.event_bus.publish(event_type, payload)
 
     def _event_name_for_status(self, status: str) -> str:
+        # Only the in-progress transitions flow through here; terminal
+        # success/failure/cancellation events are emitted by JobService.
         if status == JOB_STATUS_PREPARING:
             return "job_preparing"
         if status == JOB_STATUS_RUNNING:
             return "job_started"
         if status == JOB_STATUS_POSTPROCESSING:
             return "job_postprocessing"
-        if status == JOB_STATUS_CANCELLED:
-            return "job_cancelled"
-        if status == JOB_STATUS_FAILED:
-            return "job_failed"
         return "job_status_updated"
 
 

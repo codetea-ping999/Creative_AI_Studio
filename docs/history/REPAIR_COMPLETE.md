@@ -176,7 +176,7 @@ npm install && npm run dev
 
 詳細は以下を参照:
 
-- モデルセットアップ: `setup_musicgen.py`, `setup_anime_lora.py`
+- モデルセットアップ: `scripts/setup_musicgen.py`, `scripts/setup_anime_lora.py`
 - 新APIエンドポイント: `apps/api/routes/gallery.py`, `projects.py`, `feedback.py`
 - ビジネスロジック: `core/projects/`, `core/feedback/`
 - テスト: `tests/test_v0_2_features.py`

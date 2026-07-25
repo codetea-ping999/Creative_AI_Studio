@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 import uuid
 
-from core.storage.json_files import write_json_atomic
+from core.storage.json_files import ensure_utc, utc_now, write_json_atomic
 
 
 @dataclass(slots=True)
@@ -29,9 +29,9 @@ class Project:
 
     def __post_init__(self) -> None:
         if self.created_at is None:
-            self.created_at = datetime.now()
+            self.created_at = utc_now()
         if self.updated_at is None:
-            self.updated_at = datetime.now()
+            self.updated_at = utc_now()
         if self.job_ids is None:
             self.job_ids = []
         if self.tags is None:
@@ -80,8 +80,8 @@ class ProjectRepository:
             tags=list(tags or []),
             metadata=dict(metadata or {}),
             pinned_asset_ids=[],
-            created_at=datetime.now(),
-            updated_at=datetime.now(),
+            created_at=utc_now(),
+            updated_at=utc_now(),
             job_ids=[],
         )
         self._save_project(project)
@@ -123,7 +123,7 @@ class ProjectRepository:
             changed = True
 
         if changed:
-            project.updated_at = datetime.now()
+            project.updated_at = utc_now()
             self._save_project(project)
         return project
 
@@ -174,7 +174,7 @@ class ProjectRepository:
 
         if job_id not in project.job_ids:
             project.job_ids.append(job_id)
-            project.updated_at = datetime.now()
+            project.updated_at = utc_now()
             self._save_project(project)
 
         return project
@@ -188,7 +188,7 @@ class ProjectRepository:
             return None
 
         project.job_ids.remove(job_id)
-        project.updated_at = datetime.now()
+        project.updated_at = utc_now()
         self._save_project(project)
 
         return project
@@ -210,8 +210,8 @@ class ProjectRepository:
             tags=list(data.get("tags", [])),
             metadata=dict(data.get("metadata", {})),
             pinned_asset_ids=list(data.get("pinned_asset_ids", [])),
-            created_at=datetime.fromisoformat(data["created_at"]),
-            updated_at=datetime.fromisoformat(data["updated_at"]),
+            created_at=ensure_utc(datetime.fromisoformat(data["created_at"])),
+            updated_at=ensure_utc(datetime.fromisoformat(data["updated_at"])),
             job_ids=list(data.get("job_ids", [])),
         )
 

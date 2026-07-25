@@ -285,7 +285,7 @@ pytest tests/ -v
 A: `pip install transformers librosa audiocraft`
 
 ### Q: MusicGen が見つからない  
-A: モデルダウンロードが未完了。`python3 setup_musicgen.py` を実行
+A: モデルダウンロードが未完了。`python3 scripts/setup_musicgen.py` を実行
 
 ### Q: ポート 8000 が既に使用中
 A: `uvicorn apps.api.main:app --port 8001` で別ポートを使用
