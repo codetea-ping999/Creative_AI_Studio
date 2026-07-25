@@ -19,6 +19,9 @@
 
 ## すぐに起動
 
+前提は Python 3.10 以上と、Node.js 20.19 以上または 22.12 以上です。
+`./setup.sh` と `scripts/check_local_setup.py` は未対応バージョンを開始前に検出します。
+
 依存関係と `.env` を準備した後は、次の 1 コマンドで API と Web UI を起動します。
 
 ```bash
@@ -231,9 +234,13 @@ chmod +x setup.sh
 この検証は以下をまとめて実行します。
 
 - `scripts/check_local_setup.py --skip-runtime-files`
+- `apps/web` の `npm test`
 - `apps/web` の `npm run build`
 - `pytest -q`
 - 一時起動した API に対する `/health` と `/models` の smoke check
+
+標準検証は一時ディレクトリ内の DB・project/feedback・生成出力と、空いている
+loopback port を使います。既存の `data/`、`outputs/`、起動中の 8000 port には触れません。
 
 ### 手動セットアップ
 
@@ -241,9 +248,9 @@ chmod +x setup.sh
 
 #### 前提条件
 
-- Python 3.9 以上
-- Node.js 18 以上
-- npm または yarn
+- Python 3.10 以上
+- Node.js 20.19 以上、または 22.12 以上
+- npm
 
 #### ステップ 1: Python 環境の構築
 

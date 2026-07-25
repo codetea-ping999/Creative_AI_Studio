@@ -6,10 +6,14 @@ Creative AI Studio のローカル開発環境セットアップ手順です。
 
 ## 前提
 
-- Python 3.9 以上
-- Node.js 18 以上
+- Python 3.10 以上
+- Node.js 20.19 以上、または 22.12 以上
 - `npm`
 - Git で clone したリポジトリ直下を作業ルートとして使うこと
+
+`torch~=2.10.0` は Python 3.10 以上、Web のロック済み Vite は
+Node.js 20.19 以上または 22.12 以上を必要とします。`./setup.sh` と
+`scripts/check_local_setup.py` は未対応バージョンを明示して終了します。
 
 ## Git とローカル生成物の扱い
 
@@ -103,7 +107,9 @@ Web UI は `apps/web/.env` を Vite の標準ルールで読み込みます。
 ./venv/bin/python scripts/verify_local_stack.py --start-api
 ```
 
-このコマンドは setup check、web build、pytest、`/health` と `/models` の API smoke check をまとめて行います。
+このコマンドは setup check、web test、web build、pytest、`/health` と `/models` の
+API smoke check をまとめて行います。DB、project/feedback、生成出力は自動削除される
+一時ディレクトリへ隔離し、API は空いている loopback port で起動します。
 実モデルの存在まで確認したい場合は `--check-runtime-files` を追加してください。
 
 ### セットアップ検証

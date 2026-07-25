@@ -378,8 +378,13 @@ function App() {
         }
       }
 
+      const resolvedGalleryPayload =
+        detailPayload && !galleryPayload.some((item) => item.asset_id === detailPayload.asset_id)
+          ? [detailPayload, ...galleryPayload].slice(0, 8)
+          : galleryPayload;
+
       startTransition(() => {
-        setGalleryItems(galleryPayload);
+        setGalleryItems(resolvedGalleryPayload);
         setMetrics(metricsPayload);
         setGalleryStats(galleryStatsPayload);
         setSelectedAssetId(nextAssetId);

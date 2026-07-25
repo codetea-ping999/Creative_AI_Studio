@@ -10,6 +10,7 @@ import threading
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 from urllib.parse import urlparse
 
 
@@ -117,6 +118,65 @@ class VerifyLocalStackTests(unittest.TestCase):
         self.assertEqual(command[-4:], ["--host", "127.0.0.1", "--port", "8123"])
         self.assertEqual(env["API_HOST"], "127.0.0.1")
         self.assertEqual(env["API_PORT"], "8123")
+
+    def test_isolated_runtime_environment_creates_clean_checkout_directories(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            runtime_root = Path(tmp_dir) / "runtime"
+
+            env = MODULE.build_isolated_environment(runtime_root, base_env={})
+
+            self.assertEqual(Path(env["DB_PATH"]), runtime_root / "data" / "jobs.db")
+            self.assertEqual(Path(env["OUTPUT_DIR"]), runtime_root / "outputs")
+            self.assertTrue((runtime_root / "data").is_dir())
+            self.assertTrue((runtime_root / "outputs" / "images").is_dir())
+            self.assertTrue((runtime_root / "outputs" / "audio").is_dir())
+            self.assertTrue((runtime_root / "outputs" / "videos").is_dir())
+
+    def test_standard_verification_runs_web_tests(self) -> None:
+        commands: list[tuple[list[str], Path]] = []
+
+        def _record_command(
+            command: list[str],
+            *,
+            cwd: Path = MODULE.ROOT,
+            env: dict[str, str] | None = None,
+        ) -> None:
+            del env
+            commands.append((command, cwd))
+
+        with (
+            TemporaryDirectory() as tmp_dir,
+            patch.object(MODULE, "run_command", side_effect=_record_command),
+            patch.object(MODULE, "run_api_smoke_checks"),
+            patch.object(
+                MODULE,
+                "parse_args",
+                return_value=MODULE.argparse.Namespace(
+                    skip_setup_check=True,
+                    skip_web_build=False,
+                    skip_web_tests=False,
+                    skip_tests=True,
+                    skip_api_smoke=True,
+                    start_api=False,
+                    api_base_url="http://127.0.0.1:8123",
+                    api_timeout=1.0,
+                    check_runtime_files=False,
+                    runtime_root=Path(tmp_dir),
+                ),
+            ),
+        ):
+            self.assertEqual(MODULE.main(), 0)
+
+        self.assertIn((["npm", "test"], MODULE.ROOT / "apps" / "web"), commands)
+
+    def test_python_version_check_rejects_unsupported_runtime(self) -> None:
+        self.assertFalse(SETUP_MODULE._check_python_version((3, 9, 18)))
+        self.assertTrue(SETUP_MODULE._check_python_version((3, 10, 0)))
+
+    def test_node_version_check_rejects_unsupported_runtime(self) -> None:
+        self.assertFalse(SETUP_MODULE._check_node_version("v20.18.1"))
+        self.assertTrue(SETUP_MODULE._check_node_version("v20.19.0"))
+        self.assertTrue(SETUP_MODULE._check_node_version("v22.12.0"))
 
     def test_check_manifest_files_rejects_duplicate_ids(self) -> None:
         with TemporaryDirectory() as tmp_dir:

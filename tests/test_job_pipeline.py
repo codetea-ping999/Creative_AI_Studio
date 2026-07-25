@@ -14,7 +14,7 @@ CORE_IMPORT_ERROR: Exception | None = None
 try:
     from bootstrap import create_application_services
     from core.jobs import EventBus, JobQueue, JobRunner, JobService
-    from core.schemas import GenerationRequest
+    from core.schemas import GenerationRequest, GenerationResult
     from core.storage.repositories.job_repository import JobRepository
     from generators.base import BaseGenerator
     from generators.registry import GeneratorRegistry
@@ -363,6 +363,102 @@ class JobPipelineTests(unittest.TestCase):
             assert persisted is not None
             self.assertEqual(persisted.status, "cancelled")
             self.assertNotEqual(persisted.status, "succeeded")
+
+    def test_runner_honors_cancellation_at_postprocessing_transition(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            repository = JobRepository(root / "jobs.db")
+            queue = JobQueue()
+            event_bus = EventBus()
+            service = JobService(repository, queue, event_bus)
+            registry = GeneratorRegistry(
+                {"audio": _StubAudioGenerator(root / "outputs" / "audio")}
+            )
+            runner = JobRunner(
+                repository,
+                queue,
+                registry,
+                event_bus,
+                job_service=service,
+            )
+            job = service.create_job(
+                GenerationRequest(
+                    media_type="audio",
+                    prompt="cancel at the completion boundary",
+                    model_id="",
+                    output_format="wav",
+                    params={},
+                )
+            )
+            original_update_status = runner._update_status
+
+            def _cancel_before_postprocessing(
+                job_id: str,
+                status: str,
+                *,
+                progress: float | None = None,
+            ):
+                if status == "postprocessing":
+                    service.cancel_job(job_id)
+                return original_update_status(job_id, status, progress=progress)
+
+            with patch.object(
+                runner,
+                "_update_status",
+                side_effect=_cancel_before_postprocessing,
+            ):
+                final_job = runner.run_once()
+
+            self.assertIsNotNone(final_job)
+            assert final_job is not None
+            self.assertEqual(final_job.status, "cancelled")
+            persisted = repository.get(job.id)
+            assert persisted is not None
+            self.assertEqual(persisted.status, "cancelled")
+
+    @unittest.skipIf(API_IMPORT_ERROR is not None, f"missing dependency: {API_IMPORT_ERROR}")
+    def test_gallery_job_recovers_when_success_precedes_asset_sync(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            services = create_application_services(
+                db_path=root / "data" / "jobs.db",
+                output_dir=root / "outputs" / "images",
+            )
+            output_path = root / "outputs" / "audio" / "late-sync.wav"
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b"RIFFstub")
+
+            with TestClient(create_app(services, start_job_runner=False)) as client:
+                job = services.job_service.create_job(
+                    GenerationRequest(
+                        media_type="audio",
+                        prompt="visible before gallery sync",
+                        model_id="musicgen-small",
+                        output_format="wav",
+                        params={},
+                    )
+                )
+                persisted = services.job_repository.update(
+                    job.id,
+                    status="succeeded",
+                    progress=1.0,
+                    result=GenerationResult(
+                        job_id=job.id,
+                        status="succeeded",
+                        outputs=[str(output_path)],
+                        previews=[],
+                        metadata={"media_type": "audio"},
+                        error_message=None,
+                    ),
+                )
+                self.assertIsNotNone(persisted)
+                self.assertIsNone(services.asset_repository.get_primary_by_job(job.id))
+
+                response = client.get(f"/gallery/job/{job.id}")
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["job_id"], job.id)
+            self.assertIsNotNone(services.asset_repository.get_primary_by_job(job.id))
 
 
 if __name__ == "__main__":

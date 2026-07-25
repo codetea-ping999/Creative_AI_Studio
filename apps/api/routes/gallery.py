@@ -300,6 +300,14 @@ def get_gallery_item_by_job(
 ) -> GalleryAssetDetailResponse:
     asset = services.asset_repository.get_primary_by_job(job_id)
     if asset is None:
+        source_job = services.job_repository.get(job_id)
+        if source_job is not None and source_job.status == "succeeded":
+            # A job status and its JSON asset record live in different stores.
+            # Reconcile only this requested job if the status became visible
+            # just before JobService finished writing the gallery record.
+            services.asset_repository.sync_job(source_job)
+            asset = services.asset_repository.get_primary_by_job(job_id)
+    if asset is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Gallery asset not found")
     return _serialize_gallery_detail(asset, services)
 

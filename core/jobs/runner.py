@@ -92,9 +92,11 @@ class JobRunner:
             return job
 
         try:
-            self._update_status(job_id, JOB_STATUS_PREPARING, progress=0.0)
+            if self._update_status(job_id, JOB_STATUS_PREPARING, progress=0.0) is None:
+                return self.job_repository.get(job_id)
             generator = self.generator_registry.get(job.media_type)
-            self._update_status(job_id, JOB_STATUS_RUNNING, progress=0.1)
+            if self._update_status(job_id, JOB_STATUS_RUNNING, progress=0.1) is None:
+                return self.job_repository.get(job_id)
             # Generation itself is a blocking call and cannot be interrupted
             # mid-flight. Cancellation is cooperative: we honor it at this
             # completion boundary so an in-flight cancel is not clobbered by a
@@ -107,7 +109,8 @@ class JobRunner:
 
         if self._is_cancelled(job_id):
             return self.job_repository.get(job_id)
-        self._update_status(job_id, JOB_STATUS_POSTPROCESSING, progress=0.9)
+        if self._update_status(job_id, JOB_STATUS_POSTPROCESSING, progress=0.9) is None:
+            return self.job_repository.get(job_id)
         return self.job_service.mark_succeeded(job_id, result)
 
     def _is_cancelled(self, job_id: str) -> bool:
@@ -121,7 +124,20 @@ class JobRunner:
         *,
         progress: float | None = None,
     ) -> JobRecord | None:
-        job = self.job_repository.update_status(job_id, status, progress=progress)
+        expected_statuses = {
+            JOB_STATUS_PREPARING: (JOB_STATUS_QUEUED,),
+            JOB_STATUS_RUNNING: (JOB_STATUS_PREPARING,),
+            JOB_STATUS_POSTPROCESSING: (JOB_STATUS_RUNNING,),
+        }.get(status)
+        if expected_statuses is None:
+            job = self.job_repository.update_status(job_id, status, progress=progress)
+        else:
+            job = self.job_repository.update_if_status(
+                job_id,
+                expected_statuses,
+                status=status,
+                progress=progress,
+            )
         if job is not None:
             self._publish(
                 self._event_name_for_status(status),

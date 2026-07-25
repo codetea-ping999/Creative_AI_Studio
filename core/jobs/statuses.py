@@ -26,6 +26,13 @@ TERMINAL_JOB_STATUSES = (
     JOB_STATUS_CANCELLED,
 )
 
+ACTIVE_JOB_STATUSES = (
+    JOB_STATUS_QUEUED,
+    JOB_STATUS_PREPARING,
+    JOB_STATUS_RUNNING,
+    JOB_STATUS_POSTPROCESSING,
+)
+
 
 def is_terminal_status(status: str) -> bool:
     """Return True when the job status is final."""
@@ -42,6 +49,7 @@ __all__ = [
     "JOB_STATUS_RUNNING",
     "JOB_STATUS_SUCCEEDED",
     "JOB_STATUSES",
+    "ACTIVE_JOB_STATUSES",
     "TERMINAL_JOB_STATUSES",
     "is_terminal_status",
 ]
