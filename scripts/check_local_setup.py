@@ -10,6 +10,15 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from core.models.readiness import (  # noqa: E402  (path bootstrap above)
+    STATUS_SCAFFOLD,
+    evaluate_manifest_payload,
+    resolve_repo_path,
+)
+
 SKIP_RUNTIME_FILES = "--skip-runtime-files" in sys.argv
 
 
@@ -91,62 +100,51 @@ def _relative_to_root(path: Path) -> str:
         return str(path)
 
 
-def _check_sdxl_runtime_files() -> bool:
-    model_root = ROOT / "models" / "image" / "sdxl"
-    if not model_root.exists():
-        print(f"[WARN] SDXL model directory is missing: {model_root}")
-        return True
+def _check_runtime_model_files(manifest_root: Path | None = None) -> bool:
+    """Report runtime file readiness with the same rules `GET /models` uses."""
 
-    required_files = [
-        model_root / "model_index.json",
-        model_root / "text_encoder" / "model.fp16.safetensors",
-        model_root / "text_encoder_2" / "model.fp16.safetensors",
-        model_root / "unet" / "diffusion_pytorch_model.fp16.safetensors",
-        model_root / "vae" / "diffusion_pytorch_model.fp16.safetensors",
-    ]
+    manifest_root = manifest_root or ROOT / "models" / "manifests"
     success = True
-    for path in required_files:
-        if not _check_path(path, f"Runtime file {path.relative_to(ROOT)}"):
-            success = False
+    for manifest_path in sorted(manifest_root.rglob("*.json")):
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:  # pragma: no cover - reported by _check_manifest_files
+            continue
+        if not isinstance(payload, dict) or payload.get("enabled") is False:
+            continue
+
+        label = f"{payload.get('display_name', payload.get('id', '<unknown>'))}"
+        local_path = payload.get("local_path")
+        if not isinstance(local_path, str) or not local_path:
+            print(f"[WARN] {label}: manifest has no local_path")
+            continue
+
+        model_root = resolve_repo_path(local_path, repo_root=ROOT)
+        if not model_root.exists():
+            print(f"[WARN] {label}: model directory is missing: {local_path}")
+            continue
+
+        readiness = evaluate_manifest_payload(payload, repo_root=ROOT)
+        if readiness.is_ready:
+            print(f"[OK] {label}: runtime files are ready ({local_path})")
+            continue
+        if readiness.status == STATUS_SCAFFOLD or not _is_required_model(payload):
+            print(f"[WARN] {label}: {readiness.message}")
+            continue
+        print(f"[FAIL] {label}: {readiness.message}")
+        success = False
     return success
 
 
-def _check_cogvideox_runtime_files() -> bool:
-    model_root = ROOT / "models" / "video" / "cogvideox-2b"
-    if not model_root.exists():
-        print(f"[WARN] Optional CogVideoX-2B model directory is missing: {model_root}")
-        return True
-    component_configs = [
-        model_root / "scheduler" / "scheduler_config.json",
-        model_root / "text_encoder" / "config.json",
-        model_root / "tokenizer" / "tokenizer_config.json",
-        model_root / "transformer" / "config.json",
-        model_root / "vae" / "config.json",
-    ]
-    if not (model_root / "model_index.json").exists():
-        print(f"[WARN] Optional CogVideoX model_index.json is missing: {model_root}")
-        return True
-    missing_configs = [path for path in component_configs if not path.exists()]
-    missing_weights = [
-        component
-        for component in ("text_encoder", "transformer", "vae")
-        if not any((model_root / component).glob("*.safetensors"))
-    ]
-    if missing_configs or missing_weights:
-        details = [str(path.relative_to(ROOT)) for path in missing_configs]
-        details.extend(f"models/video/cogvideox-2b/{name}/*.safetensors" for name in missing_weights)
-        print("[WARN] Optional CogVideoX-2B weights are incomplete: " + ", ".join(details))
-        return True
-    success = all(
-        _check_path(path, f"Runtime file {path.relative_to(ROOT)}")
-        for path in [model_root / "model_index.json", *component_configs]
-    )
-    for component in ("text_encoder", "transformer", "vae"):
-        component_root = model_root / component
-        if not any(component_root.glob("*.safetensors")):
-            print(f"[FAIL] Runtime weights missing: {component_root.relative_to(ROOT)}/*.safetensors")
-            success = False
-    return success
+def _is_required_model(payload: dict[str, Any]) -> bool:
+    """Only default production models block local setup validation."""
+
+    if not payload.get("is_default"):
+        return False
+    if payload.get("runtime") == "learned":
+        return False
+    tags = payload.get("tags", [])
+    return not (isinstance(tags, list) and "experimental" in tags)
 
 
 def main() -> int:
@@ -170,8 +168,7 @@ def main() -> int:
     if SKIP_RUNTIME_FILES:
         print("[WARN] Runtime file checks skipped by --skip-runtime-files")
     else:
-        checks.append(_check_sdxl_runtime_files())
-        checks.append(_check_cogvideox_runtime_files())
+        checks.append(_check_runtime_model_files())
 
     if all(checks):
         print("[OK] Local setup looks ready.")

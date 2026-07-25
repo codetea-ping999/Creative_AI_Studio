@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .manifest import ModelManifest
+from .readiness import missing_diffusers_files, missing_transformers_files
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -85,9 +86,10 @@ class DiffusersImageLoader(BaseModelLoader):
             raise FileNotFoundError(
                 f"Model path does not exist for manifest {manifest.id!r}: {local_path}"
             )
-        if not (local_path / "model_index.json").exists():
+        missing = missing_diffusers_files(local_path)
+        if missing:
             raise FileNotFoundError(
-                f"Diffusers model_index.json was not found under: {local_path}"
+                f"Diffusers model files are missing under {local_path}: " + ", ".join(missing)
             )
         return str(local_path)
 
@@ -213,9 +215,10 @@ class TransformersMusicgenLoader(BaseModelLoader):
             raise FileNotFoundError(
                 f"Model path does not exist for manifest {manifest.id!r}: {local_path}"
             )
-        if not (local_path / "config.json").exists():
+        missing = missing_transformers_files(local_path)
+        if missing:
             raise FileNotFoundError(
-                f"Transformers config.json was not found under: {local_path}"
+                f"Transformers model files are missing under {local_path}: " + ", ".join(missing)
             )
         return str(local_path)
 

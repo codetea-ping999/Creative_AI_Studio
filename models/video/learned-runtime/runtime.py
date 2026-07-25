@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 from typing import Any
 from uuid import uuid4
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from core.models.readiness import missing_diffusers_files
 
 
 def load_runtime(manifest: dict[str, Any]) -> dict[str, Any]:
@@ -15,10 +20,14 @@ def load_runtime(manifest: dict[str, Any]) -> dict[str, Any]:
 
     defaults = dict(manifest.get("default_params", {}))
     pipeline_path = _resolve_pipeline_path(defaults.get("pipeline_path"))
-    if not (pipeline_path / "model_index.json").exists():
+    # Same requirement set /models reports, so the adapter never fails on a
+    # file the API just called ready.
+    missing = missing_diffusers_files(pipeline_path)
+    if missing:
         raise FileNotFoundError(
-            f"CogVideoX model_index.json is missing: {pipeline_path}. "
-            "Place THUDM/CogVideoX-2b Diffusers weights at that path."
+            f"CogVideoX model files are missing under {pipeline_path}: "
+            + ", ".join(missing)
+            + ". Place THUDM/CogVideoX-2b Diffusers weights at that path."
         )
 
     try:
