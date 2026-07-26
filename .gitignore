@@ -18,6 +18,9 @@ data/*.db
 data/assets/
 data/projects/
 data/feedback/
+data/bible/
+data/stories/
+data/batches/
 data/semantic-cache/
 data/calibration/
 data/model-download-*.log

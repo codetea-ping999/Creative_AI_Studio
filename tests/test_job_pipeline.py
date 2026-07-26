@@ -283,10 +283,16 @@ class JobPipelineTests(unittest.TestCase):
 
             from bootstrap import ApplicationServices, create_default_model_service
             from core.assets import AssetRepository
+            from core.batches import BatchRepository, BatchService
+            from core.bible import BibleRepository
             from core.feedback import FeedbackRepository
             from core.projects import ProjectRepository
+            from core.prompting import PromptComposer
+            from core.story import StoryRepository
 
             asset_repository = AssetRepository(root / "assets")
+            bible_repository = BibleRepository(root / "bible")
+            batch_repository = BatchRepository(root / "batches")
             services = ApplicationServices(
                 output_dir=root / "outputs" / "images",
                 model_service=create_default_model_service(),
@@ -299,6 +305,13 @@ class JobPipelineTests(unittest.TestCase):
                 project_repository=ProjectRepository(root / "projects"),
                 feedback_repository=FeedbackRepository(root / "feedback"),
                 asset_repository=asset_repository,
+                bible_repository=bible_repository,
+                prompt_composer=PromptComposer(bible_repository),
+                story_repository=StoryRepository(root / "stories"),
+                batch_repository=batch_repository,
+                batch_service=BatchService(
+                    batch_repository, service, repository, event_bus=event_bus
+                ),
             )
             client = TestClient(create_app(services, start_job_runner=False))
             job = service.create_job(

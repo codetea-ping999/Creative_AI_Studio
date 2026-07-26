@@ -1,0 +1,23 @@
+{
+  "id": "local-endpoint-writer",
+  "public_id": "local-endpoint-writer",
+  "display_name": "Local OpenAI-compatible endpoint",
+  "media_type": "text",
+  "task_type": "story",
+  "provider": "local",
+  "runtime": "openai_compatible",
+  "remote_ref": "http://127.0.0.1:11434/v1",
+  "loader": "openai_compatible_text_loader",
+  "default_params": {
+    "model_name": "qwen3:14b",
+    "context_window": 16384,
+    "temperature": 0.85,
+    "top_p": 0.95,
+    "timeout_seconds": 300,
+    "api_key_env": "LOCAL_TEXT_ENDPOINT_API_KEY"
+  },
+  "aliases": ["ollama-writer"],
+  "tags": ["text", "story", "endpoint"],
+  "is_default": false,
+  "enabled": false
+}

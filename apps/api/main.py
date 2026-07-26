@@ -7,6 +7,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from bootstrap import ApplicationServices, create_application_services
+from apps.api.routes.batches import router as batches_router
+from apps.api.routes.bible import router as bible_router
 from apps.api.routes.catalog import router as catalog_router
 from apps.api.routes.feedback import router as feedback_router
 from apps.api.routes.gallery import router as gallery_router
@@ -16,6 +18,7 @@ from apps.api.routes.jobs import router as jobs_router
 from apps.api.routes.metrics import router as metrics_router
 from apps.api.routes.models import router as models_router
 from apps.api.routes.projects import router as projects_router
+from apps.api.routes.stories import router as stories_router
 
 
 def _local_web_origins() -> list[str]:
@@ -100,6 +103,9 @@ def create_app(
     app.include_router(gallery_router)
     app.include_router(feedback_router)
     app.include_router(generate_router)
+    app.include_router(bible_router)
+    app.include_router(batches_router)
+    app.include_router(stories_router)
 
     return app
 

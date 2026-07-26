@@ -94,7 +94,7 @@ class JobRunner:
         try:
             if self._update_status(job_id, JOB_STATUS_PREPARING, progress=0.0) is None:
                 return self.job_repository.get(job_id)
-            generator = self.generator_registry.get(job.media_type)
+            generator = self.generator_registry.get(job.media_type, job.request.task_type)
             if self._update_status(job_id, JOB_STATUS_RUNNING, progress=0.1) is None:
                 return self.job_repository.get(job_id)
             controlled_run = getattr(generator, "run_with_control", None)

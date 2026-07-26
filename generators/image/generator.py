@@ -7,6 +7,7 @@ from typing import Any
 from uuid import uuid4
 
 from core.models import ModelService
+from core.prompting import PromptComposer
 from core.quality import (
     enrich_quality_report,
     evaluate_image_output,
@@ -14,6 +15,7 @@ from core.quality import (
 )
 from core.schemas import GenerationRequest, GenerationResult
 from generators.base import BaseGenerator
+from generators.common import resolve_generation_prompt
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -27,10 +29,12 @@ class ImageGenerator(BaseGenerator):
         output_dir: str | Path = "outputs/images",
         *,
         task_type: str = "text-to-image",
+        prompt_composer: PromptComposer | None = None,
     ) -> None:
         self.output_dir = Path(output_dir)
         self.model_service = model_service
         self.task_type = task_type
+        self.prompt_composer = prompt_composer
 
     def validate_request(self, request: GenerationRequest) -> None:
         if request.media_type != "image":
@@ -54,6 +58,12 @@ class ImageGenerator(BaseGenerator):
         )
         pipeline = runtime_obj["pipeline"]
         effective_params = {**manifest.default_params, **request.params}
+        resolved_prompt = resolve_generation_prompt(
+            request,
+            effective_params,
+            composer=self.prompt_composer,
+            template=str(effective_params.get("prompt_template", "image")),
+        )
         width = int(effective_params.pop("width", 1024))
         height = int(effective_params.pop("height", 1024))
         num_inference_steps = int(
@@ -65,12 +75,19 @@ class ImageGenerator(BaseGenerator):
         guidance_scale = float(effective_params.pop("guidance_scale", 7.5))
         lora_path = effective_params.pop("lora_path", None)
         lora_scale = float(effective_params.pop("lora_scale", 1.0))
+        # An explicit lora_path always wins; a bible-supplied LoRA fills in when
+        # the request did not name one.
+        if not lora_path and resolved_prompt.lora:
+            lora_path = resolved_prompt.lora.get("path")
+            lora_scale = float(resolved_prompt.lora.get("scale", lora_scale))
         lora_metadata = self._configure_lora(runtime_obj, pipeline, lora_path, lora_scale)
-        generator = self._create_generator(request.seed, runtime_obj["device"], torch)
+        generator = self._create_generator(
+            resolved_prompt.seed, runtime_obj["device"], torch
+        )
 
         generation_kwargs = {
-            "prompt": request.prompt,
-            "negative_prompt": request.negative_prompt,
+            "prompt": resolved_prompt.prompt,
+            "negative_prompt": resolved_prompt.negative_prompt,
             "width": width,
             "height": height,
             "guidance_scale": guidance_scale,
@@ -90,8 +107,8 @@ class ImageGenerator(BaseGenerator):
         quality_report = evaluate_image_output(output_path)
         semantic_report = evaluate_image_semantics(
             output_path,
-            request.prompt,
-            request.negative_prompt,
+            resolved_prompt.prompt,
+            resolved_prompt.negative_prompt,
         )
         enrich_quality_report(quality_report, semantic_report)
 
@@ -105,8 +122,11 @@ class ImageGenerator(BaseGenerator):
                 "generator": self.__class__.__name__,
                 "media_type": request.media_type,
                 "task_type": self.task_type,
-                "prompt": request.prompt,
-                "negative_prompt": request.negative_prompt,
+                "prompt": resolved_prompt.prompt,
+                "negative_prompt": resolved_prompt.negative_prompt,
+                "requested_prompt": request.prompt,
+                "prompt_composition": resolved_prompt.composition,
+                "reference_asset_ids": resolved_prompt.reference_asset_ids,
                 "requested_model_id": requested_model_id,
                 "model_id": manifest.public_model_id,
                 "manifest_id": manifest.id,
@@ -121,7 +141,8 @@ class ImageGenerator(BaseGenerator):
                 "torch_dtype": runtime_obj["torch_dtype"],
                 "lora_path": lora_metadata["path"],
                 "lora_scale": lora_metadata["scale"],
-                "seed": request.seed,
+                "seed": resolved_prompt.seed,
+                "requested_seed": request.seed,
                 "output_format": "png",
                 "default_params": dict(manifest.default_params),
                 "quality_report": quality_report,

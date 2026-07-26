@@ -18,6 +18,9 @@ models/
 ├─ image/
 │  ├─ sdxl/
 │  └─ anime-sdxl/
+├─ text/
+│  ├─ template-writer/      # weight なし。README だけの雛形 runtime
+│  └─ qwen-writer/          # 任意。GGUF を 1 ファイル置く
 ├─ video/
 │  ├─ procedural/
 │  ├─ learned-runtime/
@@ -30,6 +33,10 @@ models/
    ├─ image/
    │  ├─ sdxl-local.json
    │  └─ anime-sdxl-local.json
+   ├─ text/
+   │  ├─ template-writer-local.json
+   │  ├─ qwen-writer-local.json
+   │  └─ local-endpoint.json
    └─ video/
       └─ storyboard-local.json
 ```
@@ -47,6 +54,23 @@ AudioCraft の長尺 MusicGen は `./models/audio/musicgen-long-form` を想定�
 アニメ向け checkpoint は `./models/image/anime-sdxl`、LoRA は `./models/loras/...` を想定しています。
 Storyboard video runtime は `./models/video/procedural` を想定しています。
 CogVideoX-2B weightは `./models/video/cogvideox-2b` を想定しています。
+text（ストーリー執筆）の GGUF は `./models/text/<model>/` を想定しています。
+
+### text モデルは任意です
+
+既定の `template-writer` は weight を持たない決定的な雛形 runtime なので、
+何もダウンロードしなくても logline から scene list までの執筆フローが動きます。
+実 LLM に切り替える手順は次のとおりです。
+
+1. GGUF を `./models/text/qwen-writer/` に 1 ファイル置く
+   （複数置く場合は manifest の `default_params.model_file` で選ぶ）
+2. `pip install llama-cpp-python`
+   （Apple silicon は `CMAKE_ARGS="-DGGML_METAL=on" pip install --no-cache-dir llama-cpp-python`）
+3. `models/manifests/text/qwen-writer-local.json` の `enabled` を `true` にする
+
+Ollama / LM Studio / vLLM をすでに動かしている場合は、weight を置かずに
+`models/manifests/text/local-endpoint.json` を有効化する方法もあります。
+既定では loopback host のみ許可されます（`ALLOW_REMOTE_TEXT_ENDPOINTS` 参照）。
 
 ## ダウンロード方法
 
@@ -289,5 +313,7 @@ python3 -m unittest tests.test_model_system
 - 判定ルールは `core/model_readiness.py` に集約され、`/models`・loader・`scripts/check_local_setup.py`・`make cogvideox-smoke` が同じ結果を返します
 - モデルダウンロード管理 UI はまだありません
 - semantic judge model は生成 model とは別管理で、初回 scoring 時に必要です
+- `template-writer` は weight 不要のため常に available です。文章の質を上げるには GGUF 配置が必要です
+- text の endpoint loader は既定で loopback のみを許可し、API key は環境変数からのみ解決します
 
 次の実装候補は [next-tasks.md](/Users/toyoharukohyama/Documents/Creative_AI_Studio/docs/next-tasks.md) にまとめています。

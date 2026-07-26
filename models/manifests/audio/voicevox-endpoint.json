@@ -1,0 +1,23 @@
+{
+  "id": "voicevox-endpoint",
+  "public_id": "voicevox",
+  "display_name": "VOICEVOX Local Engine (JA)",
+  "media_type": "audio",
+  "task_type": "text-to-speech",
+  "provider": "local",
+  "runtime": "voicevox_http",
+  "remote_ref": "http://127.0.0.1:50021",
+  "loader": "voicevox_http_loader",
+  "default_params": {
+    "speaker_id": 3,
+    "speed": 1.0,
+    "pitch": 0.0,
+    "timeout_seconds": 60,
+    "max_chunk_characters": 200,
+    "chunk_gap_seconds": 0.3
+  },
+  "aliases": ["voicevox-endpoint", "voicevox-local"],
+  "tags": ["audio", "speech", "tts", "endpoint"],
+  "is_default": true,
+  "enabled": true
+}

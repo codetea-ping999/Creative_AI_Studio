@@ -32,7 +32,34 @@ http://127.0.0.1:8000
 | Jobs | `POST` | `/jobs/{job_id}/cancel` | queued / running job の cancel 要求 |
 | Generate | `POST` | `/generate/image` | 画像生成開始 |
 | Generate | `POST` | `/generate/audio` | 音声生成開始 |
+| Generate | `POST` | `/generate/speech` | ナレーション音声生成開始 |
 | Generate | `POST` | `/generate/video` | 動画生成開始 |
+| Generate | `POST` | `/generate/assembly` | timeline の動画組み立て開始 |
+| Generate | `POST` | `/generate/text` | ストーリー / 執筆タスク開始 |
+| Bible | `GET` | `/bible` | 作品設定一覧（kind / project / query で絞り込み） |
+| Bible | `POST` | `/bible` | 作品設定作成 |
+| Bible | `GET` | `/bible/{entry_id}` | 作品設定詳細 |
+| Bible | `PATCH` | `/bible/{entry_id}` | 作品設定更新 |
+| Bible | `DELETE` | `/bible/{entry_id}` | 作品設定削除 |
+| Bible | `POST` | `/bible/preview` | prompt 合成のドライラン（生成しない） |
+| Bible | `GET` | `/bible/catalogs` | 軸カタログ名一覧 |
+| Bible | `GET` | `/bible/catalogs/{name}` | 軸カタログ取得（logo 30 種など） |
+| Batches | `GET` | `/batches` | 多重生成一覧 |
+| Batches | `POST` | `/batches` | 多重生成の作成 + 起動 |
+| Batches | `GET` | `/batches/templates` | preset 一覧（件数と stage 構成つき） |
+| Batches | `GET` | `/batches/{batch_id}` | 進捗 / item / スコア |
+| Batches | `POST` | `/batches/{batch_id}/advance` | 次 stage を materialize |
+| Batches | `POST` | `/batches/{batch_id}/cancel` | 未完了の子 job を一括 cancel |
+| Batches | `POST` | `/batches/{batch_id}/items/{item_id}/promote` | 勝者を確定 |
+| Stories | `GET` | `/stories` | ストーリー一覧 |
+| Stories | `POST` | `/stories` | ストーリー作成 |
+| Stories | `GET` | `/stories/tasks` | マージ可能な執筆 task 一覧 |
+| Stories | `GET` | `/stories/{story_id}` | 詳細 + 不足素材 |
+| Stories | `PATCH` | `/stories/{story_id}` | メタ情報更新 |
+| Stories | `DELETE` | `/stories/{story_id}` | 削除 |
+| Stories | `POST` | `/stories/{story_id}/expand` | 次の執筆段階の text job を起動 |
+| Stories | `POST` | `/stories/{story_id}/apply` | 完了した text job をマージ |
+| Stories | `GET` | `/stories/{story_id}/timeline` | assembly 用 timeline を取得 |
 | Metrics | `GET` | `/metrics/summary` | Studio 全体の運用サマリ |
 | Metrics | `GET` | `/metrics/calibration` | 自動scoreとhuman feedbackの相関レポート |
 | Feedback | `POST` | `/feedback` | 人手評価保存 |
@@ -82,6 +109,22 @@ http://127.0.0.1:8000
 
 Web 側は `detail` 配列から `body.prompt: Field required` のような構造化エラーメッセージを組み立てます。
 
+### 400
+
+クライアントが直せる契約違反に使います。v0.3 で追加された主な例:
+
+- `POST /batches` の展開結果が上限を超える（件数と上限を `detail` に含む）
+- `POST /batches` が `spec` と `template` の両方、またはどちらも指定していない
+- 未知の bible `kind`、未知の story `format`
+- `POST /stories/{id}/expand` で premise / logline / title のいずれも無い
+
+### 409
+
+素材や前提が揃っていないため、まだ実行できない状態に使います。
+
+- `GET /stories/{id}/timeline` で scene に visual が無い（不足 scene id を列挙）
+- `POST /stories/{id}/apply` で対象 job が未完了、または story payload を持たない
+
 ## Shared Types
 
 ### GenerationRequest Snapshot
@@ -91,6 +134,7 @@ Web 側は `detail` 配列から `body.prompt: Field required` のような構�
 ```json
 {
   "media_type": "image",
+  "task_type": null,
   "prompt": "editorial portrait",
   "negative_prompt": "blurry",
   "model_id": "sdxl",
@@ -103,6 +147,26 @@ Web 側は `detail` 配列から `body.prompt: Field required` のような構�
   }
 }
 ```
+
+`task_type` は同一 media type 内の生成種別です。`null` は media type の既定 generator に
+ルーティングされます（後方互換）。現行の値: `story`（text）、`text-to-speech`（audio）、
+`assembly`（video）。
+
+### 宣言的な params
+
+v0.3 では、prompt を焼き込む代わりに「意図」を params に保存します。
+生成時に解決されるため、bible を更新した後の再実行は新しい設定を反映します。
+
+| Key | 意味 |
+| --- | --- |
+| `bible_refs` | 参照する `BibleEntry` id の配列（順序に意味がある） |
+| `axis_values` | 軸名 → patch。多重生成の 1 セルが持つ差分 |
+| `extra_fragments` | 追加の prompt 断片 |
+| `prompt_template` | `image` / `logo` / `thumbnail` / `video` / `text` |
+| `task` | text 生成の執筆段階（`logline`、`scene_list` など） |
+
+解決結果は job metadata の `prompt_composition` に監査ログとして残ります
+（`applied` に断片の出所、`conflicts` に seed / LoRA / locked field の衝突）。
 
 ### JobResponse
 
@@ -455,6 +519,25 @@ Response は再バインド後の `GalleryAssetDetailResponse`。
 }
 ```
 
+### POST /generate/speech
+
+`audio` の専用 `text-to-speech` generator にルーティングします。`project_id` の
+検証・job binding は他の `/generate/*` と共通です。
+
+```json
+{
+  "prompt": "静かな夜明けだった。",
+  "model_id": "kokoro-tts",
+  "project_id": "project_123",
+  "output_format": "wav",
+  "params": {
+    "voice": "jm_kumo",
+    "speed": 1.0,
+    "pitch": 0.0
+  }
+}
+```
+
 ### POST /generate/video
 
 ```json
@@ -478,6 +561,39 @@ Response は再バインド後の `GalleryAssetDetailResponse`。
 CogVideoX-2B learned runtimeは`model_id=learned-video`、`output_format=mp4`を使います。
 既定値は720x480、49 frames、8 fps、20 inference stepsです。weight未配置時は
 `GET /models`が`is_available=false`を返し、procedural runtimeへ自動fallbackしません。
+
+### POST /generate/assembly
+
+`video` の専用 `assembly` generator にルーティングします。`params.timeline` は
+`GET /stories/{story_id}/timeline` の返却値を渡します。timeline 内の `asset_id` は
+Asset repository から実ファイルへ解決されるため、`path` の直書きは必須ではありません。
+
+```json
+{
+  "prompt": "assemble the narrated short",
+  "model_id": "",
+  "project_id": "project_123",
+  "output_format": "mp4",
+  "params": {
+    "timeline": {
+      "fps": 24,
+      "resolution": [1920, 1080],
+      "tracks": {
+        "visual": [
+          {
+            "scene_id": "scene_1",
+            "asset_id": "asset_visual_1",
+            "duration_seconds": 4
+          }
+        ],
+        "narration": [],
+        "music": [],
+        "subtitles": []
+      }
+    }
+  }
+}
+```
 
 共通 response:
 

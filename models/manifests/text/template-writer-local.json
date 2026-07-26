@@ -1,0 +1,20 @@
+{
+  "id": "template-writer-local",
+  "public_id": "template-writer",
+  "display_name": "Template Writer (no weights)",
+  "media_type": "text",
+  "task_type": "story",
+  "provider": "local",
+  "runtime": "template",
+  "local_path": "./models/text/template-writer",
+  "loader": "template_text_loader",
+  "default_params": {
+    "context_window": 8192,
+    "temperature": 0.8,
+    "top_p": 0.95
+  },
+  "aliases": ["template-writer-local"],
+  "tags": ["text", "story", "base", "no-weights"],
+  "is_default": true,
+  "enabled": true
+}
