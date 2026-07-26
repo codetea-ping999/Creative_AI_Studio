@@ -6,10 +6,13 @@ from abc import ABC, abstractmethod
 import importlib.util
 import os
 from pathlib import Path
+import sys
+from types import ModuleType
 from typing import Any
 
 from core.model_readiness import (
     WEIGHT_PATTERNS,
+    audiocraft_model_readiness,
     missing_diffusers_files,
     missing_transformers_files,
 )
@@ -337,6 +340,138 @@ class TransformersMusicgenMelodyLoader(TransformersMusicgenLoader):
         }
 
 
+class AudioCraftMusicgenLoader(BaseModelLoader):
+    """Load an AudioCraft MusicGen checkpoint from an offline local export."""
+
+    def load(self, manifest: ModelManifest) -> dict[str, Any]:
+        local_path = self._resolve_local_path(manifest)
+        self._install_xformers_import_shim()
+        # Set these before importing AudioCraft/Transformers because their
+        # offline constants are initialized during module import.
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        try:
+            import torch
+            from audiocraft.models import MusicGen, builders, loaders
+            from audiocraft.modules.conditioners import T5Conditioner
+            from omegaconf import OmegaConf
+        except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency guard
+            raise RuntimeError(
+                "AudioCraft runtime dependency is missing. Install AudioCraft in "
+                "a compatible Python environment."
+            ) from exc
+
+        device = self._resolve_device(torch)
+
+        lm_package = loaders.load_lm_model_ckpt(local_path)
+        lm_config = OmegaConf.create(lm_package["xp.cfg"])
+        lm_config.device = device
+        lm_config.dtype = "float16" if device == "cuda" else "float32"
+
+        # AudioCraft 1.3 imports xformers unconditionally and the published
+        # checkpoint requests its memory-efficient attention backend. xformers
+        # is not available on Apple Silicon, while the checkpoint remains
+        # compatible with AudioCraft's built-in PyTorch attention path.
+        lm_config.transformer_lm.memory_efficient = False
+        loaders._delete_param(  # noqa: SLF001 - mirrors AudioCraft's public loader
+            lm_config,
+            "conditioners.self_wav.chroma_stem.cache_path",
+        )
+        loaders._delete_param(  # noqa: SLF001
+            lm_config,
+            "conditioners.args.merge_text_conditions_p",
+        )
+        loaders._delete_param(  # noqa: SLF001
+            lm_config,
+            "conditioners.args.drop_desc_p",
+        )
+
+        t5_path = str((Path(local_path) / "t5-base").resolve())
+        t5_config = lm_config.conditioners.description.t5
+        t5_config.name = t5_path
+        if t5_path not in T5Conditioner.MODELS:
+            T5Conditioner.MODELS.append(t5_path)
+        T5Conditioner.MODELS_DIMS[t5_path] = 768
+
+        lm = builders.get_lm_model(lm_config)
+        lm.load_state_dict(lm_package["best_state"])
+        lm.eval()
+        lm.cfg = lm_config
+        compression_model = loaders.load_compression_model(local_path, device=device)
+        if "self_wav" in lm.condition_provider.conditioners:
+            self_wav = lm.condition_provider.conditioners["self_wav"]
+            self_wav.match_len_on_eval = True
+            self_wav._use_masking = False  # noqa: SLF001 - AudioCraft setup contract
+        model = MusicGen(local_path, compression_model, lm)
+
+        return {
+            "stub": False,
+            "loader": self.__class__.__name__,
+            "manifest_id": manifest.id,
+            "display_name": manifest.display_name,
+            "runtime": manifest.runtime,
+            "provider": manifest.provider,
+            "local_path": local_path,
+            "remote_ref": manifest.remote_ref,
+            "dtype": manifest.dtype,
+            "device": device,
+            "default_params": dict(manifest.default_params),
+            "path_exists": True,
+            "model": model,
+            "sampling_rate": int(model.sample_rate),
+            "frame_rate": int(model.frame_rate),
+            "max_duration": float(model.max_duration),
+        }
+
+    def _resolve_local_path(self, manifest: ModelManifest) -> str:
+        if not manifest.local_path:
+            raise ValueError(f"Manifest {manifest.id!r} is missing local_path.")
+
+        local_path = (_REPO_ROOT / manifest.local_path).resolve()
+        readiness = audiocraft_model_readiness(local_path)
+        if not readiness.is_ready:
+            raise FileNotFoundError(readiness.message)
+        return str(local_path)
+
+    def _resolve_device(self, torch: Any) -> str:
+        requested_device = os.getenv("AUDIOCRAFT_DEVICE", "").strip().lower()
+        if requested_device:
+            return requested_device
+        if torch.cuda.is_available():
+            return "cuda"
+        # AudioCraft 1.3 does not officially support MPS and its autocast path
+        # assumes CUDA-like float16 behavior. CPU is slower but deterministic
+        # and avoids publishing a model as ready only to fail during generation.
+        return "cpu"
+
+    def _install_xformers_import_shim(self) -> None:
+        """Allow AudioCraft's torch-attention path to import without xformers."""
+
+        try:
+            import xformers  # type: ignore[import-not-found]  # noqa: F401
+            return
+        except ModuleNotFoundError:
+            pass
+
+        xformers_module = ModuleType("xformers")
+        ops_module = ModuleType("xformers.ops")
+
+        def unavailable(*_args: Any, **_kwargs: Any) -> None:
+            raise RuntimeError(
+                "xformers attention was called even though the loader selected "
+                "AudioCraft's PyTorch attention backend."
+            )
+
+        class LowerTriangularMask:
+            pass
+
+        ops_module.memory_efficient_attention = unavailable  # type: ignore[attr-defined]
+        ops_module.LowerTriangularMask = LowerTriangularMask  # type: ignore[attr-defined]
+        xformers_module.ops = ops_module  # type: ignore[attr-defined]
+        sys.modules["xformers"] = xformers_module
+        sys.modules["xformers.ops"] = ops_module
+
+
 class ProceduralVideoLoader(BaseModelLoader):
     """Expose a lightweight local runtime for storyboard-style video output."""
 
@@ -494,6 +629,7 @@ def create_default_loader_registry() -> LoaderRegistry:
         "transformers_musicgen_melody_loader",
         TransformersMusicgenMelodyLoader(),
     )
+    registry.register("audiocraft_musicgen_loader", AudioCraftMusicgenLoader())
     registry.register("procedural_video_loader", ProceduralVideoLoader())
     registry.register("learned_video_loader", LearnedVideoLoader())
     return registry
@@ -501,6 +637,7 @@ def create_default_loader_registry() -> LoaderRegistry:
 
 __all__ = [
     "BaseModelLoader",
+    "AudioCraftMusicgenLoader",
     "DiffusersImageLoader",
     "LearnedVideoLoader",
     "LoaderRegistry",
