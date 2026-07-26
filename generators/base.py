@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import inspect
 from typing import TYPE_CHECKING
 
 from core.schemas import GenerationRequest, GenerationResult
@@ -23,9 +24,34 @@ class BaseGenerator(ABC):
         self.validate_request(request)
         self.prepare(request)
         try:
-            return self.generate(request, context)
+            return self._generate_with_optional_context(request, context)
         finally:
             self.cleanup(request)
+
+    def _generate_with_optional_context(
+        self,
+        request: GenerationRequest,
+        context: "GenerationContext | None",
+    ) -> GenerationResult:
+        """Call both context-aware and legacy context-free generators."""
+
+        generate = self.generate
+        try:
+            parameters = inspect.signature(generate).parameters
+        except (TypeError, ValueError):
+            return generate(request, context)
+
+        if "context" in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        ):
+            return generate(request, context=context)
+        if any(
+            parameter.kind is inspect.Parameter.VAR_POSITIONAL
+            for parameter in parameters.values()
+        ):
+            return generate(request, context)
+        return generate(request)  # type: ignore[call-arg]
 
     @abstractmethod
     def validate_request(self, request: GenerationRequest) -> None:

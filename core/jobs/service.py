@@ -188,10 +188,9 @@ class JobService:
         )
         if job is None:
             return self.get_job(job_id)
-        # Flip the in-process signal even if the job is only "queued" (not
-        # yet picked up by the worker): the registry entry is created lazily
-        # by JobRunner, so setting it early is a harmless no-op that the
-        # worker will still observe once it does start.
+        # A running worker has already registered its Event. For a queued job
+        # this is a harmless no-op; its persisted cancelled status prevents
+        # JobRunner from starting it later.
         if self.cancellation_registry is not None:
             self.cancellation_registry.request_cancel(job_id)
         self._publish(

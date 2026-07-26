@@ -31,7 +31,7 @@ class GenerationContext:
         is_cancelled: Callable[[], bool],
         on_progress: Callable[[float], None] | None = None,
         min_interval_seconds: float = 0.5,
-        min_progress_delta: float = 0.01,
+        min_progress_delta: float = 0.05,
     ) -> None:
         self._is_cancelled = is_cancelled
         self._on_progress = on_progress
@@ -46,7 +46,10 @@ class GenerationContext:
         fraction = max(0.0, min(1.0, fraction))
         now = time.monotonic()
         if self._last_reported is not None:
-            delta = abs(fraction - self._last_reported)
+            fraction = max(self._last_reported, fraction)
+            delta = fraction - self._last_reported
+            if delta == 0.0:
+                return
             elapsed = now - (self._last_reported_at or 0.0)
             if delta < self._min_progress_delta and elapsed < self._min_interval_seconds:
                 return

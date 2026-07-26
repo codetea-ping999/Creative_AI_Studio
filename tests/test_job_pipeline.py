@@ -14,7 +14,7 @@ CORE_IMPORT_ERROR: Exception | None = None
 try:
     from bootstrap import create_application_services
     from core.jobs import CancellationRegistry, EventBus, JobQueue, JobRunner, JobService
-    from core.jobs.context import GenerationCancelled
+    from core.jobs.context import GenerationCancelled, GenerationContext
     from core.schemas import GenerationRequest, GenerationResult
     from core.storage.repositories.job_repository import JobRepository
     from generators.base import BaseGenerator
@@ -157,6 +157,33 @@ if CORE_IMPORT_ERROR is None:
         def cleanup(self, request: GenerationRequest) -> None:
             return None
 
+    class _LegacyContextFreeGenerator(BaseGenerator):
+        """Generator written before GenerationContext was introduced."""
+
+        def __init__(self, output_dir: Path) -> None:
+            self.output_dir = output_dir
+
+        def validate_request(self, request: GenerationRequest) -> None:
+            return None
+
+        def prepare(self, request: GenerationRequest) -> None:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        def generate(self, request: GenerationRequest):
+            output_path = self.output_dir / "legacy.wav"
+            output_path.write_bytes(b"RIFFlegacy")
+            return GenerationResult(
+                job_id="legacy-context-free",
+                status="succeeded",
+                outputs=[str(output_path)],
+                previews=[],
+                metadata={"legacy_context_free": True},
+                error_message=None,
+            )
+
+        def cleanup(self, request: GenerationRequest) -> None:
+            return None
+
 
 class _FakePipelineResult:
     def __init__(self, image: Image.Image) -> None:
@@ -217,6 +244,40 @@ def _fake_diffusers_load(self, manifest):
 
 @unittest.skipIf(CORE_IMPORT_ERROR is not None, f"missing dependency: {CORE_IMPORT_ERROR}")
 class JobPipelineTests(unittest.TestCase):
+    def test_generation_context_throttles_and_keeps_progress_monotonic(self) -> None:
+        reported: list[float] = []
+        context = GenerationContext(
+            is_cancelled=lambda: False,
+            on_progress=reported.append,
+            min_interval_seconds=60.0,
+            min_progress_delta=0.2,
+        )
+
+        for fraction in (0.1, 0.15, 0.05, 0.31, 1.2):
+            context.report_progress(fraction)
+
+        self.assertEqual(reported, [0.1, 0.31, 1.0])
+
+    def test_base_generator_keeps_legacy_context_free_generate_compatible(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            generator = _LegacyContextFreeGenerator(Path(tmp_dir))
+            context = GenerationContext(is_cancelled=lambda: False)
+
+            result = generator.run(
+                GenerationRequest(
+                    media_type="audio",
+                    prompt="legacy compatibility",
+                    model_id="",
+                    output_format="wav",
+                ),
+                context,
+            )
+
+            self.assertTrue(result.metadata["legacy_context_free"])
+            self.assertTrue(Path(result.outputs[0]).exists())
+
     @unittest.skipIf(API_IMPORT_ERROR is not None, f"missing dependency: {API_IMPORT_ERROR}")
     def test_generate_image_job_runs_end_to_end(self) -> None:
         with TemporaryDirectory() as tmp_dir:
