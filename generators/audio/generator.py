@@ -9,6 +9,8 @@ from typing import Any
 from uuid import uuid4
 import wave
 
+from core.assets import AssetRepository
+from core.audio_conditioning import prepare_wav_reference
 from core.models import ModelService
 from core.quality import (
     enrich_quality_report,
@@ -37,10 +39,12 @@ class AudioGenerator(BaseGenerator):
         model_service: ModelService,
         output_dir: str | Path = "outputs/audio",
         *,
+        asset_repository: AssetRepository | None = None,
         task_type: str = "text-to-music",
     ) -> None:
         self.output_dir = Path(output_dir)
         self.model_service = model_service
+        self.asset_repository = asset_repository
         self.task_type = task_type
 
     def validate_request(self, request: GenerationRequest) -> None:
@@ -83,6 +87,15 @@ class AudioGenerator(BaseGenerator):
         lineage_metadata = _extract_lineage_metadata(effective_params)
         for lineage_key in lineage_metadata:
             effective_params.pop(lineage_key, None)
+        reuse_action = str(lineage_metadata.get("reuse_action") or "")
+        min_reference_duration_value = effective_params.pop(
+            "min_reference_duration_seconds",
+            None,
+        )
+        max_reference_duration_value = effective_params.pop(
+            "max_reference_duration_seconds",
+            None,
+        )
         duration_seconds = max(1, int(effective_params.pop("duration_seconds", 8)))
         guidance_scale = float(effective_params.pop("guidance_scale", 3.0))
         temperature = float(effective_params.pop("temperature", 1.0))
@@ -103,11 +116,68 @@ class AudioGenerator(BaseGenerator):
             bpm=bpm,
         )
 
-        processor_inputs = processor(
-            text=[conditioning_prompt],
-            padding=True,
-            return_tensors="pt",
-        )
+        conditioning_metadata: dict[str, Any] = {}
+        if reuse_action == "melody":
+            if "melody-conditioning" not in manifest.tags:
+                raise ValueError(
+                    f"Model {manifest.public_model_id!r} does not support melody conditioning."
+                )
+            source_asset_id = lineage_metadata.get("source_asset_id")
+            if not isinstance(source_asset_id, str) or not source_asset_id:
+                raise ValueError("Melody generation requires a Gallery reference asset ID.")
+            if self.asset_repository is None:
+                raise RuntimeError("Melody generation requires an asset registry.")
+            source_asset = self.asset_repository.get(source_asset_id)
+            if source_asset is None:
+                raise ValueError("Melody reference asset is not present in the Gallery registry.")
+            if source_asset.media_type != "audio":
+                raise ValueError("Melody reference must be an audio Gallery asset.")
+            try:
+                min_reference_duration_seconds = float(min_reference_duration_value)
+                max_reference_duration_seconds = float(max_reference_duration_value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "Melody model does not define a valid reference duration limit."
+                ) from exc
+            sampling_rate = int(runtime_obj["sampling_rate"])
+            reference_audio, reference_info = prepare_wav_reference(
+                source_asset.path,
+                target_sampling_rate=sampling_rate,
+                min_duration_seconds=min_reference_duration_seconds,
+                max_duration_seconds=max_reference_duration_seconds,
+                torch=torch,
+            )
+            processor_inputs = processor(
+                text=[conditioning_prompt],
+                audio=[reference_audio.numpy()],
+                sampling_rate=sampling_rate,
+                padding=True,
+                return_tensors="pt",
+            )
+            if "input_features" not in processor_inputs:
+                raise RuntimeError(
+                    "MusicGen Melody processor did not produce input_features."
+                )
+            conditioning_metadata = {
+                "conditioning": {
+                    "type": "melody",
+                    "reference_asset_id": source_asset.id,
+                    "original_channels": reference_info.channels,
+                    "original_sampling_rate": reference_info.sampling_rate,
+                    "original_duration_seconds": reference_info.duration_seconds,
+                    "prepared_channels": 1,
+                    "prepared_sampling_rate": sampling_rate,
+                    "prepared_sample_count": int(reference_audio.shape[-1]),
+                    "min_reference_duration_seconds": min_reference_duration_seconds,
+                    "max_reference_duration_seconds": max_reference_duration_seconds,
+                }
+            }
+        else:
+            processor_inputs = processor(
+                text=[conditioning_prompt],
+                padding=True,
+                return_tensors="pt",
+            )
         model_inputs = {
             key: value.to(device)
             for key, value in processor_inputs.items()
@@ -178,6 +248,7 @@ class AudioGenerator(BaseGenerator):
                 "default_params": dict(manifest.default_params),
                 "quality_report": quality_report,
                 **lineage_metadata,
+                **conditioning_metadata,
                 "params": {
                     "duration_seconds": duration_seconds,
                     "max_new_tokens": max_new_tokens,

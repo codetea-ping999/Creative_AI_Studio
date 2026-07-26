@@ -51,7 +51,7 @@ const mediaTypeReadinessLabels: Record<MediaType, string> = {
 };
 
 type AssetReuseOptions = {
-  action?: "rerun" | "variation";
+  action?: "rerun" | "variation" | "melody";
   issueTags?: QuickReviewIssueTag[];
   sourceAsset?: GalleryAssetDetailResponse;
   useSourceSnapshot?: boolean;
@@ -112,6 +112,26 @@ function App() {
     (model) => model.id === activeDraft.modelId && model.isAvailable,
   );
   const activeAvailableModelCount = activeModels.filter((model) => model.isAvailable).length;
+  const selectedAudioModel = modelOptionsByMedia.audio.find(
+    (model) => model.id === drafts.audio.modelId,
+  );
+  const canConditionMelody =
+    mediaType === "audio" &&
+    selectedAssetDetail?.media_type === "audio" &&
+    /\.wav$/i.test(selectedAssetDetail.output_path) &&
+    Boolean(
+      selectedAudioModel?.isAvailable &&
+        selectedAudioModel.tags.includes("melody-conditioning"),
+    );
+  const melodyConditioningMessage = canConditionMelody
+    ? `Use ${selectedAudioModel?.displayName ?? "the selected model"} with this WAV reference.`
+    : mediaType !== "audio"
+      ? "Switch to Audio before using melody conditioning."
+      : !selectedAudioModel?.tags.includes("melody-conditioning")
+        ? "Select an available melody-conditioning model in the Audio composer."
+        : !selectedAudioModel.isAvailable
+          ? selectedAudioModel.availabilityMessage || "The selected melody model is unavailable."
+          : "Melody conditioning requires a Gallery WAV asset.";
   const readinessState =
     apiReachable === null
       ? "checking"
@@ -773,11 +793,17 @@ function App() {
       setIsSubmitting(true);
       setActiveJobId(payload.job_id);
       setStatusMessage(
-        action === "rerun" ? `Queued rerun job ${payload.job_id}.` : `Queued variation job ${payload.job_id}.`,
+        action === "rerun"
+          ? `Queued rerun job ${payload.job_id}.`
+          : action === "melody"
+            ? `Queued melody-conditioned job ${payload.job_id}.`
+            : `Queued variation job ${payload.job_id}.`,
       );
       setAssetMessage(
         action === "rerun"
           ? `Created a fresh rerun from ${sourceAsset.asset_id}.`
+          : action === "melody"
+            ? `Using ${sourceAsset.asset_id} as the melody reference.`
           : `Created a reviewed variation from ${sourceAsset.asset_id}.`,
       );
       await loadJob(payload.job_id);
@@ -1209,6 +1235,11 @@ function App() {
               onQuickReview={handleQuickReview}
               onReuse={() => {
                 void handleAssetReuse();
+              }}
+              canConditionMelody={canConditionMelody}
+              melodyConditioningMessage={melodyConditioningMessage}
+              onConditionMelody={() => {
+                void handleAssetReuse({ action: "melody" });
               }}
               onLoadIntoComposer={loadSelectedAssetIntoComposer}
               onExport={() => {

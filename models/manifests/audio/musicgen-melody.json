@@ -1,0 +1,26 @@
+{
+  "id": "musicgen-melody-local",
+  "public_id": "musicgen-melody",
+  "display_name": "MusicGen Melody Local",
+  "media_type": "audio",
+  "task_type": "text-to-music",
+  "provider": "local",
+  "runtime": "transformers",
+  "local_path": "./models/audio/musicgen-melody",
+  "remote_ref": "facebook/musicgen-melody",
+  "loader": "transformers_musicgen_melody_loader",
+  "dtype": "float32",
+  "default_params": {
+    "duration_seconds": 8,
+    "guidance_scale": 3.0,
+    "temperature": 1.0,
+    "top_k": 250,
+    "top_p": 0.0,
+    "min_reference_duration_seconds": 1,
+    "max_reference_duration_seconds": 30
+  },
+  "aliases": ["musicgen-melody-local"],
+  "tags": ["audio", "music", "melody-conditioning"],
+  "is_default": false,
+  "enabled": true
+}

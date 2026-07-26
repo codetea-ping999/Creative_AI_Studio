@@ -273,6 +273,70 @@ class TransformersMusicgenLoader(BaseModelLoader):
         return requested_dtype
 
 
+class TransformersMusicgenMelodyLoader(TransformersMusicgenLoader):
+    """Load the Transformers MusicGen Melody model and its audio processor."""
+
+    def load(self, manifest: ModelManifest) -> dict[str, Any]:
+        try:
+            import torch
+            from transformers import (
+                MusicgenMelodyConfig,
+                MusicgenMelodyForConditionalGeneration,
+                MusicgenMelodyProcessor,
+            )
+        except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
+            raise RuntimeError(
+                "Transformers MusicGen Melody dependencies are missing. "
+                "Install torch, torchaudio, transformers, sentencepiece, accelerate, "
+                "and safetensors."
+            ) from exc
+
+        self._normalize_musicgen_config_class(
+            MusicgenMelodyForConditionalGeneration,
+            MusicgenMelodyConfig,
+        )
+
+        local_path = self._resolve_local_path(manifest)
+        device = self._resolve_device(torch)
+        requested_dtype = self._resolve_weight_dtype(manifest, torch)
+        runtime_dtype = self._resolve_runtime_dtype(requested_dtype, device, torch)
+        load_dtype = self._resolve_load_dtype(requested_dtype, runtime_dtype)
+
+        processor = MusicgenMelodyProcessor.from_pretrained(
+            local_path,
+            local_files_only=True,
+        )
+        model = MusicgenMelodyForConditionalGeneration.from_pretrained(
+            local_path,
+            torch_dtype=load_dtype,
+            local_files_only=True,
+        )
+        model.to(device=device, dtype=runtime_dtype)
+        model.eval()
+
+        return {
+            "stub": False,
+            "loader": self.__class__.__name__,
+            "manifest_id": manifest.id,
+            "display_name": manifest.display_name,
+            "runtime": manifest.runtime,
+            "provider": manifest.provider,
+            "local_path": local_path,
+            "remote_ref": manifest.remote_ref,
+            "dtype": manifest.dtype,
+            "load_dtype": str(load_dtype).split(".")[-1],
+            "torch_dtype": str(runtime_dtype).split(".")[-1],
+            "weight_dtype": str(requested_dtype).split(".")[-1],
+            "device": device,
+            "default_params": dict(manifest.default_params),
+            "path_exists": True,
+            "processor": processor,
+            "model": model,
+            "sampling_rate": int(model.config.audio_encoder.sampling_rate),
+            "frame_rate": int(model.config.audio_encoder.frame_rate),
+        }
+
+
 class ProceduralVideoLoader(BaseModelLoader):
     """Expose a lightweight local runtime for storyboard-style video output."""
 
@@ -426,6 +490,10 @@ def create_default_loader_registry() -> LoaderRegistry:
     registry = LoaderRegistry()
     registry.register("diffusers_image_loader", DiffusersImageLoader())
     registry.register("transformers_musicgen_loader", TransformersMusicgenLoader())
+    registry.register(
+        "transformers_musicgen_melody_loader",
+        TransformersMusicgenMelodyLoader(),
+    )
     registry.register("procedural_video_loader", ProceduralVideoLoader())
     registry.register("learned_video_loader", LearnedVideoLoader())
     return registry
@@ -437,6 +505,7 @@ __all__ = [
     "LearnedVideoLoader",
     "LoaderRegistry",
     "ProceduralVideoLoader",
+    "TransformersMusicgenMelodyLoader",
     "TransformersMusicgenLoader",
     "create_default_loader_registry",
 ]
