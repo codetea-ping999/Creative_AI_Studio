@@ -52,6 +52,12 @@ function createInitialState(
     durationSeconds: String(merged.durationSeconds),
     bpm: String(merged.bpm),
     mood: merged.mood,
+    genre: merged.genre,
+    instruments: merged.instruments,
+    structure: merged.structure,
+    temperature: String(merged.temperature),
+    topK: String(merged.topK),
+    topP: String(merged.topP),
     cameraMotion: merged.cameraMotion,
     visualStyle: merged.visualStyle,
   };
@@ -105,6 +111,15 @@ function serializeDraft(
     ),
     bpm: parseRequiredInteger(formValues.bpm, defaultValues.bpm),
     mood: formValues.mood,
+    genre: formValues.genre,
+    instruments: formValues.instruments,
+    structure: formValues.structure,
+    temperature: parseRequiredFloat(
+      formValues.temperature,
+      defaultValues.temperature,
+    ),
+    topK: parseRequiredInteger(formValues.topK, defaultValues.topK),
+    topP: parseRequiredFloat(formValues.topP, defaultValues.topP),
     cameraMotion: formValues.cameraMotion,
     visualStyle: formValues.visualStyle,
   };
@@ -282,6 +297,9 @@ export function PromptForm({
       ...current,
       prompt: preset.prompt,
       mood: preset.mood,
+      genre: preset.genre,
+      instruments: preset.instruments,
+      structure: preset.structure,
       bpm: String(preset.bpm),
       durationSeconds: String(preset.durationSeconds),
     }));
@@ -331,6 +349,18 @@ export function PromptForm({
         typeof selectedModel?.defaultParams.duration_seconds === "number"
           ? String(selectedModel.defaultParams.duration_seconds)
           : current.durationSeconds,
+      temperature:
+        typeof selectedModel?.defaultParams.temperature === "number"
+          ? String(selectedModel.defaultParams.temperature)
+          : current.temperature,
+      topK:
+        typeof selectedModel?.defaultParams.top_k === "number"
+          ? String(selectedModel.defaultParams.top_k)
+          : current.topK,
+      topP:
+        typeof selectedModel?.defaultParams.top_p === "number"
+          ? String(selectedModel.defaultParams.top_p)
+          : current.topP,
       cameraMotion:
         typeof selectedModel?.defaultParams.camera_motion === "string"
           ? selectedModel.defaultParams.camera_motion
@@ -375,6 +405,15 @@ export function PromptForm({
       ),
       bpm: parseRequiredInteger(formValues.bpm, defaultValues.bpm),
       mood: formValues.mood,
+      genre: formValues.genre,
+      instruments: formValues.instruments.trim(),
+      structure: formValues.structure,
+      temperature: parseRequiredFloat(
+        formValues.temperature,
+        defaultValues.temperature,
+      ),
+      topK: parseRequiredInteger(formValues.topK, defaultValues.topK),
+      topP: parseRequiredFloat(formValues.topP, defaultValues.topP),
       cameraMotion: formValues.cameraMotion,
       visualStyle: formValues.visualStyle,
     });
@@ -588,7 +627,7 @@ export function PromptForm({
           <div className="form-section__header">
             <div>
               <h3>Quick Controls</h3>
-              <p>Set duration, bpm, and mood for immediate playback</p>
+              <p>Shape the tempo, palette, and arrangement before generation</p>
             </div>
           </div>
 
@@ -599,6 +638,7 @@ export function PromptForm({
                 type="number"
                 inputMode="numeric"
                 min="2"
+                max="30"
                 step="1"
                 name="durationSeconds"
                 value={formValues.durationSeconds}
@@ -611,8 +651,8 @@ export function PromptForm({
               <input
                 type="number"
                 inputMode="numeric"
-                min="60"
-                max="180"
+                min="40"
+                max="240"
                 step="1"
                 name="bpm"
                 value={formValues.bpm}
@@ -635,7 +675,58 @@ export function PromptForm({
                 <option value="gentle">Gentle</option>
               </select>
             </label>
+            <label className="field-group">
+              <span>Genre</span>
+              <select
+                name="genre"
+                value={formValues.genre}
+                onChange={(event) => setFieldValue("genre", event.target.value)}
+                disabled={disabled}
+              >
+                <option value="ambient">Ambient</option>
+                <option value="electronic">Electronic</option>
+                <option value="lo-fi hip hop">Lo-fi Hip Hop</option>
+                <option value="cinematic">Cinematic</option>
+                <option value="jazz">Jazz</option>
+                <option value="rock">Rock</option>
+                <option value="orchestral">Orchestral</option>
+              </select>
+            </label>
+            <label className="field-group">
+              <span>Structure</span>
+              <select
+                name="structure"
+                value={formValues.structure}
+                onChange={(event) => setFieldValue("structure", event.target.value)}
+                disabled={disabled}
+              >
+                <option value="seamless loop">Seamless Loop</option>
+                <option value="intro, build, drop">Intro / Build / Drop</option>
+                <option value="intro, development, climax">
+                  Intro / Development / Climax
+                </option>
+                <option value="ambient bed">Ambient Bed</option>
+                <option value="full cue with a clear ending">Full Cue</option>
+              </select>
+            </label>
           </div>
+
+          <label className="field-group field-group--full">
+            <span>Instruments</span>
+            <input
+              type="text"
+              name="instruments"
+              aria-label="Instruments"
+              aria-describedby="audio-instruments-help"
+              placeholder="warm synth, soft percussion, electric bass"
+              value={formValues.instruments}
+              onChange={(event) => setFieldValue("instruments", event.target.value)}
+              disabled={disabled}
+            />
+            <small id="audio-instruments-help" className="field-help">
+              カンマ区切りの楽器指定を、ジャンル・構成・BPMと一緒にMusicGenへ渡します。
+            </small>
+          </label>
         </section>
       );
     }
@@ -809,7 +900,7 @@ export function PromptForm({
           <div className="form-section__header">
             <div>
               <h3>Advanced Controls</h3>
-              <p>Expose guidance and seed only when you need repeatability</p>
+              <p>Tune prompt adherence, variation, and sampling diversity</p>
             </div>
           </div>
 
@@ -820,10 +911,53 @@ export function PromptForm({
                 type="number"
                 inputMode="decimal"
                 min="1"
+                max="10"
                 step="0.1"
                 name="guidanceScale"
                 value={formValues.guidanceScale}
                 onChange={(event) => setFieldValue("guidanceScale", event.target.value)}
+                disabled={disabled}
+              />
+            </label>
+            <label className="field-group">
+              <span>Temperature</span>
+              <input
+                type="number"
+                inputMode="decimal"
+                min="0.1"
+                max="2"
+                step="0.1"
+                name="temperature"
+                value={formValues.temperature}
+                onChange={(event) => setFieldValue("temperature", event.target.value)}
+                disabled={disabled}
+              />
+            </label>
+            <label className="field-group">
+              <span>Top K</span>
+              <input
+                type="number"
+                inputMode="numeric"
+                min="0"
+                max="1000"
+                step="1"
+                name="topK"
+                value={formValues.topK}
+                onChange={(event) => setFieldValue("topK", event.target.value)}
+                disabled={disabled}
+              />
+            </label>
+            <label className="field-group">
+              <span>Top P</span>
+              <input
+                type="number"
+                inputMode="decimal"
+                min="0"
+                max="1"
+                step="0.05"
+                name="topP"
+                value={formValues.topP}
+                onChange={(event) => setFieldValue("topP", event.target.value)}
                 disabled={disabled}
               />
             </label>

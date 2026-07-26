@@ -23,6 +23,12 @@ const baseValues: PromptFormSubmitValues = {
   durationSeconds: 8,
   bpm: 96,
   mood: "dreamy",
+  genre: "electronic",
+  instruments: "warm analog synth, soft percussion",
+  structure: "seamless loop",
+  temperature: 1,
+  topK: 250,
+  topP: 0,
   cameraMotion: "push-in",
   visualStyle: "storyboard",
 };
@@ -74,6 +80,12 @@ describe("generation payloads", () => {
         guidance_scale: 3,
         bpm: 110,
         mood: "energetic",
+        genre: "electronic",
+        instruments: "warm analog synth, soft percussion",
+        structure: "seamless loop",
+        temperature: 1,
+        top_k: 250,
+        top_p: 0,
       },
     });
   });

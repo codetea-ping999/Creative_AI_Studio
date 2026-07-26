@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { PromptForm, type ModelOption } from "./components/PromptForm";
 import { buildGeneratePayload, buildReusePayload } from "./lib/payloads";
-import { isVideoAsset } from "./studio";
+import { createDraftFromRequestSnapshot, isVideoAsset } from "./studio";
 import { createOutputUrl, formatApiErrorDetail } from "./studioClient";
 
 const storyboardModel: ModelOption = {
@@ -84,6 +84,62 @@ describe("PromptForm", () => {
       "夕暮れの花束",
     );
     expect(screen.getByText("作られる内容の要約")).toBeTruthy();
+  });
+
+  it("submits structured MusicGen composition and sampling controls", async () => {
+    const user = userEvent.setup();
+    const handleSubmit = vi.fn();
+    const audioModel: ModelOption = {
+      ...storyboardModel,
+      id: "musicgen-small",
+      displayName: "MusicGen Small",
+      tags: ["audio", "music"],
+      defaultParams: {
+        duration_seconds: 8,
+        guidance_scale: 3,
+        temperature: 1,
+        top_k: 250,
+        top_p: 0,
+      },
+    };
+
+    render(
+      <PromptForm
+        mediaType="audio"
+        modelOptions={[audioModel]}
+        initialValues={{ modelId: "musicgen-small", prompt: "tense trailer cue" }}
+        submitLabel="Create music"
+        onSubmit={handleSubmit}
+      />,
+    );
+
+    await user.selectOptions(screen.getByLabelText("Genre"), "cinematic");
+    await user.selectOptions(
+      screen.getByLabelText("Structure"),
+      "intro, development, climax",
+    );
+    await user.clear(screen.getByLabelText("Instruments"));
+    await user.type(screen.getByLabelText("Instruments"), "low strings, brass");
+    await user.click(screen.getByRole("tab", { name: "Advanced" }));
+    await user.clear(screen.getByLabelText("Temperature"));
+    await user.type(screen.getByLabelText("Temperature"), "0.8");
+    await user.clear(screen.getByLabelText("Top K"));
+    await user.type(screen.getByLabelText("Top K"), "180");
+    await user.clear(screen.getByLabelText("Top P"));
+    await user.type(screen.getByLabelText("Top P"), "0.9");
+    await user.click(screen.getByRole("button", { name: "Create music" }));
+
+    expect(handleSubmit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        mediaType: "audio",
+        genre: "cinematic",
+        instruments: "low strings, brass",
+        structure: "intro, development, climax",
+        temperature: 0.8,
+        topK: 180,
+        topP: 0.9,
+      }),
+    );
   });
 
   it("submits normalized video composer values", async () => {
@@ -225,6 +281,12 @@ describe("studio helpers", () => {
       durationSeconds: 2,
       bpm: 96,
       mood: "dreamy",
+      genre: "electronic",
+      instruments: "warm analog synth, soft percussion",
+      structure: "seamless loop",
+      temperature: 1,
+      topK: 250,
+      topP: 0,
       cameraMotion: "push-in",
       visualStyle: "storyboard",
     };
@@ -248,6 +310,39 @@ describe("studio helpers", () => {
       action: "variation",
       project_id: null,
       output_format: "gif",
+    });
+  });
+
+  it("restores all structured MusicGen controls from a request snapshot", () => {
+    expect(
+      createDraftFromRequestSnapshot({
+        media_type: "audio",
+        prompt: "cinematic tension cue",
+        negative_prompt: null,
+        model_id: "musicgen-small",
+        seed: 17,
+        output_format: "wav",
+        params: {
+          duration_seconds: 12,
+          guidance_scale: 3.5,
+          bpm: 84,
+          mood: "dark",
+          genre: "cinematic",
+          instruments: "low strings, brass",
+          structure: "intro, development, climax",
+          temperature: 0.8,
+          top_k: 180,
+          top_p: 0.9,
+        },
+      }),
+    ).toMatchObject({
+      mediaType: "audio",
+      genre: "cinematic",
+      instruments: "low strings, brass",
+      structure: "intro, development, climax",
+      temperature: 0.8,
+      topK: 180,
+      topP: 0.9,
     });
   });
 
