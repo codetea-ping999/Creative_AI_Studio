@@ -5,8 +5,11 @@ import { MatrixPanel } from "./components/MatrixPanel";
 import { StoryPanel } from "./components/StoryPanel";
 import {
   availableStages,
+  isReadyToAssemble,
   loglineCandidates,
+  missingRolesForScene,
   type StoryDocument,
+  type StoryScene,
 } from "./lib/storyApi";
 import {
   batchProgressLabel,
@@ -259,7 +262,9 @@ describe("StoryPanel", () => {
     expect(within(table).getByText(/不足: visual/)).toBeTruthy();
     expect(screen.getByText(/不足素材 1 件/)).toBeTruthy();
 
-    await user.click(within(table).getByRole("button", { name: "画像を生成" }));
+    await user.click(
+      within(table).getByRole("button", { name: "画像をコンポーザへ" }),
+    );
     expect(onGenerate).toHaveBeenCalledWith(
       expect.objectContaining({ id: "scene_01", image_prompt: "rooftop at dawn" }),
     );
@@ -424,5 +429,59 @@ describe("MatrixPanel", () => {
     );
     render(<MatrixPanel modelId="" />);
     expect((await screen.findByRole("alert")).textContent).toContain("nope");
+  });
+});
+
+function makeScene(overrides: Partial<StoryScene> = {}): StoryScene {
+  return {
+    id: "scene_01",
+    order: 0,
+    heading: "屋上の朝",
+    summary: "",
+    narration: "",
+    image_prompt: "rooftop at dawn",
+    image_negative: "",
+    bgm_mood: "hopeful",
+    duration_seconds: 4,
+    camera: "",
+    asset_ids: {},
+    ...overrides,
+  } as StoryScene;
+}
+
+describe("scene generation helpers", () => {
+  it("lists a scene's missing roles in production order", () => {
+    const detail = {
+      story: makeStory(),
+      missing_assets: [
+        { scene_id: "scene_01", role: "music" },
+        { scene_id: "scene_01", role: "visual" },
+        { scene_id: "scene_02", role: "visual" },
+      ],
+    } as never;
+    expect(missingRolesForScene(detail, "scene_01")).toEqual(["visual", "music"]);
+    expect(missingRolesForScene(detail, "scene_03")).toEqual([]);
+    expect(missingRolesForScene(null, "scene_01")).toEqual([]);
+  });
+
+  it("is ready to assemble only when scenes exist and nothing is missing", () => {
+    expect(isReadyToAssemble(null)).toBe(false);
+    // Scenes present but incomplete.
+    expect(
+      isReadyToAssemble({
+        story: makeStory({ scenes: [makeScene()] }),
+        missing_assets: [{ scene_id: "scene_01", role: "visual" }],
+      } as never),
+    ).toBe(false);
+    // No scenes at all is not "ready", it is empty.
+    expect(
+      isReadyToAssemble({ story: makeStory(), missing_assets: [] } as never),
+    ).toBe(false);
+    expect(
+      isReadyToAssemble({
+        story: makeStory({ scenes: [makeScene()] }),
+        missing_assets: [],
+      } as never),
+    ).toBe(true);
   });
 });

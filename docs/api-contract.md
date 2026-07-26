@@ -59,7 +59,9 @@ http://127.0.0.1:8000
 | Stories | `DELETE` | `/stories/{story_id}` | 削除 |
 | Stories | `POST` | `/stories/{story_id}/expand` | 次の執筆段階の text job を起動 |
 | Stories | `POST` | `/stories/{story_id}/apply` | 完了した text job をマージ |
+| Stories | `POST` | `/stories/{story_id}/scenes/{scene_id}/generate` | シーン 1 カットの素材を生成（結果は自動で紐付く） |
 | Stories | `GET` | `/stories/{story_id}/timeline` | assembly 用 timeline を取得 |
+| Stories | `POST` | `/stories/{story_id}/assemble` | scene から timeline を組んで MP4 を書き出す |
 | Metrics | `GET` | `/metrics/summary` | Studio 全体の運用サマリ |
 | Metrics | `GET` | `/metrics/calibration` | 自動scoreとhuman feedbackの相関レポート |
 | Feedback | `POST` | `/feedback` | 人手評価保存 |
@@ -124,6 +126,27 @@ Web 側は `detail` 配列から `body.prompt: Field required` のような構�
 
 - `GET /stories/{id}/timeline` で scene に visual が無い（不足 scene id を列挙）
 - `POST /stories/{id}/apply` で対象 job が未完了、または story payload を持たない
+
+### シーンへの自動紐付け
+
+`POST /stories/{id}/scenes/{scene_id}/generate` は `role`（`visual` / `narration` /
+`music`）だけを受け取り、必要な request を scene から組み立てます。
+
+| role | 生成対象 | 入力に使う scene のフィールド |
+| --- | --- | --- |
+| `visual` | image | `image_prompt` / `image_negative` / `bible_refs` |
+| `narration` | audio（`text-to-speech`） | `narration` |
+| `music` | audio（`text-to-music`） | `bgm_mood` / `duration_seconds` |
+
+request の params には `story_id` / `scene_id` / `scene_role` が入り、job が成功すると
+`SceneBinder` が生成物を `Scene.asset_ids[role]` へ結びつけます。UI は job 完了後に
+story を読み直すだけで、素材の紐付けを自分で管理する必要がありません。
+
+紐付けが行われない正常系:
+
+- scene が持つ元テキストが空の場合は 409（何を生成すべきか決まらないため）
+- scene list を作り直して対象 scene id が消えていた場合は binding を破棄する
+- job が失敗した場合は scene を変更しない（半端に紐付けない）
 
 ## Shared Types
 

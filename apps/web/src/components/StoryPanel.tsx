@@ -1,14 +1,19 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   applyStoryResult,
+  assembleStory,
   availableStages,
   createStory,
+  generateSceneMedia,
+  isReadyToAssemble,
+  sceneRoleLabels,
   expandStory,
   getStory,
   listStories,
   loglineCandidates,
   storyStages,
   updateStory,
+  type SceneRole,
   type StoryDetail,
   type StoryDocument,
   type StoryScene,
@@ -25,6 +30,8 @@ export type StoryPanelProps = {
   onGenerateSceneImage?: (scene: StoryScene) => void;
   /** Load one scene's narration into the audio composer. */
   onGenerateSceneNarration?: (scene: StoryScene) => void;
+  /** Models used when generating a scene's media in place. */
+  sceneModelIds?: Partial<Record<SceneRole, string>>;
 };
 
 type LoadState = "loading" | "ready" | "error";
@@ -93,10 +100,14 @@ function StoryScenes({
   detail,
   onGenerateSceneImage,
   onGenerateSceneNarration,
+  onGenerateRole,
+  busyScene,
 }: {
   detail: StoryDetail;
   onGenerateSceneImage?: (scene: StoryScene) => void;
   onGenerateSceneNarration?: (scene: StoryScene) => void;
+  onGenerateRole?: (scene: StoryScene, role: SceneRole) => void;
+  busyScene?: { sceneId: string; role: SceneRole } | null;
 }) {
   const scenes = [...detail.story.scenes].sort(
     (left, right) => left.order - right.order,
@@ -193,6 +204,45 @@ function StoryScenes({
                 </td>
                 <td data-label="次の操作">
                   <div className="story-scene-actions">
+                    {onGenerateRole
+                      ? (["visual", "narration", "music"] as SceneRole[]).map(
+                          (role) => {
+                            const isBusy =
+                              busyScene?.sceneId === scene.id &&
+                              busyScene.role === role;
+                            const hasSource =
+                              role === "visual"
+                                ? Boolean(scene.image_prompt.trim())
+                                : role === "narration"
+                                  ? Boolean(scene.narration.trim())
+                                  : Boolean(scene.bgm_mood.trim());
+                            const isFilled = Boolean(scene.asset_ids[role]);
+                            return (
+                              <button
+                                key={role}
+                                type="button"
+                                className="secondary-button"
+                                onClick={() => onGenerateRole(scene, role)}
+                                disabled={!hasSource || Boolean(busyScene)}
+                                aria-busy={isBusy}
+                                title={
+                                  hasSource
+                                    ? isFilled
+                                      ? `${sceneRoleLabels[role]}を作り直す`
+                                      : `${sceneRoleLabels[role]}を生成してこのシーンに紐付ける`
+                                    : `${sceneRoleLabels[role]}のもとになるテキストがありません`
+                                }
+                              >
+                                {isBusy
+                                  ? `${sceneRoleLabels[role]}…`
+                                  : isFilled
+                                    ? `${sceneRoleLabels[role]}を再生成`
+                                    : `${sceneRoleLabels[role]}を生成`}
+                              </button>
+                            );
+                          },
+                        )
+                      : null}
                     {onGenerateSceneImage ? (
                       <button
                         type="button"
@@ -201,11 +251,11 @@ function StoryScenes({
                         disabled={!scene.image_prompt.trim()}
                         title={
                           scene.image_prompt
-                            ? "画像プロンプトをコンポーザに読み込む"
+                            ? "画像プロンプトをコンポーザに読み込んで調整する"
                             : "画像プロンプトがありません"
                         }
                       >
-                        画像を生成
+                        画像をコンポーザへ
                       </button>
                     ) : null}
                     {onGenerateSceneNarration ? (
@@ -216,11 +266,11 @@ function StoryScenes({
                         disabled={!scene.narration.trim()}
                         title={
                           scene.narration
-                            ? "ナレーションを音声コンポーザに読み込む"
+                            ? "ナレーションを音声コンポーザに読み込んで調整する"
                             : "ナレーションがありません"
                         }
                       >
-                        音声を生成
+                        音声をコンポーザへ
                       </button>
                     ) : null}
                   </div>
@@ -240,6 +290,7 @@ export function StoryPanel({
   awaitJob,
   onGenerateSceneImage,
   onGenerateSceneNarration,
+  sceneModelIds,
 }: StoryPanelProps) {
   const [stories, setStories] = useState<StorySummary[]>([]);
   const [formats, setFormats] = useState<string[]>(["short-video"]);
@@ -258,6 +309,11 @@ export function StoryPanel({
   const [isCreating, setIsCreating] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [pending, setPending] = useState<PendingStage>(null);
+  const [busyScene, setBusyScene] = useState<{
+    sceneId: string;
+    role: SceneRole;
+  } | null>(null);
+  const [isAssembling, setIsAssembling] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
 
@@ -353,6 +409,58 @@ export function StoryPanel({
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
       setIsCreating(false);
+    }
+  }
+
+  async function handleGenerateRole(scene: StoryScene, role: SceneRole) {
+    if (!story) return;
+    setError("");
+    setNotice("");
+    setBusyScene({ sceneId: scene.id, role });
+    try {
+      const { job_id: jobId } = await generateSceneMedia(story.id, scene.id, {
+        role,
+        model_id: sceneModelIds?.[role] ?? "",
+      });
+      const status = await awaitJob(jobId);
+      // The server binds the finished asset to the scene, so the panel only has
+      // to re-read the story to see it.
+      setDetail(await getStory(story.id));
+      setNotice(
+        status === "succeeded"
+          ? `${sceneRoleLabels[role]}を ${scene.heading || scene.id} に紐付けました。`
+          : `${sceneRoleLabels[role]}の生成が ${status} で終了しました。`,
+      );
+      if (status !== "succeeded") {
+        setError(`${sceneRoleLabels[role]}の生成に失敗しました（${status}）。`);
+      }
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusyScene(null);
+    }
+  }
+
+  async function handleAssemble() {
+    if (!story) return;
+    setError("");
+    setNotice("");
+    setIsAssembling(true);
+    try {
+      const { job_id: jobId } = await assembleStory(story.id);
+      const status = await awaitJob(jobId);
+      setNotice(
+        status === "succeeded"
+          ? "動画を書き出しました。ギャラリーで確認できます。"
+          : `書き出しが ${status} で終了しました。`,
+      );
+      if (status !== "succeeded") {
+        setError(`書き出しに失敗しました（${status}）。`);
+      }
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setIsAssembling(false);
     }
   }
 
@@ -698,7 +806,36 @@ export function StoryPanel({
             detail={detail}
             onGenerateSceneImage={onGenerateSceneImage}
             onGenerateSceneNarration={onGenerateSceneNarration}
+            onGenerateRole={(scene, role) => {
+              void handleGenerateRole(scene, role);
+            }}
+            busyScene={busyScene}
           />
+
+          <div className="story-assemble-row">
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => void handleAssemble()}
+              disabled={!isReadyToAssemble(detail) || isAssembling}
+              aria-busy={isAssembling}
+              aria-describedby="story-assemble-help"
+              title={
+                isReadyToAssemble(detail)
+                  ? "シーンを 1 本の MP4 に書き出す"
+                  : "すべてのシーンに素材が揃うと書き出せます"
+              }
+            >
+              {isAssembling ? "書き出し中…" : "動画を書き出す"}
+            </button>
+            <p id="story-assemble-help" className="section-footnote">
+              {isReadyToAssemble(detail)
+                ? `${detail.story.scenes.length} シーン / ${detail.story.scenes
+                    .reduce((total, scene) => total + scene.duration_seconds, 0)
+                    .toFixed(1)} 秒を 1920x1080 で書き出します。`
+                : `素材が ${detail.missing_assets.length} 件不足しています。`}
+            </p>
+          </div>
 
           {story.chapters.length > 0 ? (
             <details className="story-disclosure">
