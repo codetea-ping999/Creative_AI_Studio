@@ -14,7 +14,8 @@
     "duration_seconds": 8,
     "guidance_scale": 3.0,
     "temperature": 1.0,
-    "top_k": 250
+    "top_k": 250,
+    "top_p": 0.0
   },
   "aliases": ["musicgen-medium-local"],
   "tags": ["audio", "music", "quality"],

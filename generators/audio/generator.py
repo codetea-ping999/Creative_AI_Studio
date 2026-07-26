@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -17,6 +18,14 @@ from core.schemas import GenerationRequest, GenerationResult
 from generators.base import BaseGenerator
 
 _MAX_INT16 = 32_767
+_AUDIO_PARAM_RANGES = {
+    "duration_seconds": (2.0, 30.0),
+    "guidance_scale": (1.0, 10.0),
+    "temperature": (0.1, 2.0),
+    "top_k": (0.0, 1000.0),
+    "top_p": (0.0, 1.0),
+    "bpm": (40.0, 240.0),
+}
 
 
 class AudioGenerator(BaseGenerator):
@@ -40,6 +49,18 @@ class AudioGenerator(BaseGenerator):
             raise ValueError("Audio prompt must not be empty.")
         if request.output_format and request.output_format.lower() != "wav":
             raise ValueError("AudioGenerator currently supports wav output only.")
+        for name, (minimum, maximum) in _AUDIO_PARAM_RANGES.items():
+            value = request.params.get(name)
+            if value is None:
+                continue
+            try:
+                numeric_value = float(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Audio parameter '{name}' must be numeric.") from exc
+            if not math.isfinite(numeric_value) or not minimum <= numeric_value <= maximum:
+                raise ValueError(
+                    f"Audio parameter '{name}' must be between {minimum:g} and {maximum:g}."
+                )
 
     def prepare(self, request: GenerationRequest) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -58,16 +79,26 @@ class AudioGenerator(BaseGenerator):
         device = runtime_obj["device"]
 
         effective_params = {**manifest.default_params, **request.params}
+        lineage_metadata = _extract_lineage_metadata(effective_params)
+        for lineage_key in lineage_metadata:
+            effective_params.pop(lineage_key, None)
         duration_seconds = max(1, int(effective_params.pop("duration_seconds", 8)))
         guidance_scale = float(effective_params.pop("guidance_scale", 3.0))
         temperature = float(effective_params.pop("temperature", 1.0))
         top_k = int(effective_params.pop("top_k", 250))
         top_p = float(effective_params.pop("top_p", 0.0))
-        bpm = effective_params.pop("bpm", None)
+        bpm_value = effective_params.pop("bpm", None)
+        bpm = int(bpm_value) if bpm_value is not None else None
         mood = str(effective_params.pop("mood", "")).strip().lower() or None
+        genre = str(effective_params.pop("genre", "")).strip().lower() or None
+        instruments = str(effective_params.pop("instruments", "")).strip() or None
+        structure = str(effective_params.pop("structure", "")).strip().lower() or None
         conditioning_prompt = self._build_conditioning_prompt(
             request.prompt,
             mood=mood,
+            genre=genre,
+            instruments=instruments,
+            structure=structure,
             bpm=bpm,
         )
 
@@ -111,7 +142,7 @@ class AudioGenerator(BaseGenerator):
 
         output_duration = float(audio_tensor.shape[-1] / sampling_rate)
         quality_report = evaluate_audio_output(output_path)
-        semantic_report = evaluate_audio_semantics(output_path, request.prompt)
+        semantic_report = evaluate_audio_semantics(output_path, conditioning_prompt)
         enrich_quality_report(quality_report, semantic_report)
 
         return GenerationResult(
@@ -145,7 +176,7 @@ class AudioGenerator(BaseGenerator):
                 "channels": int(audio_tensor.shape[0] if audio_tensor.ndim > 1 else 1),
                 "default_params": dict(manifest.default_params),
                 "quality_report": quality_report,
-                **_extract_lineage_metadata(request.params),
+                **lineage_metadata,
                 "params": {
                     "duration_seconds": duration_seconds,
                     "max_new_tokens": max_new_tokens,
@@ -155,6 +186,9 @@ class AudioGenerator(BaseGenerator):
                     "top_p": top_p,
                     "mood": mood,
                     "bpm": bpm,
+                    "genre": genre,
+                    "instruments": instruments,
+                    "structure": structure,
                     **effective_params,
                 },
                 "duration_seconds_generated": output_duration,
@@ -170,13 +204,22 @@ class AudioGenerator(BaseGenerator):
         prompt: str,
         *,
         mood: str | None,
-        bpm: object,
+        genre: str | None,
+        instruments: str | None,
+        structure: str | None,
+        bpm: int | None,
     ) -> str:
         parts: list[str] = []
+        if genre:
+            parts.append(f"{genre} music")
         if mood:
             parts.append(f"{mood} mood")
         if bpm is not None:
             parts.append(f"{bpm} BPM")
+        if instruments:
+            parts.append(f"featuring {instruments}")
+        if structure:
+            parts.append(f"{structure} structure")
         parts.append(prompt.strip())
         return ", ".join(part for part in parts if part)
 
