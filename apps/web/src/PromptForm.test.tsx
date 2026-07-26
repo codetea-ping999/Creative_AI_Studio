@@ -142,6 +142,159 @@ describe("PromptForm", () => {
     );
   });
 
+  it("shows and submits long-form duration and stride only for long-form models", async () => {
+    const user = userEvent.setup();
+    const handleSubmit = vi.fn();
+    const shortModel: ModelOption = {
+      ...storyboardModel,
+      id: "musicgen-small",
+      displayName: "MusicGen Small",
+      tags: ["audio", "music"],
+      defaultParams: { duration_seconds: 8 },
+    };
+    const longModel: ModelOption = {
+      ...storyboardModel,
+      id: "musicgen-long-form",
+      displayName: "MusicGen Small Long-form",
+      tags: ["audio", "music", "long-form"],
+      defaultParams: {
+        duration_seconds: 45,
+        extend_stride_seconds: 18,
+      },
+    };
+
+    render(
+      <PromptForm
+        mediaType="audio"
+        modelOptions={[shortModel, longModel]}
+        initialValues={{ modelId: "musicgen-small", prompt: "long evolving cue" }}
+        submitLabel="Create music"
+        onSubmit={handleSubmit}
+      />,
+    );
+
+    expect(screen.queryByLabelText("Extend stride (sec)")).toBeNull();
+    await user.selectOptions(screen.getByLabelText("Model"), "musicgen-long-form");
+
+    const duration = screen.getByLabelText("Duration (sec)") as HTMLInputElement;
+    const stride = screen.getByLabelText("Extend stride (sec)") as HTMLInputElement;
+    expect(duration.min).toBe("31");
+    expect(duration.max).toBe("120");
+    expect(duration.value).toBe("45");
+    expect(stride.min).toBe("5");
+    expect(stride.max).toBe("29");
+    expect(stride.value).toBe("18");
+
+    await user.clear(duration);
+    await user.type(duration, "60");
+    await user.clear(stride);
+    await user.type(stride, "10");
+    await user.click(screen.getByRole("button", { name: "Create music" }));
+    expect(handleSubmit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        modelId: "musicgen-long-form",
+        durationSeconds: 60,
+        extendStrideSeconds: 10,
+      }),
+    );
+
+    await user.selectOptions(screen.getByLabelText("Model"), "musicgen-small");
+    expect(screen.queryByLabelText("Extend stride (sec)")).toBeNull();
+    expect((screen.getByLabelText("Duration (sec)") as HTMLInputElement).max).toBe("30");
+  });
+
+  it("applies and preserves long-form defaults when it is the first available audio model", async () => {
+    const user = userEvent.setup();
+    const unavailableShort: ModelOption = {
+      ...storyboardModel,
+      id: "musicgen-small",
+      displayName: "MusicGen Small",
+      tags: ["audio", "music"],
+      defaultParams: { duration_seconds: 8 },
+      isAvailable: false,
+    };
+    const availableLong: ModelOption = {
+      ...storyboardModel,
+      id: "musicgen-long-form",
+      displayName: "MusicGen Small Long-form",
+      tags: ["audio", "music", "long-form"],
+      defaultParams: {
+        duration_seconds: 45,
+        extend_stride_seconds: 18,
+      },
+    };
+
+    render(
+      <PromptForm
+        mediaType="audio"
+        modelOptions={[unavailableShort, availableLong]}
+        initialValues={{ modelId: "musicgen-small" }}
+      />,
+    );
+
+    await waitFor(() => {
+      expect((screen.getByLabelText("Model") as HTMLSelectElement).value).toBe(
+        "musicgen-long-form",
+      );
+    });
+    expect((screen.getByLabelText("Duration (sec)") as HTMLInputElement).value).toBe(
+      "45",
+    );
+    expect(
+      (screen.getByLabelText("Extend stride (sec)") as HTMLInputElement).value,
+    ).toBe("18");
+    await user.click(screen.getByRole("button", { name: "Dreamy Loop" }));
+    expect((screen.getByLabelText("Duration (sec)") as HTMLInputElement).value).toBe(
+      "45",
+    );
+  });
+
+  it("keeps non-preset MusicGen values visible and submits them unchanged", async () => {
+    const user = userEvent.setup();
+    const handleSubmit = vi.fn();
+    const audioModel: ModelOption = {
+      ...storyboardModel,
+      id: "musicgen-small",
+      displayName: "MusicGen Small",
+      tags: ["audio", "music"],
+    };
+
+    render(
+      <PromptForm
+        mediaType="audio"
+        modelOptions={[audioModel]}
+        initialValues={{
+          modelId: "musicgen-small",
+          prompt: "restored cue",
+          mood: "warm",
+          genre: "lo-fi",
+          structure: "intro-outro",
+        }}
+        submitLabel="Create music"
+        onSubmit={handleSubmit}
+      />,
+    );
+
+    expect((screen.getByLabelText("Mood") as HTMLSelectElement).value).toBe("warm");
+    expect(screen.getByRole("option", { name: "warm (restored)" })).toBeTruthy();
+    expect((screen.getByLabelText("Genre") as HTMLSelectElement).value).toBe("lo-fi");
+    expect(screen.getByRole("option", { name: "lo-fi (restored)" })).toBeTruthy();
+    expect((screen.getByLabelText("Structure") as HTMLSelectElement).value).toBe(
+      "intro-outro",
+    );
+    expect(screen.getByRole("option", { name: "intro-outro (restored)" })).toBeTruthy();
+
+    await user.click(screen.getByRole("button", { name: "Create music" }));
+
+    expect(handleSubmit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        mood: "warm",
+        genre: "lo-fi",
+        structure: "intro-outro",
+      }),
+    );
+  });
+
   it("submits normalized video composer values", async () => {
     const user = userEvent.setup();
     const handleSubmit = vi.fn();
@@ -259,6 +412,12 @@ describe("studio helpers", () => {
     expect(createOutputUrl("/Users/example/CreativeOutputs/images/sample.png")).toBe(
       "http://127.0.0.1:8000/outputs/images/sample.png",
     );
+    expect(createOutputUrl("outputs/issue26/audio/sample.wav")).toBe(
+      "http://127.0.0.1:8000/outputs/audio/sample.wav",
+    );
+    expect(createOutputUrl("/repo/outputs/issue26/audio/sample.wav")).toBe(
+      "http://127.0.0.1:8000/outputs/audio/sample.wav",
+    );
   });
 
   it("builds generate and reuse payloads with project binding", () => {
@@ -279,6 +438,7 @@ describe("studio helpers", () => {
       loraScale: 0.8,
       seed: 123,
       durationSeconds: 2,
+      extendStrideSeconds: null,
       bpm: 96,
       mood: "dreamy",
       genre: "electronic",
@@ -319,11 +479,12 @@ describe("studio helpers", () => {
         media_type: "audio",
         prompt: "cinematic tension cue",
         negative_prompt: null,
-        model_id: "musicgen-small",
+        model_id: "musicgen-long-form",
         seed: 17,
         output_format: "wav",
         params: {
-          duration_seconds: 12,
+          duration_seconds: 45,
+          extend_stride_seconds: 10,
           guidance_scale: 3.5,
           bpm: 84,
           mood: "dark",
@@ -343,6 +504,7 @@ describe("studio helpers", () => {
       temperature: 0.8,
       topK: 180,
       topP: 0.9,
+      extendStrideSeconds: 10,
     });
   });
 

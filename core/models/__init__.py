@@ -8,6 +8,7 @@ from core.model_readiness import (
 
 from .cache import ModelRuntimeCache
 from .loader import (
+    AudioCraftMusicgenLoader,
     BaseModelLoader,
     BaseSpeechLoader,
     DiffusersImageLoader,
@@ -24,6 +25,7 @@ from .resolver import ModelResolver
 from .service import ModelService
 
 __all__ = [
+    "AudioCraftMusicgenLoader",
     "BaseModelLoader",
     "BaseSpeechLoader",
     "DiffusersImageLoader",

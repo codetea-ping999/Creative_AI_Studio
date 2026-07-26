@@ -16,6 +16,7 @@ without pulling in the FastAPI/pydantic stack.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import re
 from collections.abc import Mapping
@@ -48,6 +49,15 @@ _CONFIG_ONLY_PREFIXES: tuple[str, ...] = ("tokenizer", "feature_extractor", "ima
 _TRANSFORMERS_PROCESSOR_CONFIGS: tuple[str, ...] = (
     "preprocessor_config.json",
     "tokenizer_config.json",
+)
+_AUDIOCRAFT_MODEL_FILES: tuple[str, ...] = (
+    "state_dict.bin",
+    "compression_state_dict.bin",
+)
+_AUDIOCRAFT_T5_FILES: tuple[str, ...] = (
+    "config.json",
+    "model.safetensors",
+    "spiece.model",
 )
 
 
@@ -148,6 +158,8 @@ def evaluate_readiness(
         return diffusers_pipeline_readiness(model_root)
     if runtime == "transformers":
         return transformers_model_readiness(model_root)
+    if runtime == "audiocraft":
+        return audiocraft_model_readiness(model_root)
     if runtime == "learned":
         return _learned_runtime_readiness(model_root, params, repo_root=repo_root)
     return ModelReadiness(STATUS_READY, "Local runtime files are ready.")
@@ -213,6 +225,43 @@ def transformers_model_readiness(
             tuple(missing),
         )
     return ModelReadiness(STATUS_READY, f"{label} model files are ready.")
+
+
+def audiocraft_model_readiness(
+    model_path: Path,
+    *,
+    label: str = "AudioCraft",
+) -> ModelReadiness:
+    """Check the optional AudioCraft dependency and local exported checkpoint."""
+
+    if importlib.util.find_spec("audiocraft") is None:
+        return ModelReadiness(
+            STATUS_MISSING_FILES,
+            "AudioCraft dependency is not installed. "
+            "Install the optional AudioCraft 1.3 runtime described in "
+            "docs/model-download-guide.md.",
+            ("python:audiocraft",),
+        )
+
+    missing = [
+        name for name in _AUDIOCRAFT_MODEL_FILES if not (model_path / name).is_file()
+    ]
+    t5_root = model_path / "t5-base"
+    missing.extend(
+        f"t5-base/{name}"
+        for name in _AUDIOCRAFT_T5_FILES
+        if not (t5_root / name).is_file()
+    )
+    if missing:
+        return ModelReadiness(
+            STATUS_MISSING_FILES,
+            f"{label} model files are missing: " + ", ".join(missing),
+            tuple(missing),
+        )
+    return ModelReadiness(
+        STATUS_READY,
+        f"{label} dependency, checkpoint, and local T5 files are ready.",
+    )
 
 
 def missing_diffusers_files(pipeline_path: Path) -> list[str]:

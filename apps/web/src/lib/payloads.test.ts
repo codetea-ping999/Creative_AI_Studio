@@ -21,6 +21,7 @@ const baseValues: PromptFormSubmitValues = {
   loraScale: 0.8,
   seed: 42,
   durationSeconds: 8,
+  extendStrideSeconds: null,
   bpm: 96,
   mood: "dreamy",
   genre: "electronic",
@@ -90,6 +91,24 @@ describe("generation payloads", () => {
     });
   });
 
+  it("adds AudioCraft extend stride only for a long-form draft", () => {
+    const payload = buildGeneratePayload(
+      {
+        ...baseValues,
+        mediaType: "audio",
+        modelId: "musicgen-long-form",
+        durationSeconds: 45,
+        extendStrideSeconds: 10,
+      },
+      null,
+    );
+
+    expect(payload.params).toMatchObject({
+      duration_seconds: 45,
+      extend_stride_seconds: 10,
+    });
+  });
+
   it("adds reuse intent without changing the media payload", () => {
     expect(buildReusePayload(baseValues, "project-1")).toMatchObject({
       action: "variation",
@@ -114,6 +133,19 @@ describe("generation payloads", () => {
         review_issue_tags: ["mood"],
         review_source: "quick-review",
       },
+    });
+  });
+
+  it("keeps the melody action and selected conditioning model", () => {
+    expect(
+      buildReusePayload(
+        { ...baseValues, mediaType: "audio", modelId: "musicgen-melody" },
+        null,
+        { action: "melody" },
+      ),
+    ).toMatchObject({
+      action: "melody",
+      model_id: "musicgen-melody",
     });
   });
 

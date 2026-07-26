@@ -13,7 +13,8 @@
 ```text
 models/
 ├─ audio/
-│  └─ musicgen-small/
+│  ├─ musicgen-small/
+│  └─ musicgen-long-form/
 ├─ image/
 │  ├─ sdxl/
 │  └─ anime-sdxl/
@@ -49,6 +50,7 @@ models/
 
 標準では SDXL のローカル配置先を `./models/image/sdxl` としています。
 MusicGen Small は `./models/audio/musicgen-small` を想定しています。
+AudioCraft の長尺 MusicGen は `./models/audio/musicgen-long-form` を想定しています。
 アニメ向け checkpoint は `./models/image/anime-sdxl`、LoRA は `./models/loras/...` を想定しています。
 Storyboard video runtime は `./models/video/procedural` を想定しています。
 CogVideoX-2B weightは `./models/video/cogvideox-2b` を想定しています。
@@ -103,6 +105,51 @@ huggingface-cli download facebook/musicgen-small \
   --local-dir ./models/audio/musicgen-small \
   --local-dir-use-symlinks False
 ```
+
+### MusicGen long-form を配置する例
+
+長尺モデルは optional です。通常の Transformers checkpoint に加えて、
+AudioCraft 形式の `state_dict.bin` / `compression_state_dict.bin` と、完全に
+ローカルな `t5-base` encoder/tokenizer を必要とします。
+
+```bash
+mkdir -p ./models/audio/musicgen-long-form
+cp ./models/audio/musicgen-small/state_dict.bin \
+  ./models/audio/musicgen-long-form/state_dict.bin
+cp ./models/audio/musicgen-small/compression_state_dict.bin \
+  ./models/audio/musicgen-long-form/compression_state_dict.bin
+
+huggingface-cli download google-t5/t5-base \
+  --local-dir ./models/audio/musicgen-long-form/t5-base \
+  --local-dir-use-symlinks False
+```
+
+既存 checkpoint を重複コピーしたくない開発環境では、2つの `.bin` を
+`musicgen-small` からの symlink にしても構いません。weight と symlink は
+`.gitignore` 対象です。
+
+現在の PyTorch 環境を維持して optional runtime を追加する場合は、次の構成を使います。
+AudioCraft 本体の依存 pin は古い PyTorch を要求するため、まず本体だけを入れ、
+必要な runtime package を現行環境へ追加します。
+
+```bash
+./venv/bin/pip install --no-deps audiocraft==1.3.0
+./venv/bin/pip install \
+  av soundfile einops flashy hydra-core hydra-colorlog julius num2words \
+  "spacy>=3.6.1" librosa torchmetrics encodec demucs
+```
+
+Apple Silicon では xformers を必要としません。ローダーは AudioCraft checkpoint を
+PyTorch attention 互換でロードします。通常は安全な CPU を選択し、検証済み環境で
+MPS を明示する場合だけ `AUDIOCRAFT_DEVICE=mps` を設定します。
+
+```bash
+curl "http://127.0.0.1:8000/models?media_type=audio"
+```
+
+`musicgen-long-form` が `is_available=true` なら、dependency、AudioCraft checkpoint、
+local T5 の readiness check を通過しています。不足時は `availability_message` に
+dependency または相対ファイル名が表示されます。
 
 ### Storyboard video runtime
 

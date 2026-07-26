@@ -193,6 +193,7 @@ def create_default_audio_generator(
     output_dir: str | Path | None = None,
     *,
     model_service: ModelService | None = None,
+    asset_repository: AssetRepository | None = None,
     manifest_root: str | Path | None = None,
     max_cached_models: int | None = None,
     task_type: str = "text-to-music",
@@ -206,6 +207,7 @@ def create_default_audio_generator(
     return AudioGenerator(
         resolved_model_service,
         output_dir=_resolve_audio_output_dir(output_dir),
+        asset_repository=asset_repository,
         task_type=task_type,
     )
 
@@ -274,11 +276,11 @@ def create_default_assembly_generator(
 def create_default_generator_registry(
     *,
     model_service: ModelService | None = None,
+    asset_repository: AssetRepository | None = None,
     manifest_root: str | Path | None = None,
     output_dir: str | Path | None = None,
     max_cached_models: int | None = None,
     prompt_composer: PromptComposer | None = None,
-    asset_repository: AssetRepository | None = None,
 ) -> GeneratorRegistry:
     """Compose the generator registry for every supported media type."""
 
@@ -310,6 +312,9 @@ def create_default_generator_registry(
     audio_generator = create_default_audio_generator(
         output_dir=resolved_output_dir,
         model_service=resolved_model_service,
+        # Melody conditioning resolves a gallery asset as its reference, so the
+        # audio generator needs the asset repository.
+        asset_repository=asset_repository,
         manifest_root=manifest_root,
         max_cached_models=max_cached_models,
         task_type="text-to-music",
@@ -321,6 +326,8 @@ def create_default_generator_registry(
         create_default_speech_generator(
             output_dir=resolved_output_dir,
             model_service=resolved_model_service,
+            manifest_root=manifest_root,
+            max_cached_models=max_cached_models,
         ),
         task_type="text-to-speech",
     )
@@ -364,16 +371,16 @@ def create_application_services(
     )
     bible_repository = BibleRepository(resolved_db_path.parent / "bible")
     prompt_composer = PromptComposer(bible_repository)
+    job_repository = JobRepository(resolved_db_path)
     asset_repository = AssetRepository(resolved_db_path.parent / "assets")
     generator_registry = create_default_generator_registry(
         model_service=model_service,
+        asset_repository=asset_repository,
         manifest_root=resolved_manifest_root,
         output_dir=resolved_output_dir,
         max_cached_models=resolved_max_cached_models,
         prompt_composer=prompt_composer,
-        asset_repository=asset_repository,
     )
-    job_repository = JobRepository(resolved_db_path)
     job_queue = JobQueue()
     event_bus = EventBus()
     job_service = JobService(job_repository, job_queue, event_bus, asset_repository=asset_repository)

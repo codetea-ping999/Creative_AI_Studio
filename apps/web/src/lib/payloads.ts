@@ -34,6 +34,9 @@ function buildGenerationPayload(
       output_format: values.outputFormat || "wav",
       params: {
         duration_seconds: values.durationSeconds,
+        ...(values.extendStrideSeconds === null
+          ? {}
+          : { extend_stride_seconds: values.extendStrideSeconds }),
         guidance_scale: values.guidanceScale,
         bpm: values.bpm,
         mood: values.mood,
@@ -73,7 +76,7 @@ export function buildReusePayload(
   values: PromptFormSubmitValues,
   projectId: string | null,
   options: {
-    action?: "variation" | "rerun";
+    action?: "variation" | "rerun" | "melody";
     params?: Record<string, unknown>;
   } = {},
 ): Record<string, unknown> {

@@ -45,7 +45,8 @@
 - **StoryDocument**: beats / scenes / chapters と生成素材の紐付けを保持し、assembly 用 timeline を導出
 - **Web UI (React + TypeScript)**: Composer / Stage / Session History を持つ Studio UI、image / video / song surface 切り替え、モデル選択ガード、LoRA カタログ選択、品質スコア表示、音楽再生
 - **Image Generator**: ローカル SDXL と optional LoRA を使った画像生成
-- **Audio Generator**: ローカル MusicGen runtime を使った text-to-music フロー
+- **Audio Generator**: ローカル MusicGen runtime を使った text-to-music、
+  Melody conditioning、optional AudioCraft 31〜120秒長尺フロー
 - **Video Generator**: procedural storyboard GIF と optional なローカル CogVideoX-2B MP4生成
 - **Project / Feedback / Gallery**: project grouping、feedback 集計、asset detail、reuse、export、project bind を含む asset workflow
 - **Quality Evaluation**: image / audio / video 出力に対するローカル heuristic quality report と運用メトリクス集計

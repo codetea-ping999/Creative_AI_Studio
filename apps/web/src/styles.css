@@ -1178,6 +1178,17 @@ pre,
   align-items: center;
 }
 
+.melody-conditioning-action {
+  display: grid;
+  gap: 8px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.melody-conditioning-action .secondary-button {
+  justify-self: start;
+}
+
 .asset-chip-row {
   align-items: center;
 }
@@ -1441,6 +1452,7 @@ pre,
 
   .preset-row .secondary-button,
   .asset-actions button,
+  .melody-conditioning-action .secondary-button,
   .form-actions button {
     width: 100%;
   }

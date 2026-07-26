@@ -97,11 +97,24 @@ class JobRunner:
             generator = self.generator_registry.get(job.media_type, job.request.task_type)
             if self._update_status(job_id, JOB_STATUS_RUNNING, progress=0.1) is None:
                 return self.job_repository.get(job_id)
-            # Generation itself is a blocking call and cannot be interrupted
-            # mid-flight. Cancellation is cooperative: we honor it at this
-            # completion boundary so an in-flight cancel is not clobbered by a
-            # succeeded/failed transition.
-            result = generator.run(job.request)
+            controlled_run = getattr(generator, "run_with_control", None)
+            if callable(controlled_run):
+                result = controlled_run(
+                    job.request,
+                    progress_callback=lambda fraction, segment, segment_count: (
+                        self._report_generation_progress(
+                            job_id,
+                            fraction,
+                            segment=segment,
+                            segment_count=segment_count,
+                        )
+                    ),
+                    cancel_requested=lambda: self._is_cancelled(job_id),
+                )
+            else:
+                # Most generators are one blocking call. Long-form audio opts
+                # into the controlled path above to report/cancel at segments.
+                result = generator.run(job.request)
         except Exception as exc:
             if self._is_cancelled(job_id):
                 return self.job_repository.get(job_id)
@@ -116,6 +129,36 @@ class JobRunner:
     def _is_cancelled(self, job_id: str) -> bool:
         current = self.job_repository.get(job_id)
         return current is not None and current.status == JOB_STATUS_CANCELLED
+
+    def _report_generation_progress(
+        self,
+        job_id: str,
+        fraction: float,
+        *,
+        segment: int,
+        segment_count: int,
+    ) -> None:
+        if self._is_cancelled(job_id):
+            return
+        # Reserve 0.0–0.1 for preparation and 0.9–1.0 for postprocessing.
+        progress = min(0.89, 0.1 + max(0.0, min(1.0, fraction)) * 0.79)
+        job = self.job_repository.update_if_status(
+            job_id,
+            (JOB_STATUS_RUNNING,),
+            status=JOB_STATUS_RUNNING,
+            progress=progress,
+        )
+        if job is not None:
+            self._publish(
+                "job_segment_progress",
+                {
+                    "job_id": job.id,
+                    "status": job.status,
+                    "progress": job.progress,
+                    "segment": segment,
+                    "segment_count": segment_count,
+                },
+            )
 
     def _update_status(
         self,
