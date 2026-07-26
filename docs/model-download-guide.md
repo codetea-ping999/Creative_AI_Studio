@@ -56,15 +56,14 @@ CogVideoX-2B weightは `./models/video/cogvideox-2b` を想定しています。
 
 ```bash
 pip install "huggingface_hub[cli]"
-huggingface-cli login
+hf auth login
 ```
 
 モデルを配置します。
 
 ```bash
-huggingface-cli download stabilityai/stable-diffusion-xl-base-1.0 \
-  --local-dir ./models/image/sdxl \
-  --local-dir-use-symlinks False
+hf download stabilityai/stable-diffusion-xl-base-1.0 \
+  --local-dir ./models/image/sdxl
 ```
 
 ### Git LFS を使う例
@@ -76,25 +75,26 @@ git clone https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0 ./mode
 
 ### FLUX.1-dev を配置する例
 
-FLUX.1-dev の利用条件と Hugging Face 上のアクセス条件を確認してから取得します。
+FLUX.1-dev Non-Commercial LicenseとHugging Face上のgated repositoryへのアクセス条件を
+確認してから取得します。商用利用には別途ライセンスが必要です。
 
 ```bash
-huggingface-cli download black-forest-labs/FLUX.1-dev \
-  --local-dir ./models/image/flux-dev \
-  --local-dir-use-symlinks False
+hf download black-forest-labs/FLUX.1-dev \
+  --local-dir ./models/image/flux-dev
 ```
 
 loader は manifest の `"family": "flux"` から `FluxPipeline` を選択します。
 negative prompt は job snapshot と評価には残りますが、`FluxPipeline` の推論引数には
-渡しません。Apple Silicon では `bfloat16` を維持する方針ですが、M1 Max での smoke・
-標準生成・メモリ実測は weight 配置後に別途行います。
+渡しません。Apple Siliconでは`bfloat16`を維持します。M1 Maxでのsmoke・標準生成・
+メモリ実測結果は
+[`validation/flux-m1-max-2026-07-26.md`](validation/flux-m1-max-2026-07-26.md)
+に記録しています。
 
 ### MusicGen Small を配置する例
 
 ```bash
-huggingface-cli download facebook/musicgen-small \
-  --local-dir ./models/audio/musicgen-small \
-  --local-dir-use-symlinks False
+hf download facebook/musicgen-small \
+  --local-dir ./models/audio/musicgen-small
 ```
 
 ### Storyboard video runtime
@@ -108,9 +108,8 @@ huggingface-cli download facebook/musicgen-small \
 CogVideoXはoptionalです。Diffusers形式のweightを次の場所へ配置します。
 
 ```bash
-huggingface-cli download THUDM/CogVideoX-2b \
-  --local-dir ./models/video/cogvideox-2b \
-  --local-dir-use-symlinks False
+hf download THUDM/CogVideoX-2b \
+  --local-dir ./models/video/cogvideox-2b
 ```
 
 `model_index.json`はリポジトリに含まれますが、それだけではavailableになりません。
@@ -136,13 +135,11 @@ semantic judge は生成モデルとは別の評価用 model です。
 `QUALITY_SEMANTIC_LOCAL_ONLY=true` の運用では、事前に local path へ配置してから path override を設定してください。
 
 ```bash
-huggingface-cli download openai/clip-vit-base-patch32 \
-  --local-dir ./models/judges/clip-vit-base-patch32 \
-  --local-dir-use-symlinks False
+hf download openai/clip-vit-base-patch32 \
+  --local-dir ./models/judges/clip-vit-base-patch32
 
-huggingface-cli download laion/clap-htsat-unfused \
-  --local-dir ./models/judges/clap-htsat-unfused \
-  --local-dir-use-symlinks False
+hf download laion/clap-htsat-unfused \
+  --local-dir ./models/judges/clap-htsat-unfused
 ```
 
 `.env` の例:

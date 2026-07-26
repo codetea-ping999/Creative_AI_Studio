@@ -42,6 +42,22 @@ type AssetDetailPanelProps = {
 
 const RATING_OPTIONS = [1, 2, 3, 4, 5];
 
+function asRecord(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function formatMetadataValue(value: unknown): string {
+  if (typeof value === "string" && value.trim()) {
+    return value;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value);
+  }
+  return "n/a";
+}
+
 /**
  * Detail view for the selected gallery asset. Owns the feedback and
  * quick-review form state locally; mount with `key={detail.asset_id}` so those
@@ -71,6 +87,20 @@ export function AssetDetailPanel({
   const [feedbackExportReady, setFeedbackExportReady] = useState(false);
   const [feedbackIssueTags, setFeedbackIssueTags] = useState("");
   const [feedbackComments, setFeedbackComments] = useState("");
+  const generationMetadata = detail.metadata;
+  const generationParams = asRecord(generationMetadata.params);
+  const generationWidth = generationParams.width;
+  const generationHeight = generationParams.height;
+  const generationSize =
+    typeof generationWidth === "number" && typeof generationHeight === "number"
+      ? `${generationWidth} × ${generationHeight}`
+      : "n/a";
+  const negativePromptStatus =
+    generationMetadata.negative_prompt_applied === false
+      ? "Not applied (FLUX)"
+      : generationMetadata.negative_prompt_applied === true
+        ? "Applied"
+        : "n/a";
 
   function closeQuickReview(): void {
     setIsQuickReviewOpen(false);
@@ -310,6 +340,57 @@ export function AssetDetailPanel({
           <div className="metadata-item">
             <span>Feedback</span>
             <strong>{detail.feedback_count}</strong>
+          </div>
+        </div>
+
+        <div className="form-section">
+          <div className="form-section__header">
+            <div>
+              <p className="eyebrow">Generation Metadata</p>
+              <h3>Effective runtime and render settings</h3>
+            </div>
+          </div>
+          <div className="metadata-grid">
+            <div className="metadata-item">
+              <span>Pipeline</span>
+              <strong>{formatMetadataValue(generationMetadata.pipeline_class)}</strong>
+            </div>
+            <div className="metadata-item">
+              <span>Device</span>
+              <strong>{formatMetadataValue(generationMetadata.device)}</strong>
+            </div>
+            <div className="metadata-item">
+              <span>Dtype</span>
+              <strong>
+                {formatMetadataValue(
+                  generationMetadata.torch_dtype ?? generationMetadata.load_dtype,
+                )}
+              </strong>
+            </div>
+            <div className="metadata-item">
+              <span>Seed</span>
+              <strong>{formatMetadataValue(generationMetadata.seed ?? detail.seed)}</strong>
+            </div>
+            <div className="metadata-item">
+              <span>Steps</span>
+              <strong>
+                {formatMetadataValue(
+                  generationParams.num_inference_steps ?? generationParams.steps,
+                )}
+              </strong>
+            </div>
+            <div className="metadata-item">
+              <span>Guidance</span>
+              <strong>{formatMetadataValue(generationParams.guidance_scale)}</strong>
+            </div>
+            <div className="metadata-item">
+              <span>Size</span>
+              <strong>{generationSize}</strong>
+            </div>
+            <div className="metadata-item">
+              <span>Negative prompt</span>
+              <strong>{negativePromptStatus}</strong>
+            </div>
           </div>
         </div>
 
