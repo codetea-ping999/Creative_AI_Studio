@@ -21,6 +21,7 @@ export const defaultPromptFormValues: PromptFormSubmitValues = {
   loraPath: "",
   loraScale: 0.8,
   seed: null,
+  variationCount: 1,
   durationSeconds: 8,
   bpm: 96,
   mood: "dreamy",

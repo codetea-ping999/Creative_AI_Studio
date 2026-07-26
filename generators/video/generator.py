@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from core.models import ModelService
 from core.quality import (
@@ -13,6 +13,9 @@ from core.quality import (
 )
 from core.schemas import GenerationRequest, GenerationResult
 from generators.base import BaseGenerator
+
+if TYPE_CHECKING:
+    from core.jobs.context import GenerationContext
 
 from .runtime import (
     LEARNED_VIDEO_OUTPUT_FORMATS,
@@ -62,7 +65,11 @@ class VideoGenerator(BaseGenerator):
     def prepare(self, request: GenerationRequest) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    def generate(self, request: GenerationRequest) -> GenerationResult:
+    def generate(
+        self,
+        request: GenerationRequest,
+        context: "GenerationContext | None" = None,
+    ) -> GenerationResult:
         requested_model_id = request.model_id.strip() or None
         manifest, runtime_obj = self.model_service.resolve_runtime(
             requested_model_id,

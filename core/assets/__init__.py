@@ -99,15 +99,32 @@ class AssetRepository:
         if not outputs:
             return assets
 
-        preview_path = next((preview for preview in job.result.previews if preview), None)
-        for output_path in outputs:
+        result_metadata = dict(job.result.metadata)
+        raw_variations = result_metadata.pop("variations", [])
+        variation_records = (
+            [item for item in raw_variations if isinstance(item, dict)]
+            if isinstance(raw_variations, list)
+            else []
+        )
+        fallback_preview = next(
+            (preview for preview in job.result.previews if preview),
+            None,
+        )
+        for output_index, output_path in enumerate(outputs):
             asset_id = _stable_asset_id(job.id, output_path)
             existing = self.get(asset_id)
             lineage = list(existing.lineage) if existing is not None else []
             export_paths = list(existing.export_paths) if existing is not None else []
             tags = list(existing.tags) if existing is not None else []
             metadata = dict(existing.metadata) if existing is not None else {}
-            metadata.update(dict(job.result.metadata))
+            metadata.update(result_metadata)
+            variation_metadata = _variation_metadata_for_output(
+                variation_records,
+                output_path=output_path,
+                output_index=output_index,
+            )
+            metadata.update(variation_metadata)
+            metadata["request_snapshot"] = _effective_request_snapshot(job, metadata)
 
             request_params = (
                 dict(job.request.params)
@@ -123,6 +140,12 @@ class AssetRepository:
 
             metadata["reuse_count"] = int(metadata.get("reuse_count", 0))
             metadata["export_count"] = len(export_paths)
+            preview_path = (
+                job.result.previews[output_index]
+                if output_index < len(job.result.previews)
+                and job.result.previews[output_index]
+                else variation_metadata.get("preview_path") or fallback_preview
+            )
 
             asset = Asset(
                 id=asset_id,
@@ -134,7 +157,7 @@ class AssetRepository:
                 prompt=job.request.prompt,
                 model_id=job.request.model_id,
                 path=str(output_path),
-                preview_path=preview_path or str(output_path),
+                preview_path=str(preview_path or output_path),
                 parent_asset_id=parent_asset_id,
                 lineage=lineage,
                 export_paths=export_paths,
@@ -414,6 +437,52 @@ class AssetRepository:
             "metadata": dict(asset.metadata),
             "created_at": asset.created_at,
         }
+
+
+def _variation_metadata_for_output(
+    variation_records: list[dict[str, Any]],
+    *,
+    output_path: str,
+    output_index: int,
+) -> dict[str, Any]:
+    for record in variation_records:
+        if record.get("output_path") == output_path:
+            return dict(record)
+    if output_index < len(variation_records):
+        return dict(variation_records[output_index])
+    return {}
+
+
+def _effective_request_snapshot(
+    job: JobRecord,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    effective_params = dict(job.request.params)
+    runtime_params = metadata.get("params")
+    if isinstance(runtime_params, dict):
+        effective_params.update(runtime_params)
+    if "num_inference_steps" in effective_params:
+        effective_params.pop("steps", None)
+
+    seed = metadata.get("seed")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        seed = job.request.seed
+    model_id = metadata.get("model_id")
+    if not isinstance(model_id, str) or not model_id:
+        model_id = job.request.model_id
+    output_format = metadata.get("output_format")
+    if not isinstance(output_format, str) or not output_format:
+        output_format = job.request.output_format
+
+    snapshot = job.request.model_copy(
+        update={
+            "model_id": model_id,
+            "seed": seed,
+            "output_format": output_format,
+            "params": effective_params,
+        }
+    )
+    return snapshot.model_dump(mode="json")
 
 
 def _summarize_prompt(prompt: str, *, fallback: str) -> str:

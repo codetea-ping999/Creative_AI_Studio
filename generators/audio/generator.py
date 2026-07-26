@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 import wave
 
@@ -16,6 +16,9 @@ from core.quality import (
 )
 from core.schemas import GenerationRequest, GenerationResult
 from generators.base import BaseGenerator
+
+if TYPE_CHECKING:
+    from core.jobs.context import GenerationContext
 
 _MAX_INT16 = 32_767
 _AUDIO_PARAM_RANGES = {
@@ -65,7 +68,11 @@ class AudioGenerator(BaseGenerator):
     def prepare(self, request: GenerationRequest) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    def generate(self, request: GenerationRequest) -> GenerationResult:
+    def generate(
+        self,
+        request: GenerationRequest,
+        context: "GenerationContext | None" = None,
+    ) -> GenerationResult:
         import torch
 
         requested_model_id = request.model_id.strip() or None

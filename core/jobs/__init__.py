@@ -1,5 +1,7 @@
 """Job execution primitives for Creative AI Studio."""
 
+from .cancellation import CancellationRegistry
+from .context import GenerationCancelled, GenerationContext
 from .events import EventBus, JobEvent
 from .queue import JobQueue
 from .runner import JobRunner
@@ -18,7 +20,10 @@ from .statuses import (
 )
 
 __all__ = [
+    "CancellationRegistry",
     "EventBus",
+    "GenerationCancelled",
+    "GenerationContext",
     "JobEvent",
     "JobQueue",
     "JobRecord",

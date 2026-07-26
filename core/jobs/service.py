@@ -14,6 +14,7 @@ from .events import EventBus
 if TYPE_CHECKING:
     from core.assets import AssetRepository
     from core.storage.repositories.job_repository import JobRepository
+    from .cancellation import CancellationRegistry
 from .schemas import JobRecord
 from .statuses import (
     ACTIVE_JOB_STATUSES,
@@ -46,11 +47,13 @@ class JobService:
         job_queue: object,
         event_bus: EventBus | None = None,
         asset_repository: AssetRepository | None = None,
+        cancellation_registry: "CancellationRegistry | None" = None,
     ) -> None:
         self.job_repository = job_repository
         self.job_queue = job_queue
         self.event_bus = event_bus
         self.asset_repository = asset_repository
+        self.cancellation_registry = cancellation_registry
 
     def create_job(
         self,
@@ -185,6 +188,12 @@ class JobService:
         )
         if job is None:
             return self.get_job(job_id)
+        # Flip the in-process signal even if the job is only "queued" (not
+        # yet picked up by the worker): the registry entry is created lazily
+        # by JobRunner, so setting it early is a harmless no-op that the
+        # worker will still observe once it does start.
+        if self.cancellation_registry is not None:
+            self.cancellation_registry.request_cancel(job_id)
         self._publish(
             "job_cancelled",
             {

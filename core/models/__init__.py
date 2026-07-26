@@ -7,6 +7,7 @@ from core.model_readiness import (
 )
 
 from .cache import ModelRuntimeCache
+from .cleanup import release_runtime
 from .loader import (
     BaseModelLoader,
     DiffusersImageLoader,
@@ -35,4 +36,5 @@ __all__ = [
     "create_default_loader_registry",
     "evaluate_manifest_payload",
     "evaluate_manifest_readiness",
+    "release_runtime",
 ]

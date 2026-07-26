@@ -14,6 +14,7 @@ try:
 
     from apps.api.main import create_app
     from bootstrap import create_application_services
+    from core.schemas import GenerationRequest, GenerationResult
 except ModuleNotFoundError as exc:
     IMPORT_ERROR = exc
 else:
@@ -649,6 +650,118 @@ class ApiExtensionTests(unittest.TestCase):
             self.assertIn("feedback_summary", project_manifest["project"])
             self.assertEqual(project_manifest["project"]["feedback_summary"]["total_feedback"], 1)
             self.assertEqual(project_manifest["project"]["asset_count"], 3)
+
+    def test_gallery_reuses_the_selected_variation_seed_and_effective_params(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            services = create_application_services(
+                db_path=root / "jobs.db",
+                output_dir=root / "outputs" / "images",
+            )
+            client = TestClient(create_app(services, start_job_runner=False))
+            first_output = root / "outputs" / "images" / "batch_v1.png"
+            second_output = root / "outputs" / "images" / "batch_v2.png"
+            first_output.parent.mkdir(parents=True)
+            first_output.write_bytes(b"first")
+            second_output.write_bytes(b"second")
+
+            source_job = services.job_service.create_job(
+                GenerationRequest(
+                    media_type="image",
+                    prompt="Two selectable variations",
+                    negative_prompt="text",
+                    model_id="sdxl",
+                    seed=100,
+                    output_format="png",
+                    params={"steps": 12, "variation_count": 2},
+                )
+            )
+            services.job_service.mark_succeeded(
+                source_job.id,
+                GenerationResult(
+                    job_id=source_job.id,
+                    status="succeeded",
+                    outputs=[str(first_output), str(second_output)],
+                    previews=[str(first_output), str(second_output)],
+                    metadata={
+                        "model_id": "sdxl",
+                        "output_format": "png",
+                        "base_seed": 100,
+                        "variation_count": 2,
+                        "params": {
+                            "width": 1024,
+                            "height": 1024,
+                            "num_inference_steps": 30,
+                            "variation_count": 2,
+                        },
+                        "variations": [
+                            {
+                                "variation_index": 0,
+                                "seed": 100,
+                                "output_path": str(first_output),
+                                "preview_path": str(first_output),
+                                "params": {
+                                    "width": 1024,
+                                    "height": 1024,
+                                    "num_inference_steps": 30,
+                                    "variation_count": 1,
+                                },
+                            },
+                            {
+                                "variation_index": 1,
+                                "seed": 101,
+                                "output_path": str(second_output),
+                                "preview_path": str(second_output),
+                                "params": {
+                                    "width": 1024,
+                                    "height": 1024,
+                                    "num_inference_steps": 30,
+                                    "variation_count": 1,
+                                },
+                            },
+                        ],
+                    },
+                ),
+            )
+
+            gallery_items = client.get("/gallery?media_type=image").json()
+            selected = next(
+                item for item in gallery_items if item["variation_index"] == 1
+            )
+            self.assertEqual(selected["seed"], 101)
+
+            detail = client.get(f"/gallery/{selected['asset_id']}").json()
+            self.assertEqual(detail["request_snapshot"]["seed"], 101)
+            self.assertEqual(
+                detail["request_snapshot"]["params"]["num_inference_steps"],
+                30,
+            )
+            self.assertEqual(
+                detail["request_snapshot"]["params"]["variation_count"],
+                1,
+            )
+
+            reuse_response = client.post(
+                f"/gallery/{selected['asset_id']}/reuse",
+                json={"action": "variation"},
+            )
+            self.assertEqual(reuse_response.status_code, 201)
+            reused_job = client.get(
+                f"/jobs/{reuse_response.json()['job_id']}"
+            ).json()
+            self.assertEqual(reused_job["request"]["seed"], 101)
+            self.assertEqual(
+                reused_job["request"]["params"]["num_inference_steps"],
+                30,
+            )
+            self.assertEqual(
+                reused_job["request"]["params"]["variation_count"],
+                1,
+            )
+            self.assertEqual(
+                reused_job["request"]["params"]["source_asset_id"],
+                selected["asset_id"],
+            )
 
 
 if __name__ == "__main__":

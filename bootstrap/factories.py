@@ -7,13 +7,14 @@ import os
 from pathlib import Path
 
 from core.assets import AssetRepository
-from core.jobs import EventBus, JobQueue, JobRunner, JobService
+from core.jobs import CancellationRegistry, EventBus, JobQueue, JobRunner, JobService
 from core.models import (
     ModelRuntimeCache,
     ModelRegistry,
     ModelResolver,
     ModelService,
     create_default_loader_registry,
+    release_runtime,
 )
 from core.feedback import FeedbackRepository
 from core.projects import ProjectRepository
@@ -114,7 +115,10 @@ def create_default_model_service(
     registry = ModelRegistry(manifest_root=resolved_manifest_root)
     resolver = ModelResolver(registry)
     loader_registry = create_default_loader_registry()
-    runtime_cache = ModelRuntimeCache(max_entries=resolved_max_cached_models)
+    runtime_cache = ModelRuntimeCache(
+        max_entries=resolved_max_cached_models,
+        on_evict=release_runtime,
+    )
     return ModelService(
         registry=registry,
         resolver=resolver,
@@ -262,7 +266,14 @@ def create_application_services(
     asset_repository = AssetRepository(resolved_db_path.parent / "assets")
     job_queue = JobQueue()
     event_bus = EventBus()
-    job_service = JobService(job_repository, job_queue, event_bus, asset_repository=asset_repository)
+    cancellation_registry = CancellationRegistry()
+    job_service = JobService(
+        job_repository,
+        job_queue,
+        event_bus,
+        asset_repository=asset_repository,
+        cancellation_registry=cancellation_registry,
+    )
     job_runner = JobRunner(
         job_repository,
         job_queue,
@@ -270,6 +281,7 @@ def create_application_services(
         event_bus,
         asset_repository=asset_repository,
         job_service=job_service,
+        cancellation_registry=cancellation_registry,
     )
     project_repository = ProjectRepository(resolved_db_path.parent / "projects")
     feedback_repository = FeedbackRepository(resolved_db_path.parent / "feedback")

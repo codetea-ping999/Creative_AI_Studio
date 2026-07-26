@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
-from typing import Any
+import secrets
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from core.models import ModelService
@@ -15,7 +17,12 @@ from core.quality import (
 from core.schemas import GenerationRequest, GenerationResult
 from generators.base import BaseGenerator
 
+if TYPE_CHECKING:
+    from core.jobs.context import GenerationContext
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+_MAX_VARIATION_COUNT = 4
+_SEED_MODULUS = 1 << 63
 
 
 class ImageGenerator(BaseGenerator):
@@ -39,11 +46,16 @@ class ImageGenerator(BaseGenerator):
             raise ValueError("Image prompt must not be empty.")
         if request.output_format and request.output_format.lower() != "png":
             raise ValueError("ImageGenerator currently supports png output only.")
+        self._resolve_variation_count(request.params)
 
     def prepare(self, request: GenerationRequest) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    def generate(self, request: GenerationRequest) -> GenerationResult:
+    def generate(
+        self,
+        request: GenerationRequest,
+        context: "GenerationContext | None" = None,
+    ) -> GenerationResult:
         import torch
 
         requested_model_id = request.model_id.strip() or None
@@ -54,6 +66,8 @@ class ImageGenerator(BaseGenerator):
         )
         pipeline = runtime_obj["pipeline"]
         effective_params = {**manifest.default_params, **request.params}
+        variation_count = self._resolve_variation_count(effective_params)
+        effective_params.pop("variation_count", None)
         width = int(effective_params.pop("width", 1024))
         height = int(effective_params.pop("height", 1024))
         num_inference_steps = int(
@@ -65,10 +79,12 @@ class ImageGenerator(BaseGenerator):
         guidance_scale = float(effective_params.pop("guidance_scale", 7.5))
         lora_path = effective_params.pop("lora_path", None)
         lora_scale = float(effective_params.pop("lora_scale", 1.0))
+        lineage_metadata = _extract_lineage_metadata(effective_params)
+        for key in lineage_metadata:
+            effective_params.pop(key, None)
         lora_metadata = self._configure_lora(runtime_obj, pipeline, lora_path, lora_scale)
-        generator = self._create_generator(request.seed, runtime_obj["device"], torch)
-
-        generation_kwargs = {
+        base_seed = request.seed if request.seed is not None else secrets.randbits(63)
+        common_generation_kwargs = {
             "prompt": request.prompt,
             "negative_prompt": request.negative_prompt,
             "width": width,
@@ -77,29 +93,102 @@ class ImageGenerator(BaseGenerator):
             "num_inference_steps": num_inference_steps,
             **effective_params,
         }
-        if generator is not None:
-            generation_kwargs["generator"] = generator
+        batch_id = f"img_{uuid4().hex}"
+        output_paths: list[str] = []
+        variation_metadata: list[dict[str, Any]] = []
+        quality_reports: list[dict[str, Any]] = []
 
-        with torch.inference_mode():
-            pipeline_output = pipeline(**generation_kwargs)
+        try:
+            for variation_index in range(variation_count):
+                if context is not None:
+                    context.raise_if_cancelled()
+                variation_seed = self._derive_variation_seed(
+                    base_seed,
+                    variation_index,
+                )
+                generation_kwargs = dict(common_generation_kwargs)
+                generation_kwargs["generator"] = self._create_generator(
+                    variation_seed,
+                    runtime_obj["device"],
+                    torch,
+                )
+                step_callback = self._build_step_callback(
+                    pipeline,
+                    num_inference_steps,
+                    context,
+                    variation_index=variation_index,
+                    variation_count=variation_count,
+                )
+                if step_callback is not None:
+                    generation_kwargs["callback_on_step_end"] = step_callback
 
-        job_id = f"img_{uuid4().hex}"
-        output_path = self.output_dir / f"{job_id}.png"
-        image = pipeline_output.images[0]
-        image.save(output_path)
-        quality_report = evaluate_image_output(output_path)
-        semantic_report = evaluate_image_semantics(
-            output_path,
-            request.prompt,
-            request.negative_prompt,
-        )
-        enrich_quality_report(quality_report, semantic_report)
+                with torch.inference_mode():
+                    pipeline_output = pipeline(**generation_kwargs)
+
+                if context is not None:
+                    context.raise_if_cancelled()
+                output_path = self.output_dir / (
+                    f"{batch_id}.png"
+                    if variation_count == 1
+                    else f"{batch_id}_v{variation_index + 1}.png"
+                )
+                image = pipeline_output.images[0]
+                image.save(output_path)
+                output_paths.append(str(output_path))
+
+                quality_report = evaluate_image_output(output_path)
+                semantic_report = evaluate_image_semantics(
+                    output_path,
+                    request.prompt,
+                    request.negative_prompt,
+                )
+                enrich_quality_report(quality_report, semantic_report)
+                quality_reports.append(quality_report)
+                variation_params = {
+                    "width": width,
+                    "height": height,
+                    "num_inference_steps": num_inference_steps,
+                    "guidance_scale": guidance_scale,
+                    "lora_path": lora_metadata["path"],
+                    "lora_scale": lora_metadata["scale"],
+                    "variation_count": 1,
+                    **effective_params,
+                }
+                variation_metadata.append(
+                    {
+                        "variation_index": variation_index,
+                        "seed": variation_seed,
+                        "output_path": str(output_path),
+                        "preview_path": str(output_path),
+                        "params": variation_params,
+                        "quality_report": quality_report,
+                    }
+                )
+                if context is not None and step_callback is None:
+                    context.report_progress((variation_index + 1) / variation_count)
+                if context is not None:
+                    context.raise_if_cancelled()
+        except Exception:
+            for output_path in output_paths:
+                Path(output_path).unlink(missing_ok=True)
+            raise
+
+        job_params = {
+            "width": width,
+            "height": height,
+            "num_inference_steps": num_inference_steps,
+            "guidance_scale": guidance_scale,
+            "lora_path": lora_metadata["path"],
+            "lora_scale": lora_metadata["scale"],
+            "variation_count": variation_count,
+            **effective_params,
+        }
 
         return GenerationResult(
-            job_id=job_id,
+            job_id=batch_id,
             status="succeeded",
-            outputs=[str(output_path)],
-            previews=[str(output_path)],
+            outputs=output_paths,
+            previews=list(output_paths),
             metadata={
                 "stub": False,
                 "generator": self.__class__.__name__,
@@ -121,26 +210,72 @@ class ImageGenerator(BaseGenerator):
                 "torch_dtype": runtime_obj["torch_dtype"],
                 "lora_path": lora_metadata["path"],
                 "lora_scale": lora_metadata["scale"],
-                "seed": request.seed,
+                "seed": base_seed,
+                "base_seed": base_seed,
+                "variation_count": variation_count,
+                "variations": variation_metadata,
                 "output_format": "png",
                 "default_params": dict(manifest.default_params),
-                "quality_report": quality_report,
-                **_extract_lineage_metadata(request.params),
-                "params": {
-                    "width": width,
-                    "height": height,
-                    "num_inference_steps": num_inference_steps,
-                    "guidance_scale": guidance_scale,
-                    "lora_path": lora_metadata["path"],
-                    "lora_scale": lora_metadata["scale"],
-                    **effective_params,
-                },
+                "quality_report": quality_reports[0],
+                **lineage_metadata,
+                "params": job_params,
             },
             error_message=None,
         )
 
     def cleanup(self, request: GenerationRequest) -> None:
         return None
+
+    def _build_step_callback(
+        self,
+        pipeline: object,
+        num_inference_steps: int,
+        context: "GenerationContext | None",
+        *,
+        variation_index: int = 0,
+        variation_count: int = 1,
+    ):
+        if context is None or num_inference_steps <= 0:
+            return None
+        if not self._pipeline_accepts_step_callback(pipeline):
+            return None
+
+        def _on_step_end(pipe: object, step_index: int, timestep: object, callback_kwargs: dict):
+            step_fraction = (step_index + 1) / num_inference_steps
+            context.report_progress(
+                (variation_index + step_fraction) / variation_count
+            )
+            context.raise_if_cancelled()
+            return callback_kwargs
+
+        return _on_step_end
+
+    def _pipeline_accepts_step_callback(self, pipeline: object) -> bool:
+        call = getattr(pipeline, "__call__", None)
+        if call is None:
+            return False
+        try:
+            signature = inspect.signature(call)
+        except (TypeError, ValueError):
+            return False
+        return "callback_on_step_end" in signature.parameters
+
+    def _resolve_variation_count(self, params: dict[str, Any]) -> int:
+        value = params.get("variation_count", 1)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(
+                "Image parameter 'variation_count' must be an integer between 1 and 4."
+            )
+        if value < 1 or value > _MAX_VARIATION_COUNT:
+            raise ValueError(
+                "Image parameter 'variation_count' must be between 1 and 4."
+            )
+        return value
+
+    def _derive_variation_seed(self, base_seed: int, variation_index: int) -> int:
+        if variation_index == 0:
+            return base_seed
+        return (base_seed + variation_index) % _SEED_MODULUS
 
     def _create_generator(
         self,
@@ -228,6 +363,8 @@ def _extract_lineage_metadata(params: dict[str, Any]) -> dict[str, Any]:
         "source_job_id",
         "reference_asset_path",
         "reuse_action",
+        "review_issue_tags",
+        "review_source",
     )
     lineage_payload: dict[str, Any] = {}
     for key in lineage_keys:
