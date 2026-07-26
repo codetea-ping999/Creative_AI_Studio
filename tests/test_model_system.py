@@ -151,6 +151,7 @@ def _fake_diffusers_load_step_aware(self, manifest):
         "torch_dtype": "float32",
         "weight_dtype": "float16",
         "variant": "fp16",
+        "pipeline_family": "flux" if manifest.family == "flux" else "sdxl",
         "device": "cpu",
         "default_params": dict(manifest.default_params),
         "path_exists": True,
@@ -735,6 +736,42 @@ class ModelSystemTests(unittest.TestCase):
             self.assertEqual(pipeline.steps_invoked, 4)
             self.assertTrue(Path(result.outputs[0]).exists())
 
+    def test_flux_image_generator_reports_diffusers_step_progress(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir) / "outputs"
+            reported_progress: list[float] = []
+            context = GenerationContext(
+                is_cancelled=lambda: False,
+                on_progress=reported_progress.append,
+                min_interval_seconds=0.0,
+                min_progress_delta=0.0,
+            )
+            with patch(
+                "core.models.loader.DiffusersImageLoader.load",
+                new=_fake_diffusers_load_step_aware,
+            ):
+                service = create_default_model_service()
+                result = ImageGenerator(service, output_dir=output_dir).run(
+                    GenerationRequest(
+                        media_type="image",
+                        prompt="FLUX four-step progress check",
+                        negative_prompt="watermark",
+                        model_id="flux-dev",
+                        params={"steps": 4, "width": 64, "height": 64},
+                    ),
+                    context,
+                )
+                pipeline = service.get_runtime(
+                    "flux-dev",
+                    "image",
+                    "text-to-image",
+                )["pipeline"]
+
+            self.assertEqual(reported_progress, [0.25, 0.5, 0.75, 1.0])
+            self.assertEqual(pipeline.steps_invoked, 4)
+            self.assertFalse(result.metadata["negative_prompt_applied"])
+            self.assertTrue(Path(result.outputs[0]).exists())
+
     def test_image_generator_reports_progress_across_all_variations(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             output_dir = Path(tmp_dir) / "outputs"
@@ -801,6 +838,47 @@ class ModelSystemTests(unittest.TestCase):
                     )
                 pipeline = service.get_runtime(
                     "sdxl",
+                    "image",
+                    "text-to-image",
+                )["pipeline"]
+
+            self.assertEqual(pipeline.steps_invoked, 2)
+            self.assertEqual(list(output_dir.glob("*")), [])
+
+    def test_flux_image_generator_stops_diffusers_pipeline_when_cancelled(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir) / "outputs"
+            cancellation_state = {"requested": False}
+
+            def _record_progress(fraction: float) -> None:
+                if fraction >= 0.5:
+                    cancellation_state["requested"] = True
+
+            context = GenerationContext(
+                is_cancelled=lambda: cancellation_state["requested"],
+                on_progress=_record_progress,
+                min_interval_seconds=0.0,
+                min_progress_delta=0.0,
+            )
+            with patch(
+                "core.models.loader.DiffusersImageLoader.load",
+                new=_fake_diffusers_load_step_aware,
+            ):
+                service = create_default_model_service()
+                generator = ImageGenerator(service, output_dir=output_dir)
+
+                with self.assertRaises(GenerationCancelled):
+                    generator.run(
+                        GenerationRequest(
+                            media_type="image",
+                            prompt="Cancel FLUX after the second step",
+                            model_id="flux-dev",
+                            params={"steps": 4, "width": 64, "height": 64},
+                        ),
+                        context,
+                    )
+                pipeline = service.get_runtime(
+                    "flux-dev",
                     "image",
                     "text-to-image",
                 )["pipeline"]
