@@ -142,6 +142,52 @@ describe("PromptForm", () => {
     );
   });
 
+  it("keeps non-preset MusicGen values visible and submits them unchanged", async () => {
+    const user = userEvent.setup();
+    const handleSubmit = vi.fn();
+    const audioModel: ModelOption = {
+      ...storyboardModel,
+      id: "musicgen-small",
+      displayName: "MusicGen Small",
+      tags: ["audio", "music"],
+    };
+
+    render(
+      <PromptForm
+        mediaType="audio"
+        modelOptions={[audioModel]}
+        initialValues={{
+          modelId: "musicgen-small",
+          prompt: "restored cue",
+          mood: "warm",
+          genre: "lo-fi",
+          structure: "intro-outro",
+        }}
+        submitLabel="Create music"
+        onSubmit={handleSubmit}
+      />,
+    );
+
+    expect((screen.getByLabelText("Mood") as HTMLSelectElement).value).toBe("warm");
+    expect(screen.getByRole("option", { name: "warm (restored)" })).toBeTruthy();
+    expect((screen.getByLabelText("Genre") as HTMLSelectElement).value).toBe("lo-fi");
+    expect(screen.getByRole("option", { name: "lo-fi (restored)" })).toBeTruthy();
+    expect((screen.getByLabelText("Structure") as HTMLSelectElement).value).toBe(
+      "intro-outro",
+    );
+    expect(screen.getByRole("option", { name: "intro-outro (restored)" })).toBeTruthy();
+
+    await user.click(screen.getByRole("button", { name: "Create music" }));
+
+    expect(handleSubmit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        mood: "warm",
+        genre: "lo-fi",
+        structure: "intro-outro",
+      }),
+    );
+  });
+
   it("submits normalized video composer values", async () => {
     const user = userEvent.setup();
     const handleSubmit = vi.fn();
@@ -258,6 +304,12 @@ describe("studio helpers", () => {
     );
     expect(createOutputUrl("/Users/example/CreativeOutputs/images/sample.png")).toBe(
       "http://127.0.0.1:8000/outputs/images/sample.png",
+    );
+    expect(createOutputUrl("outputs/issue26/audio/sample.wav")).toBe(
+      "http://127.0.0.1:8000/outputs/audio/sample.wav",
+    );
+    expect(createOutputUrl("/repo/outputs/issue26/audio/sample.wav")).toBe(
+      "http://127.0.0.1:8000/outputs/audio/sample.wav",
     );
   });
 

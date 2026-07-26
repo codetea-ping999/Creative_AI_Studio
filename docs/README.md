@@ -53,6 +53,7 @@ Creative AI Studio のドキュメント案内です。
 
 - [model-system.md](./model-system.md)
 - [model-download-guide.md](./model-download-guide.md)
+- [MusicGen v0.2 real-model validation](./validation/musicgen-v0.2.md)
 
 ## 現在の理解ポイント
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import math
 from pathlib import Path
 from typing import Any
@@ -115,7 +116,6 @@ class AudioGenerator(BaseGenerator):
 
         frame_rate = int(runtime_obj["frame_rate"])
         max_new_tokens = max(32, int(duration_seconds * frame_rate))
-        generator = self._create_generator(request.seed, device, torch)
 
         generation_kwargs = {
             **model_inputs,
@@ -123,15 +123,16 @@ class AudioGenerator(BaseGenerator):
             "guidance_scale": guidance_scale,
             "max_new_tokens": max_new_tokens,
             "temperature": temperature,
-            "top_k": top_k,
-            "top_p": top_p,
         }
-        if generator is not None:
-            generation_kwargs["generator"] = generator
+        if top_k > 0:
+            generation_kwargs["top_k"] = top_k
+        if 0.0 < top_p < 1.0:
+            generation_kwargs["top_p"] = top_p
         generation_kwargs.update(effective_params)
 
-        with torch.inference_mode():
-            audio_values = model.generate(**generation_kwargs)
+        with self._seeded_generation(request.seed, device, torch):
+            with torch.inference_mode():
+                audio_values = model.generate(**generation_kwargs)
 
         audio_tensor = audio_values[0].detach().cpu()
         sampling_rate = int(runtime_obj["sampling_rate"])
@@ -223,16 +224,49 @@ class AudioGenerator(BaseGenerator):
         parts.append(prompt.strip())
         return ", ".join(part for part in parts if part)
 
-    def _create_generator(
+    @contextmanager
+    def _seeded_generation(
         self,
         seed: int | None,
         device: str,
         torch: object,
     ):
         if seed is None:
-            return None
-        generator_device = device if str(device).startswith("cuda") else "cpu"
-        return torch.Generator(device=generator_device).manual_seed(seed)
+            yield
+            return
+
+        device_name = str(device)
+        if device_name.startswith("cuda"):
+            cuda_device = torch.device(device_name)
+            device_index = (
+                cuda_device.index
+                if cuda_device.index is not None
+                else torch.cuda.current_device()
+            )
+            with torch.random.fork_rng(devices=[device_index], device_type="cuda"):
+                torch.manual_seed(seed)
+                torch.cuda.manual_seed(seed)
+                yield
+            return
+
+        mps_module = getattr(torch, "mps", None)
+        mps_get_state = getattr(mps_module, "get_rng_state", None)
+        mps_set_state = getattr(mps_module, "set_rng_state", None)
+        mps_state = None
+        if device_name == "mps" and callable(mps_get_state):
+            mps_state = mps_get_state()
+
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(seed)
+            if device_name == "mps":
+                mps_manual_seed = getattr(mps_module, "manual_seed", None)
+                if callable(mps_manual_seed):
+                    mps_manual_seed(seed)
+            try:
+                yield
+            finally:
+                if mps_state is not None and callable(mps_set_state):
+                    mps_set_state(mps_state)
 
     def _write_wave_file(
         self,

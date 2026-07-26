@@ -53,15 +53,6 @@ export function createOutputUrl(pathValue: string | null | undefined): string | 
   }
 
   const relativePath = normalized.replace(/^\.?\//, "");
-  if (relativePath.startsWith("outputs/")) {
-    return `${API_BASE_URL}/${relativePath}`;
-  }
-
-  const outputMarker = "/outputs/";
-  const outputMarkerIndex = normalized.lastIndexOf(outputMarker);
-  if (outputMarkerIndex >= 0) {
-    return `${API_BASE_URL}${normalized.slice(outputMarkerIndex)}`;
-  }
 
   for (const mountChild of ["images", "audio", "videos", "exports"]) {
     if (relativePath.startsWith(`${mountChild}/`)) {
@@ -73,6 +64,16 @@ export function createOutputUrl(pathValue: string | null | undefined): string | 
     if (childMarkerIndex >= 0) {
       return `${API_BASE_URL}/outputs${normalized.slice(childMarkerIndex)}`;
     }
+  }
+
+  const outputMarker = "/outputs/";
+  const outputMarkerIndex = normalized.lastIndexOf(outputMarker);
+  if (outputMarkerIndex >= 0) {
+    return `${API_BASE_URL}${normalized.slice(outputMarkerIndex)}`;
+  }
+
+  if (relativePath.startsWith("outputs/")) {
+    return `${API_BASE_URL}/${relativePath}`;
   }
 
   return null;

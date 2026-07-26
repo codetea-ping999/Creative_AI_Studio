@@ -1,6 +1,9 @@
 import { useEffect, useState, type FormEvent } from "react";
 import {
+  audioGenreOptions,
+  audioMoodOptions,
   audioPresets,
+  audioStructureOptions,
   defaultPromptFormValues,
   imageFormatPresets,
   imagePresets,
@@ -28,6 +31,13 @@ export type {
 } from "./promptFormTypes";
 
 const defaultValues = defaultPromptFormValues;
+
+function hasOption(
+  options: ReadonlyArray<{ value: string }>,
+  value: string,
+): boolean {
+  return options.some((option) => option.value === value);
+}
 
 function createInitialState(
   initialValues?: Partial<PromptFormSubmitValues>,
@@ -668,11 +678,14 @@ export function PromptForm({
                 onChange={(event) => setFieldValue("mood", event.target.value)}
                 disabled={disabled}
               >
-                <option value="dreamy">Dreamy</option>
-                <option value="bright">Bright</option>
-                <option value="dark">Dark</option>
-                <option value="energetic">Energetic</option>
-                <option value="gentle">Gentle</option>
+                {formValues.mood && !hasOption(audioMoodOptions, formValues.mood) ? (
+                  <option value={formValues.mood}>{formValues.mood} (restored)</option>
+                ) : null}
+                {audioMoodOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
               </select>
             </label>
             <label className="field-group">
@@ -683,13 +696,14 @@ export function PromptForm({
                 onChange={(event) => setFieldValue("genre", event.target.value)}
                 disabled={disabled}
               >
-                <option value="ambient">Ambient</option>
-                <option value="electronic">Electronic</option>
-                <option value="lo-fi hip hop">Lo-fi Hip Hop</option>
-                <option value="cinematic">Cinematic</option>
-                <option value="jazz">Jazz</option>
-                <option value="rock">Rock</option>
-                <option value="orchestral">Orchestral</option>
+                {formValues.genre && !hasOption(audioGenreOptions, formValues.genre) ? (
+                  <option value={formValues.genre}>{formValues.genre} (restored)</option>
+                ) : null}
+                {audioGenreOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
               </select>
             </label>
             <label className="field-group">
@@ -700,13 +714,17 @@ export function PromptForm({
                 onChange={(event) => setFieldValue("structure", event.target.value)}
                 disabled={disabled}
               >
-                <option value="seamless loop">Seamless Loop</option>
-                <option value="intro, build, drop">Intro / Build / Drop</option>
-                <option value="intro, development, climax">
-                  Intro / Development / Climax
-                </option>
-                <option value="ambient bed">Ambient Bed</option>
-                <option value="full cue with a clear ending">Full Cue</option>
+                {formValues.structure &&
+                !hasOption(audioStructureOptions, formValues.structure) ? (
+                  <option value={formValues.structure}>
+                    {formValues.structure} (restored)
+                  </option>
+                ) : null}
+                {audioStructureOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
               </select>
             </label>
           </div>
