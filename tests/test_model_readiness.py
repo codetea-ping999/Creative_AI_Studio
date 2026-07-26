@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
+import sys
 from tempfile import TemporaryDirectory
 import unittest
 
-from core.models.readiness import (
+from core.model_readiness import (
     STATUS_MISSING_FILES,
     STATUS_READY,
     STATUS_SCAFFOLD,
@@ -15,6 +17,7 @@ from core.models.readiness import (
     evaluate_readiness,
     missing_diffusers_files,
     missing_transformers_files,
+    resolve_repo_path,
 )
 
 
@@ -63,6 +66,13 @@ def _write_pipeline(
         component_root.mkdir(exist_ok=True)
         config_name = _CONFIG_NAMES.get(component, "config.json")
         (component_root / config_name).write_text("{}", encoding="utf-8")
+        if component.startswith("tokenizer"):
+            tokenizer_class = str(spec[1])
+            if "T5Tokenizer" in tokenizer_class:
+                (component_root / "spiece.model").write_bytes(b"stub")
+            else:
+                (component_root / "vocab.json").write_text("{}", encoding="utf-8")
+                (component_root / "merges.txt").write_text("", encoding="utf-8")
         if with_weights and component not in _WEIGHTLESS_COMPONENTS:
             (component_root / weight_name).write_bytes(b"stub")
     return root
@@ -107,6 +117,79 @@ class DiffusersReadinessTests(unittest.TestCase):
             self.assertEqual(missing_diffusers_files(fp16_root), [])
             self.assertEqual(missing_diffusers_files(bin_root), [])
 
+    def test_incomplete_sharded_weights_report_the_missing_shard(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = _write_pipeline(
+                Path(tmp_dir) / "sdxl",
+                SDXL_INDEX,
+                with_weights=False,
+            )
+            shard_name = "diffusion_pytorch_model-00001-of-00002.safetensors"
+            for component in ("text_encoder", "unet", "vae"):
+                (root / component / shard_name).write_bytes(b"stub")
+
+            missing = missing_diffusers_files(root)
+
+        self.assertIn(
+            "unet/diffusion_pytorch_model-00002-of-00002.safetensors",
+            missing,
+        )
+
+    def test_complete_sharded_weights_are_ready_without_an_index(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = _write_pipeline(
+                Path(tmp_dir) / "sdxl",
+                SDXL_INDEX,
+                with_weights=False,
+            )
+            for component in ("text_encoder", "unet", "vae"):
+                for part in (1, 2):
+                    name = (
+                        f"diffusion_pytorch_model-{part:05d}-of-00002.safetensors"
+                    )
+                    (root / component / name).write_bytes(b"stub")
+
+            self.assertEqual(missing_diffusers_files(root), [])
+
+    def test_weight_index_requires_every_referenced_shard(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = _write_pipeline(
+                Path(tmp_dir) / "sdxl",
+                SDXL_INDEX,
+                with_weights=False,
+            )
+            for component in ("text_encoder", "unet", "vae"):
+                component_root = root / component
+                first = "model-00001-of-00002.safetensors"
+                second = "model-00002-of-00002.safetensors"
+                (component_root / first).write_bytes(b"stub")
+                (component_root / "model.safetensors.index.json").write_text(
+                    json.dumps({"weight_map": {"a": first, "b": second}}),
+                    encoding="utf-8",
+                )
+
+            missing = missing_diffusers_files(root)
+
+        self.assertIn("unet/model-00002-of-00002.safetensors", missing)
+
+    def test_clip_tokenizer_requires_vocabulary_and_merges(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = _write_pipeline(Path(tmp_dir) / "sdxl", SDXL_INDEX)
+            (root / "tokenizer" / "merges.txt").unlink()
+
+            missing = missing_diffusers_files(root)
+
+        self.assertIn("tokenizer/merges.txt", missing)
+
+    def test_t5_tokenizer_requires_sentencepiece_assets(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = _write_pipeline(Path(tmp_dir) / "cogvideox", COGVIDEOX_INDEX)
+            (root / "tokenizer" / "spiece.model").unlink()
+
+            missing = missing_diffusers_files(root)
+
+        self.assertIn("tokenizer/spiece.model", missing)
+
     def test_null_component_slots_are_not_required(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             root = _write_pipeline(Path(tmp_dir) / "sdxl", SDXL_INDEX)
@@ -148,7 +231,7 @@ class TransformersReadinessTests(unittest.TestCase):
             readiness = evaluate_readiness(runtime="transformers", local_path=str(root))
 
         self.assertEqual(readiness.status, STATUS_MISSING_FILES)
-        self.assertEqual(readiness.missing, ("*.safetensors",))
+        self.assertIn("*.safetensors", readiness.missing)
 
     def test_config_and_weights_are_ready(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -156,11 +239,41 @@ class TransformersReadinessTests(unittest.TestCase):
             root.mkdir()
             (root / "config.json").write_text("{}", encoding="utf-8")
             (root / "model.safetensors").write_bytes(b"stub")
+            (root / "preprocessor_config.json").write_text("{}", encoding="utf-8")
+            (root / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+            (root / "tokenizer.json").write_text("{}", encoding="utf-8")
 
             self.assertEqual(missing_transformers_files(root), [])
             readiness = evaluate_readiness(runtime="transformers", local_path=str(root))
 
         self.assertEqual(readiness.status, STATUS_READY)
+
+    def test_musicgen_processor_assets_are_required(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "musicgen"
+            root.mkdir()
+            (root / "config.json").write_text("{}", encoding="utf-8")
+            (root / "model.safetensors").write_bytes(b"stub")
+
+            missing = missing_transformers_files(root)
+
+        self.assertIn("preprocessor_config.json", missing)
+        self.assertIn("tokenizer_config.json", missing)
+        self.assertIn(
+            "tokenizer.json|spiece.model|vocab.json+merges.txt|vocab.txt",
+            missing,
+        )
+
+    def test_auxiliary_bin_file_is_not_treated_as_model_weights(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "musicgen"
+            root.mkdir()
+            (root / "config.json").write_text("{}", encoding="utf-8")
+            (root / "compression_state_dict.bin").write_bytes(b"stub")
+
+            missing = missing_transformers_files(root)
+
+        self.assertIn("*.safetensors", missing)
 
 
 class LearnedReadinessTests(unittest.TestCase):
@@ -239,6 +352,11 @@ class LearnedReadinessTests(unittest.TestCase):
 
 
 class ManifestPayloadReadinessTests(unittest.TestCase):
+    def test_relative_paths_resolve_from_repository_root(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+
+        self.assertEqual(resolve_repo_path("models"), (root / "models").resolve())
+
     def test_payload_matches_manifest_fields(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             root = _write_pipeline(Path(tmp_dir) / "sdxl", SDXL_INDEX)
@@ -268,6 +386,29 @@ class ManifestPayloadReadinessTests(unittest.TestCase):
         readiness = evaluate_manifest_payload({"runtime": "diffusers", "remote_ref": "org/model"})
 
         self.assertEqual(readiness.status, STATUS_MISSING_FILES)
+
+
+class SetupCheckerDependencyTests(unittest.TestCase):
+    def test_setup_checker_imports_without_site_packages(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        script = root / "scripts" / "check_local_setup.py"
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-S",
+                "-c",
+                (
+                    "import runpy; "
+                    f"runpy.run_path({str(script)!r}, run_name='setup_probe')"
+                ),
+            ],
+            cwd=root,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
 
 if __name__ == "__main__":

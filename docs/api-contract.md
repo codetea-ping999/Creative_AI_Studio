@@ -150,9 +150,9 @@ Behavior:
 
 - runtime 自体は load しません
 - `enabled=true` の manifest のみ返します
-- `is_available` は loader が実際に開くファイル一式を見ます。判定は `core/models/readiness.py` が一元管理し、loader・`scripts/check_local_setup.py`・`make cogvideox-smoke` と同じルールです
-- diffusers runtime は `model_index.json` に記載された component ごとに設定ファイルと weight (`*.safetensors` / `*.bin`) が必要です。`model_index.json` だけでは `is_available=false` です
-- transformers runtime は `config.json` と weight が必要です
+- `is_available` は loader が実際に開くファイル一式を見ます。判定は `core/model_readiness.py` が一元管理し、loader・`scripts/check_local_setup.py`・`make cogvideox-smoke` と同じルールです
+- diffusers runtime は `model_index.json` に記載された component ごとに設定ファイル、tokenizer語彙、完全な weight set (`*.safetensors` / `*.bin`) が必要です。shardはindexの参照先または連番がすべて揃うまでreadyになりません
+- transformers runtime は `config.json`、完全なweight set、processor設定、tokenizer設定と語彙が必要です
 - learned runtime はadapter entrypoint、`pipeline_path` の component設定、weight一式が揃った場合だけ`is_available=true`です
 - `runtime_status` は `ready | missing_files | scaffold` のいずれかです
 - `availability_message` はUIへ表示可能なローカルfile readiness理由で、不足時は不足ファイルを列挙します

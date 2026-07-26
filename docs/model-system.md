@@ -110,7 +110,7 @@ resolve("sdxl-local") -> manifest "sdxl-local"
 7. alias lookup は manifest lookup より前に行い、その順序は resolver が一元管理する
 8. API / docs / generator は `GET /models` が返す public `id` をそのまま送る
 9. internal manifest id は model-system layer の内部識別子として扱う
-10. 「利用可能」の判定は `core/models/readiness.py` だけが持ち、API・loader・script は同じ関数を呼ぶ
+10. 「利用可能」の判定は `core/model_readiness.py` だけが持ち、API・loader・script は同じ関数を呼ぶ
 
 ## Learned Video Runtime Contract
 
@@ -118,5 +118,9 @@ resolve("sdxl-local") -> manifest "sdxl-local"
 - 戻り値は `runtime_adapter`, `pipeline`, `renderer`, `device`, `dtype` を持ちます
 - 現行pilotはローカル`THUDM/CogVideoX-2b`とMP4出力だけを対象にします
 - `/models`はheavy pipelineをloadせず、adapterと`pipeline_path`のcomponent設定・weight一式の存在だけを確認します
-- 確認ルールは `core/models/readiness.py` の共通実装で、adapter load時の事前checkと同一です
+- 確認ルールは `core/model_readiness.py` の共通実装で、adapter load時の事前checkと同一です
 - load/generation失敗はjob errorとして明示し、procedural storyboardへ自動fallbackしません
+
+> ⚠️ セキュリティ注意: `LearnedVideoLoader` はモデルディレクトリ内の `runtime.py` / `adapter.py`
+> を import して実行します（任意コード実行）。`MODELS_ROOT` 配下には信頼できる出所の
+> モデルパックのみを配置し、第三者製・未検証の bundle は読み込まないでください。

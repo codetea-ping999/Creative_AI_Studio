@@ -7,11 +7,13 @@ import argparse
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from urllib.error import URLError
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
@@ -39,6 +41,11 @@ def parse_args() -> argparse.Namespace:
         help="Skip the apps/web production build.",
     )
     parser.add_argument(
+        "--skip-web-tests",
+        action="store_true",
+        help="Skip the apps/web test suite.",
+    )
+    parser.add_argument(
         "--skip-tests",
         action="store_true",
         help="Skip pytest.",
@@ -55,8 +62,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--api-base-url",
-        default="http://127.0.0.1:8000",
-        help="Base URL to use for API smoke checks.",
+        default=None,
+        help=(
+            "Base URL to use for API smoke checks. With --start-api, the default "
+            "uses an available loopback port."
+        ),
     )
     parser.add_argument(
         "--api-timeout",
@@ -68,6 +78,15 @@ def parse_args() -> argparse.Namespace:
         "--check-runtime-files",
         action="store_true",
         help="Require local runtime model files during setup validation.",
+    )
+    parser.add_argument(
+        "--runtime-root",
+        type=Path,
+        default=None,
+        help=(
+            "Directory for temporary DB/output state. The default uses an "
+            "automatically removed temporary directory."
+        ),
     )
     return parser.parse_args()
 
@@ -226,11 +245,61 @@ def _check_smoke_project_jobs(base_url: str, project_id: str, job_id: str) -> No
     print(f"[OK] API project jobs check includes smoke job: {job_id}")
 
 
-def build_api_command(base_url: str) -> tuple[list[str], dict[str, str]]:
+def build_isolated_environment(
+    runtime_root: Path,
+    *,
+    base_env: dict[str, str] | None = None,
+) -> dict[str, str]:
+    data_root = runtime_root / "data"
+    output_root = runtime_root / "outputs"
+    for path in (
+        data_root,
+        data_root / "projects",
+        data_root / "feedback",
+        output_root / "images",
+        output_root / "audio",
+        output_root / "videos",
+    ):
+        path.mkdir(parents=True, exist_ok=True)
+
+    env = dict(os.environ if base_env is None else base_env)
+    for name in ("OUTPUT_IMAGE_DIR", "OUTPUT_AUDIO_DIR", "OUTPUT_VIDEO_DIR"):
+        env.pop(name, None)
+    env.update(
+        {
+            "DB_PATH": str(data_root / "jobs.db"),
+            "OUTPUT_DIR": str(output_root),
+        }
+    )
+    return env
+
+
+def _available_loopback_url() -> str:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    return f"http://127.0.0.1:{port}"
+
+
+@contextmanager
+def isolated_runtime_root(configured_root: Path | None):
+    if configured_root is not None:
+        configured_root.mkdir(parents=True, exist_ok=True)
+        yield configured_root
+        return
+    with TemporaryDirectory(prefix="creative-ai-studio-verify-") as tmp_dir:
+        yield Path(tmp_dir)
+
+
+def build_api_command(
+    base_url: str,
+    *,
+    base_env: dict[str, str] | None = None,
+) -> tuple[list[str], dict[str, str]]:
     parsed = urlparse(base_url)
     host = parsed.hostname or "127.0.0.1"
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    env = os.environ.copy()
+    env = dict(os.environ if base_env is None else base_env)
     env["API_HOST"] = host
     env["API_PORT"] = str(port)
     command = [
@@ -247,8 +316,8 @@ def build_api_command(base_url: str) -> tuple[list[str], dict[str, str]]:
 
 
 @contextmanager
-def managed_api_process(base_url: str):
-    command, env = build_api_command(base_url)
+def managed_api_process(base_url: str, *, base_env: dict[str, str] | None = None):
+    command, env = build_api_command(base_url, base_env=base_env)
     print(f"[RUN] {' '.join(command)}")
     process = subprocess.Popen(  # noqa: S603 - command is fully specified
         command,
@@ -282,36 +351,47 @@ def main() -> int:
     args = parse_args()
 
     try:
-        if not args.skip_setup_check:
-            command = [venv_python(), "scripts/check_local_setup.py"]
-            if not args.check_runtime_files:
-                command.append("--skip-runtime-files")
-            run_command(command)
+        with isolated_runtime_root(args.runtime_root) as runtime_root:
+            isolated_env = build_isolated_environment(runtime_root)
+            api_base_url = args.api_base_url or (
+                _available_loopback_url()
+                if args.start_api
+                else "http://127.0.0.1:8000"
+            )
 
-        if not args.skip_web_build:
-            run_command(["npm", "run", "build"], cwd=ROOT / "apps" / "web")
+            if not args.skip_setup_check:
+                command = [venv_python(), "scripts/check_local_setup.py"]
+                if not args.check_runtime_files:
+                    command.append("--skip-runtime-files")
+                run_command(command, env=isolated_env)
 
-        if not args.skip_tests:
-            run_command([venv_python(), "-m", "pytest", "-q"])
+            if not args.skip_web_tests:
+                run_command(["npm", "test"], cwd=ROOT / "apps" / "web", env=isolated_env)
 
-        if not args.skip_api_smoke:
-            if args.start_api:
-                with managed_api_process(args.api_base_url) as process:
-                    try:
-                        run_api_smoke_checks(args.api_base_url, timeout=args.api_timeout)
-                    except Exception as exc:
-                        if process.poll() is None:
-                            process.send_signal(signal.SIGTERM)
-                            try:
-                                process.wait(timeout=5)
-                            except subprocess.TimeoutExpired:
-                                process.kill()
-                                process.wait(timeout=5)
-                        output = read_process_output(process)
-                        detail = f"{exc}\n{output}".strip()
-                        raise VerificationError(detail) from exc
-            else:
-                run_api_smoke_checks(args.api_base_url, timeout=args.api_timeout)
+            if not args.skip_web_build:
+                run_command(["npm", "run", "build"], cwd=ROOT / "apps" / "web", env=isolated_env)
+
+            if not args.skip_tests:
+                run_command([venv_python(), "-m", "pytest", "-q"], env=isolated_env)
+
+            if not args.skip_api_smoke:
+                if args.start_api:
+                    with managed_api_process(api_base_url, base_env=isolated_env) as process:
+                        try:
+                            run_api_smoke_checks(api_base_url, timeout=args.api_timeout)
+                        except Exception as exc:
+                            if process.poll() is None:
+                                process.send_signal(signal.SIGTERM)
+                                try:
+                                    process.wait(timeout=5)
+                                except subprocess.TimeoutExpired:
+                                    process.kill()
+                                    process.wait(timeout=5)
+                            output = read_process_output(process)
+                            detail = f"{exc}\n{output}".strip()
+                            raise VerificationError(detail) from exc
+                else:
+                    run_api_smoke_checks(api_base_url, timeout=args.api_timeout)
 
     except VerificationError as exc:
         print(f"[FAIL] {exc}")

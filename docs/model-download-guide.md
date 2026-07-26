@@ -239,7 +239,7 @@ python3 -m unittest tests.test_model_system
 - `model_index.json`や`config.json`だけを置いた状態も`is_available: false`です。weight本体が揃って初めて`ready`になります
 - `storyboard-video` は procedural runtime なので追加ダウンロード不要です
 - `learned-video` はadapterと`model_index.json`だけではavailableにならず、CogVideoX-2Bのcomponent設定とweight一式が必要です
-- 判定ルールは `core/models/readiness.py` に集約され、`/models`・loader・`scripts/check_local_setup.py`・`make cogvideox-smoke` が同じ結果を返します
+- 判定ルールは `core/model_readiness.py` に集約され、`/models`・loader・`scripts/check_local_setup.py`・`make cogvideox-smoke` が同じ結果を返します
 - モデルダウンロード管理 UI はまだありません
 - semantic judge model は生成 model とは別管理で、初回 scoring 時に必要です
 

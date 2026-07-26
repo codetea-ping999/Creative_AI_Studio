@@ -1,5 +1,11 @@
 """Model management primitives for Creative AI Studio."""
 
+from core.model_readiness import (
+    ModelReadiness,
+    evaluate_manifest_payload,
+    evaluate_manifest_readiness,
+)
+
 from .cache import ModelRuntimeCache
 from .loader import (
     BaseModelLoader,
@@ -10,11 +16,6 @@ from .loader import (
     create_default_loader_registry,
 )
 from .manifest import ModelManifest
-from .readiness import (
-    ModelReadiness,
-    evaluate_manifest_payload,
-    evaluate_manifest_readiness,
-)
 from .registry import ModelRegistry
 from .resolver import ModelResolver
 from .service import ModelService

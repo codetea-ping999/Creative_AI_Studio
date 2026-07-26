@@ -366,6 +366,20 @@ class ModelSystemTests(unittest.TestCase):
             torch.float32,
         )
 
+    def test_diffusers_loader_only_requests_an_existing_weight_variant(self) -> None:
+        loader = create_default_loader_registry().get("diffusers_image_loader")
+        manifest = ModelRegistry().get("sdxl-local")
+
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            variant_weight = root / "model.fp16.safetensors"
+            variant_weight.write_bytes(b"stub")
+            self.assertEqual(loader._resolve_variant(manifest, root), "fp16")
+
+            variant_weight.unlink()
+            (root / "pytorch_model.bin").write_bytes(b"stub")
+            self.assertIsNone(loader._resolve_variant(manifest, root))
+
     def test_application_services_resolve_environment_overrides(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)

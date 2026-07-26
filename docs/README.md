@@ -67,10 +67,11 @@ Creative AI Studio のドキュメント案内です。
 
 次のファイルは「当時の実装・修復メモ」としては有用ですが、現行仕様の一次資料として読む順番は後ろで構いません。
 
-- [README_v0.2.md](../README_v0.2.md)
-- [IMPLEMENTATION_SUMMARY.md](../IMPLEMENTATION_SUMMARY.md)
-- [REPAIR_COMPLETE.md](../REPAIR_COMPLETE.md)
-- [COMPLETION_CHECKLIST.md](../COMPLETION_CHECKLIST.md)
+- [README_v0.2.md](./history/README_v0.2.md)
+- [IMPLEMENTATION_SUMMARY.md](./history/IMPLEMENTATION_SUMMARY.md)
+- [REPAIR_COMPLETE.md](./history/REPAIR_COMPLETE.md)
+- [COMPLETION_CHECKLIST.md](./history/COMPLETION_CHECKLIST.md)
+- [LFS_FIX_REPORT.md](./history/LFS_FIX_REPORT.md)
 - [api-updates-v0.2.md](./api-updates-v0.2.md)
 - [setup-guide-v0.2.md](./setup-guide-v0.2.md)
 

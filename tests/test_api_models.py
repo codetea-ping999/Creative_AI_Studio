@@ -53,13 +53,20 @@ def _write_model_index(model_path: Path, index: dict[str, object]) -> None:
 def _write_component_files(model_path: Path, index: dict[str, object]) -> None:
     """Write the component configs and weights a real pipeline load needs."""
 
-    for component in index:
+    for component, spec in index.items():
         if component.startswith("_"):
             continue
         component_root = model_path / component
         component_root.mkdir(parents=True, exist_ok=True)
         config_name = _CONFIG_NAMES.get(component, "config.json")
         (component_root / config_name).write_text("{}", encoding="utf-8")
+        if component == "tokenizer":
+            tokenizer_class = str(spec[1]) if isinstance(spec, list) else ""
+            if "T5Tokenizer" in tokenizer_class:
+                (component_root / "spiece.model").write_bytes(b"stub")
+            else:
+                (component_root / "vocab.json").write_text("{}", encoding="utf-8")
+                (component_root / "merges.txt").write_text("", encoding="utf-8")
         if component not in _WEIGHTLESS_COMPONENTS:
             (component_root / "model.safetensors").write_bytes(b"stub")
 
@@ -74,7 +81,14 @@ def _write_transformers_model(model_path: Path) -> Path:
     model_path.mkdir(parents=True, exist_ok=True)
     (model_path / "config.json").write_text("{}", encoding="utf-8")
     (model_path / "model.safetensors").write_bytes(b"stub")
+    _write_transformers_processor_files(model_path)
     return model_path
+
+
+def _write_transformers_processor_files(model_path: Path) -> None:
+    (model_path / "preprocessor_config.json").write_text("{}", encoding="utf-8")
+    (model_path / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+    (model_path / "tokenizer.json").write_text("{}", encoding="utf-8")
 
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"missing dependency: {IMPORT_ERROR}")
@@ -352,6 +366,7 @@ class ModelsApiTests(unittest.TestCase):
 
             config_only_response = client.get("/models?media_type=audio")
             (model_path / "model.safetensors").write_bytes(b"stub")
+            _write_transformers_processor_files(model_path)
             ready_response = client.get("/models?media_type=audio")
 
         config_only_model = config_only_response.json()["models"][0]

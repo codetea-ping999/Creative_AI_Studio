@@ -8,8 +8,13 @@ import os
 from pathlib import Path
 from typing import Any
 
+from core.model_readiness import (
+    WEIGHT_PATTERNS,
+    missing_diffusers_files,
+    missing_transformers_files,
+)
+
 from .manifest import ModelManifest
-from .readiness import missing_diffusers_files, missing_transformers_files
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -40,13 +45,12 @@ class DiffusersImageLoader(BaseModelLoader):
         requested_dtype = self._resolve_weight_dtype(manifest, torch)
         runtime_dtype = self._resolve_runtime_dtype(requested_dtype, device, torch)
         load_dtype = self._resolve_load_dtype(requested_dtype, runtime_dtype)
-        variant = self._resolve_variant(manifest)
+        variant = self._resolve_variant(manifest, Path(local_path))
 
         pipeline = StableDiffusionXLPipeline.from_pretrained(
             local_path,
             torch_dtype=load_dtype,
             variant=variant,
-            use_safetensors=True,
             local_files_only=True,
         )
         pipeline.set_progress_bar_config(disable=True)
@@ -128,12 +132,25 @@ class DiffusersImageLoader(BaseModelLoader):
             return runtime_dtype
         return requested_dtype
 
-    def _resolve_variant(self, manifest: ModelManifest) -> str | None:
+    def _resolve_variant(
+        self,
+        manifest: ModelManifest,
+        local_path: Path,
+    ) -> str | None:
         raw_dtype = (manifest.dtype or "").strip().lower()
         if raw_dtype in {"float16", "fp16", "half"}:
-            return "fp16"
-        if raw_dtype in {"bfloat16", "bf16"}:
-            return "bf16"
+            requested_variant = "fp16"
+        elif raw_dtype in {"bfloat16", "bf16"}:
+            requested_variant = "bf16"
+        else:
+            return None
+        if any(
+            f".{requested_variant}." in path.name
+            or f".{requested_variant}-" in path.name
+            for pattern in WEIGHT_PATTERNS
+            for path in local_path.rglob(pattern)
+        ):
+            return requested_variant
         return None
 
 
@@ -296,7 +313,13 @@ class ProceduralVideoLoader(BaseModelLoader):
 
 
 class LearnedVideoLoader(BaseModelLoader):
-    """Load a learned text-to-video runtime through a local adapter entrypoint."""
+    """Load a learned text-to-video runtime through a local adapter entrypoint.
+
+    Security note: this loader imports and executes a ``runtime.py`` / ``adapter.py``
+    found inside the model directory (arbitrary code execution). Only place model
+    packs from sources you trust under ``MODELS_ROOT``; never load third-party or
+    untrusted model bundles.
+    """
 
     def load(self, manifest: ModelManifest) -> dict[str, Any]:
         local_path = self._resolve_local_path(manifest)

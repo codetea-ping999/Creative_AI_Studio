@@ -116,6 +116,51 @@ class JobRepository:
         result: GenerationResult | None | object = _UNSET,
         error_message: str | None | object = _UNSET,
     ) -> JobRecord | None:
+        return self._update(
+            job_id,
+            status=status,
+            progress=progress,
+            project_id=project_id,
+            result=result,
+            error_message=error_message,
+        )
+
+    def update_if_status(
+        self,
+        job_id: str,
+        expected_statuses: tuple[str, ...],
+        *,
+        status: str | None = None,
+        progress: float | None = None,
+        project_id: str | None | object = _UNSET,
+        result: GenerationResult | None | object = _UNSET,
+        error_message: str | None | object = _UNSET,
+    ) -> JobRecord | None:
+        """Apply an update only while the persisted status is still expected."""
+
+        if not expected_statuses:
+            return None
+        return self._update(
+            job_id,
+            status=status,
+            progress=progress,
+            project_id=project_id,
+            result=result,
+            error_message=error_message,
+            expected_statuses=expected_statuses,
+        )
+
+    def _update(
+        self,
+        job_id: str,
+        *,
+        status: str | None,
+        progress: float | None,
+        project_id: str | None | object,
+        result: GenerationResult | None | object,
+        error_message: str | None | object,
+        expected_statuses: tuple[str, ...] | None = None,
+    ) -> JobRecord | None:
         assignments: list[str] = []
         parameters: list[Any] = []
 
@@ -145,10 +190,15 @@ class JobRepository:
         assignments.append("updated_at = ?")
         parameters.append(self._normalize_timestamp(None))
         parameters.append(job_id)
+        where_clause = "id = ?"
+        if expected_statuses is not None:
+            placeholders = ", ".join("?" for _ in expected_statuses)
+            where_clause += f" AND status IN ({placeholders})"
+            parameters.extend(expected_statuses)
 
         with self._connection() as connection:
             cursor = connection.execute(
-                f"UPDATE jobs SET {', '.join(assignments)} WHERE id = ?",
+                f"UPDATE jobs SET {', '.join(assignments)} WHERE {where_clause}",
                 parameters,
             )
 
@@ -211,6 +261,13 @@ class JobRepository:
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self._db_path)
         connection.row_factory = sqlite3.Row
+        # The API request threads and the in-process job runner thread both
+        # open short-lived connections to this database. WAL plus a busy
+        # timeout lets concurrent readers/writers coexist instead of failing
+        # with "database is locked".
+        connection.execute("PRAGMA journal_mode=WAL;")
+        connection.execute("PRAGMA busy_timeout=5000;")
+        connection.execute("PRAGMA synchronous=NORMAL;")
         return connection
 
     @contextmanager

@@ -1,4 +1,4 @@
-"""Shared readiness rules for locally installed model weights.
+"""Shared readiness rules for locally installed model weights and processor assets.
 
 `GET /models`, `scripts/check_local_setup.py`, `scripts/smoke_cogvideox.py`,
 the CogVideoX adapter, and the runtime loaders all answer the same question:
@@ -17,12 +17,13 @@ without pulling in the FastAPI/pydantic stack.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 STATUS_READY = "ready"
 STATUS_MISSING_FILES = "missing_files"
@@ -30,10 +31,22 @@ STATUS_SCAFFOLD = "scaffold"
 
 #: File patterns accepted as "real weights" for a component directory.
 WEIGHT_PATTERNS: tuple[str, ...] = ("*.safetensors", "*.bin")
+_WEIGHT_INDEX_PATTERNS: tuple[str, ...] = (
+    "*.safetensors.index.json",
+    "*.bin.index.json",
+)
+_SHARD_NAME_RE = re.compile(
+    r"^(?P<prefix>.+)-(?P<part>\d{5})-of-(?P<total>\d{5})"
+    r"(?P<suffix>\.(?:safetensors|bin))$"
+)
 
 #: Components that ship configuration only and never carry weight files.
 _CONFIG_ONLY_COMPONENTS: frozenset[str] = frozenset({"scheduler"})
 _CONFIG_ONLY_PREFIXES: tuple[str, ...] = ("tokenizer", "feature_extractor", "image_processor")
+_TRANSFORMERS_PROCESSOR_CONFIGS: tuple[str, ...] = (
+    "preprocessor_config.json",
+    "tokenizer_config.json",
+)
 
 
 class ManifestLike(Protocol):
@@ -180,8 +193,15 @@ def missing_diffusers_files(pipeline_path: Path) -> list[str]:
         config_name = _component_config_name(component)
         if not (component_root / config_name).exists():
             missing.append(f"{component}/{config_name}")
-        if _component_needs_weights(component) and not _has_weight_file(component_root):
-            missing.append(f"{component}/{WEIGHT_PATTERNS[0]}")
+        if component.startswith("tokenizer"):
+            missing.extend(
+                f"{component}/{name}"
+                for name in _missing_tokenizer_assets(component_root, class_name=spec[1])
+            )
+        if _component_needs_weights(component):
+            missing.extend(
+                f"{component}/{name}" for name in _missing_weight_files(component_root)
+            )
     return missing
 
 
@@ -191,8 +211,13 @@ def missing_transformers_files(model_path: Path) -> list[str]:
     missing: list[str] = []
     if not (model_path / "config.json").exists():
         missing.append("config.json")
-    if not _has_weight_file(model_path):
-        missing.append(WEIGHT_PATTERNS[0])
+    missing.extend(_missing_weight_files(model_path))
+    missing.extend(
+        name
+        for name in _TRANSFORMERS_PROCESSOR_CONFIGS
+        if not (model_path / name).exists()
+    )
+    missing.extend(_missing_tokenizer_assets(model_path))
     return missing
 
 
@@ -274,10 +299,113 @@ def _component_needs_weights(component: str) -> bool:
     return True
 
 
-def _has_weight_file(component_root: Path) -> bool:
-    return any(
-        any(component_root.glob(pattern)) for pattern in WEIGHT_PATTERNS
+def _missing_weight_files(component_root: Path) -> list[str]:
+    """Return missing files unless one complete local weight set is present."""
+
+    index_missing: list[str] = []
+    for index_path in sorted(
+        path
+        for pattern in _WEIGHT_INDEX_PATTERNS
+        for path in component_root.glob(pattern)
+    ):
+        try:
+            payload = json.loads(index_path.read_text(encoding="utf-8"))
+            weight_map = payload.get("weight_map") if isinstance(payload, dict) else None
+        except (OSError, ValueError):
+            weight_map = None
+        if not isinstance(weight_map, Mapping) or not weight_map:
+            index_missing.append(index_path.name)
+            continue
+        referenced_files = sorted(
+            {
+                filename
+                for filename in weight_map.values()
+                if isinstance(filename, str) and filename
+            }
+        )
+        if not referenced_files:
+            index_missing.append(index_path.name)
+            continue
+        missing = [
+            filename for filename in referenced_files if not (component_root / filename).is_file()
+        ]
+        if not missing:
+            return []
+        index_missing.extend(missing)
+
+    weight_files = sorted(
+        path
+        for pattern in WEIGHT_PATTERNS
+        for path in component_root.glob(pattern)
+        if path.is_file() and _is_candidate_weight_file(path)
     )
+    shard_groups: dict[tuple[str, str, int], set[int]] = {}
+    for path in weight_files:
+        shard_match = _SHARD_NAME_RE.fullmatch(path.name)
+        if shard_match is None:
+            return []
+        total = int(shard_match.group("total"))
+        key = (
+            shard_match.group("prefix"),
+            shard_match.group("suffix"),
+            total,
+        )
+        shard_groups.setdefault(key, set()).add(int(shard_match.group("part")))
+
+    shard_missing: list[str] = []
+    for (prefix, suffix, total), present_parts in sorted(shard_groups.items()):
+        expected_parts = set(range(1, total + 1))
+        if present_parts == expected_parts:
+            return []
+        shard_missing.extend(
+            f"{prefix}-{part:05d}-of-{total:05d}{suffix}"
+            for part in sorted(expected_parts - present_parts)
+        )
+
+    if index_missing:
+        return sorted(set(index_missing))
+    if shard_missing:
+        return shard_missing
+    return [WEIGHT_PATTERNS[0]]
+
+
+def _is_candidate_weight_file(path: Path) -> bool:
+    if path.suffix == ".safetensors":
+        return True
+    if path.suffix != ".bin":
+        return False
+    return path.name.startswith(("pytorch_model", "diffusion_pytorch_model", "model"))
+
+
+def _missing_tokenizer_assets(
+    tokenizer_root: Path,
+    *,
+    class_name: str | None = None,
+) -> list[str]:
+    """Require one vocabulary format that the configured tokenizer can load."""
+
+    if (tokenizer_root / "tokenizer.json").is_file():
+        return []
+
+    normalized_class = (class_name or "").lower()
+    if "cliptokenizer" in normalized_class:
+        return [
+            name
+            for name in ("vocab.json", "merges.txt")
+            if not (tokenizer_root / name).is_file()
+        ]
+
+    if "t5tokenizer" in normalized_class or "sentencepiece" in normalized_class:
+        return [] if (tokenizer_root / "spiece.model").is_file() else ["spiece.model"]
+
+    if any(
+        (tokenizer_root / name).is_file()
+        for name in ("spiece.model", "sentencepiece.bpe.model", "vocab.txt")
+    ):
+        return []
+    if all((tokenizer_root / name).is_file() for name in ("vocab.json", "merges.txt")):
+        return []
+    return ["tokenizer.json|spiece.model|vocab.json+merges.txt|vocab.txt"]
 
 
 __all__ = [

@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from core.storage.repositories.job_repository import JobRepository
 from .schemas import JobRecord
 from .statuses import (
+    ACTIVE_JOB_STATUSES,
     JOB_STATUS_CANCELLED,
     JOB_STATUS_FAILED,
     JOB_STATUS_POSTPROCESSING,
@@ -23,7 +24,6 @@ from .statuses import (
     JOB_STATUS_QUEUED,
     JOB_STATUS_RUNNING,
     JOB_STATUS_SUCCEEDED,
-    TERMINAL_JOB_STATUSES,
 )
 
 _STATUS_TO_EVENT = {
@@ -122,22 +122,24 @@ class JobService:
         return job
 
     def mark_failed(self, job_id: str, message: str) -> JobRecord | None:
-        job = self.job_repository.update(
+        job = self.job_repository.update_if_status(
             job_id,
+            ACTIVE_JOB_STATUSES,
             status=JOB_STATUS_FAILED,
             progress=1.0,
             error_message=message,
         )
-        if job is not None:
-            self._publish(
-                "job_failed",
-                {
-                    "job_id": job.id,
-                    "status": job.status,
-                    "progress": job.progress,
-                    "error_message": job.error_message,
-                },
-            )
+        if job is None:
+            return self.get_job(job_id)
+        self._publish(
+            "job_failed",
+            {
+                "job_id": job.id,
+                "status": job.status,
+                "progress": job.progress,
+                "error_message": job.error_message,
+            },
+        )
         return job
 
     def mark_succeeded(
@@ -152,32 +154,46 @@ class JobService:
                 "error_message": None,
             }
         )
-        job = self.job_repository.update(
+        job = self.job_repository.update_if_status(
             job_id,
+            ACTIVE_JOB_STATUSES,
             status=JOB_STATUS_SUCCEEDED,
             progress=1.0,
             result=normalized_result,
             error_message=None,
         )
-        if job is not None:
-            if self.asset_repository is not None:
-                self.asset_repository.sync_job(job)
-            self._publish(
-                "job_succeeded",
-                {
-                    "job_id": job.id,
-                    "status": job.status,
-                    "progress": job.progress,
-                    "outputs": job.result.outputs if job.result else [],
-                },
-            )
+        if job is None:
+            return self.get_job(job_id)
+        if self.asset_repository is not None:
+            self.asset_repository.sync_job(job)
+        self._publish(
+            "job_succeeded",
+            {
+                "job_id": job.id,
+                "status": job.status,
+                "progress": job.progress,
+                "outputs": job.result.outputs if job.result else [],
+            },
+        )
         return job
 
     def cancel_job(self, job_id: str) -> JobRecord | None:
-        job = self.get_job(job_id)
-        if job is None or job.status in TERMINAL_JOB_STATUSES:
-            return job
-        return self.update_status(job_id, JOB_STATUS_CANCELLED)
+        job = self.job_repository.update_if_status(
+            job_id,
+            ACTIVE_JOB_STATUSES,
+            status=JOB_STATUS_CANCELLED,
+        )
+        if job is None:
+            return self.get_job(job_id)
+        self._publish(
+            "job_cancelled",
+            {
+                "job_id": job.id,
+                "status": job.status,
+                "progress": job.progress,
+            },
+        )
+        return job
 
     def _publish(self, event_type: str, payload: dict[str, object]) -> None:
         if self.event_bus is not None:

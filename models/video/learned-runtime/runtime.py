@@ -12,7 +12,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from core.models.readiness import missing_diffusers_files
+from core.model_readiness import missing_diffusers_files
 
 
 def load_runtime(manifest: dict[str, Any]) -> dict[str, Any]:

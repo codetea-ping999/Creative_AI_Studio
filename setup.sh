@@ -34,17 +34,31 @@ print_warning() {
 print_step "前提条件を確認しています..."
 
 if ! command -v python3 &> /dev/null; then
-    echo "❌ Python 3 がインストールされていません"
+    echo "❌ Python 3.10 以上が必要ですが、Python 3 が見つかりません"
+    exit 1
+fi
+if ! python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)'; then
+    echo "❌ Python 3.10 以上が必要です（検出: $(python3 --version)）"
     exit 1
 fi
 print_success "Python 3 は インストール済み ($(python3 --version))"
 
 if ! command -v node &> /dev/null; then
-    echo "⚠️  Node.js がインストールされていません（オプション機能）"
-    SKIP_WEB=true
-else
-    print_success "Node.js はインストール済み ($(node --version))"
+    echo "❌ Node.js 20.19 以上、または 22.12 以上が必要です"
+    exit 1
 fi
+if ! node -e '
+  const [major, minor] = process.versions.node.split(".").map(Number);
+  const supported =
+    (major === 20 && minor >= 19) ||
+    (major === 22 && minor >= 12) ||
+    major > 22;
+  process.exit(supported ? 0 : 1);
+'; then
+    echo "❌ Node.js 20.19 以上、または 22.12 以上が必要です（検出: $(node --version)）"
+    exit 1
+fi
+print_success "Node.js はインストール済み ($(node --version))"
 
 echo ""
 
@@ -111,18 +125,14 @@ print_success "データベースと初期テーブルをセットアップし�
 
 echo ""
 
-# ステップ 6: Web UI セットアップ（オプション）
-if [ "$SKIP_WEB" != "true" ]; then
-    print_step "Web UI パッケージをインストールしています..."
-    
-    cd apps/web
-    npm install > /dev/null 2>&1
-    print_success "Web UI の依存パッケージをインストールしました"
-    
-    cd - > /dev/null
-else
-    print_warning "Node.js がインストールされていないため Web UI のセットアップをスキップしました"
-fi
+# ステップ 6: Web UI セットアップ
+print_step "Web UI パッケージをインストールしています..."
+
+cd apps/web
+npm ci > /dev/null 2>&1
+print_success "Web UI のロック済み依存パッケージをインストールしました"
+
+cd - > /dev/null
 
 echo ""
 
@@ -172,13 +182,11 @@ else
     print_warning ".env ファイルは既に存在します"
 fi
 
-if [ "$SKIP_WEB" != "true" ]; then
-    if [ ! -f "apps/web/.env" ]; then
-        cp apps/web/.env.example apps/web/.env
-        print_success "apps/web/.env ファイルを作成しました"
-    else
-        print_warning "apps/web/.env ファイルは既に存在します"
-    fi
+if [ ! -f "apps/web/.env" ]; then
+    cp apps/web/.env.example apps/web/.env
+    print_success "apps/web/.env ファイルを作成しました"
+else
+    print_warning "apps/web/.env ファイルは既に存在します"
 fi
 
 echo ""
