@@ -384,6 +384,175 @@ class LearnedVideoLoader(BaseModelLoader):
         return payload
 
 
+class BaseTextLoader(BaseModelLoader):
+    """Shared manifest handling for text runtimes."""
+
+    def _resolve_local_path(self, manifest: ModelManifest) -> str:
+        if not manifest.local_path:
+            raise ValueError(f"Manifest {manifest.id!r} is missing local_path.")
+
+        local_path = (_REPO_ROOT / manifest.local_path).resolve()
+        if not local_path.exists():
+            raise FileNotFoundError(
+                f"Model path does not exist for manifest {manifest.id!r}: {local_path}"
+            )
+        return str(local_path)
+
+    def _resolve_device(self, torch_available: bool = True) -> str:
+        requested_device = os.getenv("DEVICE", "auto").strip().lower()
+        if requested_device and requested_device != "auto":
+            return requested_device
+        return "auto"
+
+    def _base_payload(
+        self,
+        manifest: ModelManifest,
+        *,
+        local_path: str | None,
+        device: str,
+    ) -> dict[str, Any]:
+        return {
+            "stub": False,
+            "loader": self.__class__.__name__,
+            "manifest_id": manifest.id,
+            "display_name": manifest.display_name,
+            "runtime": manifest.runtime,
+            "provider": manifest.provider,
+            "local_path": local_path,
+            "remote_ref": manifest.remote_ref,
+            "dtype": manifest.dtype,
+            "device": device,
+            "default_params": dict(manifest.default_params),
+            "path_exists": local_path is not None,
+        }
+
+
+class TemplateTextLoader(BaseTextLoader):
+    """Expose a deterministic, dependency-free text runtime.
+
+    This is the text analogue of ``ProceduralVideoLoader``: it lets the story,
+    storyboard, and assembly flow run end to end before any language model has
+    been downloaded, and it keeps the pipeline testable in CI.
+    """
+
+    def load(self, manifest: ModelManifest) -> dict[str, Any]:
+        from .text_runtimes import build_template_runtime
+
+        local_path = self._resolve_local_path(manifest)
+        context_window = int(manifest.default_params.get("context_window", 8192))
+        return {
+            **self._base_payload(manifest, local_path=local_path, device="cpu"),
+            "generate": build_template_runtime(seed_salt=manifest.id),
+            "context_window": context_window,
+            "supports_json_schema": True,
+            "deterministic": True,
+        }
+
+
+class LlamaCppTextLoader(BaseTextLoader):
+    """Load a local GGUF model through llama-cpp-python."""
+
+    def load(self, manifest: ModelManifest) -> dict[str, Any]:
+        from .text_runtimes import build_llama_cpp_runtime
+
+        local_path = Path(self._resolve_local_path(manifest))
+        model_file = self._resolve_model_file(local_path, manifest)
+        context_window = int(manifest.default_params.get("context_window", 8192))
+        # -1 offloads every layer, which is what makes Metal and CUDA worth
+        # having; a user with limited VRAM lowers it in the manifest.
+        n_gpu_layers = int(manifest.default_params.get("n_gpu_layers", -1))
+        chat_format = manifest.default_params.get("chat_format")
+
+        generate, supports_json_schema = build_llama_cpp_runtime(
+            model_file,
+            context_window=context_window,
+            n_gpu_layers=n_gpu_layers,
+            chat_format=str(chat_format) if chat_format else None,
+        )
+        return {
+            **self._base_payload(
+                manifest,
+                local_path=str(local_path),
+                device=self._resolve_device(),
+            ),
+            "generate": generate,
+            "context_window": context_window,
+            "supports_json_schema": supports_json_schema,
+            "model_file": str(model_file),
+            "n_gpu_layers": n_gpu_layers,
+        }
+
+    def _resolve_model_file(self, local_path: Path, manifest: ModelManifest) -> Path:
+        if local_path.is_file():
+            return local_path
+
+        configured = manifest.default_params.get("model_file")
+        if isinstance(configured, str) and configured.strip():
+            candidate = local_path / configured.strip()
+            if not candidate.exists():
+                raise FileNotFoundError(
+                    f"Configured model_file was not found for manifest "
+                    f"{manifest.id!r}: {candidate}"
+                )
+            return candidate
+
+        gguf_files = sorted(local_path.glob("*.gguf"))
+        if not gguf_files:
+            raise FileNotFoundError(
+                f"No .gguf weight file found under {local_path} for manifest "
+                f"{manifest.id!r}. Place a GGUF file there or set "
+                "default_params.model_file."
+            )
+        if len(gguf_files) > 1:
+            raise ValueError(
+                f"Multiple .gguf files found under {local_path}; set "
+                f"default_params.model_file in manifest {manifest.id!r} to choose one: "
+                f"{', '.join(path.name for path in gguf_files)}"
+            )
+        return gguf_files[0]
+
+
+class OpenAICompatibleTextLoader(BaseTextLoader):
+    """Call a local OpenAI-compatible endpoint (Ollama, LM Studio, vLLM).
+
+    Non-loopback hosts are refused unless ``ALLOW_REMOTE_TEXT_ENDPOINTS=true``,
+    and the resolved base URL is returned in the payload so job metadata always
+    records where prompts were sent.
+    """
+
+    def load(self, manifest: ModelManifest) -> dict[str, Any]:
+        from .text_runtimes import build_openai_compatible_runtime, resolve_text_endpoint
+
+        if not manifest.remote_ref:
+            raise ValueError(
+                f"Manifest {manifest.id!r} needs remote_ref set to the endpoint base URL."
+            )
+
+        base_url = resolve_text_endpoint(manifest.remote_ref)
+        model_name = str(
+            manifest.default_params.get("model_name", manifest.public_model_id)
+        )
+        api_key_env = manifest.default_params.get("api_key_env")
+        context_window = int(manifest.default_params.get("context_window", 8192))
+
+        generate = build_openai_compatible_runtime(
+            base_url,
+            model_name=model_name,
+            api_key_env=str(api_key_env) if api_key_env else None,
+            timeout_seconds=float(
+                manifest.default_params.get("timeout_seconds", 300.0)
+            ),
+        )
+        return {
+            **self._base_payload(manifest, local_path=None, device="remote"),
+            "generate": generate,
+            "context_window": context_window,
+            "supports_json_schema": False,
+            "endpoint_base_url": base_url,
+            "endpoint_model_name": model_name,
+        }
+
+
 class LoaderRegistry:
     """Lookup table for named loader instances."""
 
@@ -408,15 +577,22 @@ def create_default_loader_registry() -> LoaderRegistry:
     registry.register("transformers_musicgen_loader", TransformersMusicgenLoader())
     registry.register("procedural_video_loader", ProceduralVideoLoader())
     registry.register("learned_video_loader", LearnedVideoLoader())
+    registry.register("template_text_loader", TemplateTextLoader())
+    registry.register("llama_cpp_text_loader", LlamaCppTextLoader())
+    registry.register("openai_compatible_text_loader", OpenAICompatibleTextLoader())
     return registry
 
 
 __all__ = [
     "BaseModelLoader",
+    "BaseTextLoader",
     "DiffusersImageLoader",
     "LearnedVideoLoader",
+    "LlamaCppTextLoader",
     "LoaderRegistry",
+    "OpenAICompatibleTextLoader",
     "ProceduralVideoLoader",
+    "TemplateTextLoader",
     "TransformersMusicgenLoader",
     "create_default_loader_registry",
 ]
