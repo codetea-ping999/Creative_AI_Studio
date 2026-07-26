@@ -324,6 +324,58 @@ class JobPipelineTests(unittest.TestCase):
                 self.assertEqual(list_response.status_code, 200)
                 self.assertEqual(len(list_response.json()), 1)
 
+    @unittest.skipIf(API_IMPORT_ERROR is not None, f"missing dependency: {API_IMPORT_ERROR}")
+    def test_generate_image_variations_register_every_output_in_gallery(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            with patch("core.models.loader.DiffusersImageLoader.load", new=_fake_diffusers_load):
+                root = Path(tmp_dir)
+                services = create_application_services(
+                    db_path=root / "jobs.db",
+                    output_dir=root / "outputs" / "images",
+                )
+                client = TestClient(create_app(services, start_job_runner=False))
+
+                create_response = client.post(
+                    "/generate/image",
+                    json={
+                        "prompt": "Three gallery variations",
+                        "model_id": "sdxl",
+                        "seed": 50,
+                        "params": {
+                            "steps": 1,
+                            "width": 64,
+                            "height": 64,
+                            "variation_count": 3,
+                        },
+                    },
+                )
+                self.assertEqual(create_response.status_code, 201)
+                job_id = create_response.json()["job_id"]
+
+                completed_job = services.job_runner.run_once()
+                self.assertIsNotNone(completed_job)
+                assert completed_job is not None
+                self.assertEqual(completed_job.status, "succeeded")
+                self.assertEqual(len(completed_job.result.outputs), 3)
+
+                gallery_response = client.get("/gallery?media_type=image")
+                self.assertEqual(gallery_response.status_code, 200)
+                gallery_items = sorted(
+                    gallery_response.json(),
+                    key=lambda item: item["variation_index"],
+                )
+                self.assertEqual(len(gallery_items), 3)
+                self.assertTrue(
+                    all(item["job_id"] == job_id for item in gallery_items)
+                )
+                self.assertEqual(
+                    [
+                        (item["variation_index"], item["seed"])
+                        for item in gallery_items
+                    ],
+                    [(0, 50), (1, 51), (2, 52)],
+                )
+
     def test_runner_marks_job_failed_when_generator_raises(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             repository = JobRepository(Path(tmp_dir) / "jobs.db")
