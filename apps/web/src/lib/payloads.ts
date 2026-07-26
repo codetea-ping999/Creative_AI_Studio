@@ -73,7 +73,7 @@ export function buildReusePayload(
   values: PromptFormSubmitValues,
   projectId: string | null,
   options: {
-    action?: "variation" | "rerun";
+    action?: "variation" | "rerun" | "melody";
     params?: Record<string, unknown>;
   } = {},
 ): Record<string, unknown> {

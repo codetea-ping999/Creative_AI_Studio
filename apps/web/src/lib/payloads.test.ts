@@ -117,6 +117,19 @@ describe("generation payloads", () => {
     });
   });
 
+  it("keeps the melody action and selected conditioning model", () => {
+    expect(
+      buildReusePayload(
+        { ...baseValues, mediaType: "audio", modelId: "musicgen-melody" },
+        null,
+        { action: "melody" },
+      ),
+    ).toMatchObject({
+      action: "melody",
+      model_id: "musicgen-melody",
+    });
+  });
+
   it("offers only media-appropriate quick-review reasons and clear prompt instructions", () => {
     expect(getQuickReviewIssueOptions("image").map((option) => option.id)).toEqual([
       "composition",

@@ -34,6 +34,9 @@ type AssetDetailPanelProps = {
     issueTags: QuickReviewIssueTag[],
   ) => Promise<boolean>;
   onReuse: () => void;
+  canConditionMelody: boolean;
+  melodyConditioningMessage: string;
+  onConditionMelody: () => void;
   onLoadIntoComposer: () => void;
   onExport: () => void;
   onBindProject: () => void;
@@ -57,6 +60,9 @@ export function AssetDetailPanel({
   onOpenQuickReview,
   onQuickReview,
   onReuse,
+  canConditionMelody,
+  melodyConditioningMessage,
+  onConditionMelody,
   onLoadIntoComposer,
   onExport,
   onBindProject,
@@ -234,6 +240,22 @@ export function AssetDetailPanel({
             Export asset
           </button>
         </div>
+        {detail.media_type === "audio" ? (
+          <div className="melody-conditioning-action">
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={onConditionMelody}
+              disabled={isAssetBusy || !canConditionMelody}
+              aria-describedby="melody-conditioning-help"
+            >
+              Use as melody reference
+            </button>
+            <p id="melody-conditioning-help" className="section-footnote">
+              {melodyConditioningMessage}
+            </p>
+          </div>
+        ) : null}
         <div className="form-section">
           <div className="form-section__header">
             <div>
