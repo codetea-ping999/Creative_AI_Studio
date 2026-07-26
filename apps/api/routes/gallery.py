@@ -14,6 +14,7 @@ from apps.api.dependencies import get_services
 from apps.api.export_paths import resolve_export_dir, sanitize_export_name
 from bootstrap import ApplicationServices
 from core.assets import Asset
+from core.audio_conditioning import inspect_wav_reference
 from core.quality import calibrate_quality_report
 from core.schemas import GenerationRequest
 
@@ -81,7 +82,7 @@ class ReuseAssetRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    action: Literal["variation", "rerun"] = "rerun"
+    action: Literal["variation", "rerun", "melody"] = "rerun"
     prompt: str | None = None
     negative_prompt: str | None = None
     model_id: str | None = None
@@ -241,6 +242,16 @@ def _build_reuse_request(
     if project_id is not None and services.project_repository.get(project_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
 
+    selected_model_id = (
+        req.model_id if req.model_id is not None else source_job.request.model_id
+    )
+    if req.action == "melody":
+        _validate_melody_reuse(
+            source_asset,
+            services,
+            model_id=selected_model_id,
+        )
+
     next_params = {
         **dict(source_job.request.params),
         **dict(req.params),
@@ -257,7 +268,7 @@ def _build_reuse_request(
                 if req.negative_prompt is not None
                 else source_job.request.negative_prompt
             ),
-            "model_id": req.model_id if req.model_id is not None else source_job.request.model_id,
+            "model_id": selected_model_id,
             "seed": (
                 req.seed
                 if req.seed is not None
@@ -274,6 +285,61 @@ def _build_reuse_request(
         }
     )
     return generation_request, project_id
+
+
+def _validate_melody_reuse(
+    source_asset: Asset,
+    services: ApplicationServices,
+    *,
+    model_id: str | None,
+) -> None:
+    """Reject invalid melody requests before a queued job or reuse mark exists."""
+
+    if source_asset.media_type != "audio":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Melody conditioning requires an audio Gallery asset.",
+        )
+    try:
+        manifest = services.model_service.get_manifest(
+            model_id,
+            media_type="audio",
+            task_type="text-to-music",
+        )
+    except LookupError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    if "melody-conditioning" not in manifest.tags:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Model {manifest.public_model_id!r} does not support melody conditioning."
+            ),
+        )
+
+    reference_minimum = manifest.default_params.get("min_reference_duration_seconds")
+    reference_limit = manifest.default_params.get("max_reference_duration_seconds")
+    try:
+        min_reference_duration_seconds = float(reference_minimum)
+        max_reference_duration_seconds = float(reference_limit)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Melody model does not define a valid reference duration limit.",
+        ) from exc
+    try:
+        inspect_wav_reference(
+            source_asset.path,
+            min_duration_seconds=min_reference_duration_seconds,
+            max_duration_seconds=max_reference_duration_seconds,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
 
 
 @router.get("", response_model=list[GalleryItemResponse])
