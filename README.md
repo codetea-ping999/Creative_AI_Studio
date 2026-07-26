@@ -37,8 +37,12 @@
 
 ### ✅ 実装済み機能
 
-- **Core Infrastructure**: ジョブキューシステム、イベントバス、モデルレジストリ、ストレージレイヤー
-- **API (FastAPI)**: `/health`, `/models`, `/jobs`, `/generate/image`, `/generate/audio`, `/generate/video`, `/gallery`, `/projects`, `/feedback`, `/metrics/summary`, `/metrics/calibration`, `/catalog/loras`
+- **Core Infrastructure**: ジョブキューシステム、イベントバス（購読可能）、モデルレジストリ、ストレージレイヤー
+- **API (FastAPI)**: `/health`, `/models`, `/jobs`, `/generate/{image,audio,video,text}`, `/gallery`, `/projects`, `/feedback`, `/metrics/summary`, `/metrics/calibration`, `/catalog/loras`, `/bible`, `/batches`, `/stories`
+- **Story Engine (text)**: ローカル LLM による logline / beat sheet / scene list / 本文 / 台本 / prompt pack / character sheet 生成。weight 未配置でも動く決定的な template runtime を既定とし、GGUF（llama.cpp）とローカル endpoint に差し替え可能
+- **Creative Bible**: キャラクター / スタイル / ブランド / 場所 / 小道具を再利用可能な設定として保持し、決定的・監査可能に prompt へ合成（seed lock、LoRA、参照画像、locked field の衝突検知つき）
+- **Variation Matrix**: 軸展開による多重生成と probe → refine の 2 段階選抜。ロゴ 30 構造 / サムネ 30 構造 / トーン 10 種のカタログを同梱
+- **StoryDocument**: beats / scenes / chapters と生成素材の紐付けを保持し、assembly 用 timeline を導出
 - **Web UI (React + TypeScript)**: Composer / Stage / Session History を持つ Studio UI、image / video / song surface 切り替え、モデル選択ガード、LoRA カタログ選択、品質スコア表示、音楽再生
 - **Image Generator**: ローカル SDXL と optional LoRA を使った画像生成
 - **Audio Generator**: ローカル MusicGen runtime を使った text-to-music フロー
@@ -52,6 +56,14 @@
 
 ### 🚧 進行中 / 計画中機能
 
+v0.3「構想から完成動画まで」の残作業は [docs/multimedia-content-generation-plan.md](docs/multimedia-content-generation-plan.md)
+と GitHub issue #31（親 Epic）で管理しています。
+
+- ナレーション（TTS）と共通の音声後処理
+- timeline から MP4 を書き出す assembly 工程
+- Story surface / Matrix 比較グリッドの Web UI
+- 実 GGUF weight を使った Story Engine の通し検証
+- 参照画像条件付けによるキャラクター同一性の強化
 - semantic judge を含む品質評価の高度化
 - anime checkpoint の実配置とプリセット拡充
 - CogVideoX-2B weightの実配置とM1 MaxでのMP4 smoke
@@ -60,6 +72,7 @@
 ## 企画メモ
 
 - ローカルAIを「プロンプト＋調整」で運用するための実行プラン: [docs/local-ai-creative-studio-plan.md](docs/local-ai-creative-studio-plan.md)
+- 構想 → 執筆 → 素材生成 → ナレーション/BGM → 完成動画を 1 フローにする設計: [docs/multimedia-content-generation-plan.md](docs/multimedia-content-generation-plan.md)
 
 ## アーキテクチャ詳細
 

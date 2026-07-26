@@ -22,14 +22,21 @@ Creative AI Studio のドキュメント案内です。
 5. [api-contract.md](./api-contract.md)
    API の全体像と各エンドポイントの役割を確認します。
 
-6. [next-tasks.md](./next-tasks.md)
+6. [domain-model.md](./domain-model.md)
+   Job / Asset / Project に加え、BibleEntry / Batch / StoryDocument / Timeline が
+   それぞれ何の主語なのかを確認します。
+
+7. [multimedia-content-generation-plan.md](./multimedia-content-generation-plan.md)
+   構想から完成動画までを 1 フローにする v0.3 の設計と段階計画です。
+
+8. [next-tasks.md](./next-tasks.md)
    現在の到達点と、次に進めるべき優先タスクを確認します。
 
-7. [repository-issues-improved.md](./repository-issues-improved.md)
+9. [repository-issues-improved.md](./repository-issues-improved.md)
    実コードと検証結果から抽出した改善課題と解決状況を確認します。
 
-8. [model-download-guide.md](./model-download-guide.md)
-   実モデルの配置や manifest 運用を確認します。
+10. [model-download-guide.md](./model-download-guide.md)
+    実モデルの配置や manifest 運用を確認します。
 
 ## 目的別の読み方
 

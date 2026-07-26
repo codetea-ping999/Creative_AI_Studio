@@ -36,7 +36,12 @@ Creative AI Studio を勉強しながら読むためのコードベース案内�
 | `core/assets/` | 生成物の保存と再利用 | `core/assets/__init__.py` |
 | `core/projects/` | project 単位の grouping | `core/projects/__init__.py` |
 | `core/feedback/` | human feedback 保存 | `core/feedback/__init__.py` |
-| `generators/` | image / audio / video の生成処理 | `generators/base.py` と各 generator |
+| `core/bible/` | 再利用する作品設定（統一感の単位） | `core/bible/__init__.py` |
+| `core/prompting/` | 決定的 prompt 合成と軸カタログ | `core/prompting/composer.py`, `core/prompting/patterns.py` |
+| `core/batches/` | 多重生成の軸展開と段階実行 | `core/batches/expansion.py`, `core/batches/service.py` |
+| `core/story/` | 物語ドキュメントと timeline 導出 | `core/story/schemas.py`, `core/story/timeline.py` |
+| `generators/` | image / audio / video / text の生成処理 | `generators/base.py` と各 generator |
+| `generators/common/` | generator 間で共有する解決処理 | `generators/common/prompting.py` |
 | `models/manifests/` | 利用可能モデル定義 | 各 JSON manifest |
 | `scripts/` | 開発補助と検証 | `scripts/run_api_dev.sh`, `scripts/verify_local_stack.py` |
 | `tests/` | API、job pipeline、model system の確認 | `tests/test_job_pipeline.py` など |
