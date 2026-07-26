@@ -152,6 +152,13 @@ function getInstallGuide(
   const normalizedId = modelOption.id.toLowerCase();
 
   if (mediaType === "image") {
+    if (normalizedId.includes("flux")) {
+      return {
+        label: "FLUX.1-dev",
+        url: "https://huggingface.co/black-forest-labs/FLUX.1-dev",
+        note: "利用条件を確認して `models/image/flux-dev` に配置します。",
+      };
+    }
     if (normalizedId.includes("anime-sdxl")) {
       return {
         label: "Anime SDXL checkpoint",
@@ -230,6 +237,11 @@ export function PromptForm({
   const availableModelCount = modelOptions.filter((option) => option.isAvailable).length;
   const unavailableModelCount = modelOptions.length - availableModelCount;
   const unavailableModels = modelOptions.filter((option) => !option.isAvailable);
+  const selectedModel = modelOptions.find(
+    (option) => option.id === formValues.modelId,
+  );
+  const negativePromptIsApplied =
+    mediaType !== "image" || !selectedModel?.tags.includes("flux");
   const imageFormatValue = resolveImageFormatPreset(
     parseRequiredInteger(formValues.width, defaultValues.width),
     parseRequiredInteger(formValues.height, defaultValues.height),
@@ -476,6 +488,11 @@ export function PromptForm({
             onChange={(event) => setFieldValue("negativePrompt", event.target.value)}
             disabled={disabled}
           />
+          {!negativePromptIsApplied ? (
+            <small className="field-help">
+              FLUX.1-dev では履歴・評価用に保存しますが、画像生成の推論には適用されません。
+            </small>
+          ) : null}
         </label>
       ) : null}
     </section>
@@ -542,6 +559,11 @@ export function PromptForm({
             placeholder="例：文字、ぼやけ、余分な人物"
             disabled={disabled}
           />
+          {!negativePromptIsApplied ? (
+            <small className="field-help">
+              FLUX.1-dev では履歴・評価用に保存しますが、画像生成の推論には適用されません。
+            </small>
+          ) : null}
         </label>
         <div className="simple-brief__summary">
           <div>

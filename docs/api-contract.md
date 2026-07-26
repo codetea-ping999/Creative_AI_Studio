@@ -163,6 +163,8 @@ Behavior:
 - learned runtime はadapter entrypoint、`pipeline_path` の component設定、weight一式が揃った場合だけ`is_available=true`です
 - `runtime_status` は `ready | missing_files | scaffold` のいずれかです
 - `availability_message` はUIへ表示可能なローカルfile readiness理由で、不足時は不足ファイルを列挙します
+- FLUX family の生成結果は `metadata.negative_prompt_applied=false` を返し、
+  入力された negative prompt が推論には使われなかったことを示します
 
 完全レスポンス:
 

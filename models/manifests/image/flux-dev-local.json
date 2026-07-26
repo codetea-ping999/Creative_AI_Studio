@@ -1,0 +1,23 @@
+{
+  "id": "flux-dev-local",
+  "public_id": "flux-dev",
+  "display_name": "FLUX.1-dev Local",
+  "media_type": "image",
+  "task_type": "text-to-image",
+  "provider": "local",
+  "runtime": "diffusers",
+  "local_path": "./models/image/flux-dev",
+  "remote_ref": "black-forest-labs/FLUX.1-dev",
+  "loader": "diffusers_image_loader",
+  "family": "flux",
+  "dtype": "bfloat16",
+  "default_params": {
+    "width": 1024,
+    "height": 1024,
+    "steps": 28,
+    "guidance_scale": 3.5
+  },
+  "aliases": ["flux", "flux-local"],
+  "tags": ["image", "flux", "prompt-natural-language"],
+  "enabled": true
+}

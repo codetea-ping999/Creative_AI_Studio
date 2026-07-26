@@ -33,7 +33,7 @@ class DiffusersImageLoader(BaseModelLoader):
     def load(self, manifest: ModelManifest) -> dict[str, Any]:
         try:
             import torch
-            from diffusers import StableDiffusionXLPipeline
+            import diffusers
         except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
             raise RuntimeError(
                 "Diffusers runtime dependencies are missing. "
@@ -45,9 +45,21 @@ class DiffusersImageLoader(BaseModelLoader):
         requested_dtype = self._resolve_weight_dtype(manifest, torch)
         runtime_dtype = self._resolve_runtime_dtype(requested_dtype, device, torch)
         load_dtype = self._resolve_load_dtype(requested_dtype, runtime_dtype)
-        variant = self._resolve_variant(manifest, Path(local_path))
+        pipeline_family = self._resolve_pipeline_family(manifest)
+        pipeline_class_name = self._resolve_pipeline_class_name(pipeline_family)
+        pipeline_class = getattr(diffusers, pipeline_class_name, None)
+        if pipeline_class is None:
+            raise RuntimeError(
+                f"Installed diffusers does not provide {pipeline_class_name}. "
+                "Upgrade diffusers before loading this model."
+            )
+        variant = (
+            self._resolve_variant(manifest, Path(local_path))
+            if pipeline_family == "sdxl"
+            else None
+        )
 
-        pipeline = StableDiffusionXLPipeline.from_pretrained(
+        pipeline = pipeline_class.from_pretrained(
             local_path,
             torch_dtype=load_dtype,
             variant=variant,
@@ -75,6 +87,7 @@ class DiffusersImageLoader(BaseModelLoader):
             "torch_dtype": str(runtime_dtype).split(".")[-1],
             "weight_dtype": str(requested_dtype).split(".")[-1],
             "variant": variant,
+            "pipeline_family": pipeline_family,
             "device": device,
             "default_params": dict(manifest.default_params),
             "path_exists": True,
@@ -137,8 +150,11 @@ class DiffusersImageLoader(BaseModelLoader):
         manifest: ModelManifest,
         local_path: Path,
     ) -> str | None:
+        raw_variant = (manifest.variant or "").strip().lower()
         raw_dtype = (manifest.dtype or "").strip().lower()
-        if raw_dtype in {"float16", "fp16", "half"}:
+        if raw_variant:
+            requested_variant = raw_variant
+        elif raw_dtype in {"float16", "fp16", "half"}:
             requested_variant = "fp16"
         elif raw_dtype in {"bfloat16", "bf16"}:
             requested_variant = "bf16"
@@ -152,6 +168,30 @@ class DiffusersImageLoader(BaseModelLoader):
         ):
             return requested_variant
         return None
+
+    def _resolve_pipeline_family(self, manifest: ModelManifest) -> str:
+        if manifest.family:
+            family = manifest.family.strip().lower()
+            if family not in {"sdxl", "flux"}:
+                raise ValueError(
+                    f"Unsupported diffusers image family {manifest.family!r} "
+                    f"for manifest {manifest.id!r}."
+                )
+            return family
+
+        # Preserve compatibility for custom manifests created before family
+        # became explicit. Bundled image manifests always declare it.
+        searchable = " ".join(
+            [manifest.id, manifest.public_model_id, manifest.display_name, *manifest.tags]
+        ).lower()
+        return "flux" if "flux" in searchable else "sdxl"
+
+    def _resolve_pipeline_class_name(self, pipeline_family: str) -> str:
+        if pipeline_family == "flux":
+            return "FluxPipeline"
+        if pipeline_family == "sdxl":
+            return "StableDiffusionXLPipeline"
+        raise ValueError(f"Unsupported diffusers image family: {pipeline_family!r}.")
 
 
 class TransformersMusicgenLoader(BaseModelLoader):

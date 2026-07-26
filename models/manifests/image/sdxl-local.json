@@ -8,6 +8,8 @@
   "runtime": "diffusers",
   "local_path": "./models/image/sdxl",
   "loader": "diffusers_image_loader",
+  "family": "sdxl",
+  "variant": "fp16",
   "dtype": "float16",
   "default_params": {
     "width": 1024,

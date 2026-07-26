@@ -98,6 +98,7 @@ def _fake_diffusers_load(self, manifest):
         "torch_dtype": "float32",
         "weight_dtype": "float16",
         "variant": "fp16",
+        "pipeline_family": "flux" if manifest.family == "flux" else "sdxl",
         "device": "cpu",
         "default_params": dict(manifest.default_params),
         "path_exists": True,
@@ -515,6 +516,23 @@ class ModelSystemTests(unittest.TestCase):
             (root / "pytorch_model.bin").write_bytes(b"stub")
             self.assertIsNone(loader._resolve_variant(manifest, root))
 
+    def test_diffusers_loader_uses_explicit_image_family(self) -> None:
+        registry = ModelRegistry()
+        loader = create_default_loader_registry().get("diffusers_image_loader")
+        flux_manifest = registry.get("flux-dev-local")
+        sdxl_manifest = registry.get("sdxl-local")
+
+        self.assertEqual(flux_manifest.family, "flux")
+        self.assertIsNone(flux_manifest.variant)
+        self.assertEqual(loader._resolve_pipeline_family(flux_manifest), "flux")
+        self.assertEqual(loader._resolve_pipeline_class_name("flux"), "FluxPipeline")
+        self.assertEqual(sdxl_manifest.family, "sdxl")
+        self.assertEqual(loader._resolve_pipeline_family(sdxl_manifest), "sdxl")
+        self.assertEqual(
+            loader._resolve_pipeline_class_name("sdxl"),
+            "StableDiffusionXLPipeline",
+        )
+
     def test_application_services_resolve_environment_overrides(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -861,6 +879,31 @@ class ModelSystemTests(unittest.TestCase):
             self.assertEqual(result.metadata["lora_scale"], 0.75)
             self.assertEqual(pipeline.loaded_loras[0]["weight_name"], "mai.safetensors")
             self.assertEqual(pipeline.adapter_calls[0]["adapter_weights"], 0.75)
+
+    def test_flux_image_generation_omits_unsupported_negative_prompt(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir) / "outputs"
+            with patch("core.models.loader.DiffusersImageLoader.load", new=_fake_diffusers_load):
+                service = create_default_model_service()
+                generator = ImageGenerator(service, output_dir=output_dir)
+                result = generator.run(
+                    GenerationRequest(
+                        media_type="image",
+                        prompt="An editorial portrait in natural language.",
+                        negative_prompt="text, watermark",
+                        model_id="flux-dev",
+                    )
+                )
+                runtime_obj = service.get_runtime(
+                    "flux-dev",
+                    "image",
+                    "text-to-image",
+                )
+                pipeline = runtime_obj["pipeline"]
+
+            self.assertNotIn("negative_prompt", pipeline.calls[0])
+            self.assertEqual(result.metadata["pipeline_family"], "flux")
+            self.assertFalse(result.metadata["negative_prompt_applied"])
 
     def test_image_generator_accepts_public_model_alias(self) -> None:
         with TemporaryDirectory() as tmp_dir:

@@ -28,6 +28,16 @@ class ModelManifest(BaseModel):
     local_path: str | None = None
     remote_ref: str | None = None
     loader: str = Field(min_length=1)
+    family: str | None = Field(
+        default=None,
+        min_length=1,
+        description="Pipeline family used by loaders, for example sdxl or flux.",
+    )
+    variant: str | None = Field(
+        default=None,
+        min_length=1,
+        description="Optional pretrained weight variant, for example fp16.",
+    )
     dtype: str | None = None
     revision: str | None = None
     default_params: dict[str, Any] = Field(default_factory=dict)

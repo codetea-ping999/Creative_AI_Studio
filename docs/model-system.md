@@ -66,7 +66,7 @@ models/
 - `provider`: `local`, `huggingface`, `mlx` などの供給元
 - `runtime`: `diffusers`, `transformers`, `mlx` などの実行系
 - `family`: `sdxl`, `flux` など loader が pipeline class を選ぶためのモデル系統
-- `variant`: `fp16` など明示的に読み込む weight variant。不要なモデルでは省略
+- `variant`: `fp16` など任意の weight variant。variant なしの配置では省略
 - `local_path`: ローカル保存先
 - `remote_ref`: 将来の取得元参照
 - `loader`: 呼び出す loader 名
@@ -113,6 +113,17 @@ resolve("sdxl-local") -> manifest "sdxl-local"
 8. API / docs / generator は `GET /models` が返す public `id` をそのまま送る
 9. internal manifest id は model-system layer の内部識別子として扱う
 10. 「利用可能」の判定は `core/model_readiness.py` だけが持ち、API・loader・script は同じ関数を呼ぶ
+
+## Diffusers Image Families
+
+`diffusers_image_loader` は manifest の `family` から pipeline class を選びます。
+
+- `sdxl`: `StableDiffusionXLPipeline`。negative prompt を推論へ渡します
+- `flux`: `FluxPipeline`。negative prompt は保存しますが推論へ渡しません
+
+旧 custom manifest に `family` がない場合だけ、互換性のため id・display name・tags から
+判定します。実行結果では `metadata.pipeline_family` と
+`metadata.negative_prompt_applied` を確認できます。
 
 ## Learned Video Runtime Contract
 

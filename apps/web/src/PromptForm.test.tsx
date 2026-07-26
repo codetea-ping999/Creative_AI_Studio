@@ -86,6 +86,46 @@ describe("PromptForm", () => {
     expect(screen.getByText("作られる内容の要約")).toBeTruthy();
   });
 
+  it("explains that FLUX ignores negative prompts and links its install guide", () => {
+    const fluxModel: ModelOption = {
+      id: "flux-dev",
+      displayName: "FLUX.1-dev Local",
+      defaultParams: { steps: 28, guidance_scale: 3.5 },
+      tags: ["image", "flux"],
+      isAvailable: true,
+      isDefault: false,
+      runtimeStatus: "ready",
+      availabilityMessage: "Ready",
+    };
+    const missingFluxModel = {
+      ...fluxModel,
+      id: "flux-dev-missing",
+      displayName: "FLUX.1-dev Missing",
+      isAvailable: false,
+      runtimeStatus: "missing_files",
+      availabilityMessage: "Local model path is missing.",
+    };
+
+    render(
+      <PromptForm
+        mediaType="image"
+        modelOptions={[fluxModel, missingFluxModel]}
+        initialValues={{ modelId: "flux-dev" }}
+      />,
+    );
+
+    expect(
+      screen.getByText(
+        "FLUX.1-dev では履歴・評価用に保存しますが、画像生成の推論には適用されません。",
+      ),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("link", { name: "Download" }).getAttribute("href"),
+    ).toBe(
+      "https://huggingface.co/black-forest-labs/FLUX.1-dev",
+    );
+  });
+
   it("submits structured MusicGen composition and sampling controls", async () => {
     const user = userEvent.setup();
     const handleSubmit = vi.fn();

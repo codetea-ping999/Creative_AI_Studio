@@ -83,16 +83,18 @@ class ImageGenerator(BaseGenerator):
         for key in lineage_metadata:
             effective_params.pop(key, None)
         lora_metadata = self._configure_lora(runtime_obj, pipeline, lora_path, lora_scale)
+        pipeline_family = str(runtime_obj.get("pipeline_family", "sdxl"))
         base_seed = request.seed if request.seed is not None else secrets.randbits(63)
         common_generation_kwargs = {
             "prompt": request.prompt,
-            "negative_prompt": request.negative_prompt,
             "width": width,
             "height": height,
             "guidance_scale": guidance_scale,
             "num_inference_steps": num_inference_steps,
             **effective_params,
         }
+        if pipeline_family != "flux":
+            common_generation_kwargs["negative_prompt"] = request.negative_prompt
         batch_id = f"img_{uuid4().hex}"
         output_paths: list[str] = []
         variation_metadata: list[dict[str, Any]] = []
@@ -205,6 +207,8 @@ class ImageGenerator(BaseGenerator):
                 "loader": manifest.loader,
                 "runtime_type": type(runtime_obj).__name__,
                 "pipeline_class": type(pipeline).__name__,
+                "pipeline_family": pipeline_family,
+                "negative_prompt_applied": pipeline_family != "flux",
                 "device": runtime_obj["device"],
                 "load_dtype": runtime_obj.get("load_dtype"),
                 "torch_dtype": runtime_obj["torch_dtype"],

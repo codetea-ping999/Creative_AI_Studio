@@ -16,7 +16,8 @@ models/
 │  └─ musicgen-small/
 ├─ image/
 │  ├─ sdxl/
-│  └─ anime-sdxl/
+│  ├─ anime-sdxl/
+│  └─ flux-dev/
 ├─ video/
 │  ├─ procedural/
 │  ├─ learned-runtime/
@@ -43,6 +44,7 @@ models/
 標準では SDXL のローカル配置先を `./models/image/sdxl` としています。
 MusicGen Small は `./models/audio/musicgen-small` を想定しています。
 アニメ向け checkpoint は `./models/image/anime-sdxl`、LoRA は `./models/loras/...` を想定しています。
+FLUX.1-dev は `./models/image/flux-dev` を想定しています。
 Storyboard video runtime は `./models/video/procedural` を想定しています。
 CogVideoX-2B weightは `./models/video/cogvideox-2b` を想定しています。
 
@@ -71,6 +73,21 @@ huggingface-cli download stabilityai/stable-diffusion-xl-base-1.0 \
 git lfs install
 git clone https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0 ./models/image/sdxl
 ```
+
+### FLUX.1-dev を配置する例
+
+FLUX.1-dev の利用条件と Hugging Face 上のアクセス条件を確認してから取得します。
+
+```bash
+huggingface-cli download black-forest-labs/FLUX.1-dev \
+  --local-dir ./models/image/flux-dev \
+  --local-dir-use-symlinks False
+```
+
+loader は manifest の `"family": "flux"` から `FluxPipeline` を選択します。
+negative prompt は job snapshot と評価には残りますが、`FluxPipeline` の推論引数には
+渡しません。Apple Silicon では `bfloat16` を維持する方針ですが、M1 Max での smoke・
+標準生成・メモリ実測は weight 配置後に別途行います。
 
 ### MusicGen Small を配置する例
 
@@ -237,6 +254,7 @@ python3 -m unittest tests.test_model_system
 ## 現状の制約
 
 - LoRA は現状 1 リクエストにつき 1 本を想定しています
+- FLUX.1-dev は大きなローカルモデルです。実行可否と速度は device・メモリ・weight 形式に依存します
 - 未配置の checkpoint や MusicGen モデルは `/models` には出ますが `is_available: false` になります
 - `model_index.json`や`config.json`だけを置いた状態も`is_available: false`です。weight本体が揃って初めて`ready`になります
 - `storyboard-video` は procedural runtime なので追加ダウンロード不要です
