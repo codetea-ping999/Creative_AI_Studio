@@ -122,6 +122,14 @@ def generate_audio(
     request: GenerateAudioRequest,
     services: ApplicationServices = Depends(get_services),
 ) -> CreateJobResponse:
+    generation_request = request.to_generation_request("audio")
+    try:
+        services.generator_registry.get("audio").validate_request(generation_request)
+    except (LookupError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
     return _enqueue_generation(services, "audio", request)
 
 

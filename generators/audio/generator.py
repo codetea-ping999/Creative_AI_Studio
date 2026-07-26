@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 import wave
 
@@ -22,13 +22,23 @@ from generators.base import BaseGenerator
 
 _MAX_INT16 = 32_767
 _AUDIO_PARAM_RANGES = {
-    "duration_seconds": (2.0, 30.0),
     "guidance_scale": (1.0, 10.0),
     "temperature": (0.1, 2.0),
     "top_k": (0.0, 1000.0),
     "top_p": (0.0, 1.0),
     "bpm": (40.0, 240.0),
 }
+_SHORT_DURATION_RANGE = (2.0, 30.0)
+_LONG_DURATION_RANGE = (31.0, 120.0)
+_LONG_STRIDE_RANGE = (5.0, 29.0)
+_DEFAULT_LONG_STRIDE_SECONDS = 18.0
+
+ProgressCallback = Callable[[float, int, int], None]
+CancelRequested = Callable[[], bool]
+
+
+class LongFormGenerationCancelled(RuntimeError):
+    """Raised after a completed AudioCraft segment when cancellation was requested."""
 
 
 class AudioGenerator(BaseGenerator):
@@ -54,23 +64,94 @@ class AudioGenerator(BaseGenerator):
             raise ValueError("Audio prompt must not be empty.")
         if request.output_format and request.output_format.lower() != "wav":
             raise ValueError("AudioGenerator currently supports wav output only.")
+        manifest = self.model_service.get_manifest(
+            request.model_id.strip() or None,
+            media_type="audio",
+            task_type=self.task_type,
+        )
+        is_long_form = "long-form" in manifest.tags
+        duration_minimum, duration_maximum = (
+            _LONG_DURATION_RANGE if is_long_form else _SHORT_DURATION_RANGE
+        )
+        duration_value = request.params.get(
+            "duration_seconds",
+            manifest.default_params.get("duration_seconds"),
+        )
+        self._validate_numeric_range(
+            "duration_seconds",
+            duration_value,
+            duration_minimum,
+            duration_maximum,
+        )
+
+        stride_value = request.params.get(
+            "extend_stride_seconds",
+            manifest.default_params.get("extend_stride_seconds"),
+        )
+        if is_long_form:
+            self._validate_numeric_range(
+                "extend_stride_seconds",
+                stride_value,
+                *_LONG_STRIDE_RANGE,
+            )
+        elif "extend_stride_seconds" in request.params:
+            raise ValueError(
+                "Audio parameter 'extend_stride_seconds' is only supported by "
+                "models tagged 'long-form'."
+            )
+
         for name, (minimum, maximum) in _AUDIO_PARAM_RANGES.items():
             value = request.params.get(name)
             if value is None:
                 continue
-            try:
-                numeric_value = float(value)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"Audio parameter '{name}' must be numeric.") from exc
-            if not math.isfinite(numeric_value) or not minimum <= numeric_value <= maximum:
-                raise ValueError(
-                    f"Audio parameter '{name}' must be between {minimum:g} and {maximum:g}."
-                )
+            self._validate_numeric_range(name, value, minimum, maximum)
+
+    def _validate_numeric_range(
+        self,
+        name: str,
+        value: Any,
+        minimum: float,
+        maximum: float,
+    ) -> None:
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Audio parameter '{name}' must be numeric.") from exc
+        if not math.isfinite(numeric_value) or not minimum <= numeric_value <= maximum:
+            raise ValueError(
+                f"Audio parameter '{name}' must be between {minimum:g} and {maximum:g}."
+            )
 
     def prepare(self, request: GenerationRequest) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    def generate(self, request: GenerationRequest) -> GenerationResult:
+    def run_with_control(
+        self,
+        request: GenerationRequest,
+        *,
+        progress_callback: ProgressCallback,
+        cancel_requested: CancelRequested,
+    ) -> GenerationResult:
+        """Run with cooperative segment progress/cancellation for long-form models."""
+
+        self.validate_request(request)
+        self.prepare(request)
+        try:
+            return self.generate(
+                request,
+                progress_callback=progress_callback,
+                cancel_requested=cancel_requested,
+            )
+        finally:
+            self.cleanup(request)
+
+    def generate(
+        self,
+        request: GenerationRequest,
+        *,
+        progress_callback: ProgressCallback | None = None,
+        cancel_requested: CancelRequested | None = None,
+    ) -> GenerationResult:
         import torch
 
         requested_model_id = request.model_id.strip() or None
@@ -79,6 +160,16 @@ class AudioGenerator(BaseGenerator):
             media_type="audio",
             task_type=self.task_type,
         )
+        if "long-form" in manifest.tags:
+            return self._generate_long_form(
+                request,
+                manifest=manifest,
+                runtime_obj=runtime_obj,
+                torch=torch,
+                progress_callback=progress_callback,
+                cancel_requested=cancel_requested,
+            )
+
         model = runtime_obj["model"]
         processor = runtime_obj["processor"]
         device = runtime_obj["device"]
@@ -268,6 +359,178 @@ class AudioGenerator(BaseGenerator):
             error_message=None,
         )
 
+    def _generate_long_form(
+        self,
+        request: GenerationRequest,
+        *,
+        manifest: Any,
+        runtime_obj: dict[str, Any],
+        torch: Any,
+        progress_callback: ProgressCallback | None,
+        cancel_requested: CancelRequested | None,
+    ) -> GenerationResult:
+        """Generate 31–120 seconds through AudioCraft's extended MusicGen path."""
+
+        model = runtime_obj["model"]
+        device = str(runtime_obj["device"])
+        effective_params = {**manifest.default_params, **request.params}
+        lineage_metadata = _extract_lineage_metadata(effective_params)
+        for lineage_key in lineage_metadata:
+            effective_params.pop(lineage_key, None)
+
+        duration_seconds = int(effective_params.pop("duration_seconds"))
+        extend_stride_seconds = float(
+            effective_params.pop(
+                "extend_stride_seconds",
+                _DEFAULT_LONG_STRIDE_SECONDS,
+            )
+        )
+        guidance_scale = float(effective_params.pop("guidance_scale", 3.0))
+        temperature = float(effective_params.pop("temperature", 1.0))
+        top_k = int(effective_params.pop("top_k", 250))
+        top_p = float(effective_params.pop("top_p", 0.0))
+        bpm_value = effective_params.pop("bpm", None)
+        bpm = int(bpm_value) if bpm_value is not None else None
+        mood = str(effective_params.pop("mood", "")).strip().lower() or None
+        genre = str(effective_params.pop("genre", "")).strip().lower() or None
+        instruments = str(effective_params.pop("instruments", "")).strip() or None
+        structure = str(effective_params.pop("structure", "")).strip().lower() or None
+        conditioning_prompt = self._build_conditioning_prompt(
+            request.prompt,
+            mood=mood,
+            genre=genre,
+            instruments=instruments,
+            structure=structure,
+            bpm=bpm,
+        )
+
+        model.set_generation_params(
+            use_sampling=True,
+            top_k=top_k,
+            top_p=top_p,
+            temperature=temperature,
+            duration=float(duration_seconds),
+            cfg_coef=guidance_scale,
+            extend_stride=extend_stride_seconds,
+            **effective_params,
+        )
+
+        max_duration = float(runtime_obj.get("max_duration", model.max_duration))
+        segment_count = 1 + math.ceil(
+            max(0.0, duration_seconds - max_duration) / extend_stride_seconds
+        )
+        frame_rate = int(runtime_obj["frame_rate"])
+        segment_boundaries = [
+            min(
+                duration_seconds,
+                max_duration + index * extend_stride_seconds,
+            )
+            for index in range(segment_count)
+        ]
+        completed_segments = 0
+
+        def report_token_progress(generated_tokens: int, _tokens_to_generate: int) -> None:
+            nonlocal completed_segments
+            generated_seconds = generated_tokens / max(1, frame_rate)
+            while (
+                completed_segments < segment_count
+                and generated_seconds + 1 / max(1, frame_rate)
+                >= segment_boundaries[completed_segments]
+            ):
+                completed_segments += 1
+                if progress_callback is not None:
+                    progress_callback(
+                        completed_segments / segment_count,
+                        completed_segments,
+                        segment_count,
+                    )
+                if cancel_requested is not None and cancel_requested():
+                    raise LongFormGenerationCancelled(
+                        "Long-form generation cancelled at segment boundary "
+                        f"{completed_segments}/{segment_count}."
+                    )
+
+        model.set_custom_progress_callback(report_token_progress)
+        try:
+            with self._seeded_generation(request.seed, device, torch):
+                audio_values = model.generate([conditioning_prompt], progress=True)
+        finally:
+            model.set_custom_progress_callback(None)
+
+        if cancel_requested is not None and cancel_requested():
+            raise LongFormGenerationCancelled(
+                "Long-form generation cancelled before WAV publication."
+            )
+        if completed_segments < segment_count and progress_callback is not None:
+            progress_callback(1.0, segment_count, segment_count)
+
+        audio_tensor = audio_values[0].detach().cpu()
+        sampling_rate = int(runtime_obj["sampling_rate"])
+        output_id = f"aud_{uuid4().hex}"
+        output_path = self.output_dir / f"{output_id}.wav"
+        self._write_wave_file(
+            output_path,
+            audio_tensor,
+            sampling_rate=sampling_rate,
+            torch=torch,
+        )
+
+        output_duration = float(audio_tensor.shape[-1] / sampling_rate)
+        quality_report = evaluate_audio_output(output_path)
+        semantic_report = evaluate_audio_semantics(output_path, conditioning_prompt)
+        enrich_quality_report(quality_report, semantic_report)
+
+        return GenerationResult(
+            job_id=output_id,
+            status="succeeded",
+            outputs=[str(output_path)],
+            previews=[],
+            metadata={
+                "stub": False,
+                "generator": self.__class__.__name__,
+                "media_type": request.media_type,
+                "task_type": self.task_type,
+                "prompt": request.prompt,
+                "conditioning_prompt": conditioning_prompt,
+                "requested_model_id": request.model_id.strip() or None,
+                "model_id": manifest.public_model_id,
+                "manifest_id": manifest.id,
+                "model_display_name": manifest.display_name,
+                "model_runtime": manifest.runtime,
+                "model_provider": manifest.provider,
+                "loader": manifest.loader,
+                "runtime_type": type(runtime_obj).__name__,
+                "model_class": type(model).__name__,
+                "device": device,
+                "seed": request.seed,
+                "output_format": "wav",
+                "sampling_rate": sampling_rate,
+                "channels": int(audio_tensor.shape[0] if audio_tensor.ndim > 1 else 1),
+                "default_params": dict(manifest.default_params),
+                "quality_report": quality_report,
+                **lineage_metadata,
+                "params": {
+                    "duration_seconds": duration_seconds,
+                    "extend_stride_seconds": extend_stride_seconds,
+                    "guidance_scale": guidance_scale,
+                    "temperature": temperature,
+                    "top_k": top_k,
+                    "top_p": top_p,
+                    "mood": mood,
+                    "bpm": bpm,
+                    "genre": genre,
+                    "instruments": instruments,
+                    "structure": structure,
+                    **effective_params,
+                },
+                "duration_seconds_generated": output_duration,
+                "final_duration_seconds": output_duration,
+                "segment_count": segment_count,
+                "extend_stride_seconds": extend_stride_seconds,
+            },
+            error_message=None,
+        )
+
     def cleanup(self, request: GenerationRequest) -> None:
         return None
 
@@ -384,4 +647,4 @@ def _extract_lineage_metadata(params: dict[str, Any]) -> dict[str, Any]:
     return lineage_payload
 
 
-__all__ = ["AudioGenerator"]
+__all__ = ["AudioGenerator", "LongFormGenerationCancelled"]

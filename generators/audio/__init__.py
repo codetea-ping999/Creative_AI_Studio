@@ -1,5 +1,5 @@
 """Audio generator package."""
 
-from .generator import AudioGenerator
+from .generator import AudioGenerator, LongFormGenerationCancelled
 
-__all__ = ["AudioGenerator"]
+__all__ = ["AudioGenerator", "LongFormGenerationCancelled"]

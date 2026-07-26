@@ -170,6 +170,29 @@ curl -X POST http://127.0.0.1:8000/generate/audio \
   }'
 ```
 
+30秒を超える生成は optional な `musicgen-long-form` を選択します。事前準備は
+[model-download-guide.md](./model-download-guide.md#musicgen-long-form-を配置する例)
+を参照してください。
+
+```bash
+curl -X POST http://127.0.0.1:8000/generate/audio \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "evolving cinematic ambient cue with a gradual climax",
+    "model_id": "musicgen-long-form",
+    "seed": 28,
+    "output_format": "wav",
+    "params": {
+      "duration_seconds": 45,
+      "extend_stride_seconds": 10
+    }
+  }'
+```
+
+長尺モデルは31〜120秒、stride は5〜29秒です。stride 未指定時は18秒を使います。
+生成は segment ごとに進捗を更新し、cancel または途中失敗時は不完全な WAV を
+Galleryへ公開しません。
+
 ## よくある注意点
 
 - `.env` は API 起動スクリプト経由で有効になります。`uvicorn apps.api.main:app` を直接叩く場合は、自分で環境変数を export してください。

@@ -22,6 +22,7 @@ export const defaultPromptFormValues: PromptFormSubmitValues = {
   loraScale: 0.8,
   seed: null,
   durationSeconds: 8,
+  extendStrideSeconds: null,
   bpm: 96,
   mood: "dreamy",
   genre: "electronic",

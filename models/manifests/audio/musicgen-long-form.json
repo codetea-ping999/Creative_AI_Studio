@@ -1,0 +1,24 @@
+{
+  "id": "musicgen-long-form-local",
+  "public_id": "musicgen-long-form",
+  "display_name": "MusicGen Small Long-form (AudioCraft)",
+  "media_type": "audio",
+  "task_type": "text-to-music",
+  "provider": "local",
+  "runtime": "audiocraft",
+  "local_path": "./models/audio/musicgen-long-form",
+  "loader": "audiocraft_musicgen_loader",
+  "dtype": "float32",
+  "default_params": {
+    "duration_seconds": 45,
+    "extend_stride_seconds": 18,
+    "guidance_scale": 3.0,
+    "temperature": 1.0,
+    "top_k": 250,
+    "top_p": 0.0
+  },
+  "aliases": ["musicgen-long-form-local"],
+  "tags": ["audio", "music", "long-form", "optional"],
+  "is_default": false,
+  "enabled": true
+}

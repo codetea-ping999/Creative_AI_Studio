@@ -21,6 +21,7 @@ const baseValues: PromptFormSubmitValues = {
   loraScale: 0.8,
   seed: 42,
   durationSeconds: 8,
+  extendStrideSeconds: null,
   bpm: 96,
   mood: "dreamy",
   genre: "electronic",
@@ -87,6 +88,24 @@ describe("generation payloads", () => {
         top_k: 250,
         top_p: 0,
       },
+    });
+  });
+
+  it("adds AudioCraft extend stride only for a long-form draft", () => {
+    const payload = buildGeneratePayload(
+      {
+        ...baseValues,
+        mediaType: "audio",
+        modelId: "musicgen-long-form",
+        durationSeconds: 45,
+        extendStrideSeconds: 10,
+      },
+      null,
+    );
+
+    expect(payload.params).toMatchObject({
+      duration_seconds: 45,
+      extend_stride_seconds: 10,
     });
   });
 

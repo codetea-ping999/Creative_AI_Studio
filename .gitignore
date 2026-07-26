@@ -32,6 +32,8 @@ models/audio/musicgen-small/*.model
 models/audio/musicgen-small/*.safetensors
 models/audio/musicgen-medium/
 models/audio/musicgen-melody/
+models/audio/musicgen-long-form/*.bin
+models/audio/musicgen-long-form/t5-base
 models/image/ssd-1b/
 models/image/sdxl/scheduler/
 models/image/sdxl/text_encoder/
