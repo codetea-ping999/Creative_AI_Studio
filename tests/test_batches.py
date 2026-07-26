@@ -166,6 +166,33 @@ class ExpansionTests(unittest.TestCase):
             sorted(item.request.seed for item in per_item), [100, 101, 102, 103]
         )
 
+    def test_next_stage_inherits_the_winning_seed(self) -> None:
+        spec = _spec(
+            seed=1000,
+            seed_policy="per_item",
+            stages=[Stage(name="probe", keep_top_n=2), Stage(name="refine")],
+        )
+        probe = expand_items(spec, stage=spec.stages[0], stage_index=0)
+        winners = [probe[2], probe[3]]
+
+        refine = expand_items(
+            spec, stage=spec.stages[1], stage_index=1, seed_items=winners
+        )
+        # Refining must reproduce the exact image that won the probe, so the
+        # winner's seed travels with it instead of being re-derived.
+        self.assertEqual(
+            [item.request.seed for item in refine],
+            [winner.request.seed for winner in winners],
+        )
+
+    def test_next_stage_keeps_a_shared_none_seed(self) -> None:
+        spec = _spec(stages=[Stage(name="probe", keep_top_n=1), Stage(name="refine")])
+        probe = expand_items(spec, stage=spec.stages[0], stage_index=0)
+        refine = expand_items(
+            spec, stage=spec.stages[1], stage_index=1, seed_items=[probe[0]]
+        )
+        self.assertIsNone(refine[0].request.seed)
+
     def test_items_are_grouped_by_model_id(self) -> None:
         spec = _spec(
             axes=[

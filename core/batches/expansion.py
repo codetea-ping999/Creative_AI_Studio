@@ -45,11 +45,16 @@ def expand_items(
 
     if seed_items is None:
         combinations = _combinations(spec)
+        inherited_seeds: list[int | None] = [None] * len(combinations)
     else:
         combinations = [
             [(name, label) for name, label in item.axis_values.items()]
             for item in seed_items
         ]
+        # A later stage must reproduce the winner it is refining. Re-deriving the
+        # seed from the new position would render a different image, which would
+        # make probe-then-refine select one thing and deliver another.
+        inherited_seeds = [item.request.seed for item in seed_items]
 
     items: list[BatchItem] = []
     for position, combination in enumerate(combinations):
@@ -60,6 +65,7 @@ def expand_items(
             axis_values=axis_values,
             stage=stage,
             item_index=position,
+            inherited_seed=inherited_seeds[position],
         )
         items.append(
             BatchItem(
@@ -120,6 +126,7 @@ def _build_request(
     axis_values: dict[str, str],
     stage: Stage,
     item_index: int,
+    inherited_seed: int | None = None,
 ) -> GenerationRequest:
     payload: dict[str, Any] = {
         "media_type": spec.media_type,
@@ -127,7 +134,11 @@ def _build_request(
         "prompt": spec.prompt,
         "negative_prompt": spec.negative_prompt,
         "model_id": spec.model_id,
-        "seed": _resolve_seed(spec, item_index, axis_values),
+        "seed": (
+            inherited_seed
+            if inherited_seed is not None
+            else _resolve_seed(spec, item_index, axis_values)
+        ),
         "output_format": spec.output_format,
         "params": _deep_copy(spec.params),
     }
