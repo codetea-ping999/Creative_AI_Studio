@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import ClassVar
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
@@ -41,11 +42,19 @@ class BaseGenerateRequest(BaseModel):
     project_id: str | None = None
     params: dict[str, object] = Field(default_factory=dict)
 
+    # Endpoints that target a non-default task within their media type set this;
+    # None routes to the media type's default generator.
+    task_type: ClassVar[str | None] = None
+
     def to_generation_request(self, media_type: MediaType) -> GenerationRequest:
         """Normalize a convenience request into the shared job request schema."""
 
         payload = self.model_dump(exclude={"project_id"})
-        return GenerationRequest(media_type=media_type, **payload)
+        return GenerationRequest(
+            media_type=media_type,
+            task_type=self.task_type,
+            **payload,
+        )
 
 
 class GenerateImageRequest(BaseGenerateRequest):
@@ -62,6 +71,12 @@ class GenerateVideoRequest(BaseGenerateRequest):
     """Convenience request shape for video generation."""
 
     negative_prompt: str | None = None
+
+
+class GenerateTextRequest(BaseGenerateRequest):
+    """Convenience request shape for story and writing tasks."""
+
+    task_type: ClassVar[str | None] = "story"
 
 
 def _resolve_project_id(
@@ -137,9 +152,22 @@ def generate_video(
     return _enqueue_generation(services, "video", request)
 
 
+@router.post(
+    "/text",
+    response_model=CreateJobResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def generate_text(
+    request: GenerateTextRequest,
+    services: ApplicationServices = Depends(get_services),
+) -> CreateJobResponse:
+    return _enqueue_generation(services, "text", request)
+
+
 __all__ = [
     "GenerateAudioRequest",
     "GenerateImageRequest",
+    "GenerateTextRequest",
     "GenerateVideoRequest",
     "router",
 ]

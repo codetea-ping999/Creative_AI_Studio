@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 
 from core.assets import AssetRepository
+from core.batches import BatchRepository, BatchService
+from core.bible import BibleRepository
 from core.jobs import EventBus, JobQueue, JobRunner, JobService
 from core.models import (
     ModelRuntimeCache,
@@ -17,10 +19,13 @@ from core.models import (
 )
 from core.feedback import FeedbackRepository
 from core.projects import ProjectRepository
+from core.prompting import PromptComposer
+from core.story import StoryRepository
 from core.storage.repositories.job_repository import JobRepository
 from generators.audio import AudioGenerator
 from generators.image import ImageGenerator
 from generators.registry import GeneratorRegistry
+from generators.text import TextGenerator
 from generators.video import VideoGenerator
 
 
@@ -39,6 +44,11 @@ class ApplicationServices:
     project_repository: ProjectRepository
     feedback_repository: FeedbackRepository
     asset_repository: AssetRepository
+    bible_repository: BibleRepository
+    prompt_composer: PromptComposer
+    story_repository: StoryRepository
+    batch_repository: BatchRepository
+    batch_service: BatchService
 
 
 def _resolve_manifest_root(manifest_root: str | Path | None) -> str | Path | None:
@@ -81,6 +91,17 @@ def _resolve_audio_output_dir(output_dir: str | Path | None) -> Path:
 
     resolved_image_output_dir = _resolve_output_dir(output_dir)
     return resolved_image_output_dir.parent / "audio"
+
+
+def _resolve_text_output_dir(output_dir: str | Path | None) -> Path:
+    if output_dir is not None:
+        return Path(output_dir).parent / "text"
+
+    output_text_dir_env = os.getenv("OUTPUT_TEXT_DIR")
+    if output_text_dir_env:
+        return Path(output_text_dir_env)
+
+    return _resolve_output_dir(output_dir).parent / "text"
 
 
 def _resolve_db_path(db_path: str | Path | None) -> Path:
@@ -130,6 +151,7 @@ def create_default_image_generator(
     manifest_root: str | Path | None = None,
     max_cached_models: int | None = None,
     task_type: str = "text-to-image",
+    prompt_composer: PromptComposer | None = None,
 ) -> ImageGenerator:
     """Compose the default image stub generator with its model service."""
 
@@ -141,6 +163,28 @@ def create_default_image_generator(
     return ImageGenerator(
         resolved_model_service,
         output_dir=resolved_output_dir,
+        task_type=task_type,
+        prompt_composer=prompt_composer,
+    )
+
+
+def create_default_text_generator(
+    output_dir: str | Path | None = None,
+    *,
+    model_service: ModelService | None = None,
+    manifest_root: str | Path | None = None,
+    max_cached_models: int | None = None,
+    task_type: str = "story",
+) -> TextGenerator:
+    """Compose the default local text generator."""
+
+    resolved_model_service = model_service or create_default_model_service(
+        manifest_root=manifest_root,
+        max_cached_models=max_cached_models,
+    )
+    return TextGenerator(
+        resolved_model_service,
+        output_dir=_resolve_text_output_dir(output_dir),
         task_type=task_type,
     )
 
@@ -194,8 +238,9 @@ def create_default_generator_registry(
     manifest_root: str | Path | None = None,
     output_dir: str | Path | None = None,
     max_cached_models: int | None = None,
+    prompt_composer: PromptComposer | None = None,
 ) -> GeneratorRegistry:
-    """Compose the initial generator registry with the default image generator."""
+    """Compose the generator registry for every supported media type."""
 
     resolved_output_dir = _resolve_output_dir(output_dir)
     resolved_model_service = model_service or create_default_model_service(
@@ -209,6 +254,17 @@ def create_default_generator_registry(
             output_dir=resolved_output_dir,
             model_service=resolved_model_service,
             task_type="text-to-image",
+            prompt_composer=prompt_composer,
+        ),
+    )
+    registry.register(
+        "text",
+        create_default_text_generator(
+            output_dir=resolved_output_dir,
+            model_service=resolved_model_service,
+            manifest_root=manifest_root,
+            max_cached_models=max_cached_models,
+            task_type="story",
         ),
     )
     registry.register(
@@ -252,11 +308,14 @@ def create_application_services(
         manifest_root=resolved_manifest_root,
         max_cached_models=resolved_max_cached_models,
     )
+    bible_repository = BibleRepository(resolved_db_path.parent / "bible")
+    prompt_composer = PromptComposer(bible_repository)
     generator_registry = create_default_generator_registry(
         model_service=model_service,
         manifest_root=resolved_manifest_root,
         output_dir=resolved_output_dir,
         max_cached_models=resolved_max_cached_models,
+        prompt_composer=prompt_composer,
     )
     job_repository = JobRepository(resolved_db_path)
     asset_repository = AssetRepository(resolved_db_path.parent / "assets")
@@ -273,6 +332,17 @@ def create_application_services(
     )
     project_repository = ProjectRepository(resolved_db_path.parent / "projects")
     feedback_repository = FeedbackRepository(resolved_db_path.parent / "feedback")
+    story_repository = StoryRepository(resolved_db_path.parent / "stories")
+    batch_repository = BatchRepository(resolved_db_path.parent / "batches")
+    batch_service = BatchService(
+        batch_repository,
+        job_service,
+        job_repository,
+        event_bus=event_bus,
+    )
+    # Subscribing here means a probe stage advances to refine on its own as soon
+    # as its last child finishes, without the UI having to poll and push.
+    batch_service.attach_to_event_bus()
     return ApplicationServices(
         output_dir=resolved_output_dir,
         model_service=model_service,
@@ -285,6 +355,11 @@ def create_application_services(
         project_repository=project_repository,
         feedback_repository=feedback_repository,
         asset_repository=asset_repository,
+        bible_repository=bible_repository,
+        prompt_composer=prompt_composer,
+        story_repository=story_repository,
+        batch_repository=batch_repository,
+        batch_service=batch_service,
     )
 
 __all__ = [
@@ -294,5 +369,6 @@ __all__ = [
     "create_default_generator_registry",
     "create_default_image_generator",
     "create_default_model_service",
+    "create_default_text_generator",
     "create_default_video_generator",
 ]
