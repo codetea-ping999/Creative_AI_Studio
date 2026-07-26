@@ -8,6 +8,12 @@ import os
 from pathlib import Path
 from typing import Any
 
+from core.model_readiness import (
+    WEIGHT_PATTERNS,
+    missing_diffusers_files,
+    missing_transformers_files,
+)
+
 from .manifest import ModelManifest
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -39,13 +45,12 @@ class DiffusersImageLoader(BaseModelLoader):
         requested_dtype = self._resolve_weight_dtype(manifest, torch)
         runtime_dtype = self._resolve_runtime_dtype(requested_dtype, device, torch)
         load_dtype = self._resolve_load_dtype(requested_dtype, runtime_dtype)
-        variant = self._resolve_variant(manifest)
+        variant = self._resolve_variant(manifest, Path(local_path))
 
         pipeline = StableDiffusionXLPipeline.from_pretrained(
             local_path,
             torch_dtype=load_dtype,
             variant=variant,
-            use_safetensors=True,
             local_files_only=True,
         )
         pipeline.set_progress_bar_config(disable=True)
@@ -85,9 +90,10 @@ class DiffusersImageLoader(BaseModelLoader):
             raise FileNotFoundError(
                 f"Model path does not exist for manifest {manifest.id!r}: {local_path}"
             )
-        if not (local_path / "model_index.json").exists():
+        missing = missing_diffusers_files(local_path)
+        if missing:
             raise FileNotFoundError(
-                f"Diffusers model_index.json was not found under: {local_path}"
+                f"Diffusers model files are missing under {local_path}: " + ", ".join(missing)
             )
         return str(local_path)
 
@@ -126,12 +132,25 @@ class DiffusersImageLoader(BaseModelLoader):
             return runtime_dtype
         return requested_dtype
 
-    def _resolve_variant(self, manifest: ModelManifest) -> str | None:
+    def _resolve_variant(
+        self,
+        manifest: ModelManifest,
+        local_path: Path,
+    ) -> str | None:
         raw_dtype = (manifest.dtype or "").strip().lower()
         if raw_dtype in {"float16", "fp16", "half"}:
-            return "fp16"
-        if raw_dtype in {"bfloat16", "bf16"}:
-            return "bf16"
+            requested_variant = "fp16"
+        elif raw_dtype in {"bfloat16", "bf16"}:
+            requested_variant = "bf16"
+        else:
+            return None
+        if any(
+            f".{requested_variant}." in path.name
+            or f".{requested_variant}-" in path.name
+            for pattern in WEIGHT_PATTERNS
+            for path in local_path.rglob(pattern)
+        ):
+            return requested_variant
         return None
 
 
@@ -213,9 +232,10 @@ class TransformersMusicgenLoader(BaseModelLoader):
             raise FileNotFoundError(
                 f"Model path does not exist for manifest {manifest.id!r}: {local_path}"
             )
-        if not (local_path / "config.json").exists():
+        missing = missing_transformers_files(local_path)
+        if missing:
             raise FileNotFoundError(
-                f"Transformers config.json was not found under: {local_path}"
+                f"Transformers model files are missing under {local_path}: " + ", ".join(missing)
             )
         return str(local_path)
 

@@ -1,5 +1,11 @@
 """Model management primitives for Creative AI Studio."""
 
+from core.model_readiness import (
+    ModelReadiness,
+    evaluate_manifest_payload,
+    evaluate_manifest_readiness,
+)
+
 from .cache import ModelRuntimeCache
 from .loader import (
     BaseModelLoader,
@@ -20,10 +26,13 @@ __all__ = [
     "LearnedVideoLoader",
     "LoaderRegistry",
     "ModelManifest",
+    "ModelReadiness",
     "ModelRegistry",
     "ModelResolver",
     "ModelRuntimeCache",
     "ModelService",
     "TransformersMusicgenLoader",
     "create_default_loader_registry",
+    "evaluate_manifest_payload",
+    "evaluate_manifest_readiness",
 ]

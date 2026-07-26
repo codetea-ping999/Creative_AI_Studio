@@ -97,9 +97,10 @@ huggingface-cli download THUDM/CogVideoX-2b \
 ```
 
 `model_index.json`はリポジトリに含まれますが、それだけではavailableになりません。
-`scheduler`、`text_encoder`、`tokenizer`、`transformer`、`vae`の設定と
-各weightが揃うと`GET /models?media_type=video`が`runtime_status=ready`、
-`is_available=true`を返します。生成確認は明示的に実行します。
+`model_index.json`が列挙するcomponent (`scheduler`、`text_encoder`、`tokenizer`、
+`transformer`、`vae`) の設定と各weightが揃うと`GET /models?media_type=video`が
+`runtime_status=ready`、`is_available=true`を返します。
+不足時は`availability_message`が不足ファイルを列挙します。生成確認は明示的に実行します。
 
 ```bash
 make cogvideox-smoke
@@ -235,8 +236,10 @@ python3 -m unittest tests.test_model_system
 
 - LoRA は現状 1 リクエストにつき 1 本を想定しています
 - 未配置の checkpoint や MusicGen モデルは `/models` には出ますが `is_available: false` になります
+- `model_index.json`や`config.json`だけを置いた状態も`is_available: false`です。weight本体が揃って初めて`ready`になります
 - `storyboard-video` は procedural runtime なので追加ダウンロード不要です
 - `learned-video` はadapterと`model_index.json`だけではavailableにならず、CogVideoX-2Bのcomponent設定とweight一式が必要です
+- 判定ルールは `core/model_readiness.py` に集約され、`/models`・loader・`scripts/check_local_setup.py`・`make cogvideox-smoke` が同じ結果を返します
 - モデルダウンロード管理 UI はまだありません
 - semantic judge model は生成 model とは別管理で、初回 scoring 時に必要です
 
