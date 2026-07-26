@@ -9,7 +9,9 @@ import {
 import { AssetDetailPanel, type FeedbackFormValues } from "./components/AssetDetailPanel";
 import { GalleryPanel } from "./components/GalleryPanel";
 import { LatestJobPanel } from "./components/LatestJobPanel";
+import { MatrixPanel } from "./components/MatrixPanel";
 import { ModelsSummaryPanel } from "./components/ModelsSummaryPanel";
+import { StoryPanel } from "./components/StoryPanel";
 import { buildGeneratePayload, buildReusePayload } from "./lib/payloads";
 import {
   buildQuickReviewPrompt,
@@ -160,6 +162,21 @@ function App() {
       });
     },
     [mediaType],
+  );
+  const loadDraftIntoComposer = useCallback(
+    (targetMedia: MediaType, nextDraft: Partial<PromptFormSubmitValues>) => {
+      setDrafts((current) => ({
+        ...current,
+        [targetMedia]: {
+          ...current[targetMedia],
+          ...nextDraft,
+          mediaType: targetMedia,
+        },
+      }));
+      setMediaType(targetMedia);
+      setComposerRevision((current) => current + 1);
+    },
+    [],
   );
 
   useEffect(() => {
@@ -422,6 +439,27 @@ function App() {
       setActiveJobId(null);
       setIsSubmitting(false);
       setErrorMessage(error instanceof Error ? error.message : "Failed to load job state.");
+    }
+  }
+
+  /**
+   * Poll a job until it reaches a terminal status and return that status.
+   *
+   * The story and matrix panels drive their own multi-step flows, so they need to
+   * wait on a job without taking over the composer's own submit state.
+   */
+  async function awaitJobCompletion(jobId: string): Promise<string> {
+    const intervalMs = 1200;
+    const deadline = Date.now() + 10 * 60 * 1000;
+    for (;;) {
+      const payload = await requestJson<JobResponse>(`/jobs/${jobId}`);
+      if (terminalStatuses.has(payload.status)) {
+        return payload.status;
+      }
+      if (Date.now() > deadline) {
+        return payload.status;
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, intervalMs));
     }
   }
 
@@ -1166,7 +1204,7 @@ function App() {
           />
         </section>
 
-        <div className="workspace-grid">
+        <div className="workspace-grid story-matrix-workspace">
           <LatestJobPanel
             latestJob={latestJob}
             onCancel={() => {
@@ -1228,6 +1266,47 @@ function App() {
             </div>
           )}
         </section>
+
+        <div className="workspace-grid">
+          <StoryPanel
+            modelId=""
+            projectId={selectedProjectId}
+            awaitJob={awaitJobCompletion}
+            onGenerateSceneImage={(scene) => {
+              startTransition(() => {
+                loadDraftIntoComposer("image", {
+                  prompt: scene.image_prompt,
+                  negativePrompt: scene.image_negative,
+                  imageBriefSubject: scene.heading,
+                });
+              });
+              setStatusMessage(
+                `Scene "${scene.heading || scene.id}" をコンポーザに読み込みました。`,
+              );
+            }}
+            onGenerateSceneNarration={(scene) => {
+              startTransition(() => {
+                loadDraftIntoComposer("audio", {
+                  prompt: scene.narration,
+                  mood: scene.bgm_mood,
+                });
+              });
+              setStatusMessage(
+                `Scene "${scene.heading || scene.id}" のナレーションを音声コンポーザに読み込みました。`,
+              );
+            }}
+          />
+
+          <MatrixPanel
+            modelId=""
+            projectId={selectedProjectId}
+            onInspectItem={(item) => {
+              if (item.job_id) {
+                void loadJob(item.job_id);
+              }
+            }}
+          />
+        </div>
 
         <ModelsSummaryPanel
           models={activeModels}
