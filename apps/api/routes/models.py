@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, Query
@@ -55,17 +56,40 @@ def _serialize_manifest(manifest: ModelManifest) -> ModelSummary:
         default_params=dict(manifest.default_params),
         tags=list(manifest.tags),
         is_default=manifest.is_default,
-        is_available=runtime_status == "ready",
+        is_available=runtime_status in {"ready", "configured"},
         runtime_status=runtime_status,
         availability_message=availability_message,
     )
 
 
 def _manifest_is_available(manifest: ModelManifest) -> bool:
-    return _model_runtime_status(manifest)[0] == "ready"
+    return _model_runtime_status(manifest)[0] in {"ready", "configured"}
 
 
 def _model_runtime_status(manifest: ModelManifest) -> tuple[str, str]:
+    if manifest.runtime == "voicevox_http":
+        from core.models.audio_runtimes import audio_endpoint_origin
+
+        configured_base_url = os.getenv("VOICEVOX_BASE_URL", "").strip()
+        base_url = configured_base_url or manifest.remote_ref
+        if not base_url:
+            return (
+                "invalid_configuration",
+                "VOICEVOX endpoint URL is not configured.",
+            )
+        try:
+            origin = audio_endpoint_origin(base_url)
+        except ValueError:
+            return (
+                "invalid_configuration",
+                "VOICEVOX endpoint configuration is invalid or disallowed.",
+            )
+        return (
+            "configured",
+            f"VOICEVOX endpoint is configured at {origin}. Availability is checked "
+            "when generation starts; an engine that is not running will fail that job.",
+        )
+
     if not manifest.local_path:
         return "missing_files", "Manifest does not define a local model path."
 

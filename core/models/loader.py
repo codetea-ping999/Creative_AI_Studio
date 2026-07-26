@@ -553,6 +553,126 @@ class OpenAICompatibleTextLoader(BaseTextLoader):
         }
 
 
+class BaseSpeechLoader(BaseModelLoader):
+    """Shared manifest handling for text-to-speech runtimes."""
+
+    def _resolve_local_path(self, manifest: ModelManifest) -> str:
+        if not manifest.local_path:
+            raise ValueError(f"Manifest {manifest.id!r} is missing local_path.")
+
+        local_path = (_REPO_ROOT / manifest.local_path).resolve()
+        if not local_path.exists():
+            raise FileNotFoundError(
+                f"Model path does not exist for manifest {manifest.id!r}: {local_path}"
+            )
+        return str(local_path)
+
+    def _resolve_device(self) -> str:
+        # Speech backends pick their own accelerator; "auto" records that the
+        # choice was left to them rather than pretending we selected one.
+        requested_device = os.getenv("DEVICE", "auto").strip().lower()
+        if requested_device and requested_device != "auto":
+            return requested_device
+        return "auto"
+
+    def _base_payload(
+        self,
+        manifest: ModelManifest,
+        *,
+        local_path: str | None,
+        device: str,
+    ) -> dict[str, Any]:
+        return {
+            "stub": False,
+            "loader": self.__class__.__name__,
+            "manifest_id": manifest.id,
+            "display_name": manifest.display_name,
+            "runtime": manifest.runtime,
+            "provider": manifest.provider,
+            "local_path": local_path,
+            "remote_ref": manifest.remote_ref,
+            "dtype": manifest.dtype,
+            "device": device,
+            "default_params": dict(manifest.default_params),
+            "path_exists": local_path is not None,
+        }
+
+    def _declared_voices(self, manifest: ModelManifest) -> list[str] | None:
+        declared = manifest.default_params.get("voices")
+        if not isinstance(declared, list):
+            return None
+        voices = [str(voice) for voice in declared if str(voice).strip()]
+        return voices or None
+
+
+class KokoroTtsLoader(BaseSpeechLoader):
+    """Load the local pip-installed kokoro TTS package (Japanese and English).
+
+    Voice and speed defaults come from the manifest so a project can standardize
+    on one narrator without repeating it on every request.
+    """
+
+    def load(self, manifest: ModelManifest) -> dict[str, Any]:
+        from .audio_runtimes import build_kokoro_runtime
+
+        local_path = self._resolve_local_path(manifest)
+        requested_device = self._resolve_device()
+        default_params = manifest.default_params
+        configured_voice = default_params.get("voice")
+        runtime_fragment = build_kokoro_runtime(
+            model_path=Path(local_path),
+            language=str(default_params.get("language", "ja")),
+            default_voice=str(configured_voice) if configured_voice else None,
+            default_speed=float(default_params.get("speed", 1.0)),
+            voices=self._declared_voices(manifest),
+            device=requested_device,
+        )
+        return {
+            **self._base_payload(
+                manifest,
+                local_path=local_path,
+                device=requested_device,
+            ),
+            **runtime_fragment,
+        }
+
+
+class VoicevoxHttpLoader(BaseSpeechLoader):
+    """Call a local VOICEVOX-style HTTP speech engine.
+
+    Non-loopback hosts are refused unless ``ALLOW_REMOTE_AUDIO_ENDPOINTS=true``,
+    and the resolved base URL is returned in the payload so job metadata always
+    records where the narration text was sent.
+    """
+
+    def load(self, manifest: ModelManifest) -> dict[str, Any]:
+        from .audio_runtimes import build_voicevox_runtime
+
+        configured_base_url = os.getenv("VOICEVOX_BASE_URL", "").strip()
+        base_url = configured_base_url or manifest.remote_ref
+        if not base_url:
+            raise ValueError(
+                f"Manifest {manifest.id!r} needs remote_ref set to the VOICEVOX "
+                "engine base URL, or VOICEVOX_BASE_URL must be configured, for "
+                "example http://127.0.0.1:50021."
+            )
+
+        default_params = manifest.default_params
+        runtime_fragment = build_voicevox_runtime(
+            base_url,
+            default_speaker_id=int(default_params.get("speaker_id", 1)),
+            voices=self._declared_voices(manifest),
+            timeout_seconds=float(default_params.get("timeout_seconds", 60.0)),
+        )
+        return {
+            **self._base_payload(manifest, local_path=None, device="remote"),
+            **runtime_fragment,
+            # Do not retain a manifest path or environment-supplied path prefix in
+            # runtime metadata; the audio runtime exposes a redacted origin.
+            "remote_ref": runtime_fragment["endpoint_base_url"],
+        }
+
+
 class LoaderRegistry:
     """Lookup table for named loader instances."""
 
@@ -580,13 +700,17 @@ def create_default_loader_registry() -> LoaderRegistry:
     registry.register("template_text_loader", TemplateTextLoader())
     registry.register("llama_cpp_text_loader", LlamaCppTextLoader())
     registry.register("openai_compatible_text_loader", OpenAICompatibleTextLoader())
+    registry.register("kokoro_tts_loader", KokoroTtsLoader())
+    registry.register("voicevox_http_loader", VoicevoxHttpLoader())
     return registry
 
 
 __all__ = [
     "BaseModelLoader",
+    "BaseSpeechLoader",
     "BaseTextLoader",
     "DiffusersImageLoader",
+    "KokoroTtsLoader",
     "LearnedVideoLoader",
     "LlamaCppTextLoader",
     "LoaderRegistry",
@@ -594,5 +718,6 @@ __all__ = [
     "ProceduralVideoLoader",
     "TemplateTextLoader",
     "TransformersMusicgenLoader",
+    "VoicevoxHttpLoader",
     "create_default_loader_registry",
 ]

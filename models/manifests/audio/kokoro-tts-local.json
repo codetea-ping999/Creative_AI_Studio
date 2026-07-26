@@ -1,0 +1,31 @@
+{
+  "id": "kokoro-tts-local",
+  "public_id": "kokoro-tts",
+  "display_name": "Kokoro TTS Local (JA/EN)",
+  "media_type": "audio",
+  "task_type": "text-to-speech",
+  "provider": "local",
+  "runtime": "kokoro",
+  "local_path": "./models/audio/kokoro-tts",
+  "loader": "kokoro_tts_loader",
+  "dtype": "float32",
+  "default_params": {
+    "language": "ja",
+    "voice": "jf_alpha",
+    "voices": [
+      "jf_alpha",
+      "jf_gongitsune",
+      "jm_kumo",
+      "af_heart",
+      "am_michael",
+      "bf_emma"
+    ],
+    "speed": 1.0,
+    "max_chunk_characters": 240,
+    "chunk_gap_seconds": 0.25
+  },
+  "aliases": ["kokoro-tts-local", "kokoro"],
+  "tags": ["audio", "speech", "tts", "local"],
+  "is_default": false,
+  "enabled": false
+}
