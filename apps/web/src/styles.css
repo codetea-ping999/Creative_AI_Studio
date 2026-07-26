@@ -2702,3 +2702,14 @@ pre,
     grid-column: auto;
   }
 }
+
+.story-assemble-row {
+  display: grid;
+  gap: 6px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.story-assemble-row > button {
+  justify-self: start;
+}

@@ -20,7 +20,7 @@ from core.models import (
 from core.feedback import FeedbackRepository
 from core.projects import ProjectRepository
 from core.prompting import PromptComposer
-from core.story import StoryRepository
+from core.story import SceneBinder, StoryRepository
 from core.storage.repositories.job_repository import JobRepository
 from generators.audio import AudioGenerator, SpeechGenerator
 from generators.image import ImageGenerator
@@ -47,6 +47,7 @@ class ApplicationServices:
     bible_repository: BibleRepository
     prompt_composer: PromptComposer
     story_repository: StoryRepository
+    scene_binder: SceneBinder
     batch_repository: BatchRepository
     batch_service: BatchService
 
@@ -405,6 +406,15 @@ def create_application_services(
     # Subscribing here means a probe stage advances to refine on its own as soon
     # as its last child finishes, without the UI having to poll and push.
     batch_service.attach_to_event_bus()
+    scene_binder = SceneBinder(
+        story_repository,
+        job_repository,
+        asset_repository,
+        event_bus=event_bus,
+    )
+    # Subscribing means a scene picks up its image or narration the moment that
+    # job finishes, no matter who started it.
+    scene_binder.attach_to_event_bus()
     return ApplicationServices(
         output_dir=resolved_output_dir,
         model_service=model_service,
@@ -420,6 +430,7 @@ def create_application_services(
         bible_repository=bible_repository,
         prompt_composer=prompt_composer,
         story_repository=story_repository,
+        scene_binder=scene_binder,
         batch_repository=batch_repository,
         batch_service=batch_service,
     )

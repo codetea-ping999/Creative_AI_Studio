@@ -235,3 +235,76 @@ export function loglineCandidates(story: StoryDocument | null): string[] {
     )
     .filter(Boolean);
 }
+
+export type SceneRole = "visual" | "narration" | "music";
+
+export const sceneRoleLabels: Record<SceneRole, string> = {
+  visual: "画像",
+  narration: "ナレーション",
+  music: "BGM",
+};
+
+/**
+ * Generate one role of one scene.
+ *
+ * The result binds itself back to the scene on the server, so the caller only
+ * has to refresh the story once the job finishes.
+ */
+export function generateSceneMedia(
+  storyId: string,
+  sceneId: string,
+  payload: { role: SceneRole; model_id?: string; seed?: number | null },
+): Promise<{ job_id: string; status: string }> {
+  return requestJson<{ job_id: string; status: string }>(
+    `/stories/${storyId}/scenes/${sceneId}/generate`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        role: payload.role,
+        model_id: payload.model_id ?? "",
+        seed: payload.seed ?? null,
+      }),
+    },
+  );
+}
+
+export function assembleStory(
+  storyId: string,
+  payload: { width?: number; height?: number; fps?: number } = {},
+): Promise<{ job_id: string; status: string }> {
+  return requestJson<{ job_id: string; status: string }>(
+    `/stories/${storyId}/assemble`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        width: payload.width ?? 1920,
+        height: payload.height ?? 1080,
+        fps: payload.fps ?? 30,
+      }),
+    },
+  );
+}
+
+/** Which roles a scene still needs, in production order. */
+export function missingRolesForScene(
+  detail: StoryDetail | null,
+  sceneId: string,
+): SceneRole[] {
+  if (!detail) {
+    return [];
+  }
+  const order: SceneRole[] = ["visual", "narration", "music"];
+  const missing = detail.missing_assets
+    .filter((entry) => entry.scene_id === sceneId)
+    .map((entry) => entry.role as SceneRole);
+  return order.filter((role) => missing.includes(role));
+}
+
+/** True when every scene has what the timeline needs. */
+export function isReadyToAssemble(detail: StoryDetail | null): boolean {
+  return Boolean(
+    detail && detail.story.scenes.length > 0 && detail.missing_assets.length === 0,
+  );
+}

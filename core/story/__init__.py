@@ -1,5 +1,12 @@
 """Story documents: the spine that connects writing to media production."""
 
+from .binding import (
+    SCENE_ID_PARAM,
+    SCENE_ROLE_PARAM,
+    STORY_ID_PARAM,
+    SceneBinder,
+    scene_binding_params,
+)
 from .merge import DEFAULT_SCENE_DURATION_SECONDS, SUPPORTED_TASKS, apply_text_result
 from .repository import StoryRepository
 from .schemas import (
@@ -21,6 +28,10 @@ __all__ = [
     "DEFAULT_SCENE_DURATION_SECONDS",
     "DialogueLine",
     "SCENE_ASSET_ROLES",
+    "SCENE_ID_PARAM",
+    "SCENE_ROLE_PARAM",
+    "STORY_ID_PARAM",
+    "SceneBinder",
     "STORY_FORMATS",
     "SUPPORTED_TASKS",
     "Scene",
@@ -28,6 +39,7 @@ __all__ = [
     "StoryRepository",
     "apply_text_result",
     "build_timeline",
+    "scene_binding_params",
     "count_words",
     "missing_scene_assets",
     "split_subtitle_lines",

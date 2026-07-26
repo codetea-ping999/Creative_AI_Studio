@@ -1303,6 +1303,9 @@ function App() {
             modelId=""
             projectId={selectedProjectId}
             awaitJob={awaitJobCompletion}
+            // Empty ids let the API pick each media type's default model, so a
+            // scene can be filled without first choosing models by hand.
+            sceneModelIds={{ visual: "", narration: "", music: "" }}
             onGenerateSceneImage={(scene) => {
               startTransition(() => {
                 loadDraftIntoComposer("image", {
