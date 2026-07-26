@@ -32,7 +32,9 @@ http://127.0.0.1:8000
 | Jobs | `POST` | `/jobs/{job_id}/cancel` | queued / running job の cancel 要求 |
 | Generate | `POST` | `/generate/image` | 画像生成開始 |
 | Generate | `POST` | `/generate/audio` | 音声生成開始 |
+| Generate | `POST` | `/generate/speech` | ナレーション音声生成開始 |
 | Generate | `POST` | `/generate/video` | 動画生成開始 |
+| Generate | `POST` | `/generate/assembly` | timeline の動画組み立て開始 |
 | Generate | `POST` | `/generate/text` | ストーリー / 執筆タスク開始 |
 | Bible | `GET` | `/bible` | 作品設定一覧（kind / project / query で絞り込み） |
 | Bible | `POST` | `/bible` | 作品設定作成 |
@@ -515,6 +517,25 @@ Response は再バインド後の `GalleryAssetDetailResponse`。
 }
 ```
 
+### POST /generate/speech
+
+`audio` の専用 `text-to-speech` generator にルーティングします。`project_id` の
+検証・job binding は他の `/generate/*` と共通です。
+
+```json
+{
+  "prompt": "静かな夜明けだった。",
+  "model_id": "kokoro-tts",
+  "project_id": "project_123",
+  "output_format": "wav",
+  "params": {
+    "voice": "jm_kumo",
+    "speed": 1.0,
+    "pitch": 0.0
+  }
+}
+```
+
 ### POST /generate/video
 
 ```json
@@ -538,6 +559,39 @@ Response は再バインド後の `GalleryAssetDetailResponse`。
 CogVideoX-2B learned runtimeは`model_id=learned-video`、`output_format=mp4`を使います。
 既定値は720x480、49 frames、8 fps、20 inference stepsです。weight未配置時は
 `GET /models`が`is_available=false`を返し、procedural runtimeへ自動fallbackしません。
+
+### POST /generate/assembly
+
+`video` の専用 `assembly` generator にルーティングします。`params.timeline` は
+`GET /stories/{story_id}/timeline` の返却値を渡します。timeline 内の `asset_id` は
+Asset repository から実ファイルへ解決されるため、`path` の直書きは必須ではありません。
+
+```json
+{
+  "prompt": "assemble the narrated short",
+  "model_id": "",
+  "project_id": "project_123",
+  "output_format": "mp4",
+  "params": {
+    "timeline": {
+      "fps": 24,
+      "resolution": [1920, 1080],
+      "tracks": {
+        "visual": [
+          {
+            "scene_id": "scene_1",
+            "asset_id": "asset_visual_1",
+            "duration_seconds": 4
+          }
+        ],
+        "narration": [],
+        "music": [],
+        "subtitles": []
+      }
+    }
+  }
+}
+```
 
 共通 response:
 

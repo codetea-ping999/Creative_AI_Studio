@@ -22,11 +22,11 @@ from core.projects import ProjectRepository
 from core.prompting import PromptComposer
 from core.story import StoryRepository
 from core.storage.repositories.job_repository import JobRepository
-from generators.audio import AudioGenerator
+from generators.audio import AudioGenerator, SpeechGenerator
 from generators.image import ImageGenerator
 from generators.registry import GeneratorRegistry
 from generators.text import TextGenerator
-from generators.video import VideoGenerator
+from generators.video import AssemblyGenerator, VideoGenerator
 
 
 @dataclass(slots=True)
@@ -210,6 +210,25 @@ def create_default_audio_generator(
     )
 
 
+def create_default_speech_generator(
+    output_dir: str | Path | None = None,
+    *,
+    model_service: ModelService | None = None,
+    manifest_root: str | Path | None = None,
+    max_cached_models: int | None = None,
+) -> SpeechGenerator:
+    """Compose the text-to-speech narration generator."""
+
+    resolved_model_service = model_service or create_default_model_service(
+        manifest_root=manifest_root,
+        max_cached_models=max_cached_models,
+    )
+    return SpeechGenerator(
+        resolved_model_service,
+        output_dir=_resolve_audio_output_dir(output_dir),
+    )
+
+
 def create_default_video_generator(
     output_dir: str | Path | None = None,
     *,
@@ -232,6 +251,26 @@ def create_default_video_generator(
     )
 
 
+def create_default_assembly_generator(
+    output_dir: str | Path | None = None,
+    *,
+    asset_repository: AssetRepository | None = None,
+) -> AssemblyGenerator:
+    """Compose the deterministic timeline assembly generator."""
+
+    def lookup_asset_path(asset_id: str) -> str | None:
+        if asset_repository is None:
+            return None
+        asset = asset_repository.get(asset_id)
+        return asset.path if asset is not None else None
+
+    return AssemblyGenerator(
+        output_dir=_resolve_output_dir(output_dir).parent / "videos",
+        asset_path_lookup=lookup_asset_path,
+        allow_direct_paths=False,
+    )
+
+
 def create_default_generator_registry(
     *,
     model_service: ModelService | None = None,
@@ -239,6 +278,7 @@ def create_default_generator_registry(
     output_dir: str | Path | None = None,
     max_cached_models: int | None = None,
     prompt_composer: PromptComposer | None = None,
+    asset_repository: AssetRepository | None = None,
 ) -> GeneratorRegistry:
     """Compose the generator registry for every supported media type."""
 
@@ -248,44 +288,58 @@ def create_default_generator_registry(
         max_cached_models=max_cached_models,
     )
     registry = GeneratorRegistry()
-    registry.register(
-        "image",
-        create_default_image_generator(
-            output_dir=resolved_output_dir,
-            model_service=resolved_model_service,
-            task_type="text-to-image",
-            prompt_composer=prompt_composer,
-        ),
+    image_generator = create_default_image_generator(
+        output_dir=resolved_output_dir,
+        model_service=resolved_model_service,
+        task_type="text-to-image",
+        prompt_composer=prompt_composer,
     )
-    registry.register(
-        "text",
-        create_default_text_generator(
-            output_dir=resolved_output_dir,
-            model_service=resolved_model_service,
-            manifest_root=manifest_root,
-            max_cached_models=max_cached_models,
-            task_type="story",
-        ),
+    registry.register("image", image_generator)
+    registry.register("image", image_generator, task_type="text-to-image")
+
+    text_generator = create_default_text_generator(
+        output_dir=resolved_output_dir,
+        model_service=resolved_model_service,
+        manifest_root=manifest_root,
+        max_cached_models=max_cached_models,
+        task_type="story",
     )
+    registry.register("text", text_generator)
+    registry.register("text", text_generator, task_type="story")
+
+    audio_generator = create_default_audio_generator(
+        output_dir=resolved_output_dir,
+        model_service=resolved_model_service,
+        manifest_root=manifest_root,
+        max_cached_models=max_cached_models,
+        task_type="text-to-music",
+    )
+    registry.register("audio", audio_generator)
+    registry.register("audio", audio_generator, task_type="text-to-music")
     registry.register(
         "audio",
-        create_default_audio_generator(
+        create_default_speech_generator(
             output_dir=resolved_output_dir,
             model_service=resolved_model_service,
-            manifest_root=manifest_root,
-            max_cached_models=max_cached_models,
-            task_type="text-to-music",
         ),
+        task_type="text-to-speech",
     )
+    video_generator = create_default_video_generator(
+        output_dir=resolved_output_dir,
+        model_service=resolved_model_service,
+        manifest_root=manifest_root,
+        max_cached_models=max_cached_models,
+        task_type="text-to-video",
+    )
+    registry.register("video", video_generator)
+    registry.register("video", video_generator, task_type="text-to-video")
     registry.register(
         "video",
-        create_default_video_generator(
+        create_default_assembly_generator(
             output_dir=resolved_output_dir,
-            model_service=resolved_model_service,
-            manifest_root=manifest_root,
-            max_cached_models=max_cached_models,
-            task_type="text-to-video",
+            asset_repository=asset_repository,
         ),
+        task_type="assembly",
     )
     return registry
 
@@ -310,15 +364,16 @@ def create_application_services(
     )
     bible_repository = BibleRepository(resolved_db_path.parent / "bible")
     prompt_composer = PromptComposer(bible_repository)
+    asset_repository = AssetRepository(resolved_db_path.parent / "assets")
     generator_registry = create_default_generator_registry(
         model_service=model_service,
         manifest_root=resolved_manifest_root,
         output_dir=resolved_output_dir,
         max_cached_models=resolved_max_cached_models,
         prompt_composer=prompt_composer,
+        asset_repository=asset_repository,
     )
     job_repository = JobRepository(resolved_db_path)
-    asset_repository = AssetRepository(resolved_db_path.parent / "assets")
     job_queue = JobQueue()
     event_bus = EventBus()
     job_service = JobService(job_repository, job_queue, event_bus, asset_repository=asset_repository)
@@ -365,10 +420,12 @@ def create_application_services(
 __all__ = [
     "ApplicationServices",
     "create_application_services",
+    "create_default_assembly_generator",
     "create_default_audio_generator",
     "create_default_generator_registry",
     "create_default_image_generator",
     "create_default_model_service",
+    "create_default_speech_generator",
     "create_default_text_generator",
     "create_default_video_generator",
 ]

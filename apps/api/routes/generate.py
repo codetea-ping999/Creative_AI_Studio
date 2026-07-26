@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from apps.api.dependencies import get_services
 from apps.api.routes.jobs import CreateJobResponse
 from bootstrap import ApplicationServices
+from core.assets import Asset
 from core.jobs import JobRecord
 from core.projects import ProjectRepository
 from core.schemas import GenerationRequest, MediaType
@@ -67,9 +68,22 @@ class GenerateAudioRequest(BaseGenerateRequest):
     """Convenience request shape for audio generation."""
 
 
+class GenerateSpeechRequest(BaseGenerateRequest):
+    """Convenience request shape for narration synthesis."""
+
+    task_type: ClassVar[str | None] = "text-to-speech"
+
+
 class GenerateVideoRequest(BaseGenerateRequest):
     """Convenience request shape for video generation."""
 
+    negative_prompt: str | None = None
+
+
+class GenerateAssemblyRequest(BaseGenerateRequest):
+    """Convenience request shape for deterministic timeline assembly."""
+
+    task_type: ClassVar[str | None] = "assembly"
     negative_prompt: str | None = None
 
 
@@ -116,6 +130,98 @@ def _enqueue_generation(
     return CreateJobResponse(job_id=bound_job.job.id, status=bound_job.job.status)
 
 
+_ASSEMBLY_ASSET_TRACKS = ("visual", "narration", "music")
+
+
+def _strip_timeline_paths(value: object) -> object:
+    """Copy a timeline payload without trusting any caller-provided file path."""
+
+    if isinstance(value, dict):
+        return {
+            key: _strip_timeline_paths(item)
+            for key, item in value.items()
+            if key != "path"
+        }
+    if isinstance(value, list):
+        return [_strip_timeline_paths(item) for item in value]
+    return value
+
+
+def _prepare_assembly_request(
+    services: ApplicationServices,
+    request: GenerateAssemblyRequest,
+) -> GenerateAssemblyRequest:
+    """Resolve every timeline asset inside the assembly's project boundary."""
+
+    # Resolve the target first so an invalid project cannot be used to probe
+    # whether an asset exists.
+    project_id = _resolve_project_id(services, request.project_id)
+    timeline = request.params.get("timeline")
+    sanitized_timeline = _strip_timeline_paths(timeline)
+    if not isinstance(sanitized_timeline, dict):
+        return request.model_copy(
+            update={
+                "params": {
+                    **request.params,
+                    "timeline": sanitized_timeline,
+                }
+            }
+        )
+
+    tracks = sanitized_timeline.get("tracks")
+    resolved_assets: dict[str, Asset] = {}
+    if isinstance(tracks, dict):
+        for track_name in _ASSEMBLY_ASSET_TRACKS:
+            entries = tracks.get(track_name)
+            if not isinstance(entries, list):
+                continue
+            for index, entry in enumerate(entries):
+                if not isinstance(entry, dict):
+                    continue
+                raw_asset_id = entry.get("asset_id")
+                asset_id = (
+                    raw_asset_id.strip()
+                    if isinstance(raw_asset_id, str)
+                    else ""
+                )
+                if not asset_id:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"Timeline {track_name} entry #{index} requires an "
+                            "asset_id; direct paths are not accepted."
+                        ),
+                    )
+
+                asset = resolved_assets.get(asset_id)
+                if asset is None:
+                    asset = services.asset_repository.get(asset_id)
+                    if asset is None:
+                        raise HTTPException(
+                            status_code=status.HTTP_404_NOT_FOUND,
+                            detail=f"Timeline asset not found: {asset_id}",
+                        )
+                    resolved_assets[asset_id] = asset
+
+                # Project membership is an exact boundary. In particular, an
+                # unassigned asset is accepted only for an unassigned assembly.
+                if asset.project_id != project_id:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail=f"Timeline asset not found in target project: {asset_id}",
+                    )
+                entry["asset_id"] = asset_id
+
+    return request.model_copy(
+        update={
+            "params": {
+                **request.params,
+                "timeline": sanitized_timeline,
+            }
+        }
+    )
+
+
 @router.post(
     "/image",
     response_model=CreateJobResponse,
@@ -141,6 +247,18 @@ def generate_audio(
 
 
 @router.post(
+    "/speech",
+    response_model=CreateJobResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def generate_speech(
+    request: GenerateSpeechRequest,
+    services: ApplicationServices = Depends(get_services),
+) -> CreateJobResponse:
+    return _enqueue_generation(services, "audio", request)
+
+
+@router.post(
     "/video",
     response_model=CreateJobResponse,
     status_code=status.HTTP_201_CREATED,
@@ -150,6 +268,22 @@ def generate_video(
     services: ApplicationServices = Depends(get_services),
 ) -> CreateJobResponse:
     return _enqueue_generation(services, "video", request)
+
+
+@router.post(
+    "/assembly",
+    response_model=CreateJobResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def generate_assembly(
+    request: GenerateAssemblyRequest,
+    services: ApplicationServices = Depends(get_services),
+) -> CreateJobResponse:
+    return _enqueue_generation(
+        services,
+        "video",
+        _prepare_assembly_request(services, request),
+    )
 
 
 @router.post(
@@ -165,8 +299,10 @@ def generate_text(
 
 
 __all__ = [
+    "GenerateAssemblyRequest",
     "GenerateAudioRequest",
     "GenerateImageRequest",
+    "GenerateSpeechRequest",
     "GenerateTextRequest",
     "GenerateVideoRequest",
     "router",
