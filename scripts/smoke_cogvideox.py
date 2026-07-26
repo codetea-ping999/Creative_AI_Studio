@@ -12,30 +12,21 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from bootstrap import create_default_model_service
+from core.models import evaluate_manifest_readiness
 from core.schemas import GenerationRequest
 from generators.video import VideoGenerator
 
 
 def main() -> int:
-    model_root = ROOT / "models" / "video" / "cogvideox-2b"
-    required_configs = [
-        model_root / "model_index.json",
-        model_root / "scheduler" / "scheduler_config.json",
-        model_root / "text_encoder" / "config.json",
-        model_root / "tokenizer" / "tokenizer_config.json",
-        model_root / "transformer" / "config.json",
-        model_root / "vae" / "config.json",
-    ]
-    weights_ready = all(
-        any((model_root / component).glob("*.safetensors"))
-        for component in ("text_encoder", "transformer", "vae")
-    )
-    if not all(path.exists() for path in required_configs) or not weights_ready:
-        print(f"[SKIP] CogVideoX-2B weight set is incomplete at {model_root}")
+    model_service = create_default_model_service()
+    manifest = model_service.get_manifest("learned-video", "video")
+    readiness = evaluate_manifest_readiness(manifest, repo_root=ROOT)
+    if not readiness.is_ready:
+        print(f"[SKIP] {manifest.display_name} is not ready: {readiness.message}")
         return 2
 
     output_dir = ROOT / "outputs" / "videos"
-    generator = VideoGenerator(create_default_model_service(), output_dir=output_dir)
+    generator = VideoGenerator(model_service, output_dir=output_dir)
     result = generator.run(
         GenerationRequest(
             media_type="video",

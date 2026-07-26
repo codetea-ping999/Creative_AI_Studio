@@ -99,9 +99,13 @@ def _fake_diffusers_load(self, manifest):
 
 
 class _FakeMusicgenProcessor:
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
     def __call__(self, *, text, padding, return_tensors):
         import torch
 
+        self.calls.append(text)
         return {
             "input_ids": torch.ones((1, 4), dtype=torch.long),
             "attention_mask": torch.ones((1, 4), dtype=torch.long),
@@ -366,6 +370,20 @@ class ModelSystemTests(unittest.TestCase):
             torch.float32,
         )
 
+    def test_diffusers_loader_only_requests_an_existing_weight_variant(self) -> None:
+        loader = create_default_loader_registry().get("diffusers_image_loader")
+        manifest = ModelRegistry().get("sdxl-local")
+
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            variant_weight = root / "model.fp16.safetensors"
+            variant_weight.write_bytes(b"stub")
+            self.assertEqual(loader._resolve_variant(manifest, root), "fp16")
+
+            variant_weight.unlink()
+            (root / "pytorch_model.bin").write_bytes(b"stub")
+            self.assertIsNone(loader._resolve_variant(manifest, root))
+
     def test_application_services_resolve_environment_overrides(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -554,8 +572,21 @@ class ModelSystemTests(unittest.TestCase):
                             "guidance_scale": 3.5,
                             "bpm": 96,
                             "mood": "dreamy",
+                            "genre": "ambient",
+                            "instruments": "analog synth, soft percussion",
+                            "structure": "seamless loop",
+                            "temperature": 0.8,
+                            "top_k": 180,
+                            "top_p": 0.9,
+                            "source_asset_id": "asset-audio-source",
+                            "reuse_action": "variation",
                         },
                     )
+                )
+                runtime = service.get_runtime(
+                    "musicgen-small",
+                    "audio",
+                    "text-to-music",
                 )
 
             self.assertEqual(result.status, "succeeded")
@@ -568,7 +599,71 @@ class ModelSystemTests(unittest.TestCase):
             self.assertEqual(result.metadata["stub"], False)
             self.assertIn("quality_report", result.metadata)
             self.assertIn("semantic_report", result.metadata["quality_report"])
+            self.assertEqual(
+                runtime["processor"].calls[0],
+                [
+                    "ambient music, dreamy mood, 96 BPM, "
+                    "featuring analog synth, soft percussion, "
+                    "seamless loop structure, dreamy synth loop"
+                ],
+            )
+            self.assertEqual(runtime["model"].calls[0]["temperature"], 0.8)
+            self.assertEqual(runtime["model"].calls[0]["top_k"], 180)
+            self.assertEqual(runtime["model"].calls[0]["top_p"], 0.9)
+            self.assertNotIn("source_asset_id", runtime["model"].calls[0])
+            self.assertNotIn("reuse_action", runtime["model"].calls[0])
+            self.assertEqual(result.metadata["source_asset_id"], "asset-audio-source")
+            self.assertEqual(result.metadata["reuse_action"], "variation")
+            self.assertEqual(result.metadata["params"]["structure"], "seamless loop")
             self.assertTrue(Path(result.outputs[0]).exists())
+
+    def test_audio_generator_rejects_out_of_range_params(self) -> None:
+        generator = AudioGenerator(create_default_model_service())
+        invalid_cases = (
+            ("duration_seconds", 1, "2 and 30"),
+            ("duration_seconds", 31, "2 and 30"),
+            ("guidance_scale", 0.9, "1 and 10"),
+            ("guidance_scale", 10.1, "1 and 10"),
+            ("temperature", 0.05, "0.1 and 2"),
+            ("temperature", 2.5, "0.1 and 2"),
+            ("top_k", -1, "0 and 1000"),
+            ("top_k", 1001, "0 and 1000"),
+            ("top_p", -0.1, "0 and 1"),
+            ("top_p", 1.1, "0 and 1"),
+            ("bpm", 39, "40 and 240"),
+            ("bpm", 241, "40 and 240"),
+        )
+
+        for name, value, expected_range in invalid_cases:
+            with self.subTest(name=name, value=value):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    rf"Audio parameter '{name}' must be between {expected_range}",
+                ):
+                    generator.validate_request(
+                        GenerationRequest(
+                            media_type="audio",
+                            prompt="minimal piano cue",
+                            model_id="musicgen-small",
+                            params={name: value},
+                        )
+                    )
+
+        generator.validate_request(
+            GenerationRequest(
+                media_type="audio",
+                prompt="boundary values",
+                model_id="musicgen-small",
+                params={
+                    "duration_seconds": 30,
+                    "guidance_scale": 10,
+                    "temperature": 0.1,
+                    "top_k": 0,
+                    "top_p": 1,
+                    "bpm": 240,
+                },
+            )
+        )
 
     def test_bootstrap_factory_composes_default_audio_generator(self) -> None:
         with TemporaryDirectory() as tmp_dir:

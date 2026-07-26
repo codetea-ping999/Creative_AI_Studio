@@ -37,6 +37,12 @@ function buildGenerationPayload(
         guidance_scale: values.guidanceScale,
         bpm: values.bpm,
         mood: values.mood,
+        genre: values.genre,
+        instruments: values.instruments,
+        structure: values.structure,
+        temperature: values.temperature,
+        top_k: values.topK,
+        top_p: values.topP,
       },
     };
   }

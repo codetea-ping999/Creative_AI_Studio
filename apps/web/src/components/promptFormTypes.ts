@@ -36,6 +36,12 @@ export type PromptFormState = {
   durationSeconds: string;
   bpm: string;
   mood: string;
+  genre: string;
+  instruments: string;
+  structure: string;
+  temperature: string;
+  topK: string;
+  topP: string;
   cameraMotion: string;
   visualStyle: string;
 };
@@ -59,6 +65,12 @@ export type PromptFormSubmitValues = {
   durationSeconds: number;
   bpm: number;
   mood: string;
+  genre: string;
+  instruments: string;
+  structure: string;
+  temperature: number;
+  topK: number;
+  topP: number;
   cameraMotion: string;
   visualStyle: string;
 };
@@ -87,6 +99,9 @@ export type AudioPreset = {
   name: string;
   prompt: string;
   mood: string;
+  genre: string;
+  instruments: string;
+  structure: string;
   bpm: number;
   durationSeconds: number;
 };

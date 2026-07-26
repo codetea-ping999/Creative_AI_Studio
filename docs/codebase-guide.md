@@ -33,6 +33,7 @@ Creative AI Studio を勉強しながら読むためのコードベース案内�
 | `core/jobs/` | job 作成、状態更新、runner | `core/jobs/service.py`, `core/jobs/runner.py` |
 | `core/schemas/` | 共通スキーマ | `core/schemas/generation.py` |
 | `core/models/` | manifest、resolver、runtime cache | `core/models/service.py`, `core/models/registry.py`, `core/models/resolver.py` |
+| `core/model_readiness.py` | dependency-freeなweight・tokenizer・processor readiness判定 | `core/model_readiness.py` |
 | `core/assets/` | 生成物の保存と再利用 | `core/assets/__init__.py` |
 | `core/projects/` | project 単位の grouping | `core/projects/__init__.py` |
 | `core/feedback/` | human feedback 保存 | `core/feedback/__init__.py` |

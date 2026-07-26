@@ -27,11 +27,34 @@ def test_cogvideox_adapter_requires_local_diffusers_weights(tmp_path):
     module = _load_adapter_module()
     missing_pipeline = tmp_path / "cogvideox-2b"
 
-    with pytest.raises(FileNotFoundError, match="CogVideoX model_index.json is missing"):
+    with pytest.raises(FileNotFoundError, match="model_index.json"):
         module.load_runtime(
             {
                 "default_params": {
                     "pipeline_path": str(missing_pipeline),
+                    "device": "auto",
+                    "dtype": "float16",
+                }
+            }
+        )
+
+
+def test_cogvideox_adapter_rejects_pipeline_without_component_weights(tmp_path):
+    module = _load_adapter_module()
+    pipeline_root = tmp_path / "cogvideox-2b"
+    pipeline_root.mkdir()
+    (pipeline_root / "model_index.json").write_text(
+        '{"transformer": ["diffusers", "CogVideoXTransformer3DModel"]}',
+        encoding="utf-8",
+    )
+    (pipeline_root / "transformer").mkdir()
+    (pipeline_root / "transformer" / "config.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(FileNotFoundError, match=r"transformer/\*\.safetensors"):
+        module.load_runtime(
+            {
+                "default_params": {
+                    "pipeline_path": str(pipeline_root),
                     "device": "auto",
                     "dtype": "float16",
                 }
