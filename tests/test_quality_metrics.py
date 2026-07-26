@@ -52,6 +52,27 @@ class QualityMetricsTests(unittest.TestCase):
             self.assertIn("quality_score", report)
             self.assertIn("metrics", report)
 
+    def test_clap_audio_resampling_uses_the_processor_sample_rate(self) -> None:
+        from core.quality.semantic import _resample_audio_samples
+
+        samples = [0.0, 0.5, 0.0, -0.5] * 4
+
+        converted = _resample_audio_samples(
+            samples,
+            source_sample_rate=32_000,
+            target_sample_rate=48_000,
+        )
+
+        self.assertEqual(len(converted), 24)
+        self.assertEqual(
+            _resample_audio_samples(
+                samples,
+                source_sample_rate=32_000,
+                target_sample_rate=32_000,
+            ),
+            samples,
+        )
+
     def test_semantic_judge_returns_disabled_status_by_default(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             image_path = Path(tmp_dir) / "sample.png"

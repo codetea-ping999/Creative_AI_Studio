@@ -104,7 +104,31 @@ def test_calibration_dataset_is_deterministic_and_does_not_apply_updates():
     assert report["coverage_rate"] == 100.0
     assert report["recommendation_status"] == "insufficient_data"
     assert report["metrics"]["quality"]["pearson_correlation"] == 1.0
+    assert report["metrics"]["creative_vs_quality"]["pearson_correlation"] == 1.0
+    assert report["metrics"]["creative_vs_semantic"]["pearson_correlation"] == 1.0
     assert report["automatic_updates_applied"] is False
+
+
+def test_empty_and_single_model_reports_expose_audio_review_dimensions():
+    empty_report = build_calibration_report(
+        [],
+        eligible_job_count=0,
+        eligible_segments={
+            "by_media": {"audio": 0},
+            "by_model": {"musicgen-small": 0},
+        },
+    )
+
+    assert empty_report["recommendation_status"] == "insufficient_data"
+    assert empty_report["metrics"]["quality"]["paired_count"] == 0
+    assert empty_report["metrics"]["semantic"]["paired_count"] == 0
+    assert empty_report["metrics"]["creative_vs_quality"]["paired_count"] == 0
+    assert empty_report["metrics"]["creative_vs_semantic"]["paired_count"] == 0
+    assert list(empty_report["by_model"]) == ["musicgen-small"]
+    assert (
+        empty_report["by_model"]["musicgen-small"]["recommendation_status"]
+        == "insufficient_data"
+    )
 
 
 def test_calibration_metrics_endpoint_supports_model_filter():

@@ -264,10 +264,22 @@ class _ClapAudioBackend:
         processor, model = runtime
         import torch
 
-        samples, sample_rate = _read_wav_samples(resolved_output_path)
+        samples, source_sample_rate = _read_wav_samples(resolved_output_path)
+        feature_extractor = getattr(processor, "feature_extractor", None)
+        processor_sample_rate = getattr(feature_extractor, "sampling_rate", None)
+        sample_rate = (
+            int(processor_sample_rate)
+            if isinstance(processor_sample_rate, (int, float))
+            else source_sample_rate
+        )
+        samples = _resample_audio_samples(
+            samples,
+            source_sample_rate=source_sample_rate,
+            target_sample_rate=sample_rate,
+        )
         inputs = processor(
             text=[prompt.strip() or "untitled audio prompt"],
-            audios=[samples],
+            audio=[samples],
             sampling_rate=sample_rate,
             return_tensors="pt",
             padding=True,
@@ -291,6 +303,7 @@ class _ClapAudioBackend:
             "semantic_alignment_level": _score_level(semantic_score),
             "details": {
                 "positive_cosine": round(positive_cosine, 4),
+                "source_sample_rate": source_sample_rate,
                 "sample_rate": sample_rate,
             },
             "cache_hit": False,
@@ -597,6 +610,29 @@ def _read_wav_samples(output_path: str | Path) -> tuple[list[float], int]:
         frame = decoded[index:index + channels]
         mono_samples.append(sum(frame) / len(frame))
     return mono_samples, sample_rate
+
+
+def _resample_audio_samples(
+    samples: list[float],
+    *,
+    source_sample_rate: int,
+    target_sample_rate: int,
+) -> list[float]:
+    if source_sample_rate == target_sample_rate:
+        return samples
+    if source_sample_rate <= 0 or target_sample_rate <= 0:
+        raise ValueError("Audio sample rates must be positive.")
+
+    import torch
+    from torchaudio.functional import resample
+
+    waveform = torch.tensor(samples, dtype=torch.float32).unsqueeze(0)
+    converted = resample(
+        waveform,
+        orig_freq=source_sample_rate,
+        new_freq=target_sample_rate,
+    )
+    return converted.squeeze(0).tolist()
 
 
 def _sample_video_frames(output_path: Path, *, sample_frames: int) -> list[Image.Image]:
