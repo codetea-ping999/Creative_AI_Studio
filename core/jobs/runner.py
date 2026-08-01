@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING
 
 from generators.registry import GeneratorRegistry
 
+from .cancellation import CancellationRegistry
+from .context import GenerationCancelled, GenerationContext
 from .events import EventBus
 from .service import JobService
 
@@ -24,6 +26,12 @@ from .statuses import (
     JOB_STATUS_RUNNING,
 )
 
+# The generator's own progress fraction (0.0-1.0) is mapped into this slice of
+# the job's overall progress; PREPARING/POSTPROCESSING bracket it on either
+# side (see process_job).
+_RUNNING_PROGRESS_START = 0.1
+_RUNNING_PROGRESS_SPAN = 0.8
+
 logger = logging.getLogger(__name__)
 
 
@@ -38,12 +46,14 @@ class JobRunner:
         event_bus: EventBus | None = None,
         asset_repository: AssetRepository | None = None,
         job_service: JobService | None = None,
+        cancellation_registry: CancellationRegistry | None = None,
     ) -> None:
         self.job_repository = job_repository
         self.job_queue = job_queue
         self.generator_registry = generator_registry
         self.event_bus = event_bus
         self.asset_repository = asset_repository
+        self.cancellation_registry = cancellation_registry
         # Terminal transitions (success/failure) are delegated to JobService so
         # the completion path lives in exactly one place. When callers do not
         # inject a shared service we build an equivalent one from our own deps.
@@ -91,46 +101,79 @@ class JobRunner:
             )
             return job
 
+        context = self._begin_context(job_id)
         try:
-            if self._update_status(job_id, JOB_STATUS_PREPARING, progress=0.0) is None:
+            try:
+                if self._update_status(job_id, JOB_STATUS_PREPARING, progress=0.0) is None:
+                    return self.job_repository.get(job_id)
+                generator = self.generator_registry.get(job.media_type, job.request.task_type)
+                if self._update_status(job_id, JOB_STATUS_RUNNING, progress=0.1) is None:
+                    return self.job_repository.get(job_id)
+                controlled_run = getattr(generator, "run_with_control", None)
+                if callable(controlled_run):
+                    # Long-form audio opts into segment-level progress/cancel
+                    # instead of the generic context below.
+                    result = controlled_run(
+                        job.request,
+                        progress_callback=lambda fraction, segment, segment_count: (
+                            self._report_segment_progress(
+                                job_id,
+                                fraction,
+                                segment=segment,
+                                segment_count=segment_count,
+                            )
+                        ),
+                        cancel_requested=lambda: self._is_cancelled(job_id),
+                    )
+                else:
+                    # Generators that accept ``context`` can report step-level
+                    # progress and observe cancellation mid-flight by raising
+                    # GenerationCancelled; generators that ignore it fall back to
+                    # cancellation being honored only at the boundary below.
+                    result = generator.run(job.request, context)
+            except GenerationCancelled:
                 return self.job_repository.get(job_id)
-            generator = self.generator_registry.get(job.media_type, job.request.task_type)
-            if self._update_status(job_id, JOB_STATUS_RUNNING, progress=0.1) is None:
-                return self.job_repository.get(job_id)
-            controlled_run = getattr(generator, "run_with_control", None)
-            if callable(controlled_run):
-                result = controlled_run(
-                    job.request,
-                    progress_callback=lambda fraction, segment, segment_count: (
-                        self._report_generation_progress(
-                            job_id,
-                            fraction,
-                            segment=segment,
-                            segment_count=segment_count,
-                        )
-                    ),
-                    cancel_requested=lambda: self._is_cancelled(job_id),
-                )
-            else:
-                # Most generators are one blocking call. Long-form audio opts
-                # into the controlled path above to report/cancel at segments.
-                result = generator.run(job.request)
-        except Exception as exc:
+            except Exception as exc:
+                if self._is_cancelled(job_id):
+                    return self.job_repository.get(job_id)
+                return self.job_service.mark_failed(job_id, str(exc))
+
             if self._is_cancelled(job_id):
                 return self.job_repository.get(job_id)
-            return self.job_service.mark_failed(job_id, str(exc))
-
-        if self._is_cancelled(job_id):
-            return self.job_repository.get(job_id)
-        if self._update_status(job_id, JOB_STATUS_POSTPROCESSING, progress=0.9) is None:
-            return self.job_repository.get(job_id)
-        return self.job_service.mark_succeeded(job_id, result)
+            if self._update_status(job_id, JOB_STATUS_POSTPROCESSING, progress=0.9) is None:
+                return self.job_repository.get(job_id)
+            return self.job_service.mark_succeeded(job_id, result)
+        finally:
+            if self.cancellation_registry is not None:
+                self.cancellation_registry.end(job_id)
 
     def _is_cancelled(self, job_id: str) -> bool:
         current = self.job_repository.get(job_id)
         return current is not None and current.status == JOB_STATUS_CANCELLED
 
-    def _report_generation_progress(
+    def _begin_context(self, job_id: str) -> GenerationContext | None:
+        if self.cancellation_registry is None:
+            return None
+        self.cancellation_registry.begin(job_id)
+        return GenerationContext(
+            is_cancelled=lambda: self.cancellation_registry.is_cancelled(job_id),
+            on_progress=lambda fraction: self._report_generation_progress(job_id, fraction),
+        )
+
+    def _report_generation_progress(self, job_id: str, fraction: float) -> None:
+        mapped_progress = _RUNNING_PROGRESS_START + max(0.0, min(1.0, fraction)) * _RUNNING_PROGRESS_SPAN
+        job = self.job_repository.update_if_status(
+            job_id,
+            (JOB_STATUS_RUNNING,),
+            progress=mapped_progress,
+        )
+        if job is not None:
+            self._publish(
+                "job_progress",
+                {"job_id": job.id, "status": job.status, "progress": job.progress},
+            )
+
+    def _report_segment_progress(
         self,
         job_id: str,
         fraction: float,

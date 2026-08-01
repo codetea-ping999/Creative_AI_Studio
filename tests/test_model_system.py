@@ -20,11 +20,13 @@ try:
         create_default_image_generator,
         create_default_model_service,
     )
+    from core.jobs.context import GenerationCancelled, GenerationContext
     from core.models import (
         ModelRegistry,
         ModelResolver,
         ModelRuntimeCache,
         create_default_loader_registry,
+        release_runtime,
     )
     from core.schemas import GenerationRequest
     from generators.audio import AudioGenerator
@@ -50,6 +52,7 @@ class _FakePipeline:
         self.loaded_loras: list[dict[str, object]] = []
         self.adapter_calls: list[dict[str, object]] = []
         self.unload_calls = 0
+        self.to_calls: list[str] = []
 
     def __call__(self, **kwargs: object) -> _FakePipelineResult:
         self.calls.append(kwargs)
@@ -75,6 +78,10 @@ class _FakePipeline:
     def delete_adapters(self, adapter_names: str | list[str]) -> None:
         return None
 
+    def to(self, device: str) -> "_FakePipeline":
+        self.to_calls.append(device)
+        return self
+
 
 def _fake_diffusers_load(self, manifest):
     return {
@@ -95,6 +102,58 @@ def _fake_diffusers_load(self, manifest):
         "default_params": dict(manifest.default_params),
         "path_exists": True,
         "pipeline": _FakePipeline(),
+    }
+
+
+class _FakeStepAwarePipeline:
+    """Fake pipeline that mimics diffusers' callback_on_step_end support."""
+
+    def __init__(self, num_steps_actual: int | None = None) -> None:
+        self.num_steps_actual = num_steps_actual
+        self.steps_invoked = 0
+
+    def __call__(
+        self,
+        *,
+        prompt,
+        negative_prompt=None,
+        width=64,
+        height=64,
+        guidance_scale=7.5,
+        num_inference_steps=30,
+        callback_on_step_end=None,
+        **kwargs,
+    ):
+        total_steps = self.num_steps_actual or num_inference_steps
+        for step_index in range(total_steps):
+            self.steps_invoked = step_index + 1
+            if callback_on_step_end is not None:
+                callback_on_step_end(self, step_index, 0, {})
+        return _FakePipelineResult(Image.new("RGB", (width, height), color=(7, 8, 9)))
+
+    def to(self, device: str) -> "_FakeStepAwarePipeline":
+        return self
+
+
+def _fake_diffusers_load_step_aware(self, manifest):
+    return {
+        "stub": False,
+        "loader": self.__class__.__name__,
+        "manifest_id": manifest.id,
+        "display_name": manifest.display_name,
+        "runtime": manifest.runtime,
+        "provider": manifest.provider,
+        "local_path": manifest.local_path,
+        "remote_ref": manifest.remote_ref,
+        "dtype": manifest.dtype,
+        "load_dtype": "float32",
+        "torch_dtype": "float32",
+        "weight_dtype": "float16",
+        "variant": "fp16",
+        "device": "cpu",
+        "default_params": dict(manifest.default_params),
+        "path_exists": True,
+        "pipeline": _FakeStepAwarePipeline(),
     }
 
 
@@ -333,6 +392,78 @@ class ModelSystemTests(unittest.TestCase):
         self.assertTrue(cache.has("model-b"))
         self.assertEqual(cache.loaded_ids(), ["model-b"])
 
+    def test_runtime_cache_calls_on_evict_exactly_once_per_removal(self) -> None:
+        evicted: list[str] = []
+        cache = ModelRuntimeCache(
+            max_entries=1,
+            on_evict=lambda model_id, runtime_obj: evicted.append(model_id),
+        )
+        cache.put("model-a", {"id": "model-a"})
+        cache.put("model-b", {"id": "model-b"})  # evicts model-a
+        cache.put("model-c", {"id": "model-c"})  # evicts model-b
+        cache.unload("model-c")
+        cache.unload("missing-model")  # no-op, must not call on_evict
+
+        self.assertEqual(evicted, ["model-a", "model-b", "model-c"])
+
+    def test_runtime_cache_unload_all_calls_on_evict_for_every_entry(self) -> None:
+        evicted: list[str] = []
+        cache = ModelRuntimeCache(
+            max_entries=2,
+            on_evict=lambda model_id, runtime_obj: evicted.append(model_id),
+        )
+        cache.put("model-a", {"id": "model-a"})
+        cache.put("model-b", {"id": "model-b"})
+        cache.unload_all()
+
+        self.assertEqual(sorted(evicted), ["model-a", "model-b"])
+        self.assertEqual(cache.loaded_ids(), [])
+
+    def test_runtime_cache_survives_failing_on_evict_hook(self) -> None:
+        def _broken_hook(model_id: str, runtime_obj: object) -> None:
+            raise RuntimeError("boom")
+
+        cache = ModelRuntimeCache(max_entries=1, on_evict=_broken_hook)
+        cache.put("model-a", {"id": "model-a"})
+        cache.put("model-b", {"id": "model-b"})  # triggers the broken hook
+
+        self.assertEqual(cache.loaded_ids(), ["model-b"])
+        cache.unload("model-b")  # must not raise
+        self.assertEqual(cache.loaded_ids(), [])
+
+    def test_release_runtime_resets_lora_moves_pipeline_and_drops_references(self) -> None:
+        pipeline = _FakePipeline()
+        runtime_obj = {
+            "manifest_id": "sdxl-local",
+            "pipeline": pipeline,
+            "active_lora_path": "/models/loras/example.safetensors",
+            "active_lora_adapter": "lora_abc123",
+            "active_lora_scale": 0.8,
+        }
+
+        release_runtime("sdxl-local", runtime_obj)
+
+        self.assertEqual(pipeline.unload_calls, 1)
+        self.assertEqual(pipeline.to_calls, ["cpu"])
+        self.assertNotIn("pipeline", runtime_obj)
+        self.assertNotIn("active_lora_path", runtime_obj)
+        self.assertNotIn("active_lora_adapter", runtime_obj)
+        self.assertNotIn("active_lora_scale", runtime_obj)
+
+    def test_release_runtime_ignores_non_dict_and_missing_pipeline(self) -> None:
+        release_runtime("opaque-runtime", object())  # must not raise
+        release_runtime("bare-runtime", {"manifest_id": "storyboard-local"})  # must not raise
+
+    def test_release_runtime_survives_pipeline_to_failure(self) -> None:
+        class _BrokenPipeline:
+            def to(self, device: str) -> None:
+                raise RuntimeError("device move failed")
+
+        runtime_obj = {"pipeline": _BrokenPipeline()}
+        release_runtime("broken-model", runtime_obj)  # must not raise
+
+        self.assertNotIn("pipeline", runtime_obj)
+
     def test_model_service_reuses_cached_runtime(self) -> None:
         with patch("core.models.loader.DiffusersImageLoader.load", new=_fake_diffusers_load):
             service = create_default_model_service()
@@ -468,6 +599,253 @@ class ModelSystemTests(unittest.TestCase):
             self.assertIn("quality_report", result.metadata)
             self.assertIn("semantic_report", result.metadata["quality_report"])
             self.assertTrue(Path(result.outputs[0]).exists())
+
+    def test_image_generator_rejects_invalid_variation_count(self) -> None:
+        generator = ImageGenerator(create_default_model_service())
+
+        for value in (0, 5, 1.5, "2", True):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "variation_count.*(?:integer|between 1 and 4)",
+                ):
+                    generator.validate_request(
+                        GenerationRequest(
+                            media_type="image",
+                            prompt="Variation validation",
+                            model_id="sdxl",
+                            params={"variation_count": value},
+                        )
+                    )
+
+    def test_image_generator_creates_reproducible_variations(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir) / "outputs"
+            with patch(
+                "core.models.loader.DiffusersImageLoader.load",
+                new=_fake_diffusers_load,
+            ):
+                service = create_default_model_service()
+                generator = ImageGenerator(service, output_dir=output_dir)
+                result = generator.run(
+                    GenerationRequest(
+                        media_type="image",
+                        prompt="Three reproducible variations",
+                        model_id="sdxl",
+                        seed=100,
+                        params={
+                            "steps": 2,
+                            "width": 64,
+                            "height": 64,
+                            "variation_count": 3,
+                        },
+                    )
+                )
+                pipeline = service.get_runtime(
+                    "sdxl",
+                    "image",
+                    "text-to-image",
+                )["pipeline"]
+
+            self.assertEqual(len(result.outputs), 3)
+            self.assertEqual(len(pipeline.calls), 3)
+            self.assertEqual(
+                [call["generator"].initial_seed() for call in pipeline.calls],
+                [100, 101, 102],
+            )
+            self.assertEqual(result.metadata["base_seed"], 100)
+            self.assertEqual(result.metadata["variation_count"], 3)
+            self.assertEqual(
+                [
+                    (item["variation_index"], item["seed"])
+                    for item in result.metadata["variations"]
+                ],
+                [(0, 100), (1, 101), (2, 102)],
+            )
+            self.assertTrue(all(Path(path).exists() for path in result.outputs))
+
+    def test_image_generator_persists_random_base_seed(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir) / "outputs"
+            with (
+                patch(
+                    "core.models.loader.DiffusersImageLoader.load",
+                    new=_fake_diffusers_load,
+                ),
+                patch("generators.image.generator.secrets.randbits", return_value=900),
+            ):
+                service = create_default_model_service()
+                result = ImageGenerator(service, output_dir=output_dir).run(
+                    GenerationRequest(
+                        media_type="image",
+                        prompt="Random seed becomes reproducible",
+                        model_id="sdxl",
+                        params={
+                            "steps": 1,
+                            "width": 64,
+                            "height": 64,
+                            "variation_count": 2,
+                        },
+                    )
+                )
+
+            self.assertEqual(result.metadata["base_seed"], 900)
+            self.assertEqual(
+                [item["seed"] for item in result.metadata["variations"]],
+                [900, 901],
+            )
+
+    def test_image_generator_reports_diffusers_step_progress(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir) / "outputs"
+            reported_progress: list[float] = []
+            context = GenerationContext(
+                is_cancelled=lambda: False,
+                on_progress=reported_progress.append,
+                min_interval_seconds=0.0,
+                min_progress_delta=0.0,
+            )
+            with patch(
+                "core.models.loader.DiffusersImageLoader.load",
+                new=_fake_diffusers_load_step_aware,
+            ):
+                service = create_default_model_service()
+                generator = ImageGenerator(service, output_dir=output_dir)
+
+                result = generator.run(
+                    GenerationRequest(
+                        media_type="image",
+                        prompt="A four-step progress check",
+                        model_id="sdxl",
+                        params={"steps": 4, "width": 64, "height": 64},
+                    ),
+                    context,
+                )
+                pipeline = service.get_runtime(
+                    "sdxl",
+                    "image",
+                    "text-to-image",
+                )["pipeline"]
+
+            self.assertEqual(reported_progress, [0.25, 0.5, 0.75, 1.0])
+            self.assertEqual(pipeline.steps_invoked, 4)
+            self.assertTrue(Path(result.outputs[0]).exists())
+
+    def test_image_generator_reports_progress_across_all_variations(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir) / "outputs"
+            reported_progress: list[float] = []
+            context = GenerationContext(
+                is_cancelled=lambda: False,
+                on_progress=reported_progress.append,
+            )
+            with patch(
+                "core.models.loader.DiffusersImageLoader.load",
+                new=_fake_diffusers_load_step_aware,
+            ):
+                service = create_default_model_service()
+                generator = ImageGenerator(service, output_dir=output_dir)
+                generator.run(
+                    GenerationRequest(
+                        media_type="image",
+                        prompt="Two variations with aggregate progress",
+                        model_id="sdxl",
+                        seed=21,
+                        params={
+                            "steps": 2,
+                            "width": 64,
+                            "height": 64,
+                            "variation_count": 2,
+                        },
+                    ),
+                    context,
+                )
+
+            self.assertEqual(reported_progress, [0.25, 0.5, 0.75, 1.0])
+
+    def test_image_generator_stops_diffusers_pipeline_when_cancelled(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir) / "outputs"
+            cancellation_state = {"requested": False}
+
+            def _record_progress(fraction: float) -> None:
+                if fraction >= 0.5:
+                    cancellation_state["requested"] = True
+
+            context = GenerationContext(
+                is_cancelled=lambda: cancellation_state["requested"],
+                on_progress=_record_progress,
+                min_interval_seconds=0.0,
+                min_progress_delta=0.0,
+            )
+            with patch(
+                "core.models.loader.DiffusersImageLoader.load",
+                new=_fake_diffusers_load_step_aware,
+            ):
+                service = create_default_model_service()
+                generator = ImageGenerator(service, output_dir=output_dir)
+
+                with self.assertRaises(GenerationCancelled):
+                    generator.run(
+                        GenerationRequest(
+                            media_type="image",
+                            prompt="Cancel after the second step",
+                            model_id="sdxl",
+                            params={"steps": 4, "width": 64, "height": 64},
+                        ),
+                        context,
+                    )
+                pipeline = service.get_runtime(
+                    "sdxl",
+                    "image",
+                    "text-to-image",
+                )["pipeline"]
+
+            self.assertEqual(pipeline.steps_invoked, 2)
+            self.assertEqual(list(output_dir.glob("*")), [])
+
+    def test_image_generator_removes_completed_variations_when_later_one_is_cancelled(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir) / "outputs"
+            cancellation_state = {"requested": False}
+
+            def _record_progress(fraction: float) -> None:
+                if fraction >= 0.75:
+                    cancellation_state["requested"] = True
+
+            context = GenerationContext(
+                is_cancelled=lambda: cancellation_state["requested"],
+                on_progress=_record_progress,
+                min_interval_seconds=0.0,
+                min_progress_delta=0.0,
+            )
+            with patch(
+                "core.models.loader.DiffusersImageLoader.load",
+                new=_fake_diffusers_load_step_aware,
+            ):
+                service = create_default_model_service()
+                generator = ImageGenerator(service, output_dir=output_dir)
+
+                with self.assertRaises(GenerationCancelled):
+                    generator.run(
+                        GenerationRequest(
+                            media_type="image",
+                            prompt="Cancel during the second variation",
+                            model_id="sdxl",
+                            seed=300,
+                            params={
+                                "steps": 2,
+                                "width": 64,
+                                "height": 64,
+                                "variation_count": 2,
+                            },
+                        ),
+                        context,
+                    )
+
+            self.assertEqual(list(output_dir.glob("*")), [])
 
     def test_image_generator_loads_lora_from_request_params(self) -> None:
         with TemporaryDirectory() as tmp_dir:

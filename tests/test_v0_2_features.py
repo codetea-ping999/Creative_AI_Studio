@@ -149,6 +149,107 @@ class AssetRepositoryTests(unittest.TestCase):
 
         self.assertEqual([item.id for item in assets], [asset.id])
 
+    def test_sync_job_creates_per_variation_assets_with_effective_snapshots(self):
+        first_output = self.output_dir / "job-image-v1.png"
+        second_output = self.output_dir / "job-image-v2.png"
+        first_output.write_bytes(b"first")
+        second_output.write_bytes(b"second")
+        now = datetime.now()
+        job = JobRecord(
+            id="job-image",
+            project_id=None,
+            media_type="image",
+            status="succeeded",
+            request=GenerationRequest(
+                media_type="image",
+                prompt="Two image variations",
+                negative_prompt="text",
+                model_id="sdxl",
+                seed=100,
+                output_format="png",
+                params={"variation_count": 2},
+            ),
+            result=GenerationResult(
+                job_id="job-image",
+                status="succeeded",
+                outputs=[str(first_output), str(second_output)],
+                previews=[str(first_output), str(second_output)],
+                metadata={
+                    "model_id": "sdxl",
+                    "output_format": "png",
+                    "base_seed": 100,
+                    "variation_count": 2,
+                    "params": {
+                        "width": 1024,
+                        "height": 1024,
+                        "num_inference_steps": 30,
+                        "variation_count": 2,
+                    },
+                    "variations": [
+                        {
+                            "variation_index": 0,
+                            "seed": 100,
+                            "output_path": str(first_output),
+                            "preview_path": str(first_output),
+                            "params": {
+                                "width": 1024,
+                                "height": 1024,
+                                "num_inference_steps": 30,
+                                "variation_count": 1,
+                            },
+                            "quality_report": {"quality_score": 80.0},
+                        },
+                        {
+                            "variation_index": 1,
+                            "seed": 101,
+                            "output_path": str(second_output),
+                            "preview_path": str(second_output),
+                            "params": {
+                                "width": 1024,
+                                "height": 1024,
+                                "num_inference_steps": 30,
+                                "variation_count": 1,
+                            },
+                            "quality_report": {"quality_score": 81.0},
+                        },
+                    ],
+                },
+                error_message=None,
+            ),
+            progress=1.0,
+            error_message=None,
+            created_at=now,
+            updated_at=now,
+        )
+
+        assets = self.repo.sync_job(job)
+
+        self.assertEqual(len(assets), 2)
+        self.assertEqual(
+            [
+                (asset.metadata["variation_index"], asset.metadata["seed"])
+                for asset in assets
+            ],
+            [(0, 100), (1, 101)],
+        )
+        self.assertEqual(
+            [asset.metadata["request_snapshot"]["seed"] for asset in assets],
+            [100, 101],
+        )
+        self.assertEqual(
+            [
+                asset.metadata["request_snapshot"]["params"]["variation_count"]
+                for asset in assets
+            ],
+            [1, 1],
+        )
+        self.assertEqual(
+            assets[1].metadata["request_snapshot"]["params"][
+                "num_inference_steps"
+            ],
+            30,
+        )
+
     def _make_job(self, job_id: str, output_path: Path) -> JobRecord:
         output_path.write_bytes(b"GIF89a")
         now = datetime.now()

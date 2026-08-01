@@ -1233,8 +1233,15 @@ function App() {
         <div className="workspace-grid story-matrix-workspace">
           <LatestJobPanel
             latestJob={latestJob}
-            onCancel={() => {
-              void handleCancelLatestJob();
+            onCancel={handleCancelLatestJob}
+            jobAssets={
+              latestJob
+                ? galleryItems.filter((item) => item.job_id === latestJob.id)
+                : []
+            }
+            selectedAssetId={selectedAssetId}
+            onSelectAsset={(assetId) => {
+              void loadAssetDetail(assetId);
             }}
           />
 

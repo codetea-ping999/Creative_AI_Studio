@@ -114,7 +114,7 @@ OUTPUT_AUDIO_DIR=./outputs/audio
 | `MODELS_ROOT` | `./models` | モデル関連ルート |
 | `MODELS_MANIFEST_ROOT` | `./models/manifests` | manifest 探索先 |
 | `LORA_ROOT` | `./models/loras` | LoRA catalog 探索先 |
-| `MAX_CACHED_MODELS` | `1` | runtime cache の最大保持数 |
+| `MAX_CACHED_MODELS` | `1` | runtime cache の最大保持数。上限を超えて追い出された runtime は LoRA 解除・CPU 退避・参照解放・accelerator cache 解放（`torch.cuda.empty_cache()` / `torch.mps.empty_cache()`）まで行ってから破棄される（`core/models/cleanup.py`）。`unload_model` / `unload_all` も同じ解放経路を通る |
 
 ### 実装上の優先順
 

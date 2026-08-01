@@ -166,10 +166,15 @@ story を読み直すだけで、素材の紐付けを自分で管理する必�
   "params": {
     "width": 1024,
     "height": 1024,
-    "steps": 30
+    "steps": 30,
+    "variation_count": 1
   }
 }
 ```
+
+Image の `variation_count` は `1..4` の整数で、既定値は `1` です。複数生成では
+request の `seed`（省略時は生成時に確定して result へ保存）を base seed とし、
+variation index ごとに `base_seed + index` を使います。
 
 `task_type` は同一 media type 内の生成種別です。`null` は media type の既定 generator に
 ルーティングされます（後方互換）。現行の値: `story`（text）、`text-to-speech`（audio）、
@@ -218,7 +223,9 @@ queued | preparing | running | postprocessing | succeeded | failed | cancelled
 
 ### POST /jobs/{job_id}/cancel
 
-queued / running job を `cancelled` に更新します。  
+queued / running job を `cancelled` に更新します。queued job は実行されません。
+Diffusers image job は step callback で進捗を更新し、推論途中の cancel を協調的に
+検知します。その他の generator は現在、生成処理の前後の境界で cancel を検知します。
 すでに terminal status の job に対しては現行状態の `JobResponse` を返します。
 
 Response は `JobResponse`。
@@ -443,10 +450,12 @@ Query:
 
 派生生成を開始します。
 
-`action` は `"rerun"`（既定）または `"variation"` を指定します。`variation` は元の
-asset の seed を引き継ぎます。`rerun` で `seed` を省略するか `null` にすると、新しいランダム
-seed で同じ request を再実行します。レビュー画面からの派生理由など、UI 固有の補足情報は
-`params` に任意の JSON 値として保存できます。
+`action` は `"rerun"`（既定）または `"variation"` を指定します。`variation` は選択した
+asset 固有の seed と実効パラメータを引き継ぎます。複数生成の各 asset は
+`variation_count=1` の request snapshot を持つため、選択した1枚だけを再利用できます。
+`rerun` で `seed` を省略するか `null` にすると、新しいランダム seed で同じ request を
+再実行します。レビュー画面からの派生理由など、UI 固有の補足情報は `params` に任意の
+JSON 値として保存できます。
 
 Request:
 
@@ -519,10 +528,15 @@ Response は再バインド後の `GalleryAssetDetailResponse`。
     "width": 1024,
     "height": 1024,
     "steps": 30,
-    "guidance_scale": 7.5
+    "guidance_scale": 7.5,
+    "variation_count": 4
   }
 }
 ```
+
+`variation_count > 1` は逐次生成され、job progress は全 variation を通した `0..1` として
+集約されます。途中で1件でも失敗または cancel された場合は、その job で先に保存した
+output も削除し、部分成功の asset は作成しません。
 
 ### POST /generate/audio
 

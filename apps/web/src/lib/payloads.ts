@@ -21,6 +21,7 @@ function buildGenerationPayload(
         height: values.height,
         steps: values.steps,
         guidance_scale: values.guidanceScale,
+        variation_count: values.variationCount,
         ...(values.loraPath
           ? { lora_path: values.loraPath, lora_scale: values.loraScale }
           : {}),

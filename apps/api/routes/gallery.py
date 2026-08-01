@@ -48,6 +48,8 @@ class GalleryItemResponse(BaseModel):
     average_feedback_quality: float | None = None
     reuse_count: int = 0
     export_count: int = 0
+    variation_index: int | None = None
+    seed: int | None = None
     success: bool = True
 
 
@@ -170,6 +172,8 @@ def _serialize_gallery_item(
         average_feedback_quality=_number_or_none(feedback_summary.get("average_quality_rating")),
         reuse_count=int(asset.metadata.get("reuse_count", 0)),
         export_count=len(asset.export_paths),
+        variation_index=_integer_or_none(asset.metadata.get("variation_index")),
+        seed=_integer_or_none(asset.metadata.get("seed")),
         success=Path(asset.path).exists(),
     )
 
@@ -185,10 +189,11 @@ def _serialize_gallery_detail(
     feedback_summary = services.feedback_repository.summarize(asset_id=asset.id)
     quality_report = _extract_quality_report(asset, feedback_summary)
     summary = _serialize_gallery_item(asset, services)
+    request_snapshot = _request_from_asset(asset, source_job)
     return GalleryAssetDetailResponse(
         **summary.model_dump(),
         quality_report=quality_report,
-        request_snapshot=source_job.request.model_dump(mode="json"),
+        request_snapshot=request_snapshot.model_dump(mode="json"),
         metadata=dict(asset.metadata),
         feedback_summary=feedback_summary,
         export_paths=list(asset.export_paths),
@@ -242,8 +247,9 @@ def _build_reuse_request(
     if project_id is not None and services.project_repository.get(project_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
 
+    source_request = _request_from_asset(source_asset, source_job)
     selected_model_id = (
-        req.model_id if req.model_id is not None else source_job.request.model_id
+        req.model_id if req.model_id is not None else source_request.model_id
     )
     if req.action == "melody":
         _validate_melody_reuse(
@@ -253,20 +259,20 @@ def _build_reuse_request(
         )
 
     next_params = {
-        **dict(source_job.request.params),
+        **dict(source_request.params),
         **dict(req.params),
         "source_asset_id": source_asset.id,
         "source_job_id": source_asset.job_id,
         "reference_asset_path": source_asset.path,
         "reuse_action": req.action,
     }
-    generation_request = source_job.request.model_copy(
+    generation_request = source_request.model_copy(
         update={
-            "prompt": req.prompt if req.prompt is not None else source_job.request.prompt,
+            "prompt": req.prompt if req.prompt is not None else source_request.prompt,
             "negative_prompt": (
                 req.negative_prompt
                 if req.negative_prompt is not None
-                else source_job.request.negative_prompt
+                else source_request.negative_prompt
             ),
             "model_id": selected_model_id,
             "seed": (
@@ -274,17 +280,30 @@ def _build_reuse_request(
                 if req.seed is not None
                 else secrets.randbits(63)
                 if req.action == "rerun"
-                else source_job.request.seed
+                else source_request.seed
             ),
             "output_format": (
                 req.output_format
                 if req.output_format is not None
-                else source_job.request.output_format
+                else source_request.output_format
             ),
             "params": next_params,
         }
     )
     return generation_request, project_id
+
+
+def _request_from_asset(
+    source_asset: Asset,
+    source_job,
+) -> GenerationRequest:
+    snapshot = source_asset.metadata.get("request_snapshot")
+    if isinstance(snapshot, dict):
+        try:
+            return GenerationRequest.model_validate(snapshot)
+        except (TypeError, ValueError):
+            pass
+    return source_job.request
 
 
 def _validate_melody_reuse(
@@ -505,6 +524,12 @@ def _number_or_none(value: object) -> float | None:
     if isinstance(value, (int, float)):
         return float(value)
     return None
+
+
+def _integer_or_none(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
 
 
 def _string_or_none(value: object) -> str | None:

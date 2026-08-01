@@ -20,6 +20,7 @@ const baseValues: PromptFormSubmitValues = {
   loraPath: "",
   loraScale: 0.8,
   seed: 42,
+  variationCount: 3,
   durationSeconds: 8,
   extendStrideSeconds: null,
   bpm: 96,
@@ -41,7 +42,12 @@ describe("generation payloads", () => {
       model_id: "sdxl",
       project_id: "project-1",
       output_format: "png",
-      params: { width: 1024, height: 1024, steps: 30 },
+      params: {
+        width: 1024,
+        height: 1024,
+        steps: 30,
+        variation_count: 3,
+      },
     });
     expect(withoutLora.params).not.toHaveProperty("lora_path");
 

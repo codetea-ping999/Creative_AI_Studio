@@ -14,6 +14,7 @@ from .events import EventBus
 if TYPE_CHECKING:
     from core.assets import AssetRepository
     from core.storage.repositories.job_repository import JobRepository
+    from .cancellation import CancellationRegistry
 from .schemas import JobRecord
 from .statuses import (
     ACTIVE_JOB_STATUSES,
@@ -46,11 +47,13 @@ class JobService:
         job_queue: object,
         event_bus: EventBus | None = None,
         asset_repository: AssetRepository | None = None,
+        cancellation_registry: "CancellationRegistry | None" = None,
     ) -> None:
         self.job_repository = job_repository
         self.job_queue = job_queue
         self.event_bus = event_bus
         self.asset_repository = asset_repository
+        self.cancellation_registry = cancellation_registry
 
     def create_job(
         self,
@@ -185,6 +188,11 @@ class JobService:
         )
         if job is None:
             return self.get_job(job_id)
+        # A running worker has already registered its Event. For a queued job
+        # this is a harmless no-op; its persisted cancelled status prevents
+        # JobRunner from starting it later.
+        if self.cancellation_registry is not None:
+            self.cancellation_registry.request_cancel(job_id)
         self._publish(
             "job_cancelled",
             {

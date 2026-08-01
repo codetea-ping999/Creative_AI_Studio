@@ -65,6 +65,8 @@ models/
 - `task_type`: `text-to-image` などの用途
 - `provider`: `local`, `huggingface`, `mlx` などの供給元
 - `runtime`: `diffusers`, `transformers`, `mlx` などの実行系
+- `family`: `sdxl`, `flux` など loader が pipeline class を選ぶためのモデル系統
+- `variant`: `fp16` など明示的に読み込む weight variant。不要なモデルでは省略
 - `local_path`: ローカル保存先
 - `remote_ref`: 将来の取得元参照
 - `loader`: 呼び出す loader 名

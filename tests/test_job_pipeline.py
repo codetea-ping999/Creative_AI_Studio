@@ -13,7 +13,8 @@ CORE_IMPORT_ERROR: Exception | None = None
 
 try:
     from bootstrap import create_application_services
-    from core.jobs import EventBus, JobQueue, JobRunner, JobService
+    from core.jobs import CancellationRegistry, EventBus, JobQueue, JobRunner, JobService
+    from core.jobs.context import GenerationCancelled, GenerationContext
     from core.schemas import GenerationRequest, GenerationResult
     from core.storage.repositories.job_repository import JobRepository
     from generators.base import BaseGenerator
@@ -39,7 +40,7 @@ if CORE_IMPORT_ERROR is None:
         def prepare(self, request: GenerationRequest) -> None:
             return None
 
-        def generate(self, request: GenerationRequest):
+        def generate(self, request: GenerationRequest, context=None):
             raise RuntimeError("stub generation failure")
 
         def cleanup(self, request: GenerationRequest) -> None:
@@ -55,7 +56,7 @@ if CORE_IMPORT_ERROR is None:
         def prepare(self, request: GenerationRequest) -> None:
             self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        def generate(self, request: GenerationRequest):
+        def generate(self, request: GenerationRequest, context=None):
             output_path = self.output_dir / "stub.wav"
             output_path.write_bytes(b"RIFFstub")
             from core.schemas import GenerationResult
@@ -85,7 +86,7 @@ if CORE_IMPORT_ERROR is None:
         def prepare(self, request: GenerationRequest) -> None:
             self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        def generate(self, request: GenerationRequest):
+        def generate(self, request: GenerationRequest, context=None):
             self._on_generate()
             output_path = self.output_dir / "stub.wav"
             output_path.write_bytes(b"RIFFstub")
@@ -97,6 +98,86 @@ if CORE_IMPORT_ERROR is None:
                 outputs=[str(output_path)],
                 previews=[],
                 metadata={"media_type": "audio"},
+                error_message=None,
+            )
+
+        def cleanup(self, request: GenerationRequest) -> None:
+            return None
+
+    class _StepReportingGenerator(BaseGenerator):
+        """Mimics a Diffusers-style step loop that reports progress via context
+        and checks for cancellation after every step, like ImageGenerator's
+        callback_on_step_end integration."""
+
+        def __init__(
+            self,
+            output_dir: Path,
+            total_steps: int,
+            cancel_after_step: int | None = None,
+            on_cancel_step=None,
+        ) -> None:
+            self.output_dir = output_dir
+            self.total_steps = total_steps
+            self.cancel_after_step = cancel_after_step
+            self.on_cancel_step = on_cancel_step
+            self.steps_run = 0
+            self.reported_fractions: list[float] = []
+
+        def validate_request(self, request: GenerationRequest) -> None:
+            return None
+
+        def prepare(self, request: GenerationRequest) -> None:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        def generate(self, request: GenerationRequest, context=None):
+            for step in range(1, self.total_steps + 1):
+                self.steps_run = step
+                fraction = step / self.total_steps
+                if context is not None:
+                    context.report_progress(fraction)
+                    self.reported_fractions.append(fraction)
+                if self.cancel_after_step is not None and step == self.cancel_after_step:
+                    # Simulate an external cancel request landing exactly here.
+                    assert self.on_cancel_step is not None
+                    self.on_cancel_step()
+                if context is not None:
+                    context.raise_if_cancelled()
+
+            output_path = self.output_dir / "step-stub.wav"
+            output_path.write_bytes(b"RIFFstub")
+            return GenerationResult(
+                job_id="step-stub",
+                status="succeeded",
+                outputs=[str(output_path)],
+                previews=[],
+                metadata={"media_type": "audio"},
+                error_message=None,
+            )
+
+        def cleanup(self, request: GenerationRequest) -> None:
+            return None
+
+    class _LegacyContextFreeGenerator(BaseGenerator):
+        """Generator written before GenerationContext was introduced."""
+
+        def __init__(self, output_dir: Path) -> None:
+            self.output_dir = output_dir
+
+        def validate_request(self, request: GenerationRequest) -> None:
+            return None
+
+        def prepare(self, request: GenerationRequest) -> None:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        def generate(self, request: GenerationRequest):
+            output_path = self.output_dir / "legacy.wav"
+            output_path.write_bytes(b"RIFFlegacy")
+            return GenerationResult(
+                job_id="legacy-context-free",
+                status="succeeded",
+                outputs=[str(output_path)],
+                previews=[],
+                metadata={"legacy_context_free": True},
                 error_message=None,
             )
 
@@ -163,6 +244,40 @@ def _fake_diffusers_load(self, manifest):
 
 @unittest.skipIf(CORE_IMPORT_ERROR is not None, f"missing dependency: {CORE_IMPORT_ERROR}")
 class JobPipelineTests(unittest.TestCase):
+    def test_generation_context_throttles_and_keeps_progress_monotonic(self) -> None:
+        reported: list[float] = []
+        context = GenerationContext(
+            is_cancelled=lambda: False,
+            on_progress=reported.append,
+            min_interval_seconds=60.0,
+            min_progress_delta=0.2,
+        )
+
+        for fraction in (0.1, 0.15, 0.05, 0.31, 1.2):
+            context.report_progress(fraction)
+
+        self.assertEqual(reported, [0.1, 0.31, 1.0])
+
+    def test_base_generator_keeps_legacy_context_free_generate_compatible(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            generator = _LegacyContextFreeGenerator(Path(tmp_dir))
+            context = GenerationContext(is_cancelled=lambda: False)
+
+            result = generator.run(
+                GenerationRequest(
+                    media_type="audio",
+                    prompt="legacy compatibility",
+                    model_id="",
+                    output_format="wav",
+                ),
+                context,
+            )
+
+            self.assertTrue(result.metadata["legacy_context_free"])
+            self.assertTrue(Path(result.outputs[0]).exists())
+
     @unittest.skipIf(API_IMPORT_ERROR is not None, f"missing dependency: {API_IMPORT_ERROR}")
     def test_generate_image_job_runs_end_to_end(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -208,6 +323,58 @@ class JobPipelineTests(unittest.TestCase):
                 list_response = client.get("/jobs")
                 self.assertEqual(list_response.status_code, 200)
                 self.assertEqual(len(list_response.json()), 1)
+
+    @unittest.skipIf(API_IMPORT_ERROR is not None, f"missing dependency: {API_IMPORT_ERROR}")
+    def test_generate_image_variations_register_every_output_in_gallery(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            with patch("core.models.loader.DiffusersImageLoader.load", new=_fake_diffusers_load):
+                root = Path(tmp_dir)
+                services = create_application_services(
+                    db_path=root / "jobs.db",
+                    output_dir=root / "outputs" / "images",
+                )
+                client = TestClient(create_app(services, start_job_runner=False))
+
+                create_response = client.post(
+                    "/generate/image",
+                    json={
+                        "prompt": "Three gallery variations",
+                        "model_id": "sdxl",
+                        "seed": 50,
+                        "params": {
+                            "steps": 1,
+                            "width": 64,
+                            "height": 64,
+                            "variation_count": 3,
+                        },
+                    },
+                )
+                self.assertEqual(create_response.status_code, 201)
+                job_id = create_response.json()["job_id"]
+
+                completed_job = services.job_runner.run_once()
+                self.assertIsNotNone(completed_job)
+                assert completed_job is not None
+                self.assertEqual(completed_job.status, "succeeded")
+                self.assertEqual(len(completed_job.result.outputs), 3)
+
+                gallery_response = client.get("/gallery?media_type=image")
+                self.assertEqual(gallery_response.status_code, 200)
+                gallery_items = sorted(
+                    gallery_response.json(),
+                    key=lambda item: item["variation_index"],
+                )
+                self.assertEqual(len(gallery_items), 3)
+                self.assertTrue(
+                    all(item["job_id"] == job_id for item in gallery_items)
+                )
+                self.assertEqual(
+                    [
+                        (item["variation_index"], item["seed"])
+                        for item in gallery_items
+                    ],
+                    [(0, 50), (1, 51), (2, 52)],
+                )
 
     def test_runner_marks_job_failed_when_generator_raises(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -432,6 +599,123 @@ class JobPipelineTests(unittest.TestCase):
             persisted = repository.get(job.id)
             assert persisted is not None
             self.assertEqual(persisted.status, "cancelled")
+
+    def test_runner_reports_step_progress_through_context(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            repository = JobRepository(root / "jobs.db")
+            queue = JobQueue()
+            event_bus = EventBus()
+            cancellation_registry = CancellationRegistry()
+            service = JobService(
+                repository,
+                queue,
+                event_bus,
+                cancellation_registry=cancellation_registry,
+            )
+            generator = _StepReportingGenerator(root / "outputs" / "audio", total_steps=5)
+            registry = GeneratorRegistry({"audio": generator})
+            runner = JobRunner(
+                repository,
+                queue,
+                registry,
+                event_bus,
+                job_service=service,
+                cancellation_registry=cancellation_registry,
+            )
+
+            job = service.create_job(
+                GenerationRequest(
+                    media_type="audio",
+                    prompt="watch me climb",
+                    model_id="",
+                    output_format="wav",
+                    params={},
+                )
+            )
+
+            final_job = runner.run_once()
+
+            self.assertIsNotNone(final_job)
+            assert final_job is not None
+            self.assertEqual(final_job.status, "succeeded")
+            self.assertEqual(generator.reported_fractions, [0.2, 0.4, 0.6, 0.8, 1.0])
+
+            progress_events = [
+                event.payload["progress"]
+                for event in event_bus.list_events()
+                if event.type == "job_progress"
+            ]
+            # Progress climbs monotonically within the running band (0.1-0.9)
+            # and every write lands strictly inside that band since the
+            # reported fractions never reach 0.0 or 1.0 at step boundaries
+            # that would exceed it.
+            self.assertEqual(len(progress_events), 5)
+            self.assertEqual(progress_events, sorted(progress_events))
+            for value in progress_events:
+                self.assertGreaterEqual(value, 0.1)
+                self.assertLessEqual(value, 0.9)
+
+    def test_runner_cancels_mid_generation_via_context(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            repository = JobRepository(root / "jobs.db")
+            queue = JobQueue()
+            event_bus = EventBus()
+            cancellation_registry = CancellationRegistry()
+            service = JobService(
+                repository,
+                queue,
+                event_bus,
+                cancellation_registry=cancellation_registry,
+            )
+
+            job_holder: dict[str, str] = {}
+
+            def _cancel_via_service() -> None:
+                service.cancel_job(job_holder["id"])
+
+            generator = _StepReportingGenerator(
+                root / "outputs" / "audio",
+                total_steps=5,
+                cancel_after_step=2,
+                on_cancel_step=_cancel_via_service,
+            )
+            registry = GeneratorRegistry({"audio": generator})
+            runner = JobRunner(
+                repository,
+                queue,
+                registry,
+                event_bus,
+                job_service=service,
+                cancellation_registry=cancellation_registry,
+            )
+
+            job = service.create_job(
+                GenerationRequest(
+                    media_type="audio",
+                    prompt="cancel me at step 2 of 5",
+                    model_id="",
+                    output_format="wav",
+                    params={},
+                )
+            )
+            job_holder["id"] = job.id
+
+            final_job = runner.run_once()
+
+            self.assertIsNotNone(final_job)
+            assert final_job is not None
+            self.assertEqual(final_job.status, "cancelled")
+            # The generator observed the cancel via context.raise_if_cancelled()
+            # right after step 2 and never ran steps 3-5.
+            self.assertEqual(generator.steps_run, 2)
+            self.assertFalse((root / "outputs" / "audio" / "step-stub.wav").exists())
+
+            persisted = repository.get(job.id)
+            assert persisted is not None
+            self.assertEqual(persisted.status, "cancelled")
+            self.assertNotEqual(persisted.status, "succeeded")
 
     @unittest.skipIf(API_IMPORT_ERROR is not None, f"missing dependency: {API_IMPORT_ERROR}")
     def test_gallery_job_recovers_when_success_precedes_asset_sync(self) -> None:

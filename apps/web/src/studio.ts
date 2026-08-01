@@ -93,6 +93,8 @@ export type GalleryItemResponse = {
   average_feedback_quality: number | null;
   reuse_count: number;
   export_count: number;
+  variation_index: number | null;
+  seed: number | null;
   success: boolean;
 };
 
@@ -200,6 +202,7 @@ export const defaultSubmitValues: Record<MediaType, PromptFormSubmitValues> = {
     loraPath: "",
     loraScale: 0.8,
     seed: null,
+    variationCount: 1,
     durationSeconds: 8,
     extendStrideSeconds: null,
     bpm: 96,
@@ -229,6 +232,7 @@ export const defaultSubmitValues: Record<MediaType, PromptFormSubmitValues> = {
     loraPath: "",
     loraScale: 0.8,
     seed: null,
+    variationCount: 1,
     durationSeconds: 8,
     extendStrideSeconds: null,
     bpm: 96,
@@ -258,6 +262,7 @@ export const defaultSubmitValues: Record<MediaType, PromptFormSubmitValues> = {
     loraPath: "",
     loraScale: 0.8,
     seed: null,
+    variationCount: 1,
     durationSeconds: 4,
     extendStrideSeconds: null,
     bpm: 96,
@@ -377,12 +382,18 @@ export function createDraftFromRequestSnapshot(
       negativePrompt: request.negative_prompt ?? "",
       width: asNumber(params.width) ?? defaultSubmitValues.image.width,
       height: asNumber(params.height) ?? defaultSubmitValues.image.height,
-      steps: asNumber(params.steps) ?? defaultSubmitValues.image.steps,
+      steps:
+        asNumber(params.num_inference_steps) ??
+        asNumber(params.steps) ??
+        defaultSubmitValues.image.steps,
       guidanceScale:
         asNumber(params.guidance_scale) ?? defaultSubmitValues.image.guidanceScale,
       loraPath: asString(params.lora_path) ?? "",
       loraScale: asNumber(params.lora_scale) ?? defaultSubmitValues.image.loraScale,
       seed: request.seed,
+      variationCount:
+        asNumber(params.variation_count) ??
+        defaultSubmitValues.image.variationCount,
     };
   }
 

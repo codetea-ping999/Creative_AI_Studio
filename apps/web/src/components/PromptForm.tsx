@@ -59,6 +59,7 @@ function createInitialState(
     loraPath: merged.loraPath,
     loraScale: String(merged.loraScale),
     seed: merged.seed === null ? "" : String(merged.seed),
+    variationCount: String(merged.variationCount),
     durationSeconds: String(merged.durationSeconds),
     extendStrideSeconds:
       merged.extendStrideSeconds === null ? "" : String(merged.extendStrideSeconds),
@@ -117,6 +118,10 @@ function serializeDraft(
     loraPath: formValues.loraPath.trim(),
     loraScale: parseRequiredFloat(formValues.loraScale, defaultValues.loraScale),
     seed: parseOptionalInteger(formValues.seed),
+    variationCount: parseRequiredInteger(
+      formValues.variationCount,
+      defaultValues.variationCount,
+    ),
     durationSeconds: parseRequiredInteger(
       formValues.durationSeconds,
       defaultValues.durationSeconds,
@@ -457,6 +462,10 @@ export function PromptForm({
       loraPath: formValues.loraPath.trim(),
       loraScale: parseRequiredFloat(formValues.loraScale, defaultValues.loraScale),
       seed: parseOptionalInteger(formValues.seed),
+      variationCount: parseRequiredInteger(
+        formValues.variationCount,
+        defaultValues.variationCount,
+      ),
       durationSeconds: parseRequiredInteger(
         formValues.durationSeconds,
         defaultValues.durationSeconds,
@@ -956,6 +965,27 @@ export function PromptForm({
                 disabled={disabled}
               />
             </label>
+            <div className="field-group">
+              <label htmlFor="variation-count">Variations</label>
+              <input
+                id="variation-count"
+                type="number"
+                inputMode="numeric"
+                min="1"
+                max="4"
+                step="1"
+                name="variationCount"
+                value={formValues.variationCount}
+                onChange={(event) =>
+                  setFieldValue("variationCount", event.target.value)
+                }
+                aria-describedby="variation-count-hint"
+                disabled={disabled}
+              />
+              <small id="variation-count-hint" className="field-hint">
+                Generate 1–4 reproducible seed variations.
+              </small>
+            </div>
             <label className="field-group">
               <span>LoRA Scale</span>
               <input

@@ -142,6 +142,29 @@ describe("PromptForm", () => {
     );
   });
 
+  it("submits an image variation count between one and four", async () => {
+    const user = userEvent.setup();
+    const handleSubmit = vi.fn();
+
+    render(
+      <PromptForm
+        mediaType="image"
+        modelOptions={[storyboardModel]}
+        initialValues={{ prompt: "Three lighting passes" }}
+        onSubmit={handleSubmit}
+      />,
+    );
+
+    await user.click(screen.getByRole("tab", { name: "Advanced" }));
+    await user.clear(screen.getByLabelText("Variations"));
+    await user.type(screen.getByLabelText("Variations"), "3");
+    await user.click(screen.getByRole("button", { name: "Generate" }));
+
+    expect(handleSubmit).toHaveBeenCalledWith(
+      expect.objectContaining({ variationCount: 3 }),
+    );
+  });
+
   it("shows and submits long-form duration and stride only for long-form models", async () => {
     const user = userEvent.setup();
     const handleSubmit = vi.fn();
@@ -434,6 +457,7 @@ describe("studio helpers", () => {
       height: 180,
       steps: 30,
       guidanceScale: 7.5,
+      variationCount: 1,
       loraPath: "",
       loraScale: 0.8,
       seed: 123,

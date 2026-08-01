@@ -33,6 +33,7 @@ export type PromptFormState = {
   loraPath: string;
   loraScale: string;
   seed: string;
+  variationCount: string;
   durationSeconds: string;
   extendStrideSeconds: string;
   bpm: string;
@@ -63,6 +64,7 @@ export type PromptFormSubmitValues = {
   loraPath: string;
   loraScale: number;
   seed: number | null;
+  variationCount: number;
   durationSeconds: number;
   extendStrideSeconds: number | null;
   bpm: number;
