@@ -298,6 +298,63 @@ class BatchApiTests(unittest.TestCase):
             listing = studio.client.get("/batches").json()
             self.assertEqual(len(listing["items"]), 1)
 
+    def test_gallery_items_carry_their_batch_id_and_support_batch_filtering(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            studio = _Studio(Path(tmp_dir))
+            batch = studio.client.post(
+                "/batches",
+                json={
+                    "spec": {
+                        "name": "logline sweep",
+                        "media_type": "text",
+                        "task_type": "story",
+                        "model_id": "template-writer",
+                        "prompt": "a heist in a rainy city",
+                        "params": {"task": "logline", "count": 1},
+                        "axes": [
+                            {
+                                "name": "tone",
+                                "values": [
+                                    {"label": "tense", "patch": {"params": {"tone": "tense"}}},
+                                    {"label": "playful", "patch": {"params": {"tone": "playful"}}},
+                                ],
+                            }
+                        ],
+                        "seed_policy": "per_item",
+                    }
+                },
+            ).json()
+            studio.drain()
+
+            # An unrelated, non-batch job must not be swept into the batch filter.
+            studio.client.post(
+                "/generate/text",
+                json={
+                    "prompt": "a lone standing job",
+                    "model_id": "template-writer",
+                    "params": {"task": "logline", "count": 1},
+                },
+            )
+            studio.drain()
+
+            gallery = studio.client.get("/gallery", params={"media_type": "text"}).json()
+            self.assertEqual(len(gallery), 3)
+            batch_items = [item for item in gallery if item["batch_id"] == batch["id"]]
+            self.assertEqual(len(batch_items), 2)
+            self.assertTrue(all(item["batch_label"] for item in batch_items))
+            standalone_items = [item for item in gallery if item["batch_id"] is None]
+            self.assertEqual(len(standalone_items), 1)
+
+            filtered = studio.client.get(
+                "/gallery",
+                params={"media_type": "text", "batch_id": batch["id"]},
+            ).json()
+            self.assertEqual(len(filtered), 2)
+            self.assertTrue(all(item["batch_id"] == batch["id"] for item in filtered))
+
+            detail = studio.client.get(f"/gallery/{batch_items[0]['asset_id']}").json()
+            self.assertEqual(detail["batch_id"], batch["id"])
+
     def test_two_stage_batch_advances_after_the_probe(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             studio = _Studio(Path(tmp_dir))

@@ -63,6 +63,8 @@ const baseAsset: GalleryItemResponse = {
   variation_index: 0,
   seed: 42,
   success: true,
+  batch_id: null,
+  batch_label: null,
 };
 
 afterEach(() => {

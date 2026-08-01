@@ -55,9 +55,13 @@ const quickReviewIssueOptions: readonly QuickReviewIssueOption[] = [
 ];
 
 export function getQuickReviewIssueOptions(
-  mediaType: MediaType,
+  // Widened past MediaType so a Gallery text asset's detail view can call this
+  // too; none of the options list "text", so it correctly resolves to none.
+  mediaType: MediaType | "text",
 ): readonly QuickReviewIssueOption[] {
-  return quickReviewIssueOptions.filter((option) => option.mediaTypes.includes(mediaType));
+  return quickReviewIssueOptions.filter((option) =>
+    (option.mediaTypes as readonly string[]).includes(mediaType),
+  );
 }
 
 export function buildQuickReviewPrompt(

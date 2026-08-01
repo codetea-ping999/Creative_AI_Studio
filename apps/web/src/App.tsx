@@ -32,6 +32,7 @@ import {
   type FeedbackResponse,
   type GalleryAssetDetailResponse,
   type GalleryItemResponse,
+  type GalleryMediaType,
   type GalleryStatsResponse,
   type JobResponse,
   type LoraCatalogResponse,
@@ -51,6 +52,17 @@ const mediaTypeReadinessLabels: Record<MediaType, string> = {
   audio: "音声",
   video: "動画",
 };
+
+/**
+ * Gallery assets can be `media_type: "text"` (Story surface output), but the
+ * composer's reuse/quick-review/feedback flows below predate that and have no
+ * text branch (no `defaultSubmitValues.text`, no text tab). Reusing a text
+ * asset through the composer is out of scope here — this narrows back to the
+ * type those flows already assumed.
+ */
+function toComposerMediaType(mediaType: GalleryMediaType): MediaType {
+  return mediaType as MediaType;
+}
 
 type AssetReuseOptions = {
   action?: "rerun" | "variation" | "melody";
@@ -88,6 +100,7 @@ function App() {
   const [projectStatusDraft, setProjectStatusDraft] = useState("active");
   const [projectTagsDraft, setProjectTagsDraft] = useState("");
   const [gallerySearch, setGallerySearch] = useState("");
+  const [galleryBatchFilter, setGalleryBatchFilter] = useState<string | null>(null);
   const [galleryItems, setGalleryItems] = useState<GalleryItemResponse[]>([]);
   const [galleryStats, setGalleryStats] = useState<GalleryStatsResponse | null>(null);
   const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null);
@@ -235,6 +248,9 @@ function App() {
     if (!apiReachable) {
       return;
     }
+    // A batch belongs to one media type; carrying its filter across a media
+    // type switch would just leave the gallery looking empty.
+    setGalleryBatchFilter(null);
     void loadModels(mediaType);
     void refreshStudio(mediaType);
   }, [apiReachable, mediaType]);
@@ -244,7 +260,7 @@ function App() {
       return;
     }
     void refreshStudio(mediaType);
-  }, [apiReachable, selectedProjectId, gallerySearch]);
+  }, [apiReachable, selectedProjectId, gallerySearch, galleryBatchFilter]);
 
   useEffect(() => {
     if (!activeJobId) {
@@ -378,6 +394,9 @@ function App() {
       }
       if (gallerySearch.trim()) {
         galleryQuery.set("q", gallerySearch.trim());
+      }
+      if (galleryBatchFilter) {
+        galleryQuery.set("batch_id", galleryBatchFilter);
       }
       const [galleryPayload, metricsPayload, galleryStatsPayload] = await Promise.all([
         requestJson<GalleryItemResponse[]>(`/gallery?${galleryQuery.toString()}`),
@@ -683,7 +702,7 @@ function App() {
         }),
       });
       setAssetMessage(`Saved feedback ${feedback.id}.`);
-      await refreshStudio(selectedAssetDetail.media_type, {
+      await refreshStudio(toComposerMediaType(selectedAssetDetail.media_type), {
         preferredAssetId: selectedAssetDetail.asset_id,
       });
       return true;
@@ -729,7 +748,7 @@ function App() {
       });
       if (kind === "accept") {
         setAssetMessage("採用として保存しました。書き出しまたはプロジェクトへの保存を続けられます。");
-        await refreshStudio(reviewedAsset.media_type, {
+        await refreshStudio(toComposerMediaType(reviewedAsset.media_type), {
           preferredAssetId: reviewedAsset.asset_id,
         });
         return true;
@@ -755,16 +774,17 @@ function App() {
     }
 
     const nextDraft = createDraftFromRequestSnapshot(selectedAssetDetail.request_snapshot);
+    const composerMediaType = toComposerMediaType(selectedAssetDetail.media_type);
     startTransition(() => {
       setDrafts((current) => ({
         ...current,
-        [selectedAssetDetail.media_type]: {
-          ...defaultSubmitValues[selectedAssetDetail.media_type],
+        [composerMediaType]: {
+          ...defaultSubmitValues[composerMediaType],
           ...nextDraft,
         },
       }));
       setSelectedProjectId(selectedAssetDetail.project_id ?? "");
-      setMediaType(selectedAssetDetail.media_type);
+      setMediaType(composerMediaType);
       setComposerRevision((current) => current + 1);
       setAssetMessage(`Loaded ${selectedAssetDetail.asset_id} into the composer.`);
     });
@@ -786,14 +806,15 @@ function App() {
     setErrorMessage(null);
     setAssetMessage(null);
 
+    const sourceMediaType = toComposerMediaType(sourceAsset.media_type);
     const snapshotValues = mergeDraftWithDefaults(
-      sourceAsset.media_type,
+      sourceMediaType,
       createDraftFromRequestSnapshot(sourceAsset.request_snapshot),
     );
     const sourceValues =
-      useSourceSnapshot || mediaType !== sourceAsset.media_type
+      useSourceSnapshot || mediaType !== sourceMediaType
         ? snapshotValues
-        : mergeDraftWithDefaults(sourceAsset.media_type, drafts[sourceAsset.media_type]);
+        : mergeDraftWithDefaults(sourceMediaType, drafts[sourceMediaType]);
     const reuseValues = {
       ...sourceValues,
       prompt: buildQuickReviewPrompt(sourceValues.prompt, issueTags),
@@ -826,7 +847,7 @@ function App() {
         },
       );
 
-      setMediaType(sourceAsset.media_type);
+      setMediaType(sourceMediaType);
       setSelectedProjectId(payload.project_id ?? "");
       setIsSubmitting(true);
       setActiveJobId(payload.job_id);
@@ -875,7 +896,7 @@ function App() {
         },
       );
       setAssetMessage(`Exported asset to ${payload.export_path}.`);
-      await refreshStudio(selectedAssetDetail.media_type, {
+      await refreshStudio(toComposerMediaType(selectedAssetDetail.media_type), {
         preferredAssetId: selectedAssetDetail.asset_id,
       });
     } catch (error) {
@@ -918,7 +939,7 @@ function App() {
           ? `Bound asset ${payload.asset_id} to the selected project.`
           : `Removed project binding from asset ${payload.asset_id}.`,
       );
-      await refreshStudio(payload.media_type, { preferredAssetId: payload.asset_id });
+      await refreshStudio(toComposerMediaType(payload.media_type), { preferredAssetId: payload.asset_id });
       await loadProjects();
     } catch (error) {
       setErrorMessage(
@@ -1256,6 +1277,8 @@ function App() {
               void loadAssetDetail(assetId);
             }}
             disabled={isAssetBusy || isFeedbackBusy}
+            activeBatchId={galleryBatchFilter}
+            onFilterByBatch={setGalleryBatchFilter}
           />
         </div>
 

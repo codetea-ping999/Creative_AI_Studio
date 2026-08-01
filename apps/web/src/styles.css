@@ -705,6 +705,54 @@ pre,
   width: 100%;
 }
 
+.stage-surface--text {
+  display: block;
+  padding: 24px;
+  overflow-y: auto;
+}
+
+.text-preview {
+  display: grid;
+  gap: 16px;
+}
+
+.text-preview__header {
+  display: grid;
+  gap: 5px;
+}
+
+.text-preview__header strong {
+  font-size: 0.95rem;
+  font-weight: 650;
+}
+
+.text-preview__body {
+  font-size: 0.88rem;
+  line-height: 1.6;
+  color: var(--text-primary);
+}
+
+.markdown-lite__heading {
+  margin: 0.6em 0 0.3em;
+  font-weight: 650;
+}
+
+.markdown-lite__paragraph {
+  margin: 0 0 0.6em;
+}
+
+.markdown-lite__list {
+  margin: 0 0 0.6em;
+  padding-left: 1.4em;
+}
+
+.markdown-lite__list-item.is-nested {
+  list-style-type: circle;
+  margin-left: 1em;
+  font-size: 0.85em;
+  color: var(--text-soft);
+}
+
 .empty-stage {
   display: grid;
   place-items: center;
@@ -756,6 +804,57 @@ pre,
   transition: background-color var(--transition-fast), border-color var(--transition-fast);
 }
 
+.gallery-item--nested {
+  grid-template-columns: 56px minmax(0, 1fr);
+  padding-left: 24px;
+  background: var(--surface-raised);
+}
+
+.gallery-item--batch strong {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: vertical;
+}
+
+.gallery-batch-group {
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.gallery-batch-group .gallery-item {
+  border-bottom: 0;
+}
+
+.gallery-batch-group__items {
+  display: grid;
+  gap: 0;
+  padding: 4px 0 8px;
+}
+
+.gallery-batch-group__items .secondary-button--chip {
+  justify-self: start;
+  margin: 4px 8px 6px;
+}
+
+.gallery-batch-filter {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--surface-accent);
+  font-size: 0.78rem;
+}
+
+.secondary-button--chip {
+  min-height: 26px;
+  padding: 3px 10px;
+  font-size: 0.7rem;
+}
+
 .gallery-item:hover {
   background: var(--surface-raised);
 }
@@ -795,6 +894,23 @@ pre,
   font-weight: 650;
   letter-spacing: 0.06em;
   text-transform: uppercase;
+}
+
+.gallery-item__thumb--text {
+  align-content: start;
+  padding: 6px;
+  background: var(--surface-raised);
+}
+
+.gallery-item__text-excerpt {
+  margin: 0;
+  overflow: hidden;
+  font-size: 0.68rem;
+  line-height: 1.35;
+  color: var(--text-soft);
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
 }
 
 .variation-comparison {

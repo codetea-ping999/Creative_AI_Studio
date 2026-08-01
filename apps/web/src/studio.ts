@@ -70,12 +70,18 @@ export type LoraCatalogResponse = {
   }>;
 };
 
+// Gallery assets can be older than the composer's own MediaType union (e.g.
+// "text", produced by the Story surface rather than PromptForm) — keep the
+// display-facing type a superset instead of forcing every submit form default
+// to grow a matching entry.
+export type GalleryMediaType = MediaType | "text";
+
 export type GalleryItemResponse = {
   asset_id: string;
   job_id: string;
   project_id: string | null;
   project_name: string | null;
-  media_type: MediaType;
+  media_type: GalleryMediaType;
   prompt: string;
   model_id: string;
   output_path: string;
@@ -96,6 +102,8 @@ export type GalleryItemResponse = {
   variation_index: number | null;
   seed: number | null;
   success: boolean;
+  batch_id: string | null;
+  batch_label: string | null;
 };
 
 export type GalleryAssetDetailResponse = GalleryItemResponse & {
@@ -331,6 +339,10 @@ export function isAudioAsset(pathValue: string | null | undefined): boolean {
 
 export function isVideoAsset(pathValue: string | null | undefined): boolean {
   return Boolean(pathValue && /\.(gif|mp4|webm|mov)$/i.test(pathValue));
+}
+
+export function isTextAsset(pathValue: string | null | undefined): boolean {
+  return Boolean(pathValue && /\.(md|markdown|txt)$/i.test(pathValue));
 }
 
 function asNumber(value: unknown): number | null {
