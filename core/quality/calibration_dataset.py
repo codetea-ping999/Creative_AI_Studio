@@ -25,6 +25,16 @@ SCORE_DIMENSIONS = {
         "creative_alignment_score_calibrated",
         "creative_rating",
     ),
+    "creative_vs_quality": (
+        "quality_score",
+        "quality_score_calibrated",
+        "creative_rating",
+    ),
+    "creative_vs_semantic": (
+        "semantic_alignment_score",
+        "semantic_alignment_score_calibrated",
+        "creative_rating",
+    ),
 }
 
 
