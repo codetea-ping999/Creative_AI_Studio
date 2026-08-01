@@ -8,10 +8,12 @@ from core.model_readiness import (
 
 from .cache import ModelRuntimeCache, resolve_media_cache_limits
 from .cleanup import release_runtime
+from .cloud_guard import CloudProviderDisabledError, ensure_cloud_provider_enabled
 from .loader import (
     AudioCraftMusicgenLoader,
     BaseModelLoader,
     BaseSpeechLoader,
+    CloudHttpSpeechLoader,
     DiffusersImageLoader,
     KokoroTtsLoader,
     LearnedVideoLoader,
@@ -29,6 +31,8 @@ __all__ = [
     "AudioCraftMusicgenLoader",
     "BaseModelLoader",
     "BaseSpeechLoader",
+    "CloudHttpSpeechLoader",
+    "CloudProviderDisabledError",
     "DiffusersImageLoader",
     "KokoroTtsLoader",
     "LearnedVideoLoader",
@@ -42,6 +46,7 @@ __all__ = [
     "TransformersMusicgenLoader",
     "VoicevoxHttpLoader",
     "create_default_loader_registry",
+    "ensure_cloud_provider_enabled",
     "evaluate_manifest_payload",
     "evaluate_manifest_readiness",
     "release_runtime",
