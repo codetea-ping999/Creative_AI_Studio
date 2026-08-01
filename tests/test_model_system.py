@@ -192,6 +192,14 @@ class _FakeMusicgenModel:
         return torch.zeros((1, 1, 32000), dtype=torch.float32)
 
 
+class _RandomMusicgenModel(_FakeMusicgenModel):
+    def generate(self, **kwargs):
+        import torch
+
+        self.calls.append(kwargs)
+        return torch.rand((1, 1, 32000), dtype=torch.float32)
+
+
 def _fake_musicgen_load(self, manifest):
     return {
         "stub": False,
@@ -214,6 +222,12 @@ def _fake_musicgen_load(self, manifest):
         "sampling_rate": 32000,
         "frame_rate": 50,
     }
+
+
+def _fake_random_musicgen_load(self, manifest):
+    runtime = _fake_musicgen_load(self, manifest)
+    runtime["model"] = _RandomMusicgenModel()
+    return runtime
 
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"missing dependency: {IMPORT_ERROR}")
@@ -994,6 +1008,49 @@ class ModelSystemTests(unittest.TestCase):
             self.assertEqual(result.metadata["reuse_action"], "variation")
             self.assertEqual(result.metadata["params"]["structure"], "seamless loop")
             self.assertTrue(Path(result.outputs[0]).exists())
+
+    def test_audio_generator_reuses_seed_without_unsupported_generator_kwarg(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir) / "outputs"
+            with (
+                patch(
+                    "core.models.loader.TransformersMusicgenLoader.load",
+                    new=_fake_random_musicgen_load,
+                ),
+                patch(
+                    "generators.audio.generator.evaluate_audio_semantics",
+                    return_value={"status": "skipped"},
+                ),
+            ):
+                service = create_default_model_service()
+                generator = AudioGenerator(service, output_dir=output_dir)
+
+                def generate(seed: int) -> bytes:
+                    result = generator.run(
+                        GenerationRequest(
+                            media_type="audio",
+                            prompt="deterministic synth loop",
+                            model_id="musicgen-small",
+                            seed=seed,
+                            output_format="wav",
+                            params={"duration_seconds": 2},
+                        )
+                    )
+                    return Path(result.outputs[0]).read_bytes()
+
+                first = generate(42)
+                second = generate(42)
+                different = generate(43)
+                runtime = service.get_runtime(
+                    "musicgen-small",
+                    "audio",
+                    "text-to-music",
+                )
+
+            self.assertEqual(first, second)
+            self.assertNotEqual(first, different)
+            self.assertNotIn("generator", runtime["model"].calls[0])
+            self.assertNotIn("top_p", runtime["model"].calls[0])
 
     def test_audio_generator_rejects_out_of_range_params(self) -> None:
         generator = AudioGenerator(create_default_model_service())

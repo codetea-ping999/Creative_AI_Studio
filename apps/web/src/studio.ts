@@ -204,6 +204,7 @@ export const defaultSubmitValues: Record<MediaType, PromptFormSubmitValues> = {
     seed: null,
     variationCount: 1,
     durationSeconds: 8,
+    extendStrideSeconds: null,
     bpm: 96,
     mood: "dreamy",
     genre: "electronic",
@@ -233,6 +234,7 @@ export const defaultSubmitValues: Record<MediaType, PromptFormSubmitValues> = {
     seed: null,
     variationCount: 1,
     durationSeconds: 8,
+    extendStrideSeconds: null,
     bpm: 96,
     mood: "dreamy",
     genre: "electronic",
@@ -262,6 +264,7 @@ export const defaultSubmitValues: Record<MediaType, PromptFormSubmitValues> = {
     seed: null,
     variationCount: 1,
     durationSeconds: 4,
+    extendStrideSeconds: null,
     bpm: 96,
     mood: "dreamy",
     genre: "electronic",
@@ -402,6 +405,9 @@ export function createDraftFromRequestSnapshot(
       prompt: request.prompt,
       durationSeconds:
         asNumber(params.duration_seconds) ?? defaultSubmitValues.audio.durationSeconds,
+      extendStrideSeconds:
+        asNumber(params.extend_stride_seconds) ??
+        defaultSubmitValues.audio.extendStrideSeconds,
       guidanceScale:
         asNumber(params.guidance_scale) ?? defaultSubmitValues.audio.guidanceScale,
       bpm: asNumber(params.bpm) ?? defaultSubmitValues.audio.bpm,

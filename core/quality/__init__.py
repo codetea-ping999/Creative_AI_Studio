@@ -15,6 +15,7 @@ from .semantic import (
     evaluate_image_semantics,
     evaluate_video_semantics,
 )
+from .text import evaluate_text_output
 
 __all__ = [
     "SemanticJudge",
@@ -28,6 +29,7 @@ __all__ = [
     "evaluate_audio_semantics",
     "evaluate_image_output",
     "evaluate_image_semantics",
+    "evaluate_text_output",
     "evaluate_video_output",
     "evaluate_video_semantics",
 ]

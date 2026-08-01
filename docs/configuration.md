@@ -87,10 +87,14 @@ WEB_PORT=5174
 | `OUTPUT_DIR` | `./outputs` | 出力ルート |
 | `OUTPUT_IMAGE_DIR` | `./outputs/images` | 画像出力先 |
 | `OUTPUT_AUDIO_DIR` | `./outputs/audio` | 音声出力先 |
+| `OUTPUT_TEXT_DIR` | `./outputs/text` | テキスト出力先（`.md` 本体と `.json` sidecar） |
 
 ### 実装上の補足
 
 - video 出力先は明示変数ではなく、image 出力先の sibling として `videos` が導出されます
+- text 出力先も同様に image 出力先の sibling として `text` が導出されます（`OUTPUT_TEXT_DIR` で上書き可能）
+- `data/` 配下には job SQLite 以外に `bible/`、`stories/`、`batches/`、`projects/`、
+  `assets/`、`feedback/` の JSON が置かれます。いずれも `DB_PATH` の親ディレクトリ基準です
 - asset export の既定先は `outputs/exports/...` 系です
 - `/outputs/*` の static mount は API 起動時に行われます
 
@@ -162,6 +166,36 @@ audio output root の解決:
 - learned videoのMP4も同じ`image_frames` backendでsample frameを採点します
 - CogVideoX-2B pipeline pathと推論既定値は`models/manifests/video/learned-local.json`で管理します
 - 採点結果は output path、file stat、prompt、model ref を含む key で cache されます
+
+## 多重生成（Batch）関連
+
+| 変数名 | 既定値 | 用途 |
+| --- | --- | --- |
+| `BATCH_MAX_ITEMS` | `64` | 1 batch が展開できる item 数の運用上限 |
+
+### 実装上の意味
+
+- `BatchSpec.limit` が `BATCH_MAX_ITEMS` を超える場合、運用上限側で切り下げられます
+- 展開後の件数が上限を超えるリクエストは、件数と上限を明示した 400 で拒否されます
+- probe → refine の 2 段階が既定です。probe は低解像度・低 step で当たりを付け、
+  上位 N 件だけを refine します（`logo-30` preset なら 30 件 → 上位 6 件）
+
+## Egress ガード（既定はローカルのみ）
+
+| 変数名 | 既定値 | 用途 |
+| --- | --- | --- |
+| `ALLOW_REMOTE_TEXT_ENDPOINTS` | `false` | text endpoint に loopback 以外を許可する |
+| `ALLOW_REMOTE_AUDIO_ENDPOINTS` | `false` | audio endpoint に loopback 以外を許可する |
+| `ALLOW_CLOUD_PROVIDERS` | `false` | `provider: "cloud"` の manifest を有効にする |
+| `LOCAL_TEXT_ENDPOINT_API_KEY` | 空 | ローカル endpoint が API key を要求する場合の値 |
+
+### 実装上の意味
+
+- `openai_compatible_text_loader` は既定で `127.0.0.1` / `localhost` / `::1` のみ許可し、
+  それ以外の host は明示的な opt-in なしに拒否します
+- API key は manifest ではなく環境変数から解決します。manifest に書いた鍵は読みません
+- 解決後の endpoint base URL は job metadata に記録されるため、
+  「どこへ送ったか」を後から必ず確認できます
 
 ## ログ関連
 

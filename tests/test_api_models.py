@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 IMPORT_ERROR: Exception | None = None
 
@@ -199,6 +201,44 @@ class ModelsApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(response.json()["models"]), 1)
         self.assertEqual(response.json()["models"][0]["id"], "custom-musicgen")
+
+    def test_voicevox_endpoint_is_configured_without_local_model_files(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_root = root / "manifests"
+            _write_manifest(
+                manifest_root / "audio" / "voicevox.json",
+                {
+                    "id": "voicevox-local",
+                    "public_id": "voicevox",
+                    "display_name": "VOICEVOX",
+                    "media_type": "audio",
+                    "task_type": "text-to-speech",
+                    "provider": "local",
+                    "runtime": "voicevox_http",
+                    "remote_ref": "http://127.0.0.1:50021/private/path",
+                    "loader": "voicevox_http_loader",
+                    "default_params": {"speaker_id": 3},
+                    "enabled": True,
+                },
+            )
+            services = create_application_services(
+                manifest_root=manifest_root,
+                db_path=root / "jobs.db",
+                output_dir=root / "outputs" / "images",
+            )
+            client = TestClient(create_app(services, start_job_runner=False))
+
+            with patch.dict(os.environ, {"VOICEVOX_BASE_URL": ""}):
+                response = client.get("/models?media_type=audio")
+
+        self.assertEqual(response.status_code, 200)
+        model = response.json()["models"][0]
+        self.assertTrue(model["is_available"])
+        self.assertEqual(model["runtime_status"], "configured")
+        self.assertIn("http://127.0.0.1:50021", model["availability_message"])
+        self.assertNotIn("private/path", model["availability_message"])
+        self.assertIn("fail that job", model["availability_message"])
 
     def test_learned_scaffold_model_is_not_reported_available(self) -> None:
         with TemporaryDirectory() as tmp_dir:

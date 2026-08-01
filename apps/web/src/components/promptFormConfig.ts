@@ -23,6 +23,7 @@ export const defaultPromptFormValues: PromptFormSubmitValues = {
   seed: null,
   variationCount: 1,
   durationSeconds: 8,
+  extendStrideSeconds: null,
   bpm: 96,
   mood: "dreamy",
   genre: "electronic",
@@ -84,6 +85,35 @@ export const audioPresets: AudioPreset[] = [
     durationSeconds: 12,
   },
 ];
+
+export const audioMoodOptions = [
+  { value: "dreamy", label: "Dreamy" },
+  { value: "bright", label: "Bright" },
+  { value: "dark", label: "Dark" },
+  { value: "energetic", label: "Energetic" },
+  { value: "gentle", label: "Gentle" },
+] as const;
+
+export const audioGenreOptions = [
+  { value: "ambient", label: "Ambient" },
+  { value: "electronic", label: "Electronic" },
+  { value: "lo-fi hip hop", label: "Lo-fi Hip Hop" },
+  { value: "cinematic", label: "Cinematic" },
+  { value: "jazz", label: "Jazz" },
+  { value: "rock", label: "Rock" },
+  { value: "orchestral", label: "Orchestral" },
+] as const;
+
+export const audioStructureOptions = [
+  { value: "seamless loop", label: "Seamless Loop" },
+  { value: "intro, build, drop", label: "Intro / Build / Drop" },
+  {
+    value: "intro, development, climax",
+    label: "Intro / Development / Climax",
+  },
+  { value: "ambient bed", label: "Ambient Bed" },
+  { value: "full cue with a clear ending", label: "Full Cue" },
+] as const;
 
 export const videoPresets: VideoPreset[] = [
   {

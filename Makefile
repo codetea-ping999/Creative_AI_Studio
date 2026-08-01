@@ -1,6 +1,6 @@
 PYTHON ?= ./venv/bin/python
 
-.PHONY: verify verify-lite setup-check web-build test web-test api-smoke calibration-report cogvideox-smoke
+.PHONY: verify verify-lite setup-check web-build test web-test api-smoke calibration-report cogvideox-smoke musicgen-smoke
 
 verify:
 	$(PYTHON) scripts/verify_local_stack.py --start-api
@@ -27,3 +27,6 @@ calibration-report:
 
 cogvideox-smoke:
 	$(PYTHON) scripts/smoke_cogvideox.py
+
+musicgen-smoke:
+	$(PYTHON) scripts/smoke_musicgen.py

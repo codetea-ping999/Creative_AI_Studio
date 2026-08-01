@@ -9,7 +9,9 @@ import {
 import { AssetDetailPanel, type FeedbackFormValues } from "./components/AssetDetailPanel";
 import { GalleryPanel } from "./components/GalleryPanel";
 import { LatestJobPanel } from "./components/LatestJobPanel";
+import { MatrixPanel } from "./components/MatrixPanel";
 import { ModelsSummaryPanel } from "./components/ModelsSummaryPanel";
+import { StoryPanel } from "./components/StoryPanel";
 import { buildGeneratePayload, buildReusePayload } from "./lib/payloads";
 import {
   buildQuickReviewPrompt,
@@ -51,7 +53,7 @@ const mediaTypeReadinessLabels: Record<MediaType, string> = {
 };
 
 type AssetReuseOptions = {
-  action?: "rerun" | "variation";
+  action?: "rerun" | "variation" | "melody";
   issueTags?: QuickReviewIssueTag[];
   sourceAsset?: GalleryAssetDetailResponse;
   useSourceSnapshot?: boolean;
@@ -112,6 +114,26 @@ function App() {
     (model) => model.id === activeDraft.modelId && model.isAvailable,
   );
   const activeAvailableModelCount = activeModels.filter((model) => model.isAvailable).length;
+  const selectedAudioModel = modelOptionsByMedia.audio.find(
+    (model) => model.id === drafts.audio.modelId,
+  );
+  const canConditionMelody =
+    mediaType === "audio" &&
+    selectedAssetDetail?.media_type === "audio" &&
+    /\.wav$/i.test(selectedAssetDetail.output_path) &&
+    Boolean(
+      selectedAudioModel?.isAvailable &&
+        selectedAudioModel.tags.includes("melody-conditioning"),
+    );
+  const melodyConditioningMessage = canConditionMelody
+    ? `Use ${selectedAudioModel?.displayName ?? "the selected model"} with this WAV reference.`
+    : mediaType !== "audio"
+      ? "Switch to Audio before using melody conditioning."
+      : !selectedAudioModel?.tags.includes("melody-conditioning")
+        ? "Select an available melody-conditioning model in the Audio composer."
+        : !selectedAudioModel.isAvailable
+          ? selectedAudioModel.availabilityMessage || "The selected melody model is unavailable."
+          : "Melody conditioning requires a Gallery WAV asset.";
   const readinessState =
     apiReachable === null
       ? "checking"
@@ -160,6 +182,21 @@ function App() {
       });
     },
     [mediaType],
+  );
+  const loadDraftIntoComposer = useCallback(
+    (targetMedia: MediaType, nextDraft: Partial<PromptFormSubmitValues>) => {
+      setDrafts((current) => ({
+        ...current,
+        [targetMedia]: {
+          ...current[targetMedia],
+          ...nextDraft,
+          mediaType: targetMedia,
+        },
+      }));
+      setMediaType(targetMedia);
+      setComposerRevision((current) => current + 1);
+    },
+    [],
   );
 
   useEffect(() => {
@@ -422,6 +459,27 @@ function App() {
       setActiveJobId(null);
       setIsSubmitting(false);
       setErrorMessage(error instanceof Error ? error.message : "Failed to load job state.");
+    }
+  }
+
+  /**
+   * Poll a job until it reaches a terminal status and return that status.
+   *
+   * The story and matrix panels drive their own multi-step flows, so they need to
+   * wait on a job without taking over the composer's own submit state.
+   */
+  async function awaitJobCompletion(jobId: string): Promise<string> {
+    const intervalMs = 1200;
+    const deadline = Date.now() + 10 * 60 * 1000;
+    for (;;) {
+      const payload = await requestJson<JobResponse>(`/jobs/${jobId}`);
+      if (terminalStatuses.has(payload.status)) {
+        return payload.status;
+      }
+      if (Date.now() > deadline) {
+        return payload.status;
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, intervalMs));
     }
   }
 
@@ -773,11 +831,17 @@ function App() {
       setIsSubmitting(true);
       setActiveJobId(payload.job_id);
       setStatusMessage(
-        action === "rerun" ? `Queued rerun job ${payload.job_id}.` : `Queued variation job ${payload.job_id}.`,
+        action === "rerun"
+          ? `Queued rerun job ${payload.job_id}.`
+          : action === "melody"
+            ? `Queued melody-conditioned job ${payload.job_id}.`
+            : `Queued variation job ${payload.job_id}.`,
       );
       setAssetMessage(
         action === "rerun"
           ? `Created a fresh rerun from ${sourceAsset.asset_id}.`
+          : action === "melody"
+            ? `Using ${sourceAsset.asset_id} as the melody reference.`
           : `Created a reviewed variation from ${sourceAsset.asset_id}.`,
       );
       await loadJob(payload.job_id);
@@ -1166,7 +1230,7 @@ function App() {
           />
         </section>
 
-        <div className="workspace-grid">
+        <div className="workspace-grid story-matrix-workspace">
           <LatestJobPanel
             latestJob={latestJob}
             onCancel={handleCancelLatestJob}
@@ -1217,6 +1281,11 @@ function App() {
               onReuse={() => {
                 void handleAssetReuse();
               }}
+              canConditionMelody={canConditionMelody}
+              melodyConditioningMessage={melodyConditioningMessage}
+              onConditionMelody={() => {
+                void handleAssetReuse({ action: "melody" });
+              }}
               onLoadIntoComposer={loadSelectedAssetIntoComposer}
               onExport={() => {
                 void handleAssetExport();
@@ -1235,6 +1304,50 @@ function App() {
             </div>
           )}
         </section>
+
+        <div className="workspace-grid">
+          <StoryPanel
+            modelId=""
+            projectId={selectedProjectId}
+            awaitJob={awaitJobCompletion}
+            // Empty ids let the API pick each media type's default model, so a
+            // scene can be filled without first choosing models by hand.
+            sceneModelIds={{ visual: "", narration: "", music: "" }}
+            onGenerateSceneImage={(scene) => {
+              startTransition(() => {
+                loadDraftIntoComposer("image", {
+                  prompt: scene.image_prompt,
+                  negativePrompt: scene.image_negative,
+                  imageBriefSubject: scene.heading,
+                });
+              });
+              setStatusMessage(
+                `Scene "${scene.heading || scene.id}" をコンポーザに読み込みました。`,
+              );
+            }}
+            onGenerateSceneNarration={(scene) => {
+              startTransition(() => {
+                loadDraftIntoComposer("audio", {
+                  prompt: scene.narration,
+                  mood: scene.bgm_mood,
+                });
+              });
+              setStatusMessage(
+                `Scene "${scene.heading || scene.id}" のナレーションを音声コンポーザに読み込みました。`,
+              );
+            }}
+          />
+
+          <MatrixPanel
+            modelId=""
+            projectId={selectedProjectId}
+            onInspectItem={(item) => {
+              if (item.job_id) {
+                void loadJob(item.job_id);
+              }
+            }}
+          />
+        </div>
 
         <ModelsSummaryPanel
           models={activeModels}

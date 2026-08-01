@@ -9,11 +9,15 @@ from core.model_readiness import (
 from .cache import ModelRuntimeCache
 from .cleanup import release_runtime
 from .loader import (
+    AudioCraftMusicgenLoader,
     BaseModelLoader,
+    BaseSpeechLoader,
     DiffusersImageLoader,
+    KokoroTtsLoader,
     LearnedVideoLoader,
     LoaderRegistry,
     TransformersMusicgenLoader,
+    VoicevoxHttpLoader,
     create_default_loader_registry,
 )
 from .manifest import ModelManifest
@@ -22,8 +26,11 @@ from .resolver import ModelResolver
 from .service import ModelService
 
 __all__ = [
+    "AudioCraftMusicgenLoader",
     "BaseModelLoader",
+    "BaseSpeechLoader",
     "DiffusersImageLoader",
+    "KokoroTtsLoader",
     "LearnedVideoLoader",
     "LoaderRegistry",
     "ModelManifest",
@@ -33,6 +40,7 @@ __all__ = [
     "ModelRuntimeCache",
     "ModelService",
     "TransformersMusicgenLoader",
+    "VoicevoxHttpLoader",
     "create_default_loader_registry",
     "evaluate_manifest_payload",
     "evaluate_manifest_readiness",

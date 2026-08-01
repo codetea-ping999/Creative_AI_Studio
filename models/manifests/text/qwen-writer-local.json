@@ -1,0 +1,23 @@
+{
+  "id": "qwen-writer-local",
+  "public_id": "qwen-writer",
+  "display_name": "Qwen Writer 14B GGUF (local)",
+  "media_type": "text",
+  "task_type": "story",
+  "provider": "local",
+  "runtime": "llama_cpp",
+  "local_path": "./models/text/qwen-writer",
+  "loader": "llama_cpp_text_loader",
+  "dtype": "q4_k_m",
+  "default_params": {
+    "context_window": 16384,
+    "n_gpu_layers": -1,
+    "temperature": 0.85,
+    "top_p": 0.95,
+    "max_tokens": 2600
+  },
+  "aliases": ["qwen-writer-gguf"],
+  "tags": ["text", "story", "gguf"],
+  "is_default": false,
+  "enabled": false
+}

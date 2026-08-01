@@ -106,14 +106,31 @@ class JobRunner:
             try:
                 if self._update_status(job_id, JOB_STATUS_PREPARING, progress=0.0) is None:
                     return self.job_repository.get(job_id)
-                generator = self.generator_registry.get(job.media_type)
+                generator = self.generator_registry.get(job.media_type, job.request.task_type)
                 if self._update_status(job_id, JOB_STATUS_RUNNING, progress=0.1) is None:
                     return self.job_repository.get(job_id)
-                # Generators that accept ``context`` can report step-level
-                # progress and observe cancellation mid-flight by raising
-                # GenerationCancelled; generators that ignore it fall back to
-                # cancellation being honored only at the boundary below.
-                result = generator.run(job.request, context)
+                controlled_run = getattr(generator, "run_with_control", None)
+                if callable(controlled_run):
+                    # Long-form audio opts into segment-level progress/cancel
+                    # instead of the generic context below.
+                    result = controlled_run(
+                        job.request,
+                        progress_callback=lambda fraction, segment, segment_count: (
+                            self._report_segment_progress(
+                                job_id,
+                                fraction,
+                                segment=segment,
+                                segment_count=segment_count,
+                            )
+                        ),
+                        cancel_requested=lambda: self._is_cancelled(job_id),
+                    )
+                else:
+                    # Generators that accept ``context`` can report step-level
+                    # progress and observe cancellation mid-flight by raising
+                    # GenerationCancelled; generators that ignore it fall back to
+                    # cancellation being honored only at the boundary below.
+                    result = generator.run(job.request, context)
             except GenerationCancelled:
                 return self.job_repository.get(job_id)
             except Exception as exc:
@@ -154,6 +171,36 @@ class JobRunner:
             self._publish(
                 "job_progress",
                 {"job_id": job.id, "status": job.status, "progress": job.progress},
+            )
+
+    def _report_segment_progress(
+        self,
+        job_id: str,
+        fraction: float,
+        *,
+        segment: int,
+        segment_count: int,
+    ) -> None:
+        if self._is_cancelled(job_id):
+            return
+        # Reserve 0.0–0.1 for preparation and 0.9–1.0 for postprocessing.
+        progress = min(0.89, 0.1 + max(0.0, min(1.0, fraction)) * 0.79)
+        job = self.job_repository.update_if_status(
+            job_id,
+            (JOB_STATUS_RUNNING,),
+            status=JOB_STATUS_RUNNING,
+            progress=progress,
+        )
+        if job is not None:
+            self._publish(
+                "job_segment_progress",
+                {
+                    "job_id": job.id,
+                    "status": job.status,
+                    "progress": job.progress,
+                    "segment": segment,
+                    "segment_count": segment_count,
+                },
             )
 
     def _update_status(

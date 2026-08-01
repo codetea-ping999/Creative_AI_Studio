@@ -10,6 +10,8 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from core.model_readiness import (
+    STATUS_CONFIGURED,
+    STATUS_INVALID_CONFIGURATION,
     STATUS_MISSING_FILES,
     STATUS_READY,
     STATUS_SCAFFOLD,
@@ -219,6 +221,31 @@ class DiffusersReadinessTests(unittest.TestCase):
 
         self.assertEqual(readiness.status, STATUS_MISSING_FILES)
         self.assertIn("./does-not-exist", readiness.message)
+
+
+class VoicevoxReadinessTests(unittest.TestCase):
+    def test_loopback_endpoint_is_configured_without_local_files(self) -> None:
+        readiness = evaluate_readiness(
+            runtime="voicevox_http",
+            local_path=None,
+            remote_ref="http://127.0.0.1:50021/private/path",
+        )
+
+        self.assertEqual(readiness.status, STATUS_CONFIGURED)
+        self.assertTrue(readiness.is_ready)
+        self.assertIn("http://127.0.0.1:50021", readiness.message)
+        self.assertNotIn("private/path", readiness.message)
+
+    def test_endpoint_credentials_are_rejected_without_disclosure(self) -> None:
+        readiness = evaluate_readiness(
+            runtime="voicevox_http",
+            local_path=None,
+            remote_ref="http://user:secret@127.0.0.1:50021",
+        )
+
+        self.assertEqual(readiness.status, STATUS_INVALID_CONFIGURATION)
+        self.assertFalse(readiness.is_ready)
+        self.assertNotIn("secret", readiness.message)
 
 
 class TransformersReadinessTests(unittest.TestCase):

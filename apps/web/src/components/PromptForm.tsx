@@ -1,6 +1,9 @@
 import { useEffect, useState, type FormEvent } from "react";
 import {
+  audioGenreOptions,
+  audioMoodOptions,
   audioPresets,
+  audioStructureOptions,
   defaultPromptFormValues,
   imageFormatPresets,
   imagePresets,
@@ -29,6 +32,13 @@ export type {
 
 const defaultValues = defaultPromptFormValues;
 
+function hasOption(
+  options: ReadonlyArray<{ value: string }>,
+  value: string,
+): boolean {
+  return options.some((option) => option.value === value);
+}
+
 function createInitialState(
   initialValues?: Partial<PromptFormSubmitValues>,
 ): PromptFormState {
@@ -51,6 +61,8 @@ function createInitialState(
     seed: merged.seed === null ? "" : String(merged.seed),
     variationCount: String(merged.variationCount),
     durationSeconds: String(merged.durationSeconds),
+    extendStrideSeconds:
+      merged.extendStrideSeconds === null ? "" : String(merged.extendStrideSeconds),
     bpm: String(merged.bpm),
     mood: merged.mood,
     genre: merged.genre,
@@ -114,6 +126,7 @@ function serializeDraft(
       formValues.durationSeconds,
       defaultValues.durationSeconds,
     ),
+    extendStrideSeconds: parseOptionalInteger(formValues.extendStrideSeconds),
     bpm: parseRequiredInteger(formValues.bpm, defaultValues.bpm),
     mood: formValues.mood,
     genre: formValues.genre,
@@ -230,6 +243,11 @@ export function PromptForm({
   const availableModelCount = modelOptions.filter((option) => option.isAvailable).length;
   const unavailableModelCount = modelOptions.length - availableModelCount;
   const unavailableModels = modelOptions.filter((option) => !option.isAvailable);
+  const selectedModel = modelOptions.find(
+    (option) => option.id === formValues.modelId,
+  );
+  const isLongFormAudio =
+    mediaType === "audio" && Boolean(selectedModel?.tags.includes("long-form"));
   const imageFormatValue = resolveImageFormatPreset(
     parseRequiredInteger(formValues.width, defaultValues.width),
     parseRequiredInteger(formValues.height, defaultValues.height),
@@ -258,6 +276,30 @@ export function PromptForm({
   useEffect(() => {
     const selectedModel = modelOptions.find((option) => option.id === formValues.modelId);
     if (selectedModel?.isAvailable) {
+      if (mediaType === "audio") {
+        const longForm = selectedModel.tags.includes("long-form");
+        const duration = Number.parseInt(formValues.durationSeconds, 10);
+        const minimum = longForm ? 31 : 2;
+        const maximum = longForm ? 120 : 30;
+        const stride = Number.parseInt(formValues.extendStrideSeconds, 10);
+        const invalidDuration =
+          !Number.isFinite(duration) || duration < minimum || duration > maximum;
+        const invalidStride =
+          longForm && (!Number.isFinite(stride) || stride < 5 || stride > 29);
+        if (invalidDuration || invalidStride || (!longForm && formValues.extendStrideSeconds)) {
+          setFormValues((current) => ({
+            ...current,
+            durationSeconds: invalidDuration
+              ? String(selectedModel.defaultParams.duration_seconds ?? minimum)
+              : current.durationSeconds,
+            extendStrideSeconds: longForm
+              ? invalidStride
+                ? String(selectedModel.defaultParams.extend_stride_seconds ?? 18)
+                : current.extendStrideSeconds
+              : "",
+          }));
+        }
+      }
       return;
     }
 
@@ -272,8 +314,17 @@ export function PromptForm({
     setFormValues((current) => ({
       ...current,
       modelId: nextModelId,
+      durationSeconds:
+        typeof preferredModel?.defaultParams.duration_seconds === "number"
+          ? String(preferredModel.defaultParams.duration_seconds)
+          : current.durationSeconds,
+      extendStrideSeconds:
+        preferredModel?.tags.includes("long-form") &&
+        typeof preferredModel.defaultParams.extend_stride_seconds === "number"
+          ? String(preferredModel.defaultParams.extend_stride_seconds)
+          : "",
     }));
-  }, [formValues.modelId, modelOptions]);
+  }, [formValues.modelId, mediaType, modelOptions]);
 
   const setFieldValue = <K extends keyof PromptFormState>(
     field: K,
@@ -306,7 +357,9 @@ export function PromptForm({
       instruments: preset.instruments,
       structure: preset.structure,
       bpm: String(preset.bpm),
-      durationSeconds: String(preset.durationSeconds),
+      durationSeconds: isLongFormAudio
+        ? current.durationSeconds
+        : String(preset.durationSeconds),
     }));
   };
 
@@ -354,6 +407,11 @@ export function PromptForm({
         typeof selectedModel?.defaultParams.duration_seconds === "number"
           ? String(selectedModel.defaultParams.duration_seconds)
           : current.durationSeconds,
+      extendStrideSeconds:
+        selectedModel?.tags.includes("long-form") &&
+        typeof selectedModel.defaultParams.extend_stride_seconds === "number"
+          ? String(selectedModel.defaultParams.extend_stride_seconds)
+          : "",
       temperature:
         typeof selectedModel?.defaultParams.temperature === "number"
           ? String(selectedModel.defaultParams.temperature)
@@ -412,6 +470,9 @@ export function PromptForm({
         formValues.durationSeconds,
         defaultValues.durationSeconds,
       ),
+      extendStrideSeconds: isLongFormAudio
+        ? parseRequiredInteger(formValues.extendStrideSeconds, 18)
+        : null,
       bpm: parseRequiredInteger(formValues.bpm, defaultValues.bpm),
       mood: formValues.mood,
       genre: formValues.genre,
@@ -646,8 +707,8 @@ export function PromptForm({
               <input
                 type="number"
                 inputMode="numeric"
-                min="2"
-                max="30"
+                min={isLongFormAudio ? "31" : "2"}
+                max={isLongFormAudio ? "120" : "30"}
                 step="1"
                 name="durationSeconds"
                 value={formValues.durationSeconds}
@@ -655,6 +716,29 @@ export function PromptForm({
                 disabled={disabled}
               />
             </label>
+            {isLongFormAudio ? (
+              <label className="field-group">
+                <span>Extend stride (sec)</span>
+                <input
+                  type="number"
+                  inputMode="numeric"
+                  min="5"
+                  max="29"
+                  step="1"
+                  name="extendStrideSeconds"
+                  aria-label="Extend stride (sec)"
+                  aria-describedby="audio-extend-stride-help"
+                  value={formValues.extendStrideSeconds}
+                  onChange={(event) =>
+                    setFieldValue("extendStrideSeconds", event.target.value)
+                  }
+                  disabled={disabled}
+                />
+                <small id="audio-extend-stride-help" className="field-help">
+                  生成区間を重ねる間隔です。小さいほど文脈を保ちますが処理時間が増えます。
+                </small>
+              </label>
+            ) : null}
             <label className="field-group">
               <span>BPM</span>
               <input
@@ -677,11 +761,14 @@ export function PromptForm({
                 onChange={(event) => setFieldValue("mood", event.target.value)}
                 disabled={disabled}
               >
-                <option value="dreamy">Dreamy</option>
-                <option value="bright">Bright</option>
-                <option value="dark">Dark</option>
-                <option value="energetic">Energetic</option>
-                <option value="gentle">Gentle</option>
+                {formValues.mood && !hasOption(audioMoodOptions, formValues.mood) ? (
+                  <option value={formValues.mood}>{formValues.mood} (restored)</option>
+                ) : null}
+                {audioMoodOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
               </select>
             </label>
             <label className="field-group">
@@ -692,13 +779,14 @@ export function PromptForm({
                 onChange={(event) => setFieldValue("genre", event.target.value)}
                 disabled={disabled}
               >
-                <option value="ambient">Ambient</option>
-                <option value="electronic">Electronic</option>
-                <option value="lo-fi hip hop">Lo-fi Hip Hop</option>
-                <option value="cinematic">Cinematic</option>
-                <option value="jazz">Jazz</option>
-                <option value="rock">Rock</option>
-                <option value="orchestral">Orchestral</option>
+                {formValues.genre && !hasOption(audioGenreOptions, formValues.genre) ? (
+                  <option value={formValues.genre}>{formValues.genre} (restored)</option>
+                ) : null}
+                {audioGenreOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
               </select>
             </label>
             <label className="field-group">
@@ -709,13 +797,17 @@ export function PromptForm({
                 onChange={(event) => setFieldValue("structure", event.target.value)}
                 disabled={disabled}
               >
-                <option value="seamless loop">Seamless Loop</option>
-                <option value="intro, build, drop">Intro / Build / Drop</option>
-                <option value="intro, development, climax">
-                  Intro / Development / Climax
-                </option>
-                <option value="ambient bed">Ambient Bed</option>
-                <option value="full cue with a clear ending">Full Cue</option>
+                {formValues.structure &&
+                !hasOption(audioStructureOptions, formValues.structure) ? (
+                  <option value={formValues.structure}>
+                    {formValues.structure} (restored)
+                  </option>
+                ) : null}
+                {audioStructureOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
               </select>
             </label>
           </div>

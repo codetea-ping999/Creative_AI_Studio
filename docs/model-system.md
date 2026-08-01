@@ -126,3 +126,59 @@ resolve("sdxl-local") -> manifest "sdxl-local"
 > ⚠️ セキュリティ注意: `LearnedVideoLoader` はモデルディレクトリ内の `runtime.py` / `adapter.py`
 > を import して実行します（任意コード実行）。`MODELS_ROOT` 配下には信頼できる出所の
 > モデルパックのみを配置し、第三者製・未検証の bundle は読み込まないでください。
+
+## Text Runtime Contract
+
+text 生成の backend は複数ありえます（llama.cpp / ローカル endpoint / weight 無しの雛形）。
+generator 側が backend ごとに分岐しないよう、runtime は 1 つの呼び出し規約に正規化します。
+
+```python
+runtime["generate"](
+    prompt,
+    *, system=None, max_tokens=1024, temperature=0.8, top_p=0.95,
+    seed=None, json_schema=None,
+) -> str
+runtime["context_window"]: int
+runtime["supports_json_schema"]: bool
+```
+
+| loader | 対象 | 依存 | 既定 |
+| --- | --- | --- | --- |
+| `template_text_loader` | weight 不要の決定的スキャフォルダ | なし | ✅ |
+| `llama_cpp_text_loader` | ローカル GGUF（Metal / CUDA offload） | `llama-cpp-python` | optional |
+| `openai_compatible_text_loader` | Ollama / LM Studio / vLLM | `httpx` | optional |
+
+### なぜ template runtime が既定なのか
+
+`procedural_video_loader` と同じ考え方です。モデルを 1 つも配置していない状態でも
+`logline → beat_sheet → scene_list → assembly` の全経路が動き、テストできます。
+実 LLM の導入は「品質の向上」であって「機能の解禁」ではありません。
+
+配置手順:
+
+1. GGUF を `models/text/<model>/` に置く（1 ディレクトリ 1 ファイル、
+   複数置く場合は manifest の `default_params.model_file` で選ぶ）
+2. `models/manifests/text/qwen-writer-local.json` の `enabled` を `true` にする
+3. `pip install llama-cpp-python`（Apple silicon は
+   `CMAKE_ARGS="-DGGML_METAL=on" pip install --no-cache-dir llama-cpp-python`）
+
+### endpoint loader の egress ガード
+
+`openai_compatible_text_loader` は既定で loopback（`127.0.0.1` / `localhost` / `::1`）のみ
+許可します。それ以外の host は `ALLOW_REMOTE_TEXT_ENDPOINTS=true` を明示しない限り
+拒否されます。API key は manifest ではなく `default_params.api_key_env` が指す環境変数から
+解決します。解決後の base URL は job metadata に残るため、送信先は常に追跡できます。
+
+## Structured Output Contract
+
+story task は出力 schema を固定しています。`supports_json_schema` が真の runtime には
+JSON schema（llama.cpp では grammar）を渡し、そうでない runtime には JSON を要求します。
+いずれの場合も generator 側で:
+
+1. コードフェンスや前置き文を許容して JSON を抽出する
+2. pydantic で検証する
+3. 失敗したら検証エラーを添えて 1 回だけリペアを要求する
+4. それでも失敗したら raw 応答をファイルに保存し、task 名と検証エラーを含む例外にする
+
+「LLM は JSON を壊す」ことを前提にした設計であり、壊れた出力が後続の
+画像・音声生成へ流れないための境界です。

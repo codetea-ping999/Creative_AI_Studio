@@ -16,6 +16,7 @@ without pulling in the FastAPI/pydantic stack.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import re
 from collections.abc import Mapping
@@ -26,7 +27,9 @@ from typing import Any, Protocol
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
 STATUS_READY = "ready"
+STATUS_CONFIGURED = "configured"
 STATUS_MISSING_FILES = "missing_files"
+STATUS_INVALID_CONFIGURATION = "invalid_configuration"
 STATUS_SCAFFOLD = "scaffold"
 
 #: File patterns accepted as "real weights" for a component directory.
@@ -47,6 +50,15 @@ _TRANSFORMERS_PROCESSOR_CONFIGS: tuple[str, ...] = (
     "preprocessor_config.json",
     "tokenizer_config.json",
 )
+_AUDIOCRAFT_MODEL_FILES: tuple[str, ...] = (
+    "state_dict.bin",
+    "compression_state_dict.bin",
+)
+_AUDIOCRAFT_T5_FILES: tuple[str, ...] = (
+    "config.json",
+    "model.safetensors",
+    "spiece.model",
+)
 
 
 class ManifestLike(Protocol):
@@ -54,6 +66,7 @@ class ManifestLike(Protocol):
 
     runtime: str
     local_path: str | None
+    remote_ref: str | None
     default_params: Mapping[str, Any]
 
 
@@ -67,7 +80,7 @@ class ModelReadiness:
 
     @property
     def is_ready(self) -> bool:
-        return self.status == STATUS_READY
+        return self.status in {STATUS_READY, STATUS_CONFIGURED}
 
 
 def resolve_repo_path(path_value: str, *, repo_root: Path | None = None) -> Path:
@@ -89,6 +102,7 @@ def evaluate_manifest_readiness(
     return evaluate_readiness(
         runtime=manifest.runtime,
         local_path=manifest.local_path,
+        remote_ref=getattr(manifest, "remote_ref", None),
         default_params=manifest.default_params,
         repo_root=repo_root,
     )
@@ -102,10 +116,12 @@ def evaluate_manifest_payload(
     """Evaluate readiness for a raw manifest JSON payload."""
 
     local_path = payload.get("local_path")
+    remote_ref = payload.get("remote_ref")
     default_params = payload.get("default_params")
     return evaluate_readiness(
         runtime=str(payload.get("runtime") or ""),
         local_path=local_path if isinstance(local_path, str) else None,
+        remote_ref=remote_ref if isinstance(remote_ref, str) else None,
         default_params=default_params if isinstance(default_params, Mapping) else None,
         repo_root=repo_root,
     )
@@ -115,12 +131,15 @@ def evaluate_readiness(
     *,
     runtime: str,
     local_path: str | None,
+    remote_ref: str | None = None,
     default_params: Mapping[str, Any] | None = None,
     repo_root: Path | None = None,
 ) -> ModelReadiness:
     """Evaluate readiness from the manifest fields that describe local files."""
 
     params = dict(default_params or {})
+    if runtime == "voicevox_http":
+        return _voicevox_readiness(remote_ref)
     if not local_path:
         return ModelReadiness(
             STATUS_MISSING_FILES,
@@ -139,9 +158,39 @@ def evaluate_readiness(
         return diffusers_pipeline_readiness(model_root)
     if runtime == "transformers":
         return transformers_model_readiness(model_root)
+    if runtime == "audiocraft":
+        return audiocraft_model_readiness(model_root)
     if runtime == "learned":
         return _learned_runtime_readiness(model_root, params, repo_root=repo_root)
     return ModelReadiness(STATUS_READY, "Local runtime files are ready.")
+
+
+def _voicevox_readiness(remote_ref: str | None) -> ModelReadiness:
+    """Report endpoint configuration without probing the service or leaking its path."""
+
+    import os
+
+    from core.models.audio_runtimes import audio_endpoint_origin
+
+    configured_base_url = os.getenv("VOICEVOX_BASE_URL", "").strip()
+    base_url = configured_base_url or remote_ref
+    if not base_url:
+        return ModelReadiness(
+            STATUS_INVALID_CONFIGURATION,
+            "VOICEVOX endpoint URL is not configured.",
+        )
+    try:
+        origin = audio_endpoint_origin(base_url)
+    except ValueError:
+        return ModelReadiness(
+            STATUS_INVALID_CONFIGURATION,
+            "VOICEVOX endpoint configuration is invalid or disallowed.",
+        )
+    return ModelReadiness(
+        STATUS_CONFIGURED,
+        f"VOICEVOX endpoint is configured at {origin}. Availability is checked "
+        "when generation starts; an engine that is not running will fail that job.",
+    )
 
 
 def diffusers_pipeline_readiness(
@@ -176,6 +225,43 @@ def transformers_model_readiness(
             tuple(missing),
         )
     return ModelReadiness(STATUS_READY, f"{label} model files are ready.")
+
+
+def audiocraft_model_readiness(
+    model_path: Path,
+    *,
+    label: str = "AudioCraft",
+) -> ModelReadiness:
+    """Check the optional AudioCraft dependency and local exported checkpoint."""
+
+    if importlib.util.find_spec("audiocraft") is None:
+        return ModelReadiness(
+            STATUS_MISSING_FILES,
+            "AudioCraft dependency is not installed. "
+            "Install the optional AudioCraft 1.3 runtime described in "
+            "docs/model-download-guide.md.",
+            ("python:audiocraft",),
+        )
+
+    missing = [
+        name for name in _AUDIOCRAFT_MODEL_FILES if not (model_path / name).is_file()
+    ]
+    t5_root = model_path / "t5-base"
+    missing.extend(
+        f"t5-base/{name}"
+        for name in _AUDIOCRAFT_T5_FILES
+        if not (t5_root / name).is_file()
+    )
+    if missing:
+        return ModelReadiness(
+            STATUS_MISSING_FILES,
+            f"{label} model files are missing: " + ", ".join(missing),
+            tuple(missing),
+        )
+    return ModelReadiness(
+        STATUS_READY,
+        f"{label} dependency, checkpoint, and local T5 files are ready.",
+    )
 
 
 def missing_diffusers_files(pipeline_path: Path) -> list[str]:

@@ -35,6 +35,7 @@ export type PromptFormState = {
   seed: string;
   variationCount: string;
   durationSeconds: string;
+  extendStrideSeconds: string;
   bpm: string;
   mood: string;
   genre: string;
@@ -65,6 +66,7 @@ export type PromptFormSubmitValues = {
   seed: number | null;
   variationCount: number;
   durationSeconds: number;
+  extendStrideSeconds: number | null;
   bpm: number;
   mood: string;
   genre: string;
