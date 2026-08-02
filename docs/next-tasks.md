@@ -41,28 +41,44 @@
 | Done | Variation Matrix | 軸展開、probe → refine、job repository からの再導出、自動 stage 遷移（#38） |
 | Done | 軸カタログ | ロゴ 30 構造 / サムネ 30 構造 / トーン 10 種（#52） |
 | Done | API 接続 | `/generate/text`、`/bible`、`/batches`、`/stories`（#51 の API 部分を含む） |
+| Done | Scene 素材紐付け | job 成功イベントから `SceneBinder`（`core/story/binding.py`）が scene に画像 / ナレーション / BGM を自動紐付け（#43 残分） |
+| Done | ナレーション（TTS） | `SpeechGenerator`（`generators/audio/speech.py`）+ `kokoro_tts_loader` / `voicevox_http_loader`（`core/models/loader.py`）。`voicevox-endpoint` manifest が既定 enabled、`POST /generate/speech` まで接続（#55） |
+| Done | timeline assembly（ワンショット） | `core/story/timeline.py`の`build_timeline`と`generators/video/assembly.py`の`AssemblyGenerator`が字幕焼き込み・narration/music ミックス（ducking）・ffmpeg mux で音声付き MP4 を出力。`POST /assemble/story/{id}` と Studio UI（`StoryPanel.tsx`）から起動可能（#58） |
+| Done | Story surface / Matrix 比較グリッド | `apps/web/src/components/StoryPanel.tsx`で premise→logline→beat→scene→各素材生成→assemble を1画面で実行、`MatrixPanel.tsx`で probe→refine の比較・promote を実行（#61 #53） |
 
 ## 次に進めるべきタスク
 
+コードで確認した実態をもとに優先度を見直しました。判定の根拠は本 PR の説明を参照してください。
+
 | 優先度 | 状態 | タスク | 目的 |
 | --- | --- | --- | --- |
-| P0 | Todo | ナレーション（TTS）と音声後処理 | 台本から音声を作り、動画に載せられる音量に整える（#55 #56） |
-| P0 | Todo | timeline assembly | 素材と timeline から音声付き MP4 を書き出す（#58） |
-| P0 | Todo | Story surface / Matrix 比較グリッド | 構想と多重生成を UI から回せるようにする（#61 #53） |
-| P1 | Todo | 実 LLM の Golden Path 検証 | GGUF を配置し、生成時間・JSON 失敗率・日本語品質を実測する（#45） |
-| P1 | Todo | job lane と常駐上限 | text ↔ image の載せ替えと待ち行列の詰まりを解消する（#39） |
-| P1 | Todo | 参照画像条件付け | prompt + seed で足りない同一性を補う（#50） |
-| P1 | Todo | CogVideoX-2B local smoke | weight配置後に `make cogvideox-smoke` で実MP4を生成しGallery再生を確認する |
-| P2 | Todo | 30 パターン probe の実測 | 「10 分以内」が成立するか測り既定値を決める（#54） |
-| P2 | Todo | calibration sample収集 | 全体20件、media/model segment各10件以上のhuman feedbackを蓄積する |
-| P2 | Todo | calibration review | 相関・MAE・biasを人手レビューし、補正重み変更を別変更として承認する |
-| P2 | Todo | running job cooperative cancellation | CogVideoX推論step callbackから安全にcancelできる実行contextを設計する |
+| P0 | Todo | job lane と media 別常駐上限 | `bootstrap/factories.py`は単一 `JobQueue`/`JobRunner`、`MAX_CACHED_MODELS`もmedia別ではない単一値。text↔image↔audioを1フローで回すと載せ替えが頻発する（#39） |
+| P0 | Todo | 音声後処理を music 生成経路にも適用 | `core/audio/postprocess.py`のnormalize/trim/fade/duckは`generators/audio/speech.py`（narration）のみが使用。`generators/audio/generator.py`（music）は`[-1,1]`clampのみで`MUSIC_PRESET`未適用（#56 残分） |
+| P1 | Todo | video 生成の cooperative cancellation 接続 | `core/jobs/context.py`の`GenerationContext`と`core/jobs/cancellation.py`は実装済みで image generator は`raise_if_cancelled()`を複数箇所で呼ぶが、`generators/video/generator.py`は`context`引数を受け取るのみで内部では未使用（#18） |
+| P1 | Todo | バッチ勝者の Bible 反映 | `core/batches/service.py`の`promote()`は`item.promoted=True`を立てるだけで bible への書き込みがない。character sheet batch template（`core/batches/templates.py`）自体は存在する（#49） |
+| P1 | Todo | 参照画像条件付け（identity lock L4） | `core/prompting/composer.py`は`reference_asset_ids`を収集するが、`generators/image/generator.py`はmetadataに記録するのみで img2img / IP-Adapter のpixel conditioning呼び出しがない（#50） |
+| P2 | Todo | assembly timeline panel UI | scene順・duration・narration/BGM割り当てを手動編集できるUIが無い。現状は自動生成timelineでの一発assembleボタンのみ（`StoryPanel.tsx`）（#62） |
+| P2 | Todo | batch-aware gallery grouping | `apps/api/routes/gallery.py`・gallery UIにbatch単位のグルーピングが無い（#40） |
+| P2 | Todo | 字幕のプラットフォーム別セーフエリア | 字幕焼き込み自体（`_burn_subtitles`）は実装済みだが、9:16等のsafe-area presetが無い（#60 残分） |
+| P2 | Todo | クラウド provider adapter（voice / image） | `ALLOW_CLOUD_PROVIDERS`相当の実装がコードベースに存在しない。voice（#57）・image（#66）とも未着手 |
+| P2 | Todo | Visual Orchestrator | scene単位で複数カットを合成する仕組み（Orchestratorクラス）が存在しない（#65） |
+| P2 | Todo | novel-length continuity memory | `generators/text/tasks.py`の`_prose_prompt`は単一sceneのみを入力にしており、前章の継続情報を渡す仕組みがない（#46） |
+| P2 | Todo | calibration sample収集 | 全体20件、media/model segment各10件以上のhuman feedbackを蓄積する（#19） |
+| P2 | Todo | calibration review | 相関・MAE・biasを人手レビューし、補正重み変更を別変更として承認する（#20） |
+
+### ローカル実機が必要（クラウド実行環境では検証不可）
+
+| 状態 | タスク | 根拠 |
+| --- | --- | --- |
+| Todo | 実 LLM の Golden Path 検証（#45） | `LlamaCppTextLoader`（`core/models/loader.py`）は実装済みだが`models/manifests/text/qwen-writer-local.json`は`"enabled": false`。GGUF weight とGPUが無いと生成時間・JSON失敗率・日本語品質を測れず、`docs/`にも実測記録が無い |
+| Todo | 30 パターン probe の実測（#54） | `core/batches/expansion.py`のprobe→refine実装自体はあるが、実GPUでのスループット実測値が`docs/`に記録されていない。「10分以内」の既定値はまだ未検証 |
+| Todo | CogVideoX-2B local smoke | weight配置後に `make cogvideox-smoke` で実MP4を生成しGallery再生を確認する（GPU / weight必須） |
 
 ## 直近の推奨着手順
 
-1. TTS と音声後処理（#55 #56）を入れ、台本から音声が出る状態にする
-2. assembly（#58）を入れ、scene 3 本以上の MP4 を音声付きで書き出す
-3. Story surface と Matrix グリッド（#61 #53）で UI から通しで回せるようにする
-4. GGUF を配置して Story Engine の実測（#45）を行い、既定パラメータを決める
-5. CogVideoX-2B weightを `models/video/cogvideox-2b` に配置して実MP4 smokeを通す
-6. 制作時のhuman feedbackを蓄積し、`make calibration-report` で相関を確認する
+1. job lane と media 別常駐上限（#39）を入れ、Story→画像→音声→動画の一気通貫フローでモデル載せ替えが詰まらないようにする
+2. 音声後処理を music 経路にも適用し（#56 残分）、video 側の cancellation 接続（#18）を仕上げる — どちらも配線のみで規模が小さい
+3. バッチ勝者の Bible 反映（#49）と参照画像条件付け（#50）でキャラクター同一性のループを閉じる
+4. assembly timeline panel（#62）と batch-aware gallery（#40）でUIの手動編集・閲覧性を上げる
+5. ローカル実機（GPU + weight）が用意でき次第、GGUF Golden Path 実測（#45）、30パターン probe 実測（#54）、CogVideoX-2B smoke を行い既定パラメータを決める
+6. 制作時のhuman feedbackを蓄積し（#19）、`make calibration-report` で相関を確認する（#20）
