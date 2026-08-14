@@ -50,7 +50,8 @@ LOGO_STRUCTURES: tuple[dict[str, Any], ...] = (
     ),
     _structure(
         "stacked-lockup",
-        "stacked lockup, symbol above the wordmark, tight vertical alignment, shared optical center",
+        "stacked lockup, symbol above the wordmark, tight vertical alignment, "
+        "shared optical center",
         tags=("lockup",),
     ),
     _structure(
@@ -102,7 +103,8 @@ LOGO_STRUCTURES: tuple[dict[str, Any], ...] = (
     ),
     _structure(
         "emblem-ribbon",
-        "emblem with a ribbon banner across the lower third, contained composition, vintage balance",
+        "emblem with a ribbon banner across the lower third, contained composition, "
+        "vintage balance",
         tags=("emblem", "contained"),
     ),
     _structure(
@@ -128,7 +130,8 @@ LOGO_STRUCTURES: tuple[dict[str, Any], ...] = (
     ),
     _structure(
         "isometric-cube",
-        "isometric cube construction mark, three visible faces in three tones, impossible-object hint",
+        "isometric cube construction mark, three visible faces in three tones, "
+        "impossible-object hint",
         tags=("geometric", "dimensional"),
     ),
     _structure(
@@ -394,7 +397,9 @@ TONE_AND_MANNER: tuple[dict[str, Any], ...] = (
     {
         "label": "minimal",
         "patch": {
-            "prompt_fragment": "minimal design, generous white space, restrained palette, precise alignment",
+            "prompt_fragment": (
+                "minimal design, generous white space, restrained palette, precise alignment"
+            ),
             "negative_fragment": "ornament, clutter, texture noise, busy detail",
             "palette": ["#0F172A", "#64748B", "#E2E8F0", "#FFFFFF"],
             "attributes": {"typography": "geometric sans, wide tracking"},
@@ -404,7 +409,9 @@ TONE_AND_MANNER: tuple[dict[str, Any], ...] = (
     {
         "label": "premium",
         "patch": {
-            "prompt_fragment": "premium finish, deep contrast, metallic accent, refined proportions",
+            "prompt_fragment": (
+                "premium finish, deep contrast, metallic accent, refined proportions"
+            ),
             "negative_fragment": "cheap plastic look, neon, cluttered layout",
             "palette": ["#0B0B0D", "#1C1C21", "#C8A96A", "#F5F1E8"],
             "attributes": {"typography": "high contrast serif, tight tracking"},
@@ -414,7 +421,9 @@ TONE_AND_MANNER: tuple[dict[str, Any], ...] = (
     {
         "label": "playful",
         "patch": {
-            "prompt_fragment": "playful mood, rounded shapes, bouncy asymmetry, bright saturated colors",
+            "prompt_fragment": (
+                "playful mood, rounded shapes, bouncy asymmetry, bright saturated colors"
+            ),
             "negative_fragment": "somber tone, sharp corners, corporate stiffness",
             "palette": ["#FF6B4A", "#FFC93C", "#3ABEF0", "#2D2A32"],
             "attributes": {"typography": "rounded sans, heavy weight"},
@@ -424,7 +433,9 @@ TONE_AND_MANNER: tuple[dict[str, Any], ...] = (
     {
         "label": "technical",
         "patch": {
-            "prompt_fragment": "technical diagram feel, precise grid, monospace labels, measured spacing",
+            "prompt_fragment": (
+                "technical diagram feel, precise grid, monospace labels, measured spacing"
+            ),
             "negative_fragment": "hand drawn wobble, decorative flourish",
             "palette": ["#0D1117", "#238636", "#58A6FF", "#C9D1D9"],
             "attributes": {"typography": "monospace, uniform weight"},
@@ -434,7 +445,10 @@ TONE_AND_MANNER: tuple[dict[str, Any], ...] = (
     {
         "label": "retro",
         "patch": {
-            "prompt_fragment": "retro seventies print feel, limited ink palette, slight registration offset, halftone grain",
+            "prompt_fragment": (
+                "retro seventies print feel, limited ink palette, slight registration "
+                "offset, halftone grain"
+            ),
             "negative_fragment": "clean digital gradient, modern minimalism",
             "palette": ["#E8A33D", "#C1502E", "#2F4B4E", "#F1E4CE"],
             "attributes": {"typography": "condensed slab serif"},
@@ -444,7 +458,10 @@ TONE_AND_MANNER: tuple[dict[str, Any], ...] = (
     {
         "label": "organic",
         "patch": {
-            "prompt_fragment": "organic natural feel, earthy muted tones, soft irregular edges, paper texture",
+            "prompt_fragment": (
+                "organic natural feel, earthy muted tones, soft irregular edges, "
+                "paper texture"
+            ),
             "negative_fragment": "synthetic neon, hard geometry, glossy plastic",
             "palette": ["#5C6B4C", "#A8B79A", "#D9CBB2", "#3B3227"],
             "attributes": {"typography": "humanist sans, soft terminals"},
@@ -454,7 +471,10 @@ TONE_AND_MANNER: tuple[dict[str, Any], ...] = (
     {
         "label": "editorial",
         "patch": {
-            "prompt_fragment": "editorial magazine layout, strong typographic hierarchy, generous margins, single accent",
+            "prompt_fragment": (
+                "editorial magazine layout, strong typographic hierarchy, generous "
+                "margins, single accent"
+            ),
             "negative_fragment": "amateur spacing, competing focal points",
             "palette": ["#111111", "#8C1D18", "#EDE9E2", "#FFFFFF"],
             "attributes": {"typography": "didone headline, sans deck"},
@@ -464,7 +484,9 @@ TONE_AND_MANNER: tuple[dict[str, Any], ...] = (
     {
         "label": "neon",
         "patch": {
-            "prompt_fragment": "neon night aesthetic, glowing edges, deep shadow, chromatic accent light",
+            "prompt_fragment": (
+                "neon night aesthetic, glowing edges, deep shadow, chromatic accent light"
+            ),
             "negative_fragment": "flat daylight, pastel wash, low contrast",
             "palette": ["#08040F", "#FF2E88", "#00E5FF", "#7B2CFF"],
             "attributes": {"typography": "wide sans, glowing stroke"},
@@ -474,7 +496,10 @@ TONE_AND_MANNER: tuple[dict[str, Any], ...] = (
     {
         "label": "hand-drawn",
         "patch": {
-            "prompt_fragment": "hand drawn character, visible pencil and ink texture, slightly uneven line weight",
+            "prompt_fragment": (
+                "hand drawn character, visible pencil and ink texture, slightly "
+                "uneven line weight"
+            ),
             "negative_fragment": "vector precision, mechanical repetition",
             "palette": ["#2B2B2B", "#E4D8C3", "#B5563F", "#6E8B74"],
             "attributes": {"typography": "hand lettered, irregular baseline"},
@@ -484,7 +509,10 @@ TONE_AND_MANNER: tuple[dict[str, Any], ...] = (
     {
         "label": "corporate",
         "patch": {
-            "prompt_fragment": "corporate clarity, confident blue palette, symmetric balance, dependable structure",
+            "prompt_fragment": (
+                "corporate clarity, confident blue palette, symmetric balance, "
+                "dependable structure"
+            ),
             "negative_fragment": "experimental layout, distressed texture, playful chaos",
             "palette": ["#0A2540", "#1668B3", "#7FA8CC", "#F2F6FA"],
             "attributes": {"typography": "neutral grotesque, medium weight"},
@@ -495,26 +523,94 @@ TONE_AND_MANNER: tuple[dict[str, Any], ...] = (
 
 
 CAMERA_ANGLE: tuple[dict[str, Any], ...] = (
-    {"label": "eye-level", "patch": {"prompt_fragment": "eye level shot, neutral perspective"}, "tags": ["neutral"]},
-    {"label": "low-angle", "patch": {"prompt_fragment": "low angle shot looking up, imposing scale"}, "tags": ["dramatic"]},
-    {"label": "high-angle", "patch": {"prompt_fragment": "high angle shot looking down, vulnerable framing"}, "tags": ["dramatic"]},
-    {"label": "close-up", "patch": {"prompt_fragment": "close up, shallow depth of field, facial detail"}, "tags": ["intimate"]},
-    {"label": "wide-establishing", "patch": {"prompt_fragment": "wide establishing shot, subject small in the environment"}, "tags": ["context"]},
-    {"label": "over-the-shoulder", "patch": {"prompt_fragment": "over the shoulder framing, foreground occlusion"}, "tags": ["narrative"]},
-    {"label": "dutch-tilt", "patch": {"prompt_fragment": "dutch tilt, canted horizon, unease"}, "tags": ["dramatic"]},
-    {"label": "overhead-flat", "patch": {"prompt_fragment": "directly overhead flat lay, orthographic feel"}, "tags": ["graphic"]},
+    {
+        "label": "eye-level",
+        "patch": {"prompt_fragment": "eye level shot, neutral perspective"},
+        "tags": ["neutral"],
+    },
+    {
+        "label": "low-angle",
+        "patch": {"prompt_fragment": "low angle shot looking up, imposing scale"},
+        "tags": ["dramatic"],
+    },
+    {
+        "label": "high-angle",
+        "patch": {"prompt_fragment": "high angle shot looking down, vulnerable framing"},
+        "tags": ["dramatic"],
+    },
+    {
+        "label": "close-up",
+        "patch": {"prompt_fragment": "close up, shallow depth of field, facial detail"},
+        "tags": ["intimate"],
+    },
+    {
+        "label": "wide-establishing",
+        "patch": {
+            "prompt_fragment": "wide establishing shot, subject small in the environment"
+        },
+        "tags": ["context"],
+    },
+    {
+        "label": "over-the-shoulder",
+        "patch": {"prompt_fragment": "over the shoulder framing, foreground occlusion"},
+        "tags": ["narrative"],
+    },
+    {
+        "label": "dutch-tilt",
+        "patch": {"prompt_fragment": "dutch tilt, canted horizon, unease"},
+        "tags": ["dramatic"],
+    },
+    {
+        "label": "overhead-flat",
+        "patch": {"prompt_fragment": "directly overhead flat lay, orthographic feel"},
+        "tags": ["graphic"],
+    },
 )
 
 
 COLOR_SCHEME: tuple[dict[str, Any], ...] = (
-    {"label": "monochrome", "patch": {"prompt_fragment": "monochrome palette, single hue with tonal range"}, "tags": ["restrained"]},
-    {"label": "complementary", "patch": {"prompt_fragment": "complementary color scheme, two opposing hues"}, "tags": ["contrast"]},
-    {"label": "analogous", "patch": {"prompt_fragment": "analogous color scheme, neighbouring hues, gentle transition"}, "tags": ["harmonious"]},
-    {"label": "triadic", "patch": {"prompt_fragment": "triadic color scheme, three evenly spaced hues"}, "tags": ["vivid"]},
-    {"label": "warm-dominant", "patch": {"prompt_fragment": "warm dominant palette, amber and terracotta"}, "tags": ["warm"]},
-    {"label": "cool-dominant", "patch": {"prompt_fragment": "cool dominant palette, slate and teal"}, "tags": ["cool"]},
-    {"label": "high-key", "patch": {"prompt_fragment": "high key lighting, bright even exposure, minimal shadow"}, "tags": ["light"]},
-    {"label": "low-key", "patch": {"prompt_fragment": "low key lighting, deep shadow, small bright area"}, "tags": ["dark"]},
+    {
+        "label": "monochrome",
+        "patch": {"prompt_fragment": "monochrome palette, single hue with tonal range"},
+        "tags": ["restrained"],
+    },
+    {
+        "label": "complementary",
+        "patch": {"prompt_fragment": "complementary color scheme, two opposing hues"},
+        "tags": ["contrast"],
+    },
+    {
+        "label": "analogous",
+        "patch": {
+            "prompt_fragment": "analogous color scheme, neighbouring hues, gentle transition"
+        },
+        "tags": ["harmonious"],
+    },
+    {
+        "label": "triadic",
+        "patch": {"prompt_fragment": "triadic color scheme, three evenly spaced hues"},
+        "tags": ["vivid"],
+    },
+    {
+        "label": "warm-dominant",
+        "patch": {"prompt_fragment": "warm dominant palette, amber and terracotta"},
+        "tags": ["warm"],
+    },
+    {
+        "label": "cool-dominant",
+        "patch": {"prompt_fragment": "cool dominant palette, slate and teal"},
+        "tags": ["cool"],
+    },
+    {
+        "label": "high-key",
+        "patch": {"prompt_fragment": "high key lighting, bright even exposure, minimal shadow"},
+        "tags": ["light"],
+    },
+    {
+        "label": "low-key",
+        "patch": {"prompt_fragment": "low key lighting, deep shadow, small bright area"},
+        "tags": ["dark"],
+    },
 )
 
 

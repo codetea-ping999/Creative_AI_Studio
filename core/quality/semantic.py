@@ -61,7 +61,7 @@ class _ClipImageBackend:
     def __init__(self, config: SemanticJudgeConfig, cache: ScoreCache) -> None:
         self.config = config
         self.cache = cache
-        self._runtime: tuple[object, object] | None = None
+        self._runtime: tuple[Any, Any] | None = None
         self._error: str | None = None
 
     def evaluate(
@@ -150,8 +150,8 @@ class _ClipImageBackend:
         *,
         prompt: str,
         negative_prompt: str | None,
-        processor: object,
-        model: object,
+        processor: Any,
+        model: Any,
     ) -> dict[str, Any]:
         import torch
 
@@ -193,7 +193,7 @@ class _ClipImageBackend:
             },
         }
 
-    def _load_runtime(self) -> tuple[object, object] | None:
+    def _load_runtime(self) -> tuple[Any, Any] | None:
         if self._runtime is not None:
             return self._runtime
         if self._error is not None:
@@ -225,7 +225,7 @@ class _ClapAudioBackend:
     def __init__(self, config: SemanticJudgeConfig, cache: ScoreCache) -> None:
         self.config = config
         self.cache = cache
-        self._runtime: tuple[object, object] | None = None
+        self._runtime: tuple[Any, Any] | None = None
         self._error: str | None = None
 
     def evaluate(
@@ -311,7 +311,7 @@ class _ClapAudioBackend:
         self.cache.put(cache_key, result)
         return result
 
-    def _load_runtime(self) -> tuple[object, object] | None:
+    def _load_runtime(self) -> tuple[Any, Any] | None:
         if self._runtime is not None:
             return self._runtime
         if self._error is not None:

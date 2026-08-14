@@ -54,8 +54,8 @@ class BibleEntry:
     tone_and_manner: dict[str, Any] = field(default_factory=dict)
     locked_fields: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
-    created_at: datetime | None = None
-    updated_at: datetime | None = None
+    created_at: datetime = field(default_factory=utc_now)
+    updated_at: datetime = field(default_factory=utc_now)
 
     def __post_init__(self) -> None:
         if self.kind not in BIBLE_KINDS:
@@ -71,10 +71,6 @@ class BibleEntry:
                 f"Unknown seed policy mode {seed_mode!r}; "
                 f"expected one of {', '.join(SEED_MODES)}"
             )
-        if self.created_at is None:
-            self.created_at = utc_now()
-        if self.updated_at is None:
-            self.updated_at = utc_now()
 
     @property
     def locked_seed(self) -> int | None:

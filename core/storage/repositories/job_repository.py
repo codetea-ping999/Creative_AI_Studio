@@ -10,7 +10,7 @@ import sqlite3
 from typing import Any
 
 from core.jobs.schemas import JobRecord
-from core.schemas import GenerationRequest, GenerationResult
+from core.schemas import GenerationRequest, GenerationResult, GenerationStatus
 
 _UNSET = object()
 
@@ -334,7 +334,7 @@ class JobRepository:
         *,
         job_id: str,
         request: GenerationRequest,
-        status: str,
+        status: GenerationStatus,
         progress: float = 0.0,
         result: GenerationResult | None = None,
         created_at: datetime | str | None = None,

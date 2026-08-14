@@ -145,7 +145,11 @@ class AudioGenerator(BaseGenerator):
         finally:
             self.cleanup(request)
 
-    def generate(
+    # Intentionally not context-shaped: this generator opts into segment-level
+    # progress/cancel via run_with_control() (see JobRunner.process_job in
+    # core/jobs/runner.py), a separate duck-typed dispatch path BaseGenerator.run()
+    # checks for before falling back to the generic `context` signature.
+    def generate(  # type: ignore[override]
         self,
         request: GenerationRequest,
         *,
@@ -563,7 +567,7 @@ class AudioGenerator(BaseGenerator):
         self,
         seed: int | None,
         device: str,
-        torch: object,
+        torch: Any,
     ):
         if seed is None:
             yield
@@ -608,7 +612,7 @@ class AudioGenerator(BaseGenerator):
         audio_tensor,
         *,
         sampling_rate: int,
-        torch: object,
+        torch: Any,
     ) -> None:
         if audio_tensor.ndim == 1:
             audio_tensor = audio_tensor.unsqueeze(0)

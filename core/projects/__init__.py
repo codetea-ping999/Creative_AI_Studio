@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import json
 from pathlib import Path
@@ -20,26 +20,12 @@ class Project:
     name: str
     description: str = ""
     status: str = "active"
-    tags: list[str] | None = None
-    metadata: dict[str, Any] | None = None
-    pinned_asset_ids: list[str] | None = None
-    created_at: datetime | None = None
-    updated_at: datetime | None = None
-    job_ids: list[str] | None = None
-
-    def __post_init__(self) -> None:
-        if self.created_at is None:
-            self.created_at = utc_now()
-        if self.updated_at is None:
-            self.updated_at = utc_now()
-        if self.job_ids is None:
-            self.job_ids = []
-        if self.tags is None:
-            self.tags = []
-        if self.metadata is None:
-            self.metadata = {}
-        if self.pinned_asset_ids is None:
-            self.pinned_asset_ids = []
+    tags: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    pinned_asset_ids: list[str] = field(default_factory=list)
+    created_at: datetime = field(default_factory=utc_now)
+    updated_at: datetime = field(default_factory=utc_now)
+    job_ids: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {

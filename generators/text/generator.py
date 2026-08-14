@@ -61,7 +61,10 @@ class TextGenerator(BaseGenerator):
     def prepare(self, request: GenerationRequest) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    def generate(self, request: GenerationRequest) -> GenerationResult:
+    # Intentionally omits `context`: BaseGenerator.run() introspects generate()'s
+    # signature (see generators/base.py) and calls context-free generators without
+    # it, so cancellation is only honored at the job-boundary for this generator.
+    def generate(self, request: GenerationRequest) -> GenerationResult:  # type: ignore[override]
         requested_model_id = request.model_id.strip() or None
         manifest, runtime_obj = self.model_service.resolve_runtime(
             requested_model_id,

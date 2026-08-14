@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import json
 from pathlib import Path
@@ -37,18 +37,10 @@ class Feedback:
     creative_rating: int | None = None
     reuse_intent: bool | None = None
     export_ready: bool | None = None
-    issue_tags: list[str] | None = None
+    issue_tags: list[str] = field(default_factory=list)
     comments: str = ""
-    created_at: datetime | None = None
-    metadata: dict[str, Any] | None = None
-
-    def __post_init__(self) -> None:
-        if self.created_at is None:
-            self.created_at = utc_now()
-        if self.issue_tags is None:
-            self.issue_tags = []
-        if self.metadata is None:
-            self.metadata = {}
+    created_at: datetime = field(default_factory=utc_now)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -244,11 +236,10 @@ class FeedbackRepository:
             raise ValueError(f"{field_name} must be between 1 and 5")
 
 
-def _average_rating(values: list[int | None]) -> float | None:
-    normalized = [int(value) for value in values if isinstance(value, int)]
-    if not normalized:
+def _average_rating(values: list[int]) -> float | None:
+    if not values:
         return None
-    return round(sum(normalized) / len(normalized), 2)
+    return round(sum(values) / len(values), 2)
 
 
 def _average_boolean(total_true: int, count: int) -> float | None:

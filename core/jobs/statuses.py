@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-JOB_STATUS_QUEUED = "queued"
-JOB_STATUS_PREPARING = "preparing"
-JOB_STATUS_RUNNING = "running"
-JOB_STATUS_POSTPROCESSING = "postprocessing"
-JOB_STATUS_SUCCEEDED = "succeeded"
-JOB_STATUS_FAILED = "failed"
-JOB_STATUS_CANCELLED = "cancelled"
+from core.schemas import GenerationStatus
+
+JOB_STATUS_QUEUED: GenerationStatus = "queued"
+JOB_STATUS_PREPARING: GenerationStatus = "preparing"
+JOB_STATUS_RUNNING: GenerationStatus = "running"
+JOB_STATUS_POSTPROCESSING: GenerationStatus = "postprocessing"
+JOB_STATUS_SUCCEEDED: GenerationStatus = "succeeded"
+JOB_STATUS_FAILED: GenerationStatus = "failed"
+JOB_STATUS_CANCELLED: GenerationStatus = "cancelled"
 
 JOB_STATUSES = (
     JOB_STATUS_QUEUED,

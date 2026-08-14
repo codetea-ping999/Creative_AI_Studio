@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import hashlib
 import json
@@ -38,26 +38,12 @@ class Asset:
     path: str
     preview_path: str | None = None
     parent_asset_id: str | None = None
-    lineage: list[str] | None = None
-    export_paths: list[str] | None = None
-    tags: list[str] | None = None
-    metadata: dict[str, Any] | None = None
-    created_at: datetime | None = None
-    updated_at: datetime | None = None
-
-    def __post_init__(self) -> None:
-        if self.created_at is None:
-            self.created_at = _now()
-        if self.updated_at is None:
-            self.updated_at = _now()
-        if self.lineage is None:
-            self.lineage = []
-        if self.export_paths is None:
-            self.export_paths = []
-        if self.tags is None:
-            self.tags = []
-        if self.metadata is None:
-            self.metadata = {}
+    lineage: list[str] = field(default_factory=list)
+    export_paths: list[str] = field(default_factory=list)
+    tags: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=_now)
+    updated_at: datetime = field(default_factory=_now)
 
     def to_dict(self) -> dict[str, Any]:
         return {

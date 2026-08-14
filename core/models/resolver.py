@@ -19,6 +19,7 @@ class ModelResolver:
         media_type: str,
         task_type: str | None = None,
     ) -> ModelManifest:
+        manifest: ModelManifest | None
         if model_id:
             manifest = self.registry.get(self.resolve_manifest_id(model_id))
         else:

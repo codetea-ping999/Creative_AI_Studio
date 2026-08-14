@@ -35,13 +35,17 @@ cd apps/web && npm run dev    # Web UI only (http://localhost:5173)
 Verification (mirrors CI — `python scripts/verify_local_stack.py --start-api`):
 
 ```bash
-make verify        # setup-check + web build + pytest + web test + API smoke, via verify_local_stack.py
-make verify-lite   # same, without starting/smoke-testing the API
+make verify        # setup-check + web build/test + eslint/ruff/mypy + npm audit + pytest (+coverage) + API smoke, via verify_local_stack.py
+make verify-lite   # same set of gates, without starting/smoke-testing the API
 make setup-check   # scripts/check_local_setup.py --skip-runtime-files
 make test          # pytest -q
 make web-build     # npm --prefix apps/web run build
 make web-test      # npm --prefix apps/web test
-make api-smoke     # /health + /models smoke check only
+make lint          # eslint (apps/web) + ruff (core/, generators/)
+make typecheck     # mypy (core/, generators/)
+make test-coverage # pytest --cov=core --cov=generators (fails under the pyproject.toml floor)
+make npm-audit     # npm --prefix apps/web audit --audit-level=high
+make api-smoke     # /health + /models smoke check only (skips lint/typecheck/coverage/audit)
 ```
 
 Single test:
@@ -50,12 +54,6 @@ Single test:
 ./venv/bin/python -m pytest tests/test_job_pipeline.py -v
 ./venv/bin/python -m pytest tests/test_job_pipeline.py::test_specific_case -v
 npm --prefix apps/web test -- PromptForm      # vitest, filters by filename/testname
-```
-
-Lint (per CONTRIBUTING.md, not wired into `make`):
-
-```bash
-python -m flake8 core/ generators/ apps/
 ```
 
 Optional model-specific smoke tests (require weights placed under `models/`):

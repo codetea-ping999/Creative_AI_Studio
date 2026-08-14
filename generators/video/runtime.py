@@ -6,13 +6,16 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 import random
 import textwrap
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from PIL import Image, ImageDraw, ImageFont
 
 from core.models import ModelManifest
 from core.schemas import GenerationRequest
+
+if TYPE_CHECKING:
+    from core.jobs.context import GenerationContext
 
 PROCEDURAL_VIDEO_OUTPUT_FORMATS = frozenset({"gif"})
 LEARNED_VIDEO_OUTPUT_FORMATS = frozenset({"mp4"})
@@ -31,6 +34,7 @@ class BaseVideoRuntime(ABC):
         runtime_obj: dict[str, Any],
         output_dir: Path,
         effective_params: dict[str, Any],
+        context: "GenerationContext | None" = None,
     ) -> dict[str, Any]:
         """Render a video asset and return its file paths and metadata."""
 
@@ -46,6 +50,7 @@ class ProceduralStoryboardRuntime(BaseVideoRuntime):
         runtime_obj: dict[str, Any],
         output_dir: Path,
         effective_params: dict[str, Any],
+        context: "GenerationContext | None" = None,
     ) -> dict[str, Any]:
         width = max(256, int(effective_params.pop("width", 576)))
         height = max(256, int(effective_params.pop("height", 320)))
@@ -60,24 +65,30 @@ class ProceduralStoryboardRuntime(BaseVideoRuntime):
             or "storyboard"
         )
         negative_prompt = request.negative_prompt.strip() if request.negative_prompt else None
-        palette = runtime_obj.get("palette") if isinstance(runtime_obj.get("palette"), list) else []
+        raw_palette = runtime_obj.get("palette")
+        palette = raw_palette if isinstance(raw_palette, list) else []
         rng = random.Random(request.seed if request.seed is not None else hash(request.prompt))
 
-        frames = [
-            self._render_frame(
-                index=frame_index,
-                total_frames=num_frames,
-                width=width,
-                height=height,
-                prompt=request.prompt,
-                negative_prompt=negative_prompt,
-                palette=[str(color) for color in palette],
-                camera_motion=camera_motion,
-                visual_style=visual_style,
-                rng=rng,
+        frames = []
+        for frame_index in range(num_frames):
+            if context is not None:
+                context.raise_if_cancelled()
+            frames.append(
+                self._render_frame(
+                    index=frame_index,
+                    total_frames=num_frames,
+                    width=width,
+                    height=height,
+                    prompt=request.prompt,
+                    negative_prompt=negative_prompt,
+                    palette=[str(color) for color in palette],
+                    camera_motion=camera_motion,
+                    visual_style=visual_style,
+                    rng=rng,
+                )
             )
-            for frame_index in range(num_frames)
-        ]
+            if context is not None:
+                context.report_progress((frame_index + 1) / num_frames)
 
         output_id = f"vid_{uuid4().hex}"
         output_path = output_dir / f"{output_id}.gif"
@@ -204,16 +215,21 @@ class ProceduralStoryboardRuntime(BaseVideoRuntime):
         amount: float,
     ) -> tuple[int, int, int]:
         clamped = max(0.0, min(1.0, amount))
-        return tuple(
-            int(left[channel] + (right[channel] - left[channel]) * clamped)
-            for channel in range(3)
+        return (
+            int(left[0] + (right[0] - left[0]) * clamped),
+            int(left[1] + (right[1] - left[1]) * clamped),
+            int(left[2] + (right[2] - left[2]) * clamped),
         )
 
     def _hex_to_rgb(self, value: str) -> tuple[int, int, int]:
         normalized = value.lstrip("#")
         if len(normalized) != 6:
             return (17, 24, 39)
-        return tuple(int(normalized[index:index + 2], 16) for index in (0, 2, 4))
+        return (
+            int(normalized[0:2], 16),
+            int(normalized[2:4], 16),
+            int(normalized[4:6], 16),
+        )
 
 
 class LearnedVideoRuntime(BaseVideoRuntime):
@@ -227,6 +243,7 @@ class LearnedVideoRuntime(BaseVideoRuntime):
         runtime_obj: dict[str, Any],
         output_dir: Path,
         effective_params: dict[str, Any],
+        context: "GenerationContext | None" = None,
     ) -> dict[str, Any]:
         renderer = runtime_obj.get("renderer")
         pipeline = runtime_obj.get("pipeline")
@@ -234,7 +251,9 @@ class LearnedVideoRuntime(BaseVideoRuntime):
         if load_error:
             raise RuntimeError(f"Learned video runtime is unavailable: {load_error}")
 
-        callable_runtime = renderer if callable(renderer) else pipeline if callable(pipeline) else None
+        callable_runtime = (
+            renderer if callable(renderer) else pipeline if callable(pipeline) else None
+        )
         if callable_runtime is None:
             raise RuntimeError(
                 "Learned video runtime requires a callable renderer or pipeline. "
@@ -249,6 +268,11 @@ class LearnedVideoRuntime(BaseVideoRuntime):
             "output_format": request.output_format or effective_params.get("output_format", "mp4"),
             **effective_params,
         }
+        if context is not None:
+            # The loaded model's own callable is opaque third-party code (see
+            # LearnedVideoLoader) and cannot be interrupted mid-inference, so this
+            # is a boundary check, not step-level cancellation.
+            context.raise_if_cancelled()
         generated = callable_runtime(**generation_kwargs)
         return self._normalize_generated_output(
             generated=generated,
@@ -276,8 +300,12 @@ class LearnedVideoRuntime(BaseVideoRuntime):
                 return {
                     "output_id": output_id,
                     "output_path": output_path,
-                    "preview_paths": list(preview_paths) if isinstance(preview_paths, list) else [output_path],
-                    "output_format": normalized.get("output_format", Path(output_path).suffix.lstrip(".") or "mp4"),
+                    "preview_paths": (
+                        list(preview_paths) if isinstance(preview_paths, list) else [output_path]
+                    ),
+                    "output_format": normalized.get(
+                        "output_format", Path(output_path).suffix.lstrip(".") or "mp4"
+                    ),
                     "params": dict(effective_params),
                     "runtime_metadata": {
                         "runtime_adapter": "learned_text_to_video",
@@ -302,7 +330,11 @@ class LearnedVideoRuntime(BaseVideoRuntime):
                 },
             }
 
-        if isinstance(generated, list) and generated and all(isinstance(frame, Image.Image) for frame in generated):
+        if (
+            isinstance(generated, list)
+            and generated
+            and all(isinstance(frame, Image.Image) for frame in generated)
+        ):
             output_id = f"vid_{uuid4().hex}"
             output_path = output_dir / f"{output_id}.gif"
             generated[0].save(

@@ -58,11 +58,13 @@ ISO トラックは *accountable management*、*internal audit*、*certification
 
 ISO のスコープ議論の結論に関係なく価値が確定している 3 件。ここから着手します。
 
-| 順 | issue | 内容 | 規模 |
-| --- | --- | --- | --- |
-| 1 | #87 | **High 3 件を全て解消**してから `npm audit` を CI に追加（下記） | M |
-| 2 | — | issue 整理: #55 をクローズ、#56 を「music 経路適用」に絞って再記述、**#87 の範囲を更新** | S |
-| 3 | #83 | ruff（lint+format）/ mypy / eslint / coverage を導入し `make verify` と CI を一致させる | L |
+| 順 | issue | 内容 | 規模 | 状態 |
+| --- | --- | --- | --- | --- |
+| 1 | #87 | **High 3 件を全て解消**してから `npm audit` を CI に追加（下記） | M | ✅ 実施済み（2026-08-14） |
+| 2 | — | issue 整理: #55 をクローズ、#56 を「music 経路適用」に絞って再記述、**#87 の範囲を更新** | S | #56 は本文が既に対象範囲を正しく含んでいたため再記述は不要と判明。#55 クローズと #87 本文更新は GitHub 操作のため未実施（要承認） |
+| 3 | #83 | ruff（lint+format）/ mypy / eslint / coverage を導入し `make verify` と CI を一致させる | L | ✅ 実施済み（2026-08-14）。ruff/mypy は `core/`・`generators/` の既存違反 146 件（ruff 36 + mypy 110）を修正した上でゲート化。coverage は Python 85%・Web 40% を現状値の床として設定 |
+
+トラック B の **#18**（video generator のキャンセル対応）も本バッチで実施済み（✅ 2026-08-14）。
 
 **#87 の範囲は issue の記述より広い**。issue #87 は GHSA-r28c-9q8g-f849（postcss ≤8.5.17）
 のみを挙げていますが、2026-08-14 時点の `npm audit` は High 3 件を報告します。
@@ -221,15 +223,15 @@ RTO / RPO の達成は証明できません。
 §3 の Phase 0 と同じ順序です（1〜3 が Phase 0 そのもの）。4 以降は
 トラックをまたいで次に来るものを並べています。
 
-1. #87 — postcss 更新 + `npm audit` を CI に追加（Phase 0-1）
-2. issue 整理 — #55 クローズ、#56 を残作業に絞る（Phase 0-2）
-3. #83 — ruff / mypy / eslint / coverage ゲート（Phase 0-3）
-4. #6 → #79 — 製品境界を確定し、ISO の適用範囲マトリクスを 1 本作る（Phase 1）
-5. #18 — video generator に `raise_if_cancelled()` を接続（トラック B。小さく独立なので
-   #83 の待ち時間に差し込める）
+1. ✅ #87 — postcss/nanoid/undici 更新 + `npm audit` ゲートを `verify_local_stack.py` に追加（Phase 0-1、実施済み）
+2. issue 整理 — #55 クローズ、#87 本文更新（Phase 0-2。GitHub 操作のため未実施、要承認）
+3. ✅ #83 — ruff / mypy / eslint / coverage ゲート（Phase 0-3、実施済み）
+4. **次はこれ** — #6 → #79 — 製品境界を確定し、ISO の適用範囲マトリクスを 1 本作る（Phase 1）
+5. ✅ #18 — video generator に `raise_if_cancelled()` を接続（トラック B、実施済み）
 
 **#83 を後ろに回さないでください。** ゲートが入る前にトラック B の実装を始めると、
 lint / type エラーを含むコードが積み上がってから一括修正することになります。
+（2026-08-14 実施分はこの順序どおり、#83 を #6/#79 より先に完了させています。）
 
 ## 7. 判断が要る分岐
 

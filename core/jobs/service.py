@@ -7,7 +7,7 @@ from uuid import uuid4
 
 from typing import TYPE_CHECKING
 
-from core.schemas import GenerationRequest, GenerationResult
+from core.schemas import GenerationRequest, GenerationResult, GenerationStatus
 
 from .events import EventBus
 
@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from core.assets import AssetRepository
     from core.storage.repositories.job_repository import JobRepository
     from .cancellation import CancellationRegistry
+    from .queue import JobQueue
 from .schemas import JobRecord
 from .statuses import (
     ACTIVE_JOB_STATUSES,
@@ -44,7 +45,7 @@ class JobService:
     def __init__(
         self,
         job_repository: JobRepository,
-        job_queue: object,
+        job_queue: "JobQueue",
         event_bus: EventBus | None = None,
         asset_repository: AssetRepository | None = None,
         cancellation_registry: "CancellationRegistry | None" = None,
@@ -108,7 +109,7 @@ class JobService:
     def update_status(
         self,
         job_id: str,
-        status: str,
+        status: GenerationStatus,
         progress: float | None = None,
     ) -> JobRecord | None:
         job = self.job_repository.update_status(job_id, status, progress=progress)
