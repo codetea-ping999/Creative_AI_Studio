@@ -282,7 +282,9 @@ class TransformersMusicgenMelodyLoader(TransformersMusicgenLoader):
     def load(self, manifest: ModelManifest) -> dict[str, Any]:
         try:
             import torch
-            from transformers import (
+            # transformers exposes this via its lazy-module __getattr__, which
+            # mypy's stubs don't model for this symbol.
+            from transformers import (  # type: ignore[attr-defined]
                 MusicgenMelodyConfig,
                 MusicgenMelodyForConditionalGeneration,
                 MusicgenMelodyProcessor,

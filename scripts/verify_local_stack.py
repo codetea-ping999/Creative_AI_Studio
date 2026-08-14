@@ -56,6 +56,31 @@ def parse_args() -> argparse.Namespace:
         help="Skip /health and /models smoke checks.",
     )
     parser.add_argument(
+        "--skip-npm-audit",
+        action="store_true",
+        help="Skip the apps/web npm audit dependency scan.",
+    )
+    parser.add_argument(
+        "--skip-eslint",
+        action="store_true",
+        help="Skip the apps/web ESLint check.",
+    )
+    parser.add_argument(
+        "--skip-ruff",
+        action="store_true",
+        help="Skip the ruff lint check over core/ and generators/.",
+    )
+    parser.add_argument(
+        "--skip-mypy",
+        action="store_true",
+        help="Skip the mypy type check over core/ and generators/.",
+    )
+    parser.add_argument(
+        "--skip-coverage",
+        action="store_true",
+        help="Skip the pytest coverage-threshold gate.",
+    )
+    parser.add_argument(
         "--start-api",
         action="store_true",
         help="Start a temporary uvicorn process before running API smoke checks.",
@@ -96,6 +121,13 @@ def venv_python() -> str:
     if candidate.exists():
         return str(candidate)
     return sys.executable
+
+
+def venv_executable(name: str) -> str:
+    candidate = ROOT / "venv" / "bin" / name
+    if candidate.exists():
+        return str(candidate)
+    return name
 
 
 def run_command(command: list[str], *, cwd: Path = ROOT, env: dict[str, str] | None = None) -> None:
@@ -368,11 +400,40 @@ def main() -> int:
             if not args.skip_web_tests:
                 run_command(["npm", "test"], cwd=ROOT / "apps" / "web", env=isolated_env)
 
+            if not args.skip_eslint:
+                run_command(["npm", "run", "lint"], cwd=ROOT / "apps" / "web", env=isolated_env)
+
             if not args.skip_web_build:
                 run_command(["npm", "run", "build"], cwd=ROOT / "apps" / "web", env=isolated_env)
 
+            if not args.skip_npm_audit:
+                run_command(
+                    ["npm", "audit", "--audit-level=high"],
+                    cwd=ROOT / "apps" / "web",
+                    env=isolated_env,
+                )
+
+            if not args.skip_ruff:
+                run_command([venv_executable("ruff"), "check", "core", "generators"], env=isolated_env)
+
+            if not args.skip_mypy:
+                run_command([venv_executable("mypy"), "core", "generators"], env=isolated_env)
+
             if not args.skip_tests:
                 run_command([venv_python(), "-m", "pytest", "-q"], env=isolated_env)
+
+            if not args.skip_coverage:
+                run_command(
+                    [
+                        venv_python(),
+                        "-m",
+                        "pytest",
+                        "--cov=core",
+                        "--cov=generators",
+                        "-q",
+                    ],
+                    env=isolated_env,
+                )
 
             if not args.skip_api_smoke:
                 if args.start_api:

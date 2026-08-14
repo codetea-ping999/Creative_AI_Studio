@@ -55,6 +55,7 @@ def _blend(base: float | None, human: float | None, weight: float) -> float | No
     if human is None and base is None:
         return None
     if human is None:
+        assert base is not None
         return round(float(base), 1)
     if base is None:
         return round(float(human), 1)

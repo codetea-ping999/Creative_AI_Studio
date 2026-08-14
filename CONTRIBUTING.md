@@ -58,9 +58,10 @@ Please be respectful and constructive in all interactions. We are committed to p
    pytest -q
    ```
 
-2. **Check code style:**
+2. **Check code style and types:**
    ```bash
-   python -m flake8 core/ generators/ apps/
+   make lint       # eslint (apps/web) + ruff (core/, generators/)
+   make typecheck  # mypy (core/, generators/)
    ```
 
 3. **Verify setup:**

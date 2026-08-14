@@ -17,7 +17,12 @@ from core.models.text_runtimes import BRIEF_HEADING
 
 BEAT_STRUCTURES: dict[str, tuple[str, ...]] = {
     "three-act": ("setup", "confrontation", "resolution"),
-    "kishotenketsu": ("ki (introduction)", "sho (development)", "ten (twist)", "ketsu (conclusion)"),
+    "kishotenketsu": (
+        "ki (introduction)",
+        "sho (development)",
+        "ten (twist)",
+        "ketsu (conclusion)",
+    ),
     "save-the-cat": (
         "opening image",
         "catalyst",

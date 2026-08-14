@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING
 
 from generators.registry import GeneratorRegistry
 
+from core.schemas import GenerationStatus
+
 from .cancellation import CancellationRegistry
 from .context import GenerationCancelled, GenerationContext
 from .events import EventBus
@@ -17,6 +19,7 @@ from .service import JobService
 if TYPE_CHECKING:
     from core.assets import AssetRepository
     from core.storage.repositories.job_repository import JobRepository
+    from .queue import JobQueue
 from .schemas import JobRecord
 from .statuses import (
     JOB_STATUS_CANCELLED,
@@ -41,7 +44,7 @@ class JobRunner:
     def __init__(
         self,
         job_repository: JobRepository,
-        job_queue: object,
+        job_queue: "JobQueue",
         generator_registry: GeneratorRegistry,
         event_bus: EventBus | None = None,
         asset_repository: AssetRepository | None = None,
@@ -152,16 +155,19 @@ class JobRunner:
         return current is not None and current.status == JOB_STATUS_CANCELLED
 
     def _begin_context(self, job_id: str) -> GenerationContext | None:
-        if self.cancellation_registry is None:
+        cancellation_registry = self.cancellation_registry
+        if cancellation_registry is None:
             return None
-        self.cancellation_registry.begin(job_id)
+        cancellation_registry.begin(job_id)
         return GenerationContext(
-            is_cancelled=lambda: self.cancellation_registry.is_cancelled(job_id),
+            is_cancelled=lambda: cancellation_registry.is_cancelled(job_id),
             on_progress=lambda fraction: self._report_generation_progress(job_id, fraction),
         )
 
     def _report_generation_progress(self, job_id: str, fraction: float) -> None:
-        mapped_progress = _RUNNING_PROGRESS_START + max(0.0, min(1.0, fraction)) * _RUNNING_PROGRESS_SPAN
+        mapped_progress = (
+            _RUNNING_PROGRESS_START + max(0.0, min(1.0, fraction)) * _RUNNING_PROGRESS_SPAN
+        )
         job = self.job_repository.update_if_status(
             job_id,
             (JOB_STATUS_RUNNING,),
@@ -206,7 +212,7 @@ class JobRunner:
     def _update_status(
         self,
         job_id: str,
-        status: str,
+        status: GenerationStatus,
         *,
         progress: float | None = None,
     ) -> JobRecord | None:

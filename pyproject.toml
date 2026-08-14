@@ -1,0 +1,29 @@
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+# Staged rollout (see docs/issue-execution-plan.md #83): start at pyflakes
+# (undefined names, unused imports/variables) plus pycodestyle errors. Widen
+# the selected rule set in a follow-up once core/ and generators/ are clean.
+select = ["E", "F"]
+
+[tool.coverage.run]
+source = ["core", "generators"]
+
+[tool.coverage.report]
+# Floor set to the measured baseline (2026-08-14): 86% statements. Catches
+# regressions without demanding an immediate push to 100%.
+fail_under = 85
+show_missing = true
+
+[tool.mypy]
+# No explicit python_version pin: numpy's shipped stubs use Python 3.12+
+# syntax (PEP 695 type statements) that mypy rejects when a lower version is
+# pinned. Letting mypy infer from the running interpreter (CI runs 3.10+,
+# see ci.yml) avoids that without weakening what this project's own code
+# checks against — it doesn't use any version-gated syntax itself.
+# Staged rollout: undefined-reference level first, --strict deferred until
+# core/ and generators/ have baseline type coverage.
+ignore_missing_imports = true
+check_untyped_defs = true

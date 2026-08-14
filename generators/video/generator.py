@@ -79,13 +79,18 @@ class VideoGenerator(BaseGenerator):
 
         effective_params = {**manifest.default_params, **request.params}
         runtime = self.runtime_router.resolve(runtime_obj)
+        if context is not None:
+            context.raise_if_cancelled()
         render_result = runtime.render(
             request=request,
             manifest=manifest,
             runtime_obj=runtime_obj,
             output_dir=self.output_dir,
             effective_params=effective_params,
+            context=context,
         )
+        if context is not None:
+            context.raise_if_cancelled()
 
         output_path = Path(str(render_result["output_path"]))
         quality_report = evaluate_video_output(output_path)
@@ -129,7 +134,9 @@ class VideoGenerator(BaseGenerator):
                 "loader": manifest.loader,
                 "runtime_type": type(runtime_obj).__name__,
                 "runtime_adapter": runtime_metadata.get("runtime_adapter"),
-                "output_format": render_result.get("output_format", output_path.suffix.lstrip(".") or "gif"),
+                "output_format": render_result.get(
+                    "output_format", output_path.suffix.lstrip(".") or "gif"
+                ),
                 "default_params": dict(manifest.default_params),
                 "quality_report": quality_report,
                 "params": params_payload,

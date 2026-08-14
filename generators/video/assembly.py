@@ -287,7 +287,10 @@ class AssemblyGenerator(BaseGenerator):
     def prepare(self, request: GenerationRequest) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    def generate(self, request: GenerationRequest) -> GenerationResult:
+    # Intentionally omits `context`: BaseGenerator.run() introspects generate()'s
+    # signature (see generators/base.py) and calls context-free generators without
+    # it, so cancellation is only honored at the job-boundary for this generator.
+    def generate(self, request: GenerationRequest) -> GenerationResult:  # type: ignore[override]
         timeline: dict[str, Any] = request.params["timeline"]
         tracks: dict[str, Any] = timeline.get("tracks") or {}
         size = self._resolve_resolution(timeline)
@@ -997,12 +1000,12 @@ class _MovingSourceFrames:
                 f"Could not read frames from visual source {self.path}: {exc}"
             ) from exc
 
-        frame = self._cache.get(target)
-        if frame is None:
+        cached_frame = self._cache.get(target)
+        if cached_frame is None:
             # The target was decoded in the loop and cannot be evicted unless the
             # cache bound is configured to zero.
             raise ValueError(f"Could not decode frame {target} from {self.path}.")
-        return frame
+        return cached_frame
 
     def close(self) -> None:
         iterator = self._iterator

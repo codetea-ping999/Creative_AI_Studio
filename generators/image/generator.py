@@ -188,8 +188,8 @@ class ImageGenerator(BaseGenerator):
                 if context is not None:
                     context.raise_if_cancelled()
         except Exception:
-            for output_path in output_paths:
-                Path(output_path).unlink(missing_ok=True)
+            for saved_path in output_paths:
+                Path(saved_path).unlink(missing_ok=True)
             raise
 
         job_params = {
@@ -304,7 +304,7 @@ class ImageGenerator(BaseGenerator):
         self,
         seed: int | None,
         device: str,
-        torch: object,
+        torch: Any,
     ):
         if seed is None:
             return None
@@ -315,7 +315,7 @@ class ImageGenerator(BaseGenerator):
     def _configure_lora(
         self,
         runtime_obj: dict[str, object],
-        pipeline: object,
+        pipeline: Any,
         lora_path: object,
         lora_scale: float,
     ) -> dict[str, object | None]:

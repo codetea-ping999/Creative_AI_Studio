@@ -157,6 +157,11 @@ class VerifyLocalStackTests(unittest.TestCase):
                     skip_web_tests=False,
                     skip_tests=True,
                     skip_api_smoke=True,
+                    skip_npm_audit=True,
+                    skip_eslint=True,
+                    skip_ruff=True,
+                    skip_mypy=True,
+                    skip_coverage=True,
                     start_api=False,
                     api_base_url="http://127.0.0.1:8123",
                     api_timeout=1.0,
@@ -168,6 +173,129 @@ class VerifyLocalStackTests(unittest.TestCase):
             self.assertEqual(MODULE.main(), 0)
 
         self.assertIn((["npm", "test"], MODULE.ROOT / "apps" / "web"), commands)
+
+    def test_standard_verification_runs_npm_audit(self) -> None:
+        commands: list[tuple[list[str], Path]] = []
+
+        def _record_command(
+            command: list[str],
+            *,
+            cwd: Path = MODULE.ROOT,
+            env: dict[str, str] | None = None,
+        ) -> None:
+            del env
+            commands.append((command, cwd))
+
+        with (
+            TemporaryDirectory() as tmp_dir,
+            patch.object(MODULE, "run_command", side_effect=_record_command),
+            patch.object(MODULE, "run_api_smoke_checks"),
+            patch.object(
+                MODULE,
+                "parse_args",
+                return_value=MODULE.argparse.Namespace(
+                    skip_setup_check=True,
+                    skip_web_build=True,
+                    skip_web_tests=True,
+                    skip_tests=True,
+                    skip_api_smoke=True,
+                    skip_npm_audit=False,
+                    skip_eslint=True,
+                    skip_ruff=True,
+                    skip_mypy=True,
+                    skip_coverage=True,
+                    start_api=False,
+                    api_base_url="http://127.0.0.1:8123",
+                    api_timeout=1.0,
+                    check_runtime_files=False,
+                    runtime_root=Path(tmp_dir),
+                ),
+            ),
+        ):
+            self.assertEqual(MODULE.main(), 0)
+
+        self.assertIn(
+            (["npm", "audit", "--audit-level=high"], MODULE.ROOT / "apps" / "web"),
+            commands,
+        )
+
+    def _run_with_only(self, tmp_dir: str, **enabled_flags: bool) -> list[tuple[list[str], Path]]:
+        commands: list[tuple[list[str], Path]] = []
+
+        def _record_command(
+            command: list[str],
+            *,
+            cwd: Path = MODULE.ROOT,
+            env: dict[str, str] | None = None,
+        ) -> None:
+            del env
+            commands.append((command, cwd))
+
+        all_skip_flags = {
+            "skip_setup_check": True,
+            "skip_web_build": True,
+            "skip_web_tests": True,
+            "skip_tests": True,
+            "skip_api_smoke": True,
+            "skip_npm_audit": True,
+            "skip_eslint": True,
+            "skip_ruff": True,
+            "skip_mypy": True,
+            "skip_coverage": True,
+        }
+        for name, enabled in enabled_flags.items():
+            all_skip_flags[f"skip_{name}"] = not enabled
+
+        with (
+            patch.object(MODULE, "run_command", side_effect=_record_command),
+            patch.object(MODULE, "run_api_smoke_checks"),
+            patch.object(
+                MODULE,
+                "parse_args",
+                return_value=MODULE.argparse.Namespace(
+                    start_api=False,
+                    api_base_url="http://127.0.0.1:8123",
+                    api_timeout=1.0,
+                    check_runtime_files=False,
+                    runtime_root=Path(tmp_dir),
+                    **all_skip_flags,
+                ),
+            ),
+        ):
+            self.assertEqual(MODULE.main(), 0)
+        return commands
+
+    def test_standard_verification_runs_eslint(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            commands = self._run_with_only(tmp_dir, eslint=True)
+        self.assertIn((["npm", "run", "lint"], MODULE.ROOT / "apps" / "web"), commands)
+
+    def test_standard_verification_runs_ruff(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            commands = self._run_with_only(tmp_dir, ruff=True)
+        self.assertIn(
+            ([MODULE.venv_executable("ruff"), "check", "core", "generators"], MODULE.ROOT),
+            commands,
+        )
+
+    def test_standard_verification_runs_mypy(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            commands = self._run_with_only(tmp_dir, mypy=True)
+        self.assertIn(
+            ([MODULE.venv_executable("mypy"), "core", "generators"], MODULE.ROOT),
+            commands,
+        )
+
+    def test_standard_verification_runs_coverage(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            commands = self._run_with_only(tmp_dir, coverage=True)
+        self.assertIn(
+            (
+                [MODULE.venv_python(), "-m", "pytest", "--cov=core", "--cov=generators", "-q"],
+                MODULE.ROOT,
+            ),
+            commands,
+        )
 
     def test_python_version_check_rejects_unsupported_runtime(self) -> None:
         self.assertFalse(SETUP_MODULE._check_python_version((3, 9, 18)))

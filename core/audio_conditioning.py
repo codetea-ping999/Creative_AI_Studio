@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 import wave
 
 
@@ -82,8 +83,8 @@ def prepare_wav_reference(
     target_sampling_rate: int,
     min_duration_seconds: float = 1.0,
     max_duration_seconds: float,
-    torch: object,
-) -> tuple[object, WavReferenceInfo]:
+    torch: Any,
+) -> tuple[Any, WavReferenceInfo]:
     """Decode PCM, convert to mono, and resample before processor invocation."""
 
     info = inspect_wav_reference(
@@ -116,7 +117,7 @@ def prepare_wav_reference(
     return mono.contiguous(), info
 
 
-def _decode_pcm(raw_frames: bytearray, *, sample_width: int, torch: object):
+def _decode_pcm(raw_frames: bytearray, *, sample_width: int, torch: Any):
     if sample_width == 1:
         values = torch.frombuffer(raw_frames, dtype=torch.uint8).clone()
         return (values.to(torch.float32) - 128.0) / 128.0
