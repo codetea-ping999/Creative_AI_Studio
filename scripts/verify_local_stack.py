@@ -81,6 +81,11 @@ def parse_args() -> argparse.Namespace:
         help="Skip the pytest coverage-threshold gate.",
     )
     parser.add_argument(
+        "--skip-web-coverage",
+        action="store_true",
+        help="Skip the apps/web vitest coverage-threshold gate.",
+    )
+    parser.add_argument(
         "--start-api",
         action="store_true",
         help="Start a temporary uvicorn process before running API smoke checks.",
@@ -402,6 +407,13 @@ def main() -> int:
 
             if not args.skip_eslint:
                 run_command(["npm", "run", "lint"], cwd=ROOT / "apps" / "web", env=isolated_env)
+
+            if not args.skip_web_coverage:
+                run_command(
+                    ["npm", "run", "test:coverage"],
+                    cwd=ROOT / "apps" / "web",
+                    env=isolated_env,
+                )
 
             if not args.skip_web_build:
                 run_command(["npm", "run", "build"], cwd=ROOT / "apps" / "web", env=isolated_env)

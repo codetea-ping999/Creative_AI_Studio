@@ -162,6 +162,7 @@ class VerifyLocalStackTests(unittest.TestCase):
                     skip_ruff=True,
                     skip_mypy=True,
                     skip_coverage=True,
+                    skip_web_coverage=True,
                     start_api=False,
                     api_base_url="http://127.0.0.1:8123",
                     api_timeout=1.0,
@@ -204,6 +205,7 @@ class VerifyLocalStackTests(unittest.TestCase):
                     skip_ruff=True,
                     skip_mypy=True,
                     skip_coverage=True,
+                    skip_web_coverage=True,
                     start_api=False,
                     api_base_url="http://127.0.0.1:8123",
                     api_timeout=1.0,
@@ -242,6 +244,7 @@ class VerifyLocalStackTests(unittest.TestCase):
             "skip_ruff": True,
             "skip_mypy": True,
             "skip_coverage": True,
+            "skip_web_coverage": True,
         }
         for name, enabled in enabled_flags.items():
             all_skip_flags[f"skip_{name}"] = not enabled
@@ -294,6 +297,14 @@ class VerifyLocalStackTests(unittest.TestCase):
                 [MODULE.venv_python(), "-m", "pytest", "--cov=core", "--cov=generators", "-q"],
                 MODULE.ROOT,
             ),
+            commands,
+        )
+
+    def test_standard_verification_runs_web_coverage(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            commands = self._run_with_only(tmp_dir, web_coverage=True)
+        self.assertIn(
+            (["npm", "run", "test:coverage"], MODULE.ROOT / "apps" / "web"),
             commands,
         )
 
