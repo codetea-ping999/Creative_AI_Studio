@@ -51,6 +51,8 @@ class GalleryItemResponse(BaseModel):
     variation_index: int | None = None
     seed: int | None = None
     success: bool = True
+    batch_id: str | None = None
+    batch_label: str | None = None
 
 
 class GalleryAssetDetailResponse(GalleryItemResponse):
@@ -133,9 +135,42 @@ class BindAssetProjectRequest(BaseModel):
     project_id: str | None = None
 
 
+def _build_job_to_batch_map(services: ApplicationServices) -> dict[str, tuple[str, str]]:
+    """Map every job id currently owned by a batch to ``(batch_id, item_label)``.
+
+    Built once per gallery list request rather than once per asset, since a
+    per-asset ``find_by_job_id`` scan would be quadratic in the number of batches.
+    """
+
+    job_to_batch: dict[str, tuple[str, str]] = {}
+    for record in services.batch_repository.list_all():
+        for item in record.items:
+            if item.job_id is not None:
+                job_to_batch[item.job_id] = (record.id, item.label)
+    return job_to_batch
+
+
+def _resolve_batch_info(
+    asset: Asset,
+    services: ApplicationServices,
+    *,
+    batch_lookup: dict[str, tuple[str, str]] | None,
+) -> tuple[str | None, str | None]:
+    if batch_lookup is not None:
+        found = batch_lookup.get(asset.job_id)
+        return found if found is not None else (None, None)
+    record = services.batch_repository.find_by_job_id(asset.job_id)
+    if record is None:
+        return None, None
+    item = next((entry for entry in record.items if entry.job_id == asset.job_id), None)
+    return record.id, (item.label if item is not None else None)
+
+
 def _serialize_gallery_item(
     asset: Asset,
     services: ApplicationServices,
+    *,
+    batch_lookup: dict[str, tuple[str, str]] | None = None,
 ) -> GalleryItemResponse:
     source_job = services.job_repository.get(asset.job_id)
     if source_job is None:
@@ -144,6 +179,7 @@ def _serialize_gallery_item(
     feedback_summary = services.feedback_repository.summarize(asset_id=asset.id)
     quality_report = _extract_quality_report(asset, feedback_summary)
     project = services.project_repository.get(asset.project_id) if asset.project_id else None
+    batch_id, batch_label = _resolve_batch_info(asset, services, batch_lookup=batch_lookup)
 
     return GalleryItemResponse(
         asset_id=asset.id,
@@ -175,6 +211,8 @@ def _serialize_gallery_item(
         variation_index=_integer_or_none(asset.metadata.get("variation_index")),
         seed=_integer_or_none(asset.metadata.get("seed")),
         success=Path(asset.path).exists(),
+        batch_id=batch_id,
+        batch_label=batch_label,
     )
 
 
@@ -366,16 +404,37 @@ def list_gallery(
     media_type: str | None = Query(None, min_length=1),
     project_id: str | None = Query(None, min_length=1),
     q: str | None = Query(None, min_length=1),
+    batch_id: str | None = Query(None, min_length=1),
     limit: int = Query(50, ge=1, le=200),
     services: ApplicationServices = Depends(get_services),
 ) -> list[GalleryItemResponse]:
-    items = services.asset_repository.list_all(
-        media_type=media_type,
-        project_id=project_id,
-        query_text=q,
-        limit=limit,
-    )
-    return [_serialize_gallery_item(item, services) for item in items]
+    batch_lookup = _build_job_to_batch_map(services)
+
+    if batch_id is not None:
+        # A batch's items can be older than the page the plain ``limit`` would
+        # return, so filter by membership first and apply ``limit`` after.
+        batch_job_ids = {
+            job_id for job_id, (owner_id, _label) in batch_lookup.items() if owner_id == batch_id
+        }
+        items = [
+            item
+            for item in services.asset_repository.list_all(
+                media_type=media_type,
+                project_id=project_id,
+                query_text=q,
+            )
+            if item.job_id in batch_job_ids
+        ][:limit]
+    else:
+        items = services.asset_repository.list_all(
+            media_type=media_type,
+            project_id=project_id,
+            query_text=q,
+            limit=limit,
+        )
+    return [
+        _serialize_gallery_item(item, services, batch_lookup=batch_lookup) for item in items
+    ]
 
 
 @router.get("/job/{job_id}", response_model=GalleryAssetDetailResponse)

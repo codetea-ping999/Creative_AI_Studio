@@ -1,9 +1,10 @@
 import { createOutputUrl } from "../studioClient";
-import { isAudioAsset, isVideoAsset } from "../studio";
-import type { MediaType } from "./promptFormTypes";
+import { isAudioAsset, isTextAsset, isVideoAsset, type GalleryMediaType } from "../studio";
+import { excerptFromMarkdown, useTextAssetContent } from "../lib/textAssetPreview";
+import { renderMarkdownLite } from "../lib/markdownLite";
 
 type StagePreviewProps = {
-  mediaType: MediaType;
+  mediaType: GalleryMediaType;
   outputPath: string | null;
   title: string;
   subtitle: string;
@@ -53,6 +54,10 @@ export function StagePreview({
     );
   }
 
+  if (mediaType === "text" || isTextAsset(outputPath)) {
+    return <TextStagePreview src={src} title={title} subtitle={subtitle} />;
+  }
+
   return (
     <div className="stage-surface stage-surface--hero">
       <img src={src} alt={title} loading="lazy" />
@@ -60,8 +65,40 @@ export function StagePreview({
   );
 }
 
+function TextStagePreview({
+  src,
+  title,
+  subtitle,
+}: {
+  src: string;
+  title: string;
+  subtitle: string;
+}) {
+  const { content, isLoading } = useTextAssetContent(src);
+  return (
+    <div className="stage-surface stage-surface--text">
+      <div className="text-preview">
+        <div className="text-preview__header">
+          <p className="eyebrow">Text Preview</p>
+          <strong>{title}</strong>
+          <p className="sidebar-copy">{subtitle}</p>
+        </div>
+        <div className="text-preview__body">
+          {isLoading ? (
+            <p className="markdown-lite__paragraph">Loading…</p>
+          ) : content ? (
+            renderMarkdownLite(content)
+          ) : (
+            <p className="markdown-lite__paragraph">Preview unavailable.</p>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 type OutputThumbnailProps = {
-  mediaType: MediaType;
+  mediaType: GalleryMediaType;
   outputPath: string | null;
 };
 
@@ -92,9 +129,24 @@ export function OutputThumbnail({ mediaType, outputPath }: OutputThumbnailProps)
     );
   }
 
+  if (mediaType === "text" || isTextAsset(outputPath)) {
+    return <TextThumbnail src={src} />;
+  }
+
   return (
     <div className="gallery-item__thumb">
       <img src={src} alt="" loading="lazy" />
+    </div>
+  );
+}
+
+function TextThumbnail({ src }: { src: string }) {
+  const { content, isLoading } = useTextAssetContent(src);
+  return (
+    <div className="gallery-item__thumb gallery-item__thumb--text">
+      <p className="gallery-item__text-excerpt">
+        {isLoading ? "Loading…" : content ? excerptFromMarkdown(content) : "No preview"}
+      </p>
     </div>
   );
 }
