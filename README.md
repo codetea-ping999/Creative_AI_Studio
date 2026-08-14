@@ -170,7 +170,8 @@ creative-ai-studio/
 - [Setup Guide](docs/setup-guide.md) - セットアップと起動確認
 - [Model System](docs/model-system.md) - manifest、resolver、runtime cache の構成
 - [Model Download Guide](docs/model-download-guide.md) - モデル配置と manifest 管理
-- [Next Tasks](docs/next-tasks.md) - 次に進めるべきタスク
+- [Issue Execution Plan](docs/issue-execution-plan.md) - open issue 全体の着手順（次に何をするかはここが正）
+- [Next Tasks](docs/next-tasks.md) - 現在の到達点と v0.3 トラックの内訳
 - [Initial Issues](docs/initial_issues.md) - 初期段階での課題
 
 補足:

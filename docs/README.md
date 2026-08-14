@@ -29,13 +29,17 @@ Creative AI Studio のドキュメント案内です。
 7. [multimedia-content-generation-plan.md](./multimedia-content-generation-plan.md)
    構想から完成動画までを 1 フローにする v0.3 の設計と段階計画です。
 
-8. [next-tasks.md](./next-tasks.md)
-   現在の到達点と、次に進めるべき優先タスクを確認します。
+8. [issue-execution-plan.md](./issue-execution-plan.md)
+   open issue 全体の着手順です。**次に何をするかはここが正**です。
 
-9. [repository-issues-improved.md](./repository-issues-improved.md)
-   実コードと検証結果から抽出した改善課題と解決状況を確認します。
+9. [next-tasks.md](./next-tasks.md)
+   現在の到達点（実装済み一覧）と、v0.3 トラック内の内訳を確認します。
+   全体の着手順は上の実行計画を参照してください。
 
-10. [model-download-guide.md](./model-download-guide.md)
+10. [repository-issues-improved.md](./repository-issues-improved.md)
+    実コードと検証結果から抽出した改善課題と解決状況を確認します。
+
+11. [model-download-guide.md](./model-download-guide.md)
     実モデルの配置や manifest 運用を確認します。
 
 ## 目的別の読み方

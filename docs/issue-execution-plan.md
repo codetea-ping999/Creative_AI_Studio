@@ -18,11 +18,12 @@ open issue はほぼ 4 つの塊に分かれます。
 （#9 はクローズ済み、#81 は issue ではなく PR）。合計は 18 + 20 + 9 + 6 = 53 で
 `gh issue list --state open` の件数と一致します。
 
-**meta issue の扱い**: #78（ISO epic）と #31〜#36（v0.3 epic）は傘であり、
-固有の実装作業を持たないため Phase 表には現れません。**配下の子 issue が
+**meta issue の扱い**: #78（ISO）、#31〜#36（v0.3）、#5（v0.1 Image）、#25（v0.2 Audio）は
+傘であり、固有の実装作業を持たないため Phase 表には現れません。**配下の子 issue が
 すべてクローズした時点で、チェックリストを最終確認してクローズします**
 （#78 なら #79〜#96、#96 の判定公開をもって閉じる）。件数には含めていますが、
-着手対象としては数えないでください。
+着手対象としては数えないでください。meta は計 9 件（#5, #25, #31〜#36, #78）で、
+実際に着手対象となる issue は 53 − 9 = **44 件**です。
 
 **この計画の骨子**: トラック A は「ドキュメント 18 本を書く」ではなく
 「まず CI で強制できるものをコードにし、残りを最小限の証跡パックに畳む」。
@@ -42,7 +43,7 @@ ISO トラックは *accountable management*、*internal audit*、*certification
 | --- | --- | --- |
 | CI は `verify_local_stack.py --start-api` のみ。lint / type / coverage / format ゲートなし | [ci.yml](../.github/workflows/ci.yml) | #83 |
 | CONTRIBUTING は flake8 を要求するが `requirements.txt` に無い。mypy / ruff / eslint も未導入 | [CONTRIBUTING.md#L63](../CONTRIBUTING.md#L63), [requirements.txt](../requirements.txt) | #83 |
-| `postcss` はロックファイル上 8.5.16（勧告該当は ≤8.5.17） | [package-lock.json](../apps/web/package-lock.json) | #87 |
+| `npm audit` は High 3 件（postcss / nanoid / undici）。**#87 が挙げる postcss だけでは解消しない** | [package-lock.json](../apps/web/package-lock.json) | #87 |
 | API は無認証、`allow_methods=["*"]` / `allow_headers=["*"]`、`/outputs` を StaticFiles で公開 | [main.py#L86](../apps/api/main.py#L86) | #85 |
 | `run_api_dev.sh` は `API_HOST` を Uvicorn へそのまま渡す（既定 `127.0.0.1`、非 loopback を拒否しない） | [run_api_dev.sh#L22](../scripts/run_api_dev.sh#L22) | #85 |
 | Python 依存はすべて範囲指定でハッシュ固定なし。SBOM 生成なし | [requirements.txt](../requirements.txt) | #84 |
@@ -59,9 +60,26 @@ ISO のスコープ議論の結論に関係なく価値が確定している 3 �
 
 | 順 | issue | 内容 | 規模 |
 | --- | --- | --- | --- |
-| 1 | #87 | postcss を非該当版へ更新し、`npm audit` を CI に追加 | S |
-| 2 | — | issue 整理: #55 をクローズ、#56 を「music 経路適用」に絞って再記述 | S |
+| 1 | #87 | **High 3 件を全て解消**してから `npm audit` を CI に追加（下記） | M |
+| 2 | — | issue 整理: #55 をクローズ、#56 を「music 経路適用」に絞って再記述、**#87 の範囲を更新** | S |
 | 3 | #83 | ruff（lint+format）/ mypy / eslint / coverage を導入し `make verify` と CI を一致させる | L |
+
+**#87 の範囲は issue の記述より広い**。issue #87 は GHSA-r28c-9q8g-f849（postcss ≤8.5.17）
+のみを挙げていますが、2026-08-14 時点の `npm audit` は High 3 件を報告します。
+
+| package | lock | 該当範囲 | 必要バージョン |
+| --- | --- | --- | --- |
+| postcss | 8.5.16 | ≤8.5.22（#87 の勧告は不完全修正で、後続勧告が範囲を拡大） | ≥8.5.23 |
+| nanoid | 3.3.15 | ≤3.3.17 | ≥3.3.18 |
+| undici | 7.28.0 | ≥7.0.0 <7.29.0 | ≥7.29.0 |
+
+`npm audit` は脆弱性を 1 件でも検出すると既定で非ゼロ終了します。
+**postcss だけ更新してゲートを入れると CI は赤のままです。** 手順は
+(1) 3 件すべてを更新（いずれも `fixAvailable: true`）、(2) `npm audit` が
+クリーンなことを確認、(3) そのうえでゲートを追加、の順にしてください。
+閾値を `--audit-level=high` などに緩める場合は、除外した内容と理由を
+#84 の例外記録として残します。**issue #87 の本文も、postcss 単体から
+「監査ベースラインをクリーンにする」範囲へ更新が必要です**（Phase 0-2 に含む）。
 
 **#83 の設計方針（ゲートの接続先に注意）**: 現在 `make verify` も CI も
 `scripts/verify_local_stack.py --start-api` を直接呼んでおり、`verify-lite` を経由しません。
@@ -86,9 +104,17 @@ mypy は `core/` と `generators/` から段階導入（`--strict` は後回し�
 
 **#82 の追跡単位**: テストは 26 モジュールに対し `test_*` 関数が 469 件あります。
 ファイル名単位で紐づけると、1 モジュール内で独立に検証されている数十の振る舞いが
-1 要件に潰れて可視性を失います。**モジュール名ではなくテストケース ID
-（`tests/test_job_pipeline.py::test_xxx` 形式）を追跡単位に定義**し、
-要件に紐づかないテスト（orphan）の検出もこの粒度で行ってください。
+1 要件に潰れて可視性を失います。
+
+さらに `tests/test_speech_audio.py` は `@pytest.mark.parametrize` を 6 箇所で使い、
+1 関数が複数ケースへ展開されます（例: `test_speech_generator_rejects_invalid_controls_before_synthesis`
+は `speed=0` / `speed=inf` / `pitch=nan` / `max_chunk_characters=0` を個別に収集）。
+関数名までで切ると、これらが 1 エントリに潰れます。
+
+**追跡単位は `[parameter]` サフィックスまで含む完全な pytest node ID**
+（`tests/test_speech_audio.py::test_xxx[params3-...]` 形式）と定義してください。
+実際の一覧は `pytest --collect-only -q` の出力を正とし、
+要件に紐づかないテスト（orphan）の検出も同じ粒度で行います。
 
 ### Phase 2 — セキュリティとデータ（P0 集中帯）
 
@@ -176,9 +202,19 @@ RTO / RPO の達成は証明できません。
 - **#6 は Phase 1 の入口**（#79 が製品境界を必要とするため）。単独で先に確定させます。
 - **#7 / #21 / #45** は実 weight とハードウェアが要る検証。#90 の証跡としてそのまま使えるので、
   ISO 側の要求フォーマット（環境・モデル・seed・日付のメタデータ）を決めてから実施すると二度手間になりません。
+- **#8（画像プリセット 3 種）** は #7 / #21 で既定パラメータが決まってから着手します。
+  検証前に作ると、実測後にプリセットを作り直すことになります。
+- **#10（実生成 50 件のドッグフーディング）** は #8 の後。#88 の性能ベースラインと
+  #94 の安全性リスク登録簿に流し込む実データを兼ねるので、記録フォーマットは
+  #80 で決めた測定項目に合わせてから走らせてください。
+- **#11（v0.1 release gate）** は #10 の結果を受けて判定。**#96 と統合**します（§3 Phase 4 参照）。
 - **#19 / #20 / #29** は較正データ待ち。#80 の「proxy metric であることを明示する」要件と直結します。
 - **#3（App.tsx 分割）** は #91 と #62 の前にやると UI 作業が楽になります。
 - **#2 / #4** は独立。手が空いたときの詰め物。
+
+トラック C の実行順は **#6 → #7 / #21 → #8 → #10 → #11（#96 と統合）** です。
+実 weight とハードウェアが前提になるため、Phase 0〜1 とは独立に、
+機材が用意できたタイミングで走らせてください。
 
 ## 6. 直近の着手順（最初の 5 手）
 
