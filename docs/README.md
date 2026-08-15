@@ -55,6 +55,10 @@ Creative AI Studio のドキュメント案内です。
 - [model-system.md](./model-system.md)
 - [api-contract.md](./api-contract.md)
 
+### 複数エージェントで並列に実装したい
+
+- [agent-harness.md](./agent-harness.md) — 検証ゲート、ファイル所有権、禁止事項
+
 ### API を叩きたい
 
 - [api-contract.md](./api-contract.md)

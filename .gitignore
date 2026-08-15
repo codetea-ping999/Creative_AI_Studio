@@ -5,6 +5,12 @@ __pycache__/
 *.py[cod]
 
 venv/
+
+# Claude Code local state. .claude/workflows/ IS tracked (shared harness), but
+# worktrees are full checkouts and settings.local.json is per-machine.
+.claude/worktrees/
+.claude/settings.local.json
+
 apps/web/node_modules/
 apps/web/dist/
 apps/web/coverage/
