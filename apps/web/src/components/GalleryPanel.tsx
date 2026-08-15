@@ -155,7 +155,9 @@ export function GalleryPanel({
                   />
                   <div className="gallery-item__body">
                     <div className="gallery-item__topline">
-                      <span className="history-item__media">Batch · {row.items.length} items</span>
+                      <span className="history-item__media">
+                        Batch · {row.items.length} {row.items.length === 1 ? "item" : "items"}
+                      </span>
                       <span className="history-score">
                         {formatScore(
                           representative.quality_score_calibrated ?? representative.quality_score,
