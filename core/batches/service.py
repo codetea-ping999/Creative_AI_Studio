@@ -216,9 +216,18 @@ class BatchService:
             id_prefix=f"{record.id}_item",
         )
         # Carry each winner's label forward so the refined output is traceable to
-        # the probe that earned it.
-        for new_item, winner in zip(new_items, winners):
-            new_item.label = f"{winner.label}__{next_stage.name}"
+        # the probe that earned it. Match on axis values rather than position:
+        # expand_items sorts by model_id to protect the runtime cache, so a spec
+        # whose axis patches model_id yields an order different from the score
+        # ranking, and zipping the two labels a refine item with another winner's
+        # combination.
+        winners_by_axis = {_axis_key(winner.axis_values): winner for winner in winners}
+        for new_item in new_items:
+            winner = winners_by_axis.get(_axis_key(new_item.axis_values))
+            if winner is not None:
+                new_item.label = f"{winner.label}__{next_stage.name}"
+            else:  # pragma: no cover - expansion mirrors the winners it was given
+                new_item.label = f"{new_item.label}__{next_stage.name}"
 
         record.items.extend(new_items)
         record.stage_index = next_stage_index
@@ -335,6 +344,12 @@ def _derive_status(record: BatchRecord) -> str:
     if aggregate.cancelled:
         return BATCH_STATUS_CANCELLED
     return BATCH_STATUS_FAILED
+
+
+def _axis_key(axis_values: dict[str, str]) -> tuple[tuple[str, str], ...]:
+    """Order-independent identity for one cell of the sweep."""
+
+    return tuple(sorted(axis_values.items()))
 
 
 def _rank_winners(

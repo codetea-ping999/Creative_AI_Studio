@@ -352,6 +352,48 @@ class BatchServiceTests(unittest.TestCase):
         }
         self.assertEqual({item.label for item in refine_items}, expected_labels)
 
+    def test_refine_labels_match_their_own_model_when_an_axis_patches_model_id(
+        self,
+    ) -> None:
+        """Regression for #102.
+
+        expand_items sorts by model_id to protect the runtime cache, so with a
+        model axis the expansion order differs from the score ranking. Pairing the
+        two positionally labelled each refine item with another winner's
+        combination.
+        """
+
+        spec = _spec(
+            axes=[
+                Axis(
+                    name="m",
+                    values=[
+                        AxisValue(label="zzz-model", patch={"model_id": "zzz"}),
+                        AxisValue(label="aaa-model", patch={"model_id": "aaa"}),
+                    ],
+                )
+            ],
+            stages=[Stage(name="probe", keep_top_n=2), Stage(name="refine")],
+        )
+        record = self.service.create_batch(spec)
+        # Score so the zzz item wins, inverting the model_id sort order.
+        for item in record.items:
+            self._succeed(item.job_id, 90.0 if item.label == "zzz-model" else 40.0)
+
+        advanced = self.service.advance(record.id)
+        refine_items = advanced.items_for_stage(1)
+        self.assertEqual(len(refine_items), 2)
+
+        for item in refine_items:
+            with self.subTest(label=item.label):
+                expected_model = item.axis_values["m"].split("-")[0]
+                self.assertEqual(
+                    item.request.model_id,
+                    expected_model,
+                    "the axis value and the request must agree",
+                )
+                self.assertEqual(item.label, f"{item.axis_values['m']}__refine")
+
     def test_advance_waits_for_the_stage_to_finish(self) -> None:
         spec = _spec(
             stages=[
