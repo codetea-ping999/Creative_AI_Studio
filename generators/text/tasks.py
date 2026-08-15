@@ -14,6 +14,7 @@ from typing import Any, Callable
 from pydantic import BaseModel, ConfigDict, Field
 
 from core.models.text_runtimes import BRIEF_HEADING
+from core.story.timeline import SUPPORTED_MOTIONS
 
 BEAT_STRUCTURES: dict[str, tuple[str, ...]] = {
     "three-act": ("setup", "confrontation", "resolution"),
@@ -205,6 +206,10 @@ def _scene_list_prompt(params: dict[str, Any]) -> str:
             "For each scene provide: a heading, a one-sentence summary, narration text,",
             "an English image_prompt suitable for a diffusion model, an image_negative,",
             "a bgm_mood keyword, a duration_seconds, and a camera movement.",
+            # The renderer supports exactly these motions. Asking for "a camera
+            # movement" in free text yields phrases like "slow push in", which the
+            # timeline can only fall back on rather than render.
+            f"camera must be exactly one of: {', '.join(SUPPORTED_MOTIONS)}.",
             f"Scene durations should sum to roughly {total_duration} seconds.",
             "",
             _brief(

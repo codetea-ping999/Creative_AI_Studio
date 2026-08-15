@@ -10,6 +10,67 @@ from .text_utils import split_subtitle_lines
 # Music sits under narration, so it is mixed well below unity gain by default.
 DEFAULT_MUSIC_GAIN_DB = -14.0
 
+# The motions the assembly generator can actually render. ``Scene.camera`` is
+# written by a language model, so it is free text: "slow push in" is a reasonable
+# thing to write and a useless thing to render. Normalizing here — rather than
+# letting assembly silently degrade every unknown value to a static shot — keeps
+# the substitution visible and testable.
+SUPPORTED_MOTIONS: tuple[str, ...] = (
+    "none",
+    "ken_burns_in",
+    "ken_burns_out",
+    "pan_left",
+    "pan_right",
+)
+
+# Phrasings a writer or a model reaches for, mapped to what we can render.
+_MOTION_ALIASES: dict[str, str] = {
+    "push in": "ken_burns_in",
+    "pushin": "ken_burns_in",
+    "slow push in": "ken_burns_in",
+    "zoom in": "ken_burns_in",
+    "dolly in": "ken_burns_in",
+    "pull out": "ken_burns_out",
+    "pull back": "ken_burns_out",
+    "zoom out": "ken_burns_out",
+    "dolly out": "ken_burns_out",
+    "pan left": "pan_left",
+    "truck left": "pan_left",
+    "pan right": "pan_right",
+    "truck right": "pan_right",
+    "static": "none",
+    "still": "none",
+    "locked off": "none",
+    "fixed": "none",
+}
+
+
+def normalize_motion(
+    raw_camera: str | None,
+    *,
+    default_motion: str,
+) -> tuple[str, bool]:
+    """Resolve a scene's camera text to a renderable motion.
+
+    Returns the motion and whether the original value had to be reinterpreted, so
+    the caller can record the substitution rather than losing it silently.
+    """
+
+    text = (raw_camera or "").strip().lower()
+    if not text:
+        return default_motion, False
+    if text in SUPPORTED_MOTIONS:
+        return text, False
+    # Treat "ken-burns in" and "ken_burns_in" as the same request.
+    collapsed = text.replace("_", " ").replace("-", " ")
+    collapsed = " ".join(collapsed.split())
+    if collapsed.replace(" ", "_") in SUPPORTED_MOTIONS:
+        return collapsed.replace(" ", "_"), True
+    aliased = _MOTION_ALIASES.get(collapsed)
+    if aliased is not None:
+        return aliased, True
+    return default_motion, True
+
 
 def missing_scene_assets(story: StoryDocument) -> list[dict[str, str]]:
     """List the assets a story still needs before it can be assembled.
@@ -65,15 +126,23 @@ def build_timeline(
     start_seconds = 0.0
     for scene in scenes:
         duration = float(scene.duration_seconds)
+        motion, motion_substituted = normalize_motion(
+            scene.camera, default_motion=default_motion
+        )
+        visual_entry: dict[str, Any] = {
+            "scene_id": scene.id,
+            "asset_id": scene.asset_ids["visual"],
+            "duration_seconds": duration,
+            "transition": transition,
+            "motion": motion,
+        }
+        if motion_substituted:
+            # Keep the writer's wording so a reviewer can see why the shot moves
+            # the way it does, instead of wondering where their direction went.
+            visual_entry["requested_camera"] = scene.camera
         visual.append(
             _with_path(
-                {
-                    "scene_id": scene.id,
-                    "asset_id": scene.asset_ids["visual"],
-                    "duration_seconds": duration,
-                    "transition": transition,
-                    "motion": scene.camera or default_motion,
-                },
+                visual_entry,
                 scene.asset_ids["visual"],
                 asset_path_lookup,
             )

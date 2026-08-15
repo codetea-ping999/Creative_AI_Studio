@@ -19,7 +19,13 @@ from .schemas import (
     StoryDocument,
 )
 from .text_utils import count_words, split_subtitle_lines
-from .timeline import DEFAULT_MUSIC_GAIN_DB, build_timeline, missing_scene_assets
+from .timeline import (
+    DEFAULT_MUSIC_GAIN_DB,
+    SUPPORTED_MOTIONS,
+    build_timeline,
+    missing_scene_assets,
+    normalize_motion,
+)
 
 __all__ = [
     "Beat",
@@ -28,6 +34,7 @@ __all__ = [
     "DEFAULT_SCENE_DURATION_SECONDS",
     "DialogueLine",
     "SCENE_ASSET_ROLES",
+    "SUPPORTED_MOTIONS",
     "SCENE_ID_PARAM",
     "SCENE_ROLE_PARAM",
     "STORY_ID_PARAM",
@@ -42,5 +49,6 @@ __all__ = [
     "scene_binding_params",
     "count_words",
     "missing_scene_assets",
+    "normalize_motion",
     "split_subtitle_lines",
 ]
