@@ -1,5 +1,12 @@
 # Repository Agent Instructions
 
+## Working as one of several parallel agents
+
+When you are a subagent in a fan-out (see `.claude/workflows/issue-fleet.js`),
+read `docs/agent-harness.md` first. It defines the verification gate, which files
+are reserved for the integrator, and what you must not do (commit, install heavy
+dependencies, download weights).
+
 ## Frontend design source of truth
 
 When changing the web UI, follow:
