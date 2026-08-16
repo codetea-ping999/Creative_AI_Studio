@@ -350,9 +350,67 @@ class SceneGenerationApiTests(unittest.TestCase):
         timeline = job["request"]["params"]["timeline"]
         self.assertEqual(timeline["resolution"], [1080, 1920])
         self.assertEqual(len(timeline["tracks"]["visual"]), 2)
-        # Timelines travel as asset ids so the assembly route can enforce the
-        # project boundary; a raw path would bypass that check.
+        # Timelines travel as asset ids, and this route resolved every one of
+        # them against the story's project before queueing; a raw path would
+        # have bypassed that check.
         self.assertNotIn("path", timeline["tracks"]["visual"][0])
+
+    def test_assemble_accepts_media_that_shares_the_story_project(self) -> None:
+        """A project-bound story assembles its own project's media.
+
+        The project boundary is an exact match, so this is the branch that the
+        project-less story above never reaches: without it, the only green
+        assemble coverage would be ``None == None``.
+        """
+
+        project_id = self.client.post(
+            "/projects", json={"name": "Short film"}
+        ).json()["id"]
+        story_id = self.client.post(
+            "/stories",
+            json={"title": "Bound", "premise": "p", "project_id": project_id},
+        ).json()["id"]
+        story = self.services.story_repository.save(
+            apply_text_result(
+                self.services.story_repository.get(story_id), "scene_list", _SCENES
+            )
+        )
+
+        for scene in story.scenes:
+            job = self.services.job_service.create_job(
+                GenerationRequest(
+                    media_type="image",
+                    prompt="x",
+                    model_id="sdxl",
+                    params=scene_binding_params(story.id, scene.id, "visual"),
+                ),
+                project_id=project_id,
+            )
+            self.services.job_service.mark_succeeded(
+                job.id,
+                GenerationResult(
+                    job_id=job.id,
+                    status="succeeded",
+                    outputs=[f"outputs/images/{scene.id}.png"],
+                    previews=[f"outputs/images/{scene.id}.png"],
+                    metadata={},
+                ),
+            )
+
+        response = self.client.post(f"/stories/{story_id}/assemble", json={})
+        self.assertEqual(response.status_code, 201, response.text)
+
+        job = self.client.get(f"/jobs/{response.json()['job_id']}").json()
+        timeline = job["request"]["params"]["timeline"]
+        self.assertEqual(len(timeline["tracks"]["visual"]), 2)
+        # Asserting that each asset resolves and matches the project would be dead
+        # weight: resolve_timeline_assets already 404s on either, so the 201 above
+        # proves both. Pin instead what the 201 does not imply — that the assembly
+        # job is itself filed under the story's project, and that the timeline
+        # travels as asset ids with no host path (issue #105).
+        self.assertEqual(job["project_id"], project_id)
+        for entry in timeline["tracks"]["visual"]:
+            self.assertNotIn("path", entry)
 
     def test_scene_jobs_join_the_story_project(self) -> None:
         project_id = self.client.post(

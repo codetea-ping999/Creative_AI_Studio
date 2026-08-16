@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
@@ -147,26 +147,21 @@ def _strip_timeline_paths(value: object) -> object:
     return value
 
 
-def _prepare_assembly_request(
+def resolve_timeline_assets(
     services: ApplicationServices,
-    request: GenerateAssemblyRequest,
-) -> GenerateAssemblyRequest:
-    """Resolve every timeline asset inside the assembly's project boundary."""
+    timeline: Any,
+    project_id: str | None,
+) -> Any:
+    """Return a copy of ``timeline`` whose assets all live in ``project_id``.
 
-    # Resolve the target first so an invalid project cannot be used to probe
-    # whether an asset exists.
-    project_id = _resolve_project_id(services, request.project_id)
-    timeline = request.params.get("timeline")
+    Shared by every route that queues an assembly job, so the project boundary is
+    enforced in one place: a timeline built server-side from a story and one
+    posted by a client are checked by the same code.
+    """
+
     sanitized_timeline = _strip_timeline_paths(timeline)
     if not isinstance(sanitized_timeline, dict):
-        return request.model_copy(
-            update={
-                "params": {
-                    **request.params,
-                    "timeline": sanitized_timeline,
-                }
-            }
-        )
+        return sanitized_timeline
 
     tracks = sanitized_timeline.get("tracks")
     resolved_assets: dict[str, Asset] = {}
@@ -204,19 +199,57 @@ def _prepare_assembly_request(
                     resolved_assets[asset_id] = asset
 
                 # Project membership is an exact boundary. In particular, an
-                # unassigned asset is accepted only for an unassigned assembly.
+                # unassigned asset is accepted only for an unassigned assembly,
+                # so moving a story into a project after its media was generated
+                # leaves that media behind — the message names the way back.
                 if asset.project_id != project_id:
+                    # Name a recovery that actually exists. Attaching an asset to
+                    # a project is a route; detaching it is not, so when the
+                    # assembly targets no project the only way back is to move the
+                    # assembly into the asset's project instead.
+                    if project_id is None:
+                        recovery = (
+                            f"Bind the assembly to project {asset.project_id} "
+                            "instead (PATCH /stories/{story_id} with project_id), "
+                            "or assemble from assets that belong to no project."
+                        )
+                    else:
+                        recovery = (
+                            "Re-parent the asset with "
+                            f"POST /projects/{project_id}/assets/{asset_id} "
+                            "before assembling."
+                        )
                     raise HTTPException(
                         status_code=status.HTTP_404_NOT_FOUND,
-                        detail=f"Timeline asset not found in target project: {asset_id}",
+                        detail=(
+                            "Timeline asset not found in target project: "
+                            f"{asset_id} belongs to "
+                            f"{asset.project_id or 'no project'} while this "
+                            f"assembly targets {project_id or 'no project'}. "
+                            + recovery
+                        ),
                     )
                 entry["asset_id"] = asset_id
 
+    return sanitized_timeline
+
+
+def _prepare_assembly_request(
+    services: ApplicationServices,
+    request: GenerateAssemblyRequest,
+) -> GenerateAssemblyRequest:
+    """Resolve every timeline asset inside the assembly's project boundary."""
+
+    # Resolve the target first so an invalid project cannot be used to probe
+    # whether an asset exists.
+    project_id = _resolve_project_id(services, request.project_id)
     return request.model_copy(
         update={
             "params": {
                 **request.params,
-                "timeline": sanitized_timeline,
+                "timeline": resolve_timeline_assets(
+                    services, request.params.get("timeline"), project_id
+                ),
             }
         }
     )
@@ -313,5 +346,6 @@ __all__ = [
     "GenerateSpeechRequest",
     "GenerateTextRequest",
     "GenerateVideoRequest",
+    "resolve_timeline_assets",
     "router",
 ]

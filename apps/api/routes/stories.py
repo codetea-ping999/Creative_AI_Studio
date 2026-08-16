@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from apps.api.dependencies import get_services
+from apps.api.routes.generate import resolve_timeline_assets
 from apps.api.routes.jobs import CreateJobResponse
 from bootstrap import ApplicationServices
 from core.schemas import GenerationRequest
@@ -24,6 +26,12 @@ from core.story import (
 )
 
 router = APIRouter(prefix="/stories", tags=["stories"])
+
+# Tasks that write into one named scene rather than into the story as a whole.
+SCENE_SCOPED_TASKS: frozenset[str] = frozenset({"script"})
+
+# The tracks whose entries reference an asset the UI may want to preview.
+_PREVIEWABLE_TRACKS = ("visual", "narration", "music")
 
 
 class StorySummaryResponse(BaseModel):
@@ -143,6 +151,89 @@ def _get_story(services: ApplicationServices, story_id: str) -> StoryDocument:
     return story
 
 
+def _scene_brief(scene: Scene) -> str:
+    """Flatten a scene into the brief the script task writes dialogue against."""
+
+    parts = (scene.heading, scene.summary, scene.narration)
+    return " / ".join(part.strip() for part in parts if part.strip())
+
+
+def _bind_task_to_scene(story: StoryDocument, params: dict[str, Any]) -> None:
+    """Pin a scene-scoped writing task to one scene, in place.
+
+    A language model cannot invent the scene id it is writing for, so the target
+    is chosen here and travels on the request. Without it, every multi-scene
+    story would merge its dialogue into ``metadata["unassigned_script_lines"]``
+    instead of into a scene.
+    """
+
+    scene_ids = [scene.id for scene in story.scenes_in_order()]
+    if not scene_ids:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Story {story.id} has no scenes yet; run the scene_list stage "
+                "before writing a script."
+            ),
+        )
+
+    raw_scene_id = params.get("scene_id")
+    # One scene is unambiguous, so naming it is optional there.
+    if raw_scene_id is None and len(scene_ids) == 1:
+        raw_scene_id = scene_ids[0]
+    if not isinstance(raw_scene_id, str) or not raw_scene_id.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "This task writes into one scene and needs params.scene_id; "
+                f"story {story.id} has {', '.join(scene_ids)}."
+            ),
+        )
+
+    scene = _find_scene(story, raw_scene_id.strip())
+    params["scene_id"] = scene.id
+    if not str(params.get("scene") or "").strip():
+        params["scene"] = _scene_brief(scene)
+    if story.characters and not params.get("characters"):
+        params["characters"] = list(story.characters)
+
+
+def _names_a_scene(story: StoryDocument, structured: dict[str, Any]) -> bool:
+    """Whether a scene-scoped payload has a target ``apply_text_result`` will use.
+
+    Mirrors the target selection in ``core.story.merge._merge_script``. A named
+    but unknown target counts as named: the merge rejects it by name, which is a
+    better error than the generic one below.
+    """
+
+    scene_id = structured.get("scene_id")
+    if isinstance(scene_id, str) and scene_id:
+        return True
+    scene_index = structured.get("scene_index")
+    if isinstance(scene_index, int) and not isinstance(scene_index, bool):
+        return True
+    # One scene is unambiguous, so an unnamed payload still lands.
+    return len(story.scenes) == 1
+
+
+def _no_scene_target_detail(story: StoryDocument, job_id: str, task: str) -> str:
+    """Explain which stage to re-run so the lines land in a scene."""
+
+    scene_ids = [scene.id for scene in story.scenes_in_order()]
+    where = (
+        f"story {story.id} has no scenes yet, so run the scene_list stage first, then"
+        if not scene_ids
+        else (
+            f"story {story.id} has {len(scene_ids)} scenes ({', '.join(scene_ids)}), "
+            "so the target has to be named:"
+        )
+    )
+    return (
+        f"Job {job_id} carries {task} lines but names no scene; {where} "
+        f"queue it with POST /stories/{story.id}/expand and params.scene_id."
+    )
+
+
 @router.get("", response_model=StoryListResponse)
 def list_stories(
     project_id: str | None = Query(default=None),
@@ -237,19 +328,29 @@ def expand_story(
 
     story = _get_story(services, story_id)
     params: dict[str, Any] = {
-        "task": request.task,
-        "story_id": story.id,
+        # Story context the caller may tune for a single run (a scene written in
+        # a different tone, say) without editing the story itself.
         "language": story.language,
         "genre": story.genre,
         "tone": story.tone,
         "audience": story.audience,
         "structure": story.structure,
         **request.params,
+        # Server-owned, so they are written AFTER the caller's params rather than
+        # before. `task` is the field the request already names, and `story_id` is
+        # the job's owner: if a caller could set it, a job queued from story A
+        # could be made to carry story B's id, which `/apply` then reads as
+        # permission to merge A's text into B — the exact silent cross-story
+        # contamination that check exists to stop.
+        "task": request.task,
+        "story_id": story.id,
     }
     if story.logline and "logline" not in params:
         params["logline"] = story.logline
     if story.beats and "beats" not in params:
         params["beats"] = [beat.model_dump(mode="json") for beat in story.beats]
+    if request.task in SCENE_SCOPED_TASKS:
+        _bind_task_to_scene(story, params)
 
     generation_request = GenerationRequest(
         media_type="text",
@@ -279,7 +380,14 @@ def apply_story_result(
     request: ApplyResultRequest,
     services: ApplicationServices = Depends(get_services),
 ) -> StoryDetailResponse:
-    """Merge a completed text job into the story document."""
+    """Merge a completed text job into the story document.
+
+    A job started by ``/expand`` carries its ``story_id``, and only that story may
+    take the result: mixing one story's prose into another is far more likely to
+    happen by a mistyped id than by malice, and it is silent once merged. A job
+    with no ``story_id`` (a hand-built ``POST /generate/text``) belongs to no
+    story, so any story may adopt it.
+    """
 
     story = _get_story(services, story_id)
     job = services.job_repository.get(request.job_id)
@@ -293,6 +401,17 @@ def apply_story_result(
             detail=f"Job {request.job_id} has not succeeded yet (status: {job.status}).",
         )
 
+    job_params = job.request.params if isinstance(job.request.params, dict) else {}
+    job_story_id = job_params.get("story_id")
+    if isinstance(job_story_id, str) and job_story_id and job_story_id != story.id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Job {request.job_id} was written for story {job_story_id}, "
+                f"not {story.id}."
+            ),
+        )
+
     structured = job.result.metadata.get("structured")
     task = job.result.metadata.get("story_task")
     if not isinstance(structured, dict) or not isinstance(task, str):
@@ -300,6 +419,22 @@ def apply_story_result(
             status_code=status.HTTP_409_CONFLICT,
             detail="Job result does not carry a structured story payload.",
         )
+
+    if task in SCENE_SCOPED_TASKS:
+        # The scene was chosen when the job was queued; the model's payload has
+        # no way to name it, so the target is restored from the request here.
+        scene_id = job_params.get("scene_id")
+        if isinstance(scene_id, str) and scene_id:
+            structured = {**structured, "scene_id": scene_id}
+        elif not _names_a_scene(story, structured):
+            # Merging would park the lines in metadata["unassigned_script_lines"],
+            # where no route can read them back into a scene: the dialogue would be
+            # generated, reported as applied, and lost. Refusing with the stage to
+            # re-run keeps the work recoverable.
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=_no_scene_target_detail(story, request.job_id, task),
+            )
 
     try:
         merged = apply_text_result(story, task, structured, job_id=job.id)
@@ -315,6 +450,49 @@ def apply_story_result(
     )
 
 
+def _public_output_url(services: ApplicationServices, asset_path: str) -> str | None:
+    """Map a stored asset path onto the ``/outputs`` mount, or give up.
+
+    The client is served files through that mount, so it never needs — and must
+    never be handed — where the file lives on this machine. Anything outside the
+    served root has no public URL, and is simply omitted.
+    """
+
+    output_root = services.output_dir.parent
+    try:
+        relative = Path(asset_path).resolve().relative_to(output_root.resolve())
+    except (OSError, ValueError):
+        return None
+    return f"/outputs/{relative.as_posix()}"
+
+
+def _attach_preview_urls(
+    services: ApplicationServices, timeline: dict[str, Any]
+) -> dict[str, Any]:
+    """Add a servable URL beside each asset id, in place."""
+
+    tracks = timeline.get("tracks")
+    if not isinstance(tracks, dict):
+        return timeline
+    urls: dict[str, str | None] = {}
+    for track_name in _PREVIEWABLE_TRACKS:
+        for entry in tracks.get(track_name) or []:
+            asset_id = entry.get("asset_id") if isinstance(entry, dict) else None
+            if not isinstance(asset_id, str) or not asset_id:
+                continue
+            if asset_id not in urls:
+                asset = services.asset_repository.get(asset_id)
+                urls[asset_id] = (
+                    _public_output_url(services, asset.path)
+                    if asset is not None
+                    else None
+                )
+            preview_url = urls[asset_id]
+            if preview_url is not None:
+                entry["preview_url"] = preview_url
+    return timeline
+
+
 @router.get("/{story_id}/timeline", response_model=TimelineResponse)
 def get_story_timeline(
     story_id: str,
@@ -323,24 +501,26 @@ def get_story_timeline(
     fps: int = Query(default=30, ge=1, le=120),
     services: ApplicationServices = Depends(get_services),
 ) -> TimelineResponse:
+    """Return the assembly timeline, with previews as ``/outputs`` URLs.
+
+    Entries carry ``asset_id`` and, when the asset is served, ``preview_url`` —
+    never a host filesystem path.
+    """
+
     story = _get_story(services, story_id)
-
-    def lookup(asset_id: str) -> str | None:
-        asset = services.asset_repository.get(asset_id)
-        return asset.path if asset is not None else None
-
     try:
         timeline = build_timeline(
             story,
             resolution=(width, height),
             fps=fps,
-            asset_path_lookup=lookup,
         )
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail=str(exc)
         ) from exc
-    return TimelineResponse(story_id=story.id, timeline=timeline)
+    return TimelineResponse(
+        story_id=story.id, timeline=_attach_preview_urls(services, timeline)
+    )
 
 
 class GenerateSceneRequest(BaseModel):
@@ -494,8 +674,9 @@ def assemble_story(
 ) -> CreateJobResponse:
     """Build the timeline from the story and queue the assembly job.
 
-    Timeline entries stay as asset ids: the assembly route resolves them inside
-    the project boundary, so a story cannot pull in another project's media.
+    Timeline entries stay as asset ids, and every one of them is resolved here
+    against the story's project through the same check ``POST /generate/assembly``
+    uses, so a story cannot pull in another project's media.
     """
 
     story = _get_story(services, story_id)
@@ -510,6 +691,7 @@ def assemble_story(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail=str(exc)
         ) from exc
+    timeline = resolve_timeline_assets(services, timeline, story.project_id)
 
     generation_request = GenerationRequest(
         media_type="video",
@@ -527,4 +709,4 @@ def assemble_story(
     return CreateJobResponse(job_id=job.id, status=job.status)
 
 
-__all__ = ["router"]
+__all__ = ["SCENE_SCOPED_TASKS", "router"]

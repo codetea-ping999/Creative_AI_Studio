@@ -102,6 +102,13 @@ class ScriptLine(BaseModel):
 
 
 class ScriptResponse(BaseModel):
+    """Spoken lines for one scene.
+
+    Deliberately carries no scene identifier: the model is given a scene brief,
+    not the story's scene ids, so it could only guess. ``POST /stories/{id}/expand``
+    pins the target scene on the request and ``/apply`` restores it before merging.
+    """
+
     model_config = ConfigDict(extra="ignore")
 
     lines: list[ScriptLine] = Field(min_length=1)

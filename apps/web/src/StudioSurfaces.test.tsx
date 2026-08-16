@@ -8,6 +8,7 @@ import {
   isReadyToAssemble,
   loglineCandidates,
   missingRolesForScene,
+  resolveSceneTarget,
   type StoryDocument,
   type StoryScene,
 } from "./lib/storyApi";
@@ -136,6 +137,23 @@ describe("story stage gating", () => {
   it("treats an empty story with no premise as having nothing to write", () => {
     const empty = makeStory({ premise: "", title: "", logline: "" });
     expect(availableStages(empty).size).toBe(0);
+  });
+
+  it("keeps the script target on a scene that still exists", () => {
+    expect(resolveSceneTarget(null, "scene_02")).toBe("");
+    expect(resolveSceneTarget(makeStory(), "scene_02")).toBe("");
+
+    const withScenes = makeStory({
+      scenes: [
+        makeScene({ id: "scene_01", order: 0 }),
+        makeScene({ id: "scene_02", order: 1 }),
+      ],
+    });
+    expect(resolveSceneTarget(withScenes, "scene_02")).toBe("scene_02");
+    // A regenerated scene list can drop the selection; the first scene keeps the
+    // stage reachable instead of leaving it disabled.
+    expect(resolveSceneTarget(withScenes, "scene_09")).toBe("scene_01");
+    expect(resolveSceneTarget(withScenes, "")).toBe("scene_01");
   });
 
   it("reads logline candidates defensively", () => {
@@ -291,6 +309,127 @@ describe("StoryPanel", () => {
     });
     expect(screen.getByRole("button", { name: "Scenes" }).hasAttribute("disabled")).toBe(
       true,
+    );
+  });
+
+  it("writes the script into the scene the user picked", async () => {
+    const story = makeStory({
+      logline: "a girl rewinds a day",
+      beats: [{ id: "beat_01", act: "1", purpose: "p", summary: "s", order: 0 }],
+      scenes: [
+        makeScene({ id: "scene_01", order: 0, heading: "屋上の朝" }),
+        makeScene({ id: "scene_02", order: 1, heading: "路地の追跡" }),
+      ],
+    });
+    const calls = stubFetch([
+      ["/stories/story_1/expand", { job_id: "job_1", status: "queued" }, "POST"],
+      ["/stories/story_1/apply", { story, missing_assets: [] }, "POST"],
+      ["/stories/story_1", { story, missing_assets: [] }],
+      ["/stories", { items: [{ id: "story_1", title: "Rewind", scene_count: 2 }] }],
+    ]);
+
+    const user = userEvent.setup();
+    render(<StoryPanel modelId="" awaitJob={async () => "succeeded"} />);
+    await waitFor(() => {
+      expect(screen.getByRole("option", { name: /Rewind/ })).toBeTruthy();
+    });
+    await user.selectOptions(screen.getByLabelText("編集中のストーリー"), "story_1");
+
+    const target = await screen.findByLabelText("Script の対象シーン");
+    await user.selectOptions(target, "scene_02");
+    await user.click(screen.getByRole("button", { name: "Script" }));
+
+    await waitFor(() => {
+      expect(calls.some((call) => call.url.includes("/expand"))).toBe(true);
+    });
+    expect(calls.find((call) => call.url.includes("/expand"))?.body).toMatchObject({
+      task: "script",
+      params: { scene_id: "scene_02" },
+    });
+  });
+
+  it("shows the dialogue a script stage produced", async () => {
+    const story = makeStory({
+      logline: "l",
+      beats: [{ id: "beat_01", act: "1", purpose: "p", summary: "s", order: 0 }],
+      scenes: [
+        makeScene({
+          id: "scene_01",
+          order: 0,
+          dialogue: [{ speaker: "ミナ", text: "こっちへ", direction: "小声で" }],
+        }),
+      ],
+    });
+    stubFetch([
+      ["/stories/story_1", { story, missing_assets: [] }],
+      ["/stories", { items: [{ id: "story_1", title: "Rewind", scene_count: 1 }] }],
+    ]);
+
+    const user = userEvent.setup();
+    render(<StoryPanel modelId="" awaitJob={async () => "succeeded"} />);
+    await waitFor(() => {
+      expect(screen.getByRole("option", { name: /Rewind/ })).toBeTruthy();
+    });
+    await user.selectOptions(screen.getByLabelText("編集中のストーリー"), "story_1");
+
+    const table = await screen.findByRole("table");
+    expect(within(table).getByText("台詞 1 行")).toBeTruthy();
+    expect(within(table).getByText("こっちへ")).toBeTruthy();
+  });
+
+  it("calls the script stage complete only once a scene carries dialogue", async () => {
+    // Narration is written by the scene_list stage, so a narration-only story has
+    // not run Script yet — claiming otherwise hides the stage that #106 is about.
+    const scene = makeScene({
+      id: "scene_01",
+      order: 0,
+      narration: "朝の光が街を照らしていた。",
+    });
+    const withoutDialogue = makeStory({
+      logline: "l",
+      beats: [{ id: "beat_01", act: "1", purpose: "p", summary: "s", order: 0 }],
+      scenes: [scene],
+    });
+    stubFetch([
+      ["/stories/story_1", { story: withoutDialogue, missing_assets: [] }],
+      ["/stories", { items: [{ id: "story_1", title: "Rewind", scene_count: 1 }] }],
+    ]);
+
+    const user = userEvent.setup();
+    render(<StoryPanel modelId="" awaitJob={async () => "succeeded"} />);
+    await waitFor(() => {
+      expect(screen.getByRole("option", { name: /Rewind/ })).toBeTruthy();
+    });
+    await user.selectOptions(screen.getByLabelText("編集中のストーリー"), "story_1");
+
+    const hint = await screen.findByText(/台詞を書く —/);
+    expect(hint.textContent).not.toContain("完了");
+    // The state is readable without relying on colour, and names the target.
+    expect(hint.textContent).toContain("屋上の朝");
+
+    cleanup();
+    stubFetch([
+      [
+        "/stories/story_1",
+        {
+          story: makeStory({
+            ...withoutDialogue,
+            scenes: [
+              { ...scene, dialogue: [{ speaker: "ミナ", text: "こっちへ" }] },
+            ],
+          }),
+          missing_assets: [],
+        },
+      ],
+      ["/stories", { items: [{ id: "story_1", title: "Rewind", scene_count: 1 }] }],
+    ]);
+    render(<StoryPanel modelId="" awaitJob={async () => "succeeded"} />);
+    await waitFor(() => {
+      expect(screen.getByRole("option", { name: /Rewind/ })).toBeTruthy();
+    });
+    await user.selectOptions(screen.getByLabelText("編集中のストーリー"), "story_1");
+    expect((await screen.findByText(/台詞を書く —/)).textContent).toContain(
+      "完了・再生成可能",
     );
   });
 

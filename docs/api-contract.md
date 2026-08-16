@@ -119,6 +119,8 @@ Web 側は `detail` 配列から `body.prompt: Field required` のような構�
 - `POST /batches` が `spec` と `template` の両方、またはどちらも指定していない
 - 未知の bible `kind`、未知の story `format`
 - `POST /stories/{id}/expand` で premise / logline / title のいずれも無い
+- `POST /stories/{id}/expand` の `script` task で `params.scene_id` が無く、
+  対象を一意に決められない（scene が 2 つ以上ある）
 
 ### 409
 
@@ -126,6 +128,11 @@ Web 側は `detail` 配列から `body.prompt: Field required` のような構�
 
 - `GET /stories/{id}/timeline` で scene に visual が無い（不足 scene id を列挙）
 - `POST /stories/{id}/apply` で対象 job が未完了、または story payload を持たない
+- `POST /stories/{id}/apply` で対象 job が別の story のために書かれている
+  （どの story の job かを `detail` に含む）
+- `POST /stories/{id}/expand` の `script` task をまだ scene の無い story に投げた
+- `POST /stories/{id}/apply` の `script` job が対象 scene を持たず、story の scene が
+  1 つでない（再実行すべき stage を `detail` に含む）
 
 ### シーンへの自動紐付け
 
@@ -147,6 +154,90 @@ story を読み直すだけで、素材の紐付けを自分で管理する必�
 - scene が持つ元テキストが空の場合は 409（何を生成すべきか決まらないため）
 - scene list を作り直して対象 scene id が消えていた場合は binding を破棄する
 - job が失敗した場合は scene を変更しない（半端に紐付けない）
+
+### 執筆段階の適用範囲
+
+`POST /stories/{id}/expand` が起動した text job は `params.story_id` を持ちます。
+`POST /stories/{id}/apply` はこれを URL の story と照合し、別 story のために
+書かれた job は 409 で拒否します。`story_id` を持たない job（`POST /generate/text`
+で手作りしたものなど）はどの story にも属さないため、どの story でも取り込めます。
+
+`params.task` と `params.story_id` は **server が決める値**で、request の
+`params` に同じキーを入れても上書きされます（URL の story と `task` が常に勝ちます）。
+これを許すと、story A から投げた job に story B の id を持たせて B の `/apply` に
+通す、という取り違えが黙って成立してしまうためです。その他の `params`
+（`language` / `genre` / `tone` / `audience` / `structure` など）は story の値を
+既定にしつつ、request 側で 1 回だけ上書きできます。
+
+`script` task だけは story 全体ではなく **1 つの scene** に書き込みます。
+モデルは scene id を知らないので、対象は request 側で決めます。
+
+| 状況 | `POST /stories/{id}/expand` の応答 |
+| --- | --- |
+| `params.scene_id` を指定 | 201（その scene に台詞が入る） |
+| scene が 1 つだけで未指定 | 201（その 1 つが対象） |
+| scene が 2 つ以上で未指定 | 400（選べる scene id を `detail` に列挙） |
+| 未知の `scene_id` | 404 |
+| scene がまだ無い | 409（先に `scene_list` を実行する） |
+
+`/apply` は job の `params.scene_id` を structured payload に戻してからマージするため、
+複数 scene の story でも `metadata.unassigned_script_lines` には落ちません。
+`scene_list` を作り直して対象 scene が消えていた場合は 400 で失敗します
+（黙って metadata に退避すると、成功に見えて scene は空のままになるため）。
+
+`params.scene_id` を持たない `script` job（`POST /generate/text` で手作りしたものなど）
+を `/apply` した場合の扱い:
+
+| story の scene 数 | `POST /stories/{id}/apply` の応答 |
+| --- | --- |
+| 1 | 200（その 1 つに台詞が入る） |
+| 2 つ以上 | 409（`POST /stories/{id}/expand` と `params.scene_id` を `detail` で案内） |
+| 0 | 409（先に `scene_list` を実行するよう `detail` で案内） |
+
+台詞を `metadata.unassigned_script_lines` へ退避する経路は API からは到達しません。
+退避先を読み戻す route が無い以上、成功として返すと生成した台詞が失われるためです
+（`core.story.apply_text_result` を直接呼ぶライブラリ利用者向けの fallback としてのみ残しています）。
+
+`Scene.dialogue` は台本として保存されるだけで、動画には合成されません。
+`build_timeline` が音声・字幕に使うのは `Scene.narration` のみです。
+
+### timeline と assemble
+
+`GET /stories/{id}/timeline` の各 entry は `asset_id` と、配信できる場合のみ
+`preview_url`（`/outputs/...` の相対 URL）を持ちます。ホストの絶対パスは返しません。
+`preview_url` は **任意フィールド**です。asset のファイルが `/outputs` の配信ルートの
+外にある（別の場所から取り込んだ場合など）と URL を作れないため、キー自体が現れません。
+consumer は `asset_id` だけがある entry を扱えるようにしてください。
+
+```json
+{
+  "scene_id": "scene_01",
+  "asset_id": "asset_visual_1",
+  "duration_seconds": 4.0,
+  "transition": "crossfade",
+  "motion": "ken_burns_in",
+  "preview_url": "/outputs/images/scene_01.png"
+}
+```
+
+`POST /stories/{id}/assemble` は timeline を組んだあと、`POST /generate/assembly` と
+同じ検証を通します。asset は story の `project_id` に属していなければならず、
+属さないものは 404（`detail` に asset id）になります。
+
+**project を後から変えた場合の注意**: この判定は完全一致です。素材を生成したあとに
+`PATCH /stories/{id}` で `project_id` を付け替えると、既存 asset は元の project
+（多くは `null`）に残ったままなので `/assemble` は 404 になります。別 project の素材を
+黙って合成するより、名指しで拒否して移動を促す方を選んでいます。
+
+復旧手段は向きによって違い、404 の `detail` はその向きに応じた案内を返します。
+
+| 付け替えの向き | 案内される復旧手段 |
+| --- | --- |
+| story を project に入れた（`project_id` が非 null） | `POST /projects/{project_id}/assets/{asset_id}` で asset を移す。実 ID を埋めた形で返すのでそのまま実行できます |
+| story を project から外した（`project_id` が null） | `PATCH /stories/{story_id}` で story を asset 側の project に戻す |
+
+外す向きで asset の移動を案内しないのは、**asset を project から外す route が存在しない**
+ためです。実行できない手順を案内しないという方針です。
 
 ## Shared Types
 
@@ -603,7 +694,8 @@ CogVideoX-2B learned runtimeは`model_id=learned-video`、`output_format=mp4`を
 
 `video` の専用 `assembly` generator にルーティングします。`params.timeline` は
 `GET /stories/{story_id}/timeline` の返却値を渡します。timeline 内の `asset_id` は
-Asset repository から実ファイルへ解決されるため、`path` の直書きは必須ではありません。
+Asset repository から実ファイルへ解決されます。`path` は受け付けず（送っても破棄され）、
+asset は `project_id` に属している必要があります。属さない asset は 404 です。
 
 ```json
 {

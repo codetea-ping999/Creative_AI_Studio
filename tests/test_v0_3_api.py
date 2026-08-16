@@ -598,6 +598,503 @@ class StoryApiTests(unittest.TestCase):
                 404,
             )
 
+    def test_apply_refuses_a_job_written_for_another_story(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            studio = _Studio(Path(tmp_dir))
+            written_for = self._create_story(studio)
+            other = self._create_story(studio, title="Another film")
+
+            job_id = studio.client.post(
+                f"/stories/{written_for['id']}/expand",
+                json={"task": "logline", "model_id": "template-writer"},
+            ).json()["job_id"]
+            studio.drain()
+
+            stolen = studio.client.post(
+                f"/stories/{other['id']}/apply", json={"job_id": job_id}
+            )
+            self.assertEqual(stolen.status_code, 409, stolen.text)
+            self.assertIn(written_for["id"], stolen.json()["detail"])
+            self.assertIn(other["id"], stolen.json()["detail"])
+            self.assertEqual(
+                studio.client.get(f"/stories/{other['id']}").json()["story"]["logline"],
+                "",
+            )
+
+            # The story the job was written for still takes it.
+            owned = studio.client.post(
+                f"/stories/{written_for['id']}/apply", json={"job_id": job_id}
+            )
+            self.assertEqual(owned.status_code, 200, owned.text)
+            self.assertTrue(owned.json()["story"]["logline"])
+
+    def test_expand_ignores_a_caller_supplied_story_id(self) -> None:
+        """The queueing story owns the job, whatever ``params`` claims.
+
+        ``params`` is otherwise passed through to the writer, so a caller could
+        set ``story_id`` there and hand its own job's result to another story.
+        """
+
+        with TemporaryDirectory() as tmp_dir:
+            studio = _Studio(Path(tmp_dir))
+            written_for = self._create_story(studio)
+            other = self._create_story(studio, title="Another film")
+
+            job_id = studio.client.post(
+                f"/stories/{written_for['id']}/expand",
+                json={
+                    "task": "logline",
+                    "model_id": "template-writer",
+                    "params": {"story_id": other["id"], "task": "prose"},
+                },
+            ).json()["job_id"]
+            studio.drain()
+
+            job_params = studio.client.get(f"/jobs/{job_id}").json()["request"]["params"]
+            self.assertEqual(job_params["story_id"], written_for["id"])
+            self.assertEqual(job_params["task"], "logline")
+
+            # The story that queued it can still apply it, and the named story
+            # cannot: the ownership check reads the server's value.
+            hijacked = studio.client.post(
+                f"/stories/{other['id']}/apply", json={"job_id": job_id}
+            )
+            self.assertEqual(hijacked.status_code, 409, hijacked.text)
+            self.assertEqual(
+                studio.client.get(f"/stories/{other['id']}").json()["story"]["logline"],
+                "",
+            )
+
+            owned = studio.client.post(
+                f"/stories/{written_for['id']}/apply", json={"job_id": job_id}
+            )
+            self.assertEqual(owned.status_code, 200, owned.text)
+            self.assertTrue(owned.json()["story"]["logline"])
+
+    def test_apply_accepts_a_hand_built_text_job_that_names_no_story(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            studio = _Studio(Path(tmp_dir))
+            story = self._create_story(studio)
+
+            job_id = studio.client.post(
+                "/generate/text",
+                json={
+                    "prompt": "時を巻き戻せる少女",
+                    "model_id": "template-writer",
+                    "params": {"task": "logline"},
+                },
+            ).json()["job_id"]
+            studio.drain()
+
+            applied = studio.client.post(
+                f"/stories/{story['id']}/apply", json={"job_id": job_id}
+            )
+            self.assertEqual(applied.status_code, 200, applied.text)
+            self.assertTrue(applied.json()["story"]["logline"])
+
+    def test_assemble_refuses_media_from_another_project(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            studio = _Studio(Path(tmp_dir))
+            home = studio.client.post(
+                "/projects", json={"name": "Short film"}
+            ).json()["id"]
+            elsewhere = studio.client.post(
+                "/projects", json={"name": "Client work"}
+            ).json()["id"]
+            story = self._create_story(studio, project_id=home)
+
+            scene_job_id = studio.client.post(
+                f"/stories/{story['id']}/expand",
+                json={
+                    "task": "scene_list",
+                    "model_id": "template-writer",
+                    "params": {"scene_count": 2},
+                },
+            ).json()["job_id"]
+            studio.drain()
+            studio.client.post(
+                f"/stories/{story['id']}/apply", json={"job_id": scene_job_id}
+            )
+
+            foreign_job_id = studio.client.post(
+                "/generate/text",
+                json={
+                    "prompt": "another client's brief",
+                    "model_id": "template-writer",
+                    "project_id": elsewhere,
+                    "params": {"task": "logline"},
+                },
+            ).json()["job_id"]
+            studio.drain()
+            foreign = studio.services.asset_repository.get_primary_by_job(
+                foreign_job_id
+            )
+            self.assertIsNotNone(foreign)
+
+            stored = studio.services.story_repository.get(story["id"])
+            studio.services.story_repository.save(
+                stored.model_copy(
+                    update={
+                        "scenes": [
+                            scene.model_copy(
+                                update={"asset_ids": {"visual": foreign.id}}
+                            )
+                            for scene in stored.scenes
+                        ]
+                    }
+                )
+            )
+
+            response = studio.client.post(f"/stories/{story['id']}/assemble", json={})
+            self.assertEqual(response.status_code, 404, response.text)
+            detail = response.json()["detail"]
+            self.assertIn(foreign.id, detail)
+            # The same refusal fires after PATCH /stories/{id} {project_id} moves a
+            # story away from media that was generated before the move, so the
+            # message has to name the way back instead of only saying "not found".
+            # The ids are interpolated, not left as {placeholders}, so the line can
+            # be pasted straight into a request.
+            self.assertIn(f"POST /projects/{home}/assets/{foreign.id}", detail)
+            self.assertIn(elsewhere, detail)
+            self.assertIn(home, detail)
+
+    def test_assemble_refusal_names_a_recovery_that_exists_when_the_story_leaves(
+        self,
+    ) -> None:
+        """The refusal must not prescribe an impossible fix.
+
+        Attaching an asset to a project is a route; detaching it is not. So when a
+        story is moved *out* of a project after its media was generated, telling the
+        user to re-parent the asset names a step they cannot take — there is no
+        target project id to POST to. The message has to point the other way.
+        """
+
+        with TemporaryDirectory() as tmp_dir:
+            studio = _Studio(Path(tmp_dir))
+            home = studio.client.post(
+                "/projects", json={"name": "Short film"}
+            ).json()["id"]
+            story = self._create_story(studio, project_id=home)
+
+            scene_job_id = studio.client.post(
+                f"/stories/{story['id']}/expand",
+                json={
+                    "task": "scene_list",
+                    "model_id": "template-writer",
+                    "params": {"scene_count": 2},
+                },
+            ).json()["job_id"]
+            studio.drain()
+            studio.client.post(
+                f"/stories/{story['id']}/apply", json={"job_id": scene_job_id}
+            )
+
+            media_job_id = studio.client.post(
+                "/generate/text",
+                json={
+                    "prompt": "a shot description",
+                    "model_id": "template-writer",
+                    "project_id": home,
+                    "params": {"task": "logline"},
+                },
+            ).json()["job_id"]
+            studio.drain()
+            asset = studio.services.asset_repository.get_primary_by_job(media_job_id)
+            self.assertIsNotNone(asset)
+            self.assertEqual(asset.project_id, home)
+
+            stored = studio.services.story_repository.get(story["id"])
+            studio.services.story_repository.save(
+                stored.model_copy(
+                    update={
+                        "scenes": [
+                            scene.model_copy(
+                                update={"asset_ids": {"visual": asset.id}}
+                            )
+                            for scene in stored.scenes
+                        ]
+                    }
+                )
+            )
+
+            moved_out = studio.client.patch(
+                f"/stories/{story['id']}", json={"project_id": None}
+            )
+            self.assertEqual(moved_out.status_code, 200, moved_out.text)
+
+            response = studio.client.post(f"/stories/{story['id']}/assemble", json={})
+            self.assertEqual(response.status_code, 404, response.text)
+            detail = response.json()["detail"]
+            self.assertIn(asset.id, detail)
+            self.assertIn(home, detail)
+            self.assertIn("PATCH /stories/{story_id}", detail)
+            # The route it would send them to does not exist in this direction.
+            self.assertNotIn(
+                "POST /projects/",
+                detail,
+                "the refusal must not prescribe a step the API cannot perform",
+            )
+
+    def test_script_stage_writes_into_the_named_scene(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            studio = _Studio(Path(tmp_dir))
+            story = self._create_story(studio)
+
+            scene_job_id = studio.client.post(
+                f"/stories/{story['id']}/expand",
+                json={
+                    "task": "scene_list",
+                    "model_id": "template-writer",
+                    "params": {"scene_count": 3},
+                },
+            ).json()["job_id"]
+            studio.drain()
+            studio.client.post(
+                f"/stories/{story['id']}/apply", json={"job_id": scene_job_id}
+            )
+
+            queued = studio.client.post(
+                f"/stories/{story['id']}/expand",
+                json={
+                    "task": "script",
+                    "model_id": "template-writer",
+                    "params": {"scene_id": "scene_02"},
+                },
+            )
+            self.assertEqual(queued.status_code, 201, queued.text)
+            studio.drain()
+
+            applied = studio.client.post(
+                f"/stories/{story['id']}/apply",
+                json={"job_id": queued.json()["job_id"]},
+            )
+            self.assertEqual(applied.status_code, 200, applied.text)
+            scenes = applied.json()["story"]["scenes"]
+            self.assertEqual(len(scenes), 3)
+            self.assertEqual(scenes[0]["dialogue"], [])
+            self.assertTrue(scenes[1]["dialogue"])
+            self.assertEqual(scenes[2]["dialogue"], [])
+            # Nothing was parked out of reach.
+            self.assertNotIn(
+                "unassigned_script_lines", applied.json()["story"]["metadata"]
+            )
+
+    def test_apply_rejects_a_script_job_whose_scene_was_regenerated_away(
+        self,
+    ) -> None:
+        """A stale scene target fails loudly instead of parking the dialogue.
+
+        ``docs/api-contract.md`` promises a 400 here, but the only coverage was at
+        the library level (``core.story.apply_text_result`` raising ValueError).
+        Nothing pinned the HTTP boundary, so a regression turning this back into a
+        silent park-in-metadata would not have been caught — which is exactly the
+        failure #106 exists to prevent.
+        """
+
+        with TemporaryDirectory() as tmp_dir:
+            studio = _Studio(Path(tmp_dir))
+            story = self._create_story(studio)
+
+            def rebuild_scenes(count: int) -> None:
+                job_id = studio.client.post(
+                    f"/stories/{story['id']}/expand",
+                    json={
+                        "task": "scene_list",
+                        "model_id": "template-writer",
+                        "params": {"scene_count": count},
+                    },
+                ).json()["job_id"]
+                studio.drain()
+                studio.client.post(
+                    f"/stories/{story['id']}/apply", json={"job_id": job_id}
+                )
+
+            rebuild_scenes(3)
+            queued = studio.client.post(
+                f"/stories/{story['id']}/expand",
+                json={
+                    "task": "script",
+                    "model_id": "template-writer",
+                    "params": {"scene_id": "scene_03"},
+                },
+            )
+            self.assertEqual(queued.status_code, 201, queued.text)
+            studio.drain()
+
+            # The writer trims the story down before applying the queued script.
+            rebuild_scenes(2)
+
+            applied = studio.client.post(
+                f"/stories/{story['id']}/apply",
+                json={"job_id": queued.json()["job_id"]},
+            )
+            self.assertEqual(applied.status_code, 400, applied.text)
+            detail = applied.json()["detail"]
+            self.assertIn("scene_03", detail)
+
+            after = studio.client.get(f"/stories/{story['id']}").json()["story"]
+            self.assertNotIn("unassigned_script_lines", after["metadata"])
+            self.assertEqual([scene["dialogue"] for scene in after["scenes"]], [[], []])
+
+    def test_apply_refuses_script_lines_with_no_scene_to_land_in(self) -> None:
+        """Dialogue is never accepted into a place nothing can read it back from.
+
+        A hand-built ``POST /generate/text`` script job names no scene, and the
+        merge would park its lines in ``metadata.unassigned_script_lines`` — where
+        no route returns them to a scene. The API refuses and names the stage that
+        does bind a target.
+        """
+
+        with TemporaryDirectory() as tmp_dir:
+            studio = _Studio(Path(tmp_dir))
+            story = self._create_story(studio)
+
+            scene_job_id = studio.client.post(
+                f"/stories/{story['id']}/expand",
+                json={
+                    "task": "scene_list",
+                    "model_id": "template-writer",
+                    "params": {"scene_count": 3},
+                },
+            ).json()["job_id"]
+            studio.drain()
+            studio.client.post(
+                f"/stories/{story['id']}/apply", json={"job_id": scene_job_id}
+            )
+
+            loose_job_id = studio.client.post(
+                "/generate/text",
+                json={
+                    "prompt": "屋上で二人が言い争う",
+                    "model_id": "template-writer",
+                    "params": {"task": "script"},
+                },
+            ).json()["job_id"]
+            studio.drain()
+            self.assertEqual(
+                studio.client.get(f"/jobs/{loose_job_id}").json()["status"],
+                "succeeded",
+            )
+
+            refused = studio.client.post(
+                f"/stories/{story['id']}/apply", json={"job_id": loose_job_id}
+            )
+            self.assertEqual(refused.status_code, 409, refused.text)
+            detail = refused.json()["detail"]
+            self.assertIn(f"POST /stories/{story['id']}/expand", detail)
+            self.assertIn("params.scene_id", detail)
+
+            stored = studio.client.get(f"/stories/{story['id']}").json()["story"]
+            self.assertNotIn("unassigned_script_lines", stored["metadata"])
+            self.assertEqual(
+                [scene["dialogue"] for scene in stored["scenes"]], [[], [], []]
+            )
+
+    def test_apply_refuses_script_lines_when_the_story_has_no_scenes(self) -> None:
+        """The same refusal, with the scene_list stage named instead."""
+
+        with TemporaryDirectory() as tmp_dir:
+            studio = _Studio(Path(tmp_dir))
+            story = self._create_story(studio)
+
+            loose_job_id = studio.client.post(
+                "/generate/text",
+                json={
+                    "prompt": "屋上で二人が言い争う",
+                    "model_id": "template-writer",
+                    "params": {"task": "script"},
+                },
+            ).json()["job_id"]
+            studio.drain()
+
+            refused = studio.client.post(
+                f"/stories/{story['id']}/apply", json={"job_id": loose_job_id}
+            )
+            self.assertEqual(refused.status_code, 409, refused.text)
+            self.assertIn("scene_list", refused.json()["detail"])
+            self.assertNotIn(
+                "unassigned_script_lines",
+                studio.client.get(f"/stories/{story['id']}").json()["story"]["metadata"],
+            )
+
+    def test_apply_still_binds_script_lines_on_a_single_scene_story(self) -> None:
+        """One scene is unambiguous, so an unnamed payload still lands in it."""
+
+        with TemporaryDirectory() as tmp_dir:
+            studio = _Studio(Path(tmp_dir))
+            story = self._create_story(studio)
+
+            scene_job_id = studio.client.post(
+                f"/stories/{story['id']}/expand",
+                json={
+                    "task": "scene_list",
+                    "model_id": "template-writer",
+                    "params": {"scene_count": 1},
+                },
+            ).json()["job_id"]
+            studio.drain()
+            studio.client.post(
+                f"/stories/{story['id']}/apply", json={"job_id": scene_job_id}
+            )
+
+            loose_job_id = studio.client.post(
+                "/generate/text",
+                json={
+                    "prompt": "屋上で二人が言い争う",
+                    "model_id": "template-writer",
+                    "params": {"task": "script"},
+                },
+            ).json()["job_id"]
+            studio.drain()
+
+            applied = studio.client.post(
+                f"/stories/{story['id']}/apply", json={"job_id": loose_job_id}
+            )
+            self.assertEqual(applied.status_code, 200, applied.text)
+            self.assertTrue(applied.json()["story"]["scenes"][0]["dialogue"])
+
+    def test_script_stage_requires_a_scene_it_can_write_into(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            studio = _Studio(Path(tmp_dir))
+            story = self._create_story(studio)
+
+            before_scenes = studio.client.post(
+                f"/stories/{story['id']}/expand",
+                json={"task": "script", "model_id": "template-writer"},
+            )
+            self.assertEqual(before_scenes.status_code, 409, before_scenes.text)
+            self.assertIn("scene_list", before_scenes.json()["detail"])
+
+            scene_job_id = studio.client.post(
+                f"/stories/{story['id']}/expand",
+                json={
+                    "task": "scene_list",
+                    "model_id": "template-writer",
+                    "params": {"scene_count": 3},
+                },
+            ).json()["job_id"]
+            studio.drain()
+            studio.client.post(
+                f"/stories/{story['id']}/apply", json={"job_id": scene_job_id}
+            )
+
+            unnamed = studio.client.post(
+                f"/stories/{story['id']}/expand",
+                json={"task": "script", "model_id": "template-writer"},
+            )
+            self.assertEqual(unnamed.status_code, 400, unnamed.text)
+            self.assertIn("scene_02", unnamed.json()["detail"])
+
+            unknown = studio.client.post(
+                f"/stories/{story['id']}/expand",
+                json={
+                    "task": "script",
+                    "model_id": "template-writer",
+                    "params": {"scene_id": "scene_99"},
+                },
+            )
+            self.assertEqual(unknown.status_code, 404, unknown.text)
+
     def test_timeline_requires_generated_visuals(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             studio = _Studio(Path(tmp_dir))
@@ -651,15 +1148,79 @@ class StoryApiTests(unittest.TestCase):
                 stored.model_copy(update={"scenes": scenes})
             )
 
-            timeline = studio.client.get(
+            response = studio.client.get(
                 f"/stories/{story['id']}/timeline",
                 params={"width": 1080, "height": 1920, "fps": 24},
-            ).json()["timeline"]
+            )
+            timeline = response.json()["timeline"]
 
             self.assertEqual(timeline["resolution"], [1080, 1920])
             self.assertEqual(timeline["fps"], 24)
             self.assertEqual(len(timeline["tracks"]["visual"]), 2)
-            self.assertEqual(timeline["tracks"]["visual"][0]["path"], asset.path)
+
+            # The client is served through the /outputs mount, so it gets a URL
+            # it can fetch — never where the file lives on this machine.
+            entry = timeline["tracks"]["visual"][0]
+            self.assertNotIn("path", entry)
+            self.assertEqual(entry["asset_id"], asset.id)
+            self.assertTrue(
+                entry["preview_url"].startswith("/outputs/"), entry["preview_url"]
+            )
+            self.assertTrue(entry["preview_url"].endswith(Path(asset.path).name))
+            self.assertNotIn(tmp_dir, response.text)
+            self.assertNotIn(str(Path(asset.path).parent), response.text)
+
+    def test_timeline_omits_the_preview_of_an_unserved_asset(self) -> None:
+        """An asset outside the served root has no URL, so the key is absent.
+
+        ``asset_id`` always identifies the entry; ``preview_url`` is the optional
+        half, and a consumer has to handle it missing rather than assume every
+        entry is fetchable.
+        """
+
+        with TemporaryDirectory() as tmp_dir:
+            studio = _Studio(Path(tmp_dir))
+            story = self._create_story(studio)
+
+            scene_job_id = studio.client.post(
+                f"/stories/{story['id']}/expand",
+                json={
+                    "task": "scene_list",
+                    "model_id": "template-writer",
+                    "params": {"scene_count": 2},
+                },
+            ).json()["job_id"]
+            studio.drain()
+            studio.client.post(
+                f"/stories/{story['id']}/apply", json={"job_id": scene_job_id}
+            )
+
+            asset = studio.services.asset_repository.get_primary_by_job(scene_job_id)
+            self.assertIsNotNone(asset)
+            # An asset imported from elsewhere on disk is not under /outputs.
+            outside = Path(tmp_dir) / "imported" / "elsewhere.png"
+            asset.path = str(outside)
+            studio.services.asset_repository.create_or_update(asset)
+
+            stored = studio.services.story_repository.get(story["id"])
+            studio.services.story_repository.save(
+                stored.model_copy(
+                    update={
+                        "scenes": [
+                            scene.model_copy(update={"asset_ids": {"visual": asset.id}})
+                            for scene in stored.scenes
+                        ]
+                    }
+                )
+            )
+
+            response = studio.client.get(f"/stories/{story['id']}/timeline")
+            self.assertEqual(response.status_code, 200, response.text)
+            entry = response.json()["timeline"]["tracks"]["visual"][0]
+            self.assertEqual(entry["asset_id"], asset.id)
+            self.assertNotIn("preview_url", entry)
+            self.assertNotIn("path", entry)
+            self.assertNotIn(str(outside), response.text)
 
     def test_story_can_be_bound_to_a_project(self) -> None:
         with TemporaryDirectory() as tmp_dir:

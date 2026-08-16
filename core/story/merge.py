@@ -186,11 +186,25 @@ def _merge_script(
     by_id = {scene.id: scene for scene in scenes}
     by_order = {scene.order: scene for scene in scenes}
 
+    # A named target that no longer exists is an error rather than a fallback:
+    # the caller asked for one scene, and silently parking the lines in metadata
+    # would look like success while the scene stayed empty.
     target: Scene | None = None
-    if isinstance(scene_id, str) and scene_id in by_id:
-        target = by_id[scene_id]
-    elif isinstance(scene_index, int) and scene_index in by_order:
-        target = by_order[scene_index]
+    if isinstance(scene_id, str) and scene_id:
+        target = by_id.get(scene_id)
+        if target is None:
+            raise ValueError(
+                f"script payload targets scene {scene_id!r}, which story "
+                f"{story.id!r} does not have "
+                f"({', '.join(by_id) or 'no scenes'})"
+            )
+    elif isinstance(scene_index, int) and not isinstance(scene_index, bool):
+        target = by_order.get(scene_index)
+        if target is None:
+            raise ValueError(
+                f"script payload targets scene_index {scene_index}, which story "
+                f"{story.id!r} does not have ({len(scenes)} scenes)"
+            )
     elif len(scenes) == 1:
         target = scenes[0]
 
@@ -210,7 +224,10 @@ def _merge_script(
     if target is None:
         # Without a scene to attach to, the lines are still worth keeping: losing
         # generated dialogue because the payload omitted an index would be worse
-        # than parking it in metadata for the caller to place.
+        # than parking it in metadata for the caller to place. Nothing reads that
+        # metadata back into a scene, so this is a library-caller fallback only:
+        # POST /stories/{id}/apply refuses before it can get here, and names the
+        # stage to re-run instead.
         metadata = dict(story.metadata)
         metadata["unassigned_script_lines"] = [
             line.model_dump(mode="json") for line in dialogue
