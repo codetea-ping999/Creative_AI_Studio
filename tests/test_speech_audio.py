@@ -24,6 +24,7 @@ from bootstrap import create_application_services
 from core.audio import (
     apply_fades,
     duck,
+    duck_envelope,
     normalize_peak,
     normalize_rms,
     process_audio,
@@ -269,6 +270,79 @@ def test_duck_is_a_no_op_for_empty_or_silent_narration():
     empty_music, info = duck(np.zeros(0, dtype=np.float32), _sine(0.5), _RATE)
     assert empty_music.size == 0
     assert info["skipped_reason"] == "empty music buffer"
+
+
+def test_duck_applies_exactly_the_shared_envelope():
+    """duck() must be the envelope and nothing else, so both callers agree."""
+
+    music = np.full(4_000, 0.5, dtype=np.float32)
+    narration = np.zeros(4_000, dtype=np.float32)
+    narration[2_000:3_000] = _sine(1.0)
+
+    ducked, info = duck(music, narration, _RATE, reduction_db=-9.0)
+    envelope = duck_envelope(
+        [(2_000, 3_000)], music.size, _RATE, reduction_db=-9.0
+    )
+
+    assert info["ducked_spans"] == 1
+    # The span boundaries the level follower finds may sit a few samples wide of
+    # the phrase, so compare where the curve is settled rather than sample-exact.
+    assert np.allclose(ducked[2_200:2_800], music[2_200:2_800] * envelope[2_200:2_800])
+    assert np.allclose(ducked[:1_700], music[:1_700] * envelope[:1_700])
+
+
+def test_duck_envelope_keeps_the_ramp_slope_when_a_span_starts_early():
+    """A span nearer the head than the attack gets a shorter dip, same slope."""
+
+    attack_seconds = 0.4
+    envelope = duck_envelope(
+        [(100, 400)],
+        1_000,
+        _RATE,
+        reduction_db=-12.0,
+        attack_seconds=attack_seconds,
+        release_seconds=0.1,
+    )
+    full = duck_envelope(
+        [(400, 700)],
+        1_000,
+        _RATE,
+        reduction_db=-12.0,
+        attack_seconds=attack_seconds,
+        release_seconds=0.1,
+    )
+
+    # Truncating the ramp must not steepen it: the clipped attack is the tail of
+    # the full one, so the buffer opens part-way down instead of at unity.
+    assert envelope[0] < 1.0
+    assert np.allclose(envelope[:100], full[300:400])
+    assert np.allclose(envelope[100:400], 0.2512, atol=0.005)
+
+
+def test_duck_envelope_clips_spans_to_the_buffer():
+    envelope = duck_envelope(
+        [(-500, 200), (900, 5_000), (5_000, 6_000)],
+        1_000,
+        _RATE,
+        reduction_db=-12.0,
+        attack_seconds=0.05,
+        release_seconds=0.05,
+    )
+
+    assert envelope.shape == (1_000,)
+    assert np.allclose(envelope[:200], 0.2512, atol=0.005)
+    # A span running past the end stays ducked to the last sample: there is no
+    # room left to release into.
+    assert np.allclose(envelope[900:], 0.2512, atol=0.005)
+    assert float(envelope[500]) == pytest.approx(1.0)
+
+
+def test_duck_envelope_is_flat_without_spans():
+    envelope = duck_envelope([], 500, _RATE)
+
+    assert envelope.shape == (500,)
+    assert np.array_equal(envelope, np.ones(500, dtype=np.float32))
+    assert duck_envelope([(0, 10)], 0, _RATE).size == 0
 
 
 def test_process_audio_runs_the_speech_chain_and_stays_json_safe():

@@ -20,6 +20,7 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from core.audio import duck_envelope  # noqa: E402
 from core.schemas import GenerationRequest  # noqa: E402
 from generators.video import assembly as assembly_module  # noqa: E402
 from generators.video.assembly import AssemblyGenerator  # noqa: E402
@@ -79,6 +80,25 @@ def _write_wav(
     pcm = (np.clip(data, -1.0, 1.0) * 32_767).astype("<i2")
     with wave.open(str(path), "wb") as wav_file:
         wav_file.setnchannels(channels)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm.tobytes())
+
+
+def _write_constant_wav(
+    path: Path,
+    *,
+    seconds: float,
+    value: float,
+    sample_rate: int = _SAMPLE_RATE,
+) -> None:
+    """Write a DC wav, so anything multiplied into it is readable off the mix."""
+
+    frame_count = max(1, int(round(seconds * sample_rate)))
+    # 32_768 rather than 32_767: a power of two round-trips 0.5 exactly.
+    pcm = np.full((frame_count, 1), round(value * 32_768), dtype="<i2")
+    with wave.open(str(path), "wb") as wav_file:
+        wav_file.setnchannels(1)
         wav_file.setsampwidth(2)
         wav_file.setframerate(sample_rate)
         wav_file.writeframes(pcm.tobytes())
@@ -518,6 +538,73 @@ class AssemblyGeneratorTests(unittest.TestCase):
 
             self.assertGreater(outside, 0.0)
             self.assertLess(inside, outside * 0.75)
+
+    def test_ducking_uses_the_shared_core_audio_envelope(self) -> None:
+        """The mix must match core.audio's curve, not a second copy of the math.
+
+        Two ducking implementations drift: this pins assembly's music gain to the
+        shared builder so a change to the ramp or the depth moves both.
+        """
+
+        with TemporaryDirectory() as root:
+            workspace = Path(root)
+            music = workspace / "music.wav"
+            narration = workspace / "narration.wav"
+            # Constant music and silent narration make the mix *be* the gain
+            # curve, so the comparison is exact instead of statistical.
+            _write_constant_wav(music, seconds=3.0, value=0.5)
+            _write_constant_wav(narration, seconds=1.0, value=0.0)
+
+            generator = AssemblyGenerator(
+                workspace / "outputs", sample_rate=_SAMPLE_RATE
+            )
+            # 0.05 s in is closer to the head than the 0.12 s attack, so this also
+            # covers the truncated ramp.
+            narration_start = round(0.05 * _SAMPLE_RATE)
+            tracks = {
+                "narration": [
+                    {
+                        "scene_id": "sc_0",
+                        "asset_id": "aud_narration",
+                        "path": str(narration),
+                        "start_seconds": 0.05,
+                    }
+                ],
+                "music": [
+                    {
+                        "asset_id": "aud_music",
+                        "path": str(music),
+                        "start_seconds": 0.0,
+                        "duration_seconds": 3.0,
+                        "gain_db": 0.0,
+                        "loop": False,
+                        "duck": True,
+                    }
+                ],
+            }
+
+            mix = generator._build_audio_mix(tracks, total_seconds=3.0)
+
+            self.assertIsNotNone(mix)
+            self.assertTrue(mix.ducked)
+            gain = mix.samples[:, 0] / 0.5
+            expected = duck_envelope(
+                [(narration_start, narration_start + _SAMPLE_RATE)],
+                mix.samples.shape[0],
+                _SAMPLE_RATE,
+                reduction_db=assembly_module._DUCK_GAIN_DB,
+                attack_seconds=assembly_module._DUCK_RAMP_SECONDS,
+                release_seconds=assembly_module._DUCK_RAMP_SECONDS,
+            )
+
+            self.assertTrue(
+                np.allclose(gain, expected, atol=1e-6),
+                f"gain diverges from core.audio.duck_envelope by "
+                f"{float(np.max(np.abs(gain - expected)))}",
+            )
+            # The clipped attack keeps the shared slope, so the mix opens part-way
+            # down rather than at unity.
+            self.assertLess(float(gain[0]), 1.0)
 
     def test_video_source_is_sampled_across_its_frames(self) -> None:
         with TemporaryDirectory() as root:

@@ -23,6 +23,7 @@ import wave
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
+from core.audio import duck_envelope
 from core.quality import evaluate_video_output
 from core.schemas import GenerationRequest, GenerationResult
 from generators.base import BaseGenerator
@@ -64,6 +65,11 @@ _FONT_CANDIDATES = (
     "DejaVuSans.ttf",
 )
 
+# Assembly's settings for the shared ducker in ``core.audio``. The dip is
+# shallower and the ramps shorter than that function's standalone defaults
+# because a timeline bed is already gain-staged per entry, and scenes hand off
+# every few seconds — a 0.4 s release would still be recovering when the next
+# line starts.
 _DUCK_GAIN_DB = -9.0
 _DUCK_RAMP_SECONDS = 0.12
 _MAX_INT16 = 32_767
@@ -729,7 +735,16 @@ class AssemblyGenerator(BaseGenerator):
             entry.get("duck") for entry in music_entries
         )
         envelope = (
-            self._duck_envelope(total_samples, narration_spans) if wants_ducking else None
+            duck_envelope(
+                narration_spans,
+                total_samples,
+                self.sample_rate,
+                reduction_db=_DUCK_GAIN_DB,
+                attack_seconds=_DUCK_RAMP_SECONDS,
+                release_seconds=_DUCK_RAMP_SECONDS,
+            )
+            if wants_ducking
+            else None
         )
         ducked = False
         has_music = False
@@ -773,42 +788,6 @@ class AssemblyGenerator(BaseGenerator):
             ducked=ducked,
             unresolved=unresolved,
         )
-
-    def _duck_envelope(
-        self, total_samples: int, spans: list[tuple[int, int]]
-    ) -> np.ndarray:
-        """Build the music gain curve, ramping in and out of narration spans.
-
-        An instant jump is audible as a click and reads as a mistake, so the dip
-        starts just before the voice and recovers just after it.
-        """
-
-        envelope = np.ones(total_samples, dtype=np.float32)
-        if not spans:
-            return envelope
-
-        duck_gain = float(10.0 ** (_DUCK_GAIN_DB / 20.0))
-        ramp = max(1, round(_DUCK_RAMP_SECONDS * self.sample_rate))
-        for begin, end in spans:
-            attack_start = max(0, begin - ramp)
-            if begin > attack_start:
-                attack = np.linspace(
-                    1.0, duck_gain, begin - attack_start, dtype=np.float32
-                )
-                envelope[attack_start:begin] = np.minimum(
-                    envelope[attack_start:begin], attack
-                )
-            envelope[begin:end] = np.minimum(envelope[begin:end], duck_gain)
-
-            release_end = min(total_samples, end + ramp)
-            if release_end > end:
-                release = np.linspace(
-                    duck_gain, 1.0, release_end - end, dtype=np.float32
-                )
-                envelope[end:release_end] = np.minimum(
-                    envelope[end:release_end], release
-                )
-        return envelope
 
     def _read_audio(
         self, path: Path, *, max_output_samples: int | None = None
