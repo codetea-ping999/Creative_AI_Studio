@@ -20,19 +20,30 @@
 **これを通らないものを「完了」と呼ばないでください。**
 
 ```bash
-./venv/bin/python -m pytest -q
+/Users/toyoharukohyama/Documents/Creative_AI_Studio/venv/bin/python -m pytest -q
+```
+
+**フロントのゲートは `apps/web/` を変更した場合だけ**適用されます。変更した場合は、
+先に依存関係を張ってから実行してください（理由は「実行環境の前提」）。
+
+```bash
+ln -s /Users/toyoharukohyama/Documents/Creative_AI_Studio/apps/web/node_modules apps/web/node_modules
 npm --prefix apps/web test
 npm --prefix apps/web run build
 ```
 
-現在の基準値は **backend 498 passed / frontend 58 passed / build 成功** です。
-自分の変更で減った場合、原因を特定するまで完了報告をしないでください。
+`apps/web/` を変更していない場合は「該当なし」と報告してください。
+**走らせていないゲートを「通した」と書かないでください。**
+
+### 基準値は自分で測る
+
+固定値をここに書くと必ず陳腐化します（実際に 2 回ずれました）。
+**作業を始める前に、変更前の状態で 1 回計測**し、その数字を自分の基準にしてください。
+
+参考値: `ffc34cc` 時点で backend 503 passed / 97 subtests、frontend 52 passed。
+自分の変更で基準より減った場合、原因を特定するまで完了報告をしないでください。
 
 作業中は自分のテストファイルだけを回して構いませんが、**完了報告の前に必ず全体を 1 回**通します。
-
-```bash
-./venv/bin/python -m pytest -q tests/test_<your_area>.py   # 作業中
-```
 
 ## ファイル所有権
 
@@ -61,9 +72,10 @@ npm --prefix apps/web run build
 
 ## 禁止事項
 
-- **`git commit` / `git add` / `git push` をしない。** コミットはオーケストレータが行います
-- **`pip install -r requirements.txt` を実行しない。** torch を含み非常に重く、
-  検証環境には既にインストール済みです
+- **`git commit` / `git push` をしない。** コミットはオーケストレータが行います
+  （`git add -A` は成果物の受け渡しでのみ使います。後述の「成果物の受け渡し」を参照）
+- **`pip install -r requirements.txt` / `npm install` を実行しない。** torch を含み
+  非常に重く、共有の venv と node_modules を使えば足ります
 - **モデル weight をダウンロードしない。** ネットワークと時間を浪費します
 - **既存のテストを「通すために」書き換えない。** 落ちたテストは仕様の主張です。
   仕様の方が誤っていると判断した場合は、変更せずに報告へ根拠を書いてください
@@ -71,10 +83,13 @@ npm --prefix apps/web run build
 
 ## 実行環境の前提
 
+エージェントのワークツリーは **`origin/main` のクリーンな checkout** です。
+`.gitignore` されているものは**存在しません**。実測で確認した内容が次の表です。
+
 | 項目 | 状態 |
 | --- | --- |
-| Python | `./venv/bin/python`（依存関係はインストール済み） |
-| Node | `npm --prefix apps/web`（`node_modules` はインストール済み） |
+| Python | ワークツリーに `venv/` は**無い**。本体リポジトリの `venv/bin/python` を絶対パスで使う。自分のワークツリーのコードに対して正しく動くことを実測済み |
+| Node | ワークツリーに `node_modules` は**無い**。`apps/web/` を変更した場合のみ、本体から symlink する |
 | ffmpeg | `imageio-ffmpeg` 同梱。**システム ffmpeg は無い**ので前提にしない |
 | 画像モデル | SDXL weight 未配置。画像生成は実行できない |
 | テキストモデル | `template-writer` のみ有効（weight 不要、決定的） |
@@ -82,6 +97,32 @@ npm --prefix apps/web run build
 
 weight が要る検証は、この環境では**できません**。必要な場合は報告に
 「ローカル実機が必要」と明記してください。推測で「動作確認した」と書かないでください。
+
+`flake8` は venv に入っていません。`CONTRIBUTING.md` の lint コマンドは実行できないので、
+実行したと書かないでください。
+
+## 成果物の受け渡し
+
+**diff を戻り値の文字列として返さないでください。パッチはファイルで渡します。**
+
+実測した失敗です（run `wf_08239cc6-8cb`）。構造化出力の文字列フィールドで diff を返した
+ところ、片方は**ハンクの途中で切り詰められ**、両方が **HTML エスケープ**されました
+（`<` が `&lt;` に化ける）。結果としてどちらも `git apply` に失敗しています。さらに、
+ワークツリーはワークフロー終了時に削除されるため、**壊れたパッチしか残りません**。
+
+```bash
+mkdir -p /private/tmp/claude-501/harness/patches
+git add -A && git diff --cached --binary > /private/tmp/claude-501/harness/patches/<name>.patch
+git reset
+wc -c /private/tmp/claude-501/harness/patches/<name>.patch
+```
+
+- `git add -A` を先に打つのは、**新規ファイルを含めるため**です
+- `--binary` は情報を落とさないため
+- 出力先は**ワークツリーの外**にします。中に置くと消えます
+
+書いたら、**自分で受け渡しを検証してください。** 別の場所に `origin/main` のワークツリーを
+作り、そこで `git apply --check` が通ることを確認してから成功と報告します。
 
 ## コード規約
 

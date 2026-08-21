@@ -1,17 +1,26 @@
 export const meta = {
   name: 'issue-fleet',
   description: 'Work a set of GitHub issues in isolated worktrees, verify adversarially, then hand back an integration report',
-  whenToUse: 'When several independent issues should be implemented in parallel. Pass issue numbers via args, e.g. args: [101, 102, 107].',
+  whenToUse: 'When several independent issues should be implemented in parallel. Pass issue numbers via args, e.g. args: [103, 104, 105].',
   phases: [
-    { title: 'Triage', detail: 'read each issue and map the files it touches' },
-    { title: 'Implement', detail: 'one agent per issue, each in its own git worktree' },
-    { title: 'Verify', detail: 'adversarial review per change, looking for how it breaks' },
+    { title: 'Triage', detail: 'read each issue, map its files, report overlaps' },
+    { title: 'Implement', detail: 'one agent per non-overlapping cluster, each in its own git worktree' },
+    { title: 'Verify', detail: 'adversarial review per cluster, looking for how it breaks' },
     { title: 'Report', detail: 'collect integration instructions for the orchestrator' },
   ],
 }
 
 const REPO = '/Users/toyoharukohyama/Documents/Creative_AI_Studio'
 const PY = `${REPO}/venv/bin/python`
+
+// A patch returned through a structured-output string field does not survive the
+// trip: measured on run wf_08239cc6-8cb, one diff came back truncated mid-hunk and
+// both came back HTML-escaped (`&lt;` for `<`), so neither applied. Worse, the
+// agent worktrees are cleaned up when the workflow ends, so the work was only
+// recoverable because the corruption happened to be repairable. Agents now write
+// the patch to a durable path OUTSIDE their worktree and return that path; the
+// diff field is kept only as a human-readable excerpt.
+const PATCH_DIR = '/private/tmp/claude-501/harness/patches'
 
 // Files where parallel work collides. Only the integrator touches these; agents
 // that need wiring describe it instead of doing it. This is the rule that stops
@@ -30,19 +39,34 @@ const SHARED_FILES = [
 
 const issues = (Array.isArray(args) ? args : [args]).filter(Boolean)
 if (issues.length === 0) {
-  throw new Error('Pass issue numbers via args, e.g. {args: [101, 102, 107]}')
+  throw new Error('Pass issue numbers via args, e.g. {args: [103, 104, 105]}')
 }
 
+// Measured, not assumed: a fresh worktree is a clean checkout of origin/main, so
+// every gitignored artifact is absent. Stating "deps are installed" here is how an
+// agent ends up either running `npm install` or reporting a gate it never ran.
 const CONTRACT = `
 Repository: ${REPO}
+You are working in your OWN git worktree, branched from origin/main. Your worktree
+root is your cwd — stay inside it. Never cd into ${REPO} itself: other people have
+uncommitted work there.
 
 **Read \`docs/agent-harness.md\` first and follow it.** It is the contract for this
 work: the verification gate, the shared-file ownership rules, and the prohibitions
 (no commits, no \`pip install -r requirements.txt\`, no weight downloads).
 
 Environment facts you must not re-derive:
-- Python is \`${PY}\`; dependencies are already installed.
-- Node deps are installed; use \`npm --prefix apps/web\`.
+- Python is \`${PY}\` — the main repo's venv interpreter. Run it from your worktree
+  root and it executes against YOUR code. This is verified; use it as-is.
+- Your worktree has NO \`venv/\` and NO \`apps/web/node_modules/\` (both are
+  gitignored, so a fresh worktree lacks them). Do NOT run \`pip install\` or
+  \`npm install\`.
+- The frontend gate applies ONLY if you changed something under \`apps/web/\`.
+  - If you did, symlink the deps first, from your worktree root:
+    \`ln -s ${REPO}/apps/web/node_modules apps/web/node_modules\`
+    then run \`npm --prefix apps/web test\` and \`npm --prefix apps/web run build\`.
+  - If you changed nothing under \`apps/web/\`, report frontend and build as
+    "not applicable — no apps/web changes". Do NOT claim you ran them.
 - ffmpeg comes from imageio-ffmpeg. There is NO system ffmpeg.
 - No image model weights and no working TTS backend. You cannot validate anything
   that needs them — say so rather than claiming you did.
@@ -108,16 +132,66 @@ overlap means the same path, not the same directory. Do not modify anything.`,
 
 const plan = triage?.issues ?? []
 const conflicts = triage?.conflicts ?? []
-if (conflicts.length > 0) {
-  log(`conflicts detected: ${conflicts.map((c) => `#${c.a}~#${c.b}`).join(', ')} — these are reported, not auto-serialized`)
+if (plan.length === 0) {
+  throw new Error('Triage returned no issues; nothing to implement.')
 }
-log(`triaged ${plan.length} issues; ${plan.filter((i) => i.blocked_by_environment).length} blocked by environment`)
+
+// Two agents editing the same file in separate worktrees do not collide on disk —
+// they collide at integration, where their diffs have to be reconciled by hand.
+// So issues that share a file are given to ONE agent as a cluster instead of being
+// split across two. Clusters are connected components over the conflict pairs.
+const parent = new Map(plan.map((item) => [item.number, item.number]))
+const find = (n) => {
+  let root = n
+  while (parent.get(root) !== root) root = parent.get(root)
+  let cursor = n
+  while (parent.get(cursor) !== cursor) {
+    const next = parent.get(cursor)
+    parent.set(cursor, root)
+    cursor = next
+  }
+  return root
+}
+const union = (a, b) => {
+  if (!parent.has(a) || !parent.has(b)) return
+  const [ra, rb] = [find(a), find(b)]
+  if (ra !== rb) parent.set(Math.max(ra, rb), Math.min(ra, rb))
+}
+for (const conflict of conflicts) union(conflict.a, conflict.b)
+
+const clusterMap = new Map()
+for (const item of plan) {
+  const root = find(item.number)
+  if (!clusterMap.has(root)) clusterMap.set(root, [])
+  clusterMap.get(root).push(item)
+}
+const clusters = [...clusterMap.values()].map((items) => ({
+  items,
+  numbers: items.map((i) => i.number).sort((x, y) => x - y),
+  sharedPaths: [
+    ...new Set(
+      conflicts
+        .filter((c) => items.some((i) => i.number === c.a))
+        .flatMap((c) => c.shared_paths || []),
+    ),
+  ],
+}))
+
+log(
+  `triaged ${plan.length} issues into ${clusters.length} clusters: ` +
+    clusters.map((c) => c.numbers.map((n) => `#${n}`).join('+')).join(', '),
+)
+if (conflicts.length > 0) {
+  log(`file overlaps: ${conflicts.map((c) => `#${c.a}~#${c.b} (${(c.shared_paths || []).join(', ')})`).join('; ')}`)
+}
+const blocked = plan.filter((i) => i.blocked_by_environment).map((i) => `#${i.number}`)
+if (blocked.length) log(`blocked by environment: ${blocked.join(', ')}`)
 
 const IMPLEMENT_SCHEMA = {
   type: 'object',
   properties: {
-    number: { type: 'integer' },
-    completed: { type: 'boolean' },
+    numbers: { type: 'array', items: { type: 'integer' } },
+    completed: { type: 'array', items: { type: 'integer' }, description: 'Issue numbers actually finished' },
     files_changed: { type: 'array', items: { type: 'string' } },
     public_signatures: { type: 'array', items: { type: 'string' } },
     verification: {
@@ -126,6 +200,7 @@ const IMPLEMENT_SCHEMA = {
         backend: { type: 'string' },
         frontend: { type: 'string' },
         build: { type: 'string' },
+        red_before_fix: { type: 'string', description: 'How you confirmed each new test fails without the fix' },
       },
     },
     wiring_needed: {
@@ -134,23 +209,36 @@ const IMPLEMENT_SCHEMA = {
       items: { type: 'string' },
     },
     could_not_do: { type: 'array', items: { type: 'string' } },
-    diff: { type: 'string', description: 'Full unified diff of the change' },
+    patch_path: {
+      type: 'string',
+      description: 'Absolute path of the patch file you wrote (the authoritative artifact)',
+    },
+    patch_bytes: { type: 'integer', description: 'Size of that file, so truncation is detectable' },
+    diff_excerpt: {
+      type: 'string',
+      description: 'First ~4000 chars of the diff, for humans only. Never the transport.',
+    },
   },
-  required: ['number', 'completed', 'files_changed', 'verification', 'could_not_do', 'diff'],
+  required: ['numbers', 'completed', 'files_changed', 'verification', 'could_not_do', 'patch_path'],
 }
 
 const VERDICT_SCHEMA = {
   type: 'object',
   properties: {
-    number: { type: 'integer' },
+    numbers: { type: 'array', items: { type: 'integer' } },
     verdict: { type: 'string', enum: ['ship', 'fix_first', 'reject'] },
     tests_rerun_output: { type: 'string' },
+    red_proof_confirmed: {
+      type: 'string',
+      description: 'What you observed when you reverted the source fix and re-ran the new tests',
+    },
     findings: {
       type: 'array',
       items: {
         type: 'object',
         properties: {
           severity: { type: 'string', enum: ['high', 'medium', 'low'] },
+          issue_number: { type: 'integer' },
           claim: { type: 'string' },
           failure_scenario: { type: 'string' },
           file: { type: 'string' },
@@ -161,95 +249,158 @@ const VERDICT_SCHEMA = {
     acceptance_criteria_unmet: { type: 'array', items: { type: 'string' } },
     summary: { type: 'string' },
   },
-  required: ['number', 'verdict', 'findings', 'acceptance_criteria_unmet', 'summary'],
+  required: ['numbers', 'verdict', 'findings', 'acceptance_criteria_unmet', 'summary'],
 }
 
-// Each issue runs implement -> verify independently. pipeline() means a fast
-// issue reaches Verify while a slow one is still being implemented, and a
-// failure in one issue drops only that issue.
+// Each cluster runs implement -> verify independently. pipeline() means a fast
+// cluster reaches Verify while a slow one is still being implemented, and a
+// failure in one cluster drops only that cluster.
 phase('Implement')
 const results = await pipeline(
-  plan,
-  (item) =>
+  clusters,
+  (cluster) =>
     agent(
       `${CONTRACT}
 
-Implement GitHub issue #${item.number}: ${item.title}
-
-Triage says it touches: ${(item.files_to_change || []).join(', ') || '(determine yourself)'}
-${item.needs_ui_review ? '\nThis changes the web UI, so the AGENTS.md review requirements apply.' : ''}
-${item.blocked_by_environment ? '\nTriage flagged this as not fully verifiable here. Implement it anyway and be explicit about what you could not verify.' : ''}
+Implement ${cluster.items.length > 1 ? 'these GitHub issues' : 'this GitHub issue'}, in this order:
+${cluster.items.map((i) => `  - #${i.number}: ${i.title}\n    triage says it touches: ${(i.files_to_change || []).join(', ') || '(determine yourself)'}`).join('\n')}
+${cluster.items.length > 1 ? `\nThese were grouped together because they edit the same files (${cluster.sharedPaths.join(', ') || 'overlapping paths'}). One agent owns all of them so their changes cannot conflict.` : ''}
+${cluster.items.some((i) => i.needs_ui_review) ? '\nAt least one of these changes the web UI, so the AGENTS.md review requirements apply to that part.' : ''}
+${cluster.items.some((i) => i.blocked_by_environment) ? '\nTriage flagged part of this as not fully verifiable here. Implement it anyway and be explicit about what you could not verify.' : ''}
 
 Steps:
-1. \`gh issue view ${item.number}\` and read the acceptance criteria. They are the definition of done.
-2. Implement the change. Follow the conventions in CLAUDE.md and docs/agent-harness.md.
+1. \`gh issue view <number>\` for each and read the acceptance criteria. They are the definition of done.
+2. Implement the changes. Follow the conventions in CLAUDE.md and docs/agent-harness.md.
 3. Add or update tests. For a bug fix, write the test so that it **fails before your
-   fix and passes after** — state how you confirmed that.
-4. Run your own tests, then the full gate:
-   \`${PY} -m pytest -q\` and \`npm --prefix apps/web test\` and \`npm --prefix apps/web run build\`
-5. Do NOT commit. Produce \`git diff\` and return it in the diff field.
+   fix and passes after**. Prove it: revert ONLY the source change (keep any new
+   imports/exports so the failure is a real assertion, not an ImportError), run the
+   test, observe it go red, then restore. Put the exact red output in
+   verification.red_before_fix. A test that passes either way is worth nothing.
+4. Run the full gate: \`${PY} -m pytest -q\` from your worktree root, plus the
+   frontend gate only if it applies (see the environment facts above).
+5. Do NOT commit. Hand the work over as a FILE, not as a returned string:
+   \`\`\`
+   mkdir -p ${PATCH_DIR}
+   git add -A && git diff --cached --binary > ${PATCH_DIR}/${cluster.numbers.join('-')}.patch
+   git reset
+   wc -c ${PATCH_DIR}/${cluster.numbers.join('-')}.patch
+   \`\`\`
+   \`git add -A\` first so new files are included; \`--binary\` so nothing is lossy.
+   Return that path in patch_path and the byte count in patch_bytes. Then verify
+   your own handover: \`cd\` to a scratch clone of origin/main, \`git apply --check\`
+   the file, and only report success if it applies. Put at most the first 4000
+   characters in diff_excerpt — a returned string is NOT the transport and will be
+   truncated and HTML-escaped.
 
-You are in your own git worktree, so you cannot collide with the other agents.
+If an issue in this cluster turns out to be wrong or already fixed, say so in
+could_not_do and leave it out of completed rather than inventing a change.
 If you need a shared file edited, put it in wiring_needed instead of editing it.`,
-      { label: `impl:#${item.number}`, phase: 'Implement', schema: IMPLEMENT_SCHEMA, isolation: 'worktree' },
+      {
+        label: `impl:${cluster.numbers.map((n) => `#${n}`).join('+')}`,
+        phase: 'Implement',
+        schema: IMPLEMENT_SCHEMA,
+        isolation: 'worktree',
+      },
     ),
-  (built, item) => {
+  (built, cluster) => {
     if (!built) return null
+    // pipeline() returns the LAST stage's value, so carry the implementation
+    // forward with the verdict — otherwise the diffs never reach the orchestrator.
     return agent(
       `${CONTRACT}
 
-Adversarially review the implementation of issue #${item.number}: ${item.title}
+Adversarially review the implementation of ${cluster.numbers.map((n) => `#${n}`).join(', ')}:
+${cluster.items.map((i) => `  - #${i.number}: ${i.title}`).join('\n')}
 
 The implementing agent reported:
-- completed: ${built.completed}
+- claims completed: ${(built.completed || []).map((n) => `#${n}`).join(', ') || '(none)'}
 - files: ${(built.files_changed || []).join(', ')}
 - could not do: ${(built.could_not_do || []).join('; ') || '(nothing reported)'}
 - backend: ${built.verification?.backend || '(not reported)'}
 - frontend: ${built.verification?.frontend || '(not reported)'}
+- red-before-fix claim: ${built.verification?.red_before_fix || '(NOT REPORTED — treat as unproven)'}
 
-Its diff:
-\`\`\`diff
-${(built.diff || '(no diff returned)').slice(0, 20000)}
-\`\`\`
+Its patch is a FILE — read it from disk, do not work from any excerpt:
+  ${built.patch_path || '(NO PATCH PATH REPORTED — report this as a high finding and stop)'}
+  reported size: ${built.patch_bytes ?? 'unknown'} bytes
+Check the file is intact before you trust it: \`wc -c\` it, confirm it ends with a
+complete hunk, and \`git apply --check\` it. A patch that does not apply is a high
+finding on the handover, not something to work around.
 
 Your job is to find what is WRONG, not to confirm it works.
 
-1. \`gh issue view ${item.number}\` and check every acceptance criterion against the
-   diff. List any that are claimed but not actually met.
-2. Apply the diff in your own worktree and re-run \`${PY} -m pytest -q\`. Record the tail.
-3. For a bug fix: verify the new test genuinely fails without the fix. Revert just
-   the source change, run the test, and confirm it goes red. A test that passes
-   either way is worth nothing — report it as a high finding.
+1. \`gh issue view <number>\` for each and check every acceptance criterion against
+   the diff. List any that are claimed but not actually met.
+2. Apply the patch file in your own worktree and re-run \`${PY} -m pytest -q\`. Record the tail.
+3. Independently reproduce the red proof. Revert just the source change — keeping
+   imports and exports intact so you get a real assertion failure rather than an
+   ImportError — run the new tests, and confirm they go red for the RIGHT reason.
+   Put what you actually saw in red_proof_confirmed. An ImportError is NOT a valid
+   red proof; report it as a high finding.
 4. Hunt specifically for: assertions that cannot fail, silent \`except: pass\`,
    behavior changes outside the issue's scope, edits to shared files, tests
    rewritten to accommodate a bug rather than fix it, and claims of verification
-   that the environment cannot support (no weights, no TTS, no system ffmpeg).
+   that the environment cannot support (no weights, no TTS, no system ffmpeg, and
+   no node_modules in a fresh worktree).
 
 Default to skepticism. If you cannot convince yourself something holds, report it.
 Return verdict "ship" only when every acceptance criterion is met and the tests are real.`,
-      { label: `verify:#${item.number}`, phase: 'Verify', schema: VERDICT_SCHEMA, effort: 'high' },
-    )
+      {
+        label: `verify:${cluster.numbers.map((n) => `#${n}`).join('+')}`,
+        phase: 'Verify',
+        schema: VERDICT_SCHEMA,
+        effort: 'high',
+      },
+    ).then((verdict) => ({ cluster: cluster.numbers, built, verdict }))
   },
 )
 
 phase('Report')
-const verdicts = results.filter(Boolean)
-const shippable = verdicts.filter((v) => v.verdict === 'ship').map((v) => v.number)
-const needsWork = verdicts.filter((v) => v.verdict !== 'ship')
+const done = results.filter(Boolean)
+const verdicts = done.map((entry) => entry.verdict).filter(Boolean)
+const shippable = done
+  .filter((entry) => entry.verdict?.verdict === 'ship')
+  .flatMap((entry) => entry.verdict.numbers || entry.cluster)
+const needsWork = done.filter((entry) => entry.verdict?.verdict !== 'ship')
+const dropped = clusters
+  .filter((c, index) => !results[index])
+  .map((c) => c.numbers.map((n) => `#${n}`).join('+'))
 
 log(`ship: ${shippable.length ? shippable.map((n) => `#${n}`).join(', ') : 'none'}`)
 if (needsWork.length) {
-  log(`needs work: ${needsWork.map((v) => `#${v.number}(${v.verdict})`).join(', ')}`)
+  log(
+    `needs work: ${needsWork
+      .map((entry) => `${entry.cluster.map((n) => `#${n}`).join('+')}(${entry.verdict?.verdict ?? 'no verdict'})`)
+      .join(', ')}`,
+  )
+}
+if (dropped.length) {
+  log(`dropped (agent failed, no result): ${dropped.join(', ')}`)
 }
 
 // Integration is deliberately NOT automated: committing, wiring shared files, and
 // opening PRs stay with the orchestrator, who can see the whole picture.
 return {
   triage,
+  clusters: clusters.map((c) => c.numbers),
   verdicts,
   shippable,
-  needs_work: needsWork,
-  shared_file_wiring: verdicts.map((v) => ({ number: v.number })),
+  needs_work: needsWork.map((entry) => ({
+    cluster: entry.cluster,
+    verdict: entry.verdict?.verdict ?? 'no verdict',
+    summary: entry.verdict?.summary ?? '',
+    findings: entry.verdict?.findings ?? [],
+    acceptance_criteria_unmet: entry.verdict?.acceptance_criteria_unmet ?? [],
+  })),
+  dropped,
+  patches: done.map((entry) => ({
+    cluster: entry.cluster.map((n) => `#${n}`).join('+'),
+    patch_path: entry.built?.patch_path ?? null,
+    patch_bytes: entry.built?.patch_bytes ?? null,
+    completed: entry.built?.completed ?? [],
+    wiring_needed: entry.built?.wiring_needed ?? [],
+    could_not_do: entry.built?.could_not_do ?? [],
+  })),
   next_step:
     'Orchestrator: apply the shippable diffs, make any wiring_needed edits to shared files, run the full gate, then commit and open a PR.',
 }
