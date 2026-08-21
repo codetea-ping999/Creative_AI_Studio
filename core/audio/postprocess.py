@@ -14,7 +14,7 @@ would be the largest install in the project.
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -216,6 +216,75 @@ def apply_fades(
     return processed, info
 
 
+def duck_envelope(
+    spans: Sequence[tuple[int, int]],
+    length: int,
+    sample_rate: int,
+    *,
+    reduction_db: float = -12.0,
+    attack_seconds: float = 0.15,
+    release_seconds: float = 0.4,
+) -> np.ndarray:
+    """Build the music gain curve that dips to ``reduction_db`` across ``spans``.
+
+    This is the entire ducking DSP, and it lives here alone on purpose. Two
+    callers need the same curve from different evidence: :func:`duck` derives the
+    spans by following the level of a narration buffer, while the assembly
+    generator derives them from where narration clips were *placed* on a
+    timeline. When each owned its own ramp math, a change to the depth or the
+    ramps moved one mix and not the other, which is indistinguishable from a bug
+    to whoever is listening.
+
+    The gain moves along ramps rather than jumping between the two levels. A step
+    change in gain is a discontinuity in the waveform: it clicks, and even when it
+    does not, the music appears to "pump" in and out on every pause, which is far
+    more distracting than the narration it was meant to make room for. The attack
+    ramp also starts *before* the span so the bed is already down on the first
+    syllable, the way a broadcast ducker behaves.
+
+    ``spans`` are ``[start, end)`` sample indices; anything outside
+    ``[0, length)`` is clipped rather than rejected, because a narration clip that
+    runs past the end of the bed is a normal timeline, not an error.
+    """
+
+    total = max(0, int(length))
+    rate = _require_sample_rate(sample_rate)
+    gain = np.ones(total, dtype=np.float32)
+    if total == 0:
+        return gain
+
+    reduction = _db_to_amplitude(reduction_db)
+    attack = max(1, int(round(max(0.0, float(attack_seconds)) * rate)))
+    release = max(1, int(round(max(0.0, float(release_seconds)) * rate)))
+    attack_ramp = np.linspace(1.0, reduction, attack + 1, dtype=np.float32)[:-1]
+    release_ramp = np.linspace(reduction, 1.0, release + 1, dtype=np.float32)[1:]
+
+    for raw_start, raw_end in spans:
+        start = max(0, int(raw_start))
+        end = min(total, int(raw_end))
+        if start >= total or end <= start:
+            continue
+
+        # np.minimum everywhere: when spans are close enough that a release ramp
+        # runs into the next attack, the lower (more ducked) value has to win or
+        # the gain would bounce back up between two words.
+        ramp_start = max(0, start - attack)
+        if start > ramp_start:
+            # Take the tail of the ramp, never a compressed copy of it: a span
+            # near the head of the buffer gets a shorter dip, at the same slope.
+            segment = attack_ramp[attack - (start - ramp_start) :]
+            gain[ramp_start:start] = np.minimum(gain[ramp_start:start], segment)
+
+        gain[start:end] = np.minimum(gain[start:end], reduction)
+
+        release_end = min(total, end + release)
+        if release_end > end:
+            segment = release_ramp[: release_end - end]
+            gain[end:release_end] = np.minimum(gain[end:release_end], segment)
+
+    return gain
+
+
 def duck(
     music: Any,
     narration: Any,
@@ -227,12 +296,8 @@ def duck(
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Attenuate ``music`` wherever ``narration`` is speaking.
 
-    The gain moves along ramps rather than jumping between the two levels. A step
-    change in gain is a discontinuity in the waveform: it clicks, and even when it
-    does not, the music appears to "pump" in and out on every pause, which is far
-    more distracting than the narration it was meant to make room for. The attack
-    ramp also starts *before* the phrase so the bed is already down on the first
-    syllable, the way a broadcast ducker behaves.
+    Span detection lives here; the curve itself comes from
+    :func:`duck_envelope`, which the assembly generator also uses.
 
     The returned array always has the length of ``music``; a narration longer or
     shorter than the bed simply covers less or more of it.
@@ -269,32 +334,14 @@ def duck(
         info["skipped_reason"] = "no narration above threshold"
         return music_array, info
 
-    reduction = _db_to_amplitude(reduction_db)
-    attack = max(1, int(round(max(0.0, float(attack_seconds)) * rate)))
-    release = max(1, int(round(max(0.0, float(release_seconds)) * rate)))
-    attack_ramp = np.linspace(1.0, reduction, attack + 1, dtype=np.float32)[:-1]
-    release_ramp = np.linspace(reduction, 1.0, release + 1, dtype=np.float32)[1:]
-
-    gain = np.ones(music_array.size, dtype=np.float32)
-    for start, end in spans:
-        if start >= gain.size:
-            break
-        # np.minimum everywhere: when spans are close enough that a release ramp
-        # runs into the next attack, the lower (more ducked) value has to win or
-        # the gain would bounce back up between two words.
-        ramp_start = max(0, start - attack)
-        if start > ramp_start:
-            segment = attack_ramp[attack - (start - ramp_start) :]
-            gain[ramp_start:start] = np.minimum(gain[ramp_start:start], segment)
-
-        core_end = min(end, gain.size)
-        if core_end > start:
-            gain[start:core_end] = np.minimum(gain[start:core_end], reduction)
-
-        release_end = min(gain.size, end + release)
-        if release_end > end:
-            segment = release_ramp[: release_end - end]
-            gain[end:release_end] = np.minimum(gain[end:release_end], segment)
+    gain = duck_envelope(
+        spans,
+        music_array.size,
+        rate,
+        reduction_db=reduction_db,
+        attack_seconds=attack_seconds,
+        release_seconds=release_seconds,
+    )
 
     ducked_samples = int(np.count_nonzero(gain < 1.0 - 1e-6))
     info["applied"] = ducked_samples > 0
@@ -487,6 +534,7 @@ __all__ = [
     "SPEECH_PRESET",
     "apply_fades",
     "duck",
+    "duck_envelope",
     "normalize_peak",
     "normalize_rms",
     "process_audio",
