@@ -93,6 +93,34 @@ export const storyStages = [
 
 export type StoryStageTask = (typeof storyStages)[number]["task"];
 
+/**
+ * Stages that write into one scene and must be told which one.
+ *
+ * The writer model is given a scene brief, not the story's scene ids, so the
+ * target travels on the request. Without it the API refuses the job rather than
+ * generating dialogue that has nowhere to land.
+ */
+export const sceneScopedStages: ReadonlySet<string> = new Set(["script"]);
+
+/**
+ * Keep a scene selection usable across regenerations.
+ *
+ * Rewriting the scene list can drop the id that was selected; falling back to
+ * the first scene keeps the stage reachable instead of silently disabling it.
+ */
+export function resolveSceneTarget(
+  story: StoryDocument | null,
+  selected: string,
+): string {
+  const scenes = [...(story?.scenes ?? [])].sort(
+    (left, right) => left.order - right.order,
+  );
+  if (scenes.length === 0) {
+    return "";
+  }
+  return scenes.some((scene) => scene.id === selected) ? selected : scenes[0].id;
+}
+
 export function listStories(options: {
   projectId?: string;
   query?: string;

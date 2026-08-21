@@ -210,6 +210,32 @@ class ApplyTextResultTests(unittest.TestCase):
         self.assertEqual(merged.scenes[1].dialogue[0].speaker, "ミナ")
         self.assertEqual(merged.scenes[1].dialogue[0].direction, "小声で")
 
+    def test_script_naming_a_missing_scene_is_rejected(self) -> None:
+        story = apply_text_result(_story(), "scene_list", _SCENE_PAYLOAD)
+        with self.assertRaises(ValueError) as context:
+            apply_text_result(
+                story,
+                "script",
+                {
+                    "scene_id": "scene_99",
+                    "lines": [{"speaker": "ミナ", "text": "こっちへ"}],
+                },
+            )
+        # Parking the lines in metadata would look like a successful merge while
+        # the named scene stayed empty.
+        self.assertIn("scene_99", str(context.exception))
+        self.assertIn("scene_01", str(context.exception))
+
+    def test_script_naming_a_missing_scene_index_is_rejected(self) -> None:
+        story = apply_text_result(_story(), "scene_list", _SCENE_PAYLOAD)
+        with self.assertRaises(ValueError) as context:
+            apply_text_result(
+                story,
+                "script",
+                {"scene_index": 7, "lines": [{"speaker": "A", "text": "x"}]},
+            )
+        self.assertIn("7", str(context.exception))
+
     def test_script_without_target_is_parked_in_metadata(self) -> None:
         story = apply_text_result(_story(), "scene_list", _SCENE_PAYLOAD)
         merged = apply_text_result(

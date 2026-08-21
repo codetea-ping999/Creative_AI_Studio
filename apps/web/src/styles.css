@@ -2168,6 +2168,49 @@ pre,
   font-weight: 650;
 }
 
+.story-scene-dialogue {
+  margin-top: 8px;
+}
+
+.story-scene-dialogue summary {
+  color: var(--text-soft);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.story-scene-dialogue ol {
+  display: grid;
+  gap: 6px;
+  margin: 8px 0 0;
+  padding-left: 18px;
+}
+
+.story-scene-dialogue li {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.story-scene-dialogue strong {
+  margin-right: 6px;
+}
+
+.story-scene-dialogue em {
+  margin-right: 6px;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.story-script-target {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.story-script-target select {
+  width: 100%;
+  min-width: 0;
+}
+
 .story-assets {
   margin-top: 8px;
 }

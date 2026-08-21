@@ -6,7 +6,9 @@ import {
   createStory,
   generateSceneMedia,
   isReadyToAssemble,
+  resolveSceneTarget,
   sceneRoleLabels,
+  sceneScopedStages,
   expandStory,
   getStory,
   listStories,
@@ -57,9 +59,9 @@ function stageIsComplete(story: StoryDocument, task: string): boolean {
   if (task === "beat_sheet") return story.beats.length > 0;
   if (task === "scene_list") return story.scenes.length > 0;
   if (task === "script") {
-    return story.scenes.some(
-      (scene) => scene.narration.trim() || (scene.dialogue?.length ?? 0) > 0,
-    );
+    // Narration is written by the scene_list stage, so only dialogue proves the
+    // script stage has run.
+    return story.scenes.some((scene) => (scene.dialogue?.length ?? 0) > 0);
   }
   if (task === "prose") return story.chapters.length > 0;
   return false;
@@ -170,6 +172,20 @@ function StoryScenes({
                       <span>ナレーション</span>
                       {scene.narration}
                     </p>
+                  ) : null}
+                  {scene.dialogue && scene.dialogue.length > 0 ? (
+                    <details className="story-scene-dialogue">
+                      <summary>台詞 {scene.dialogue.length} 行</summary>
+                      <ol>
+                        {scene.dialogue.map((line, lineIndex) => (
+                          <li key={`${scene.id}-${lineIndex}`}>
+                            <strong>{line.speaker || "話者未設定"}</strong>
+                            {line.direction ? <em>（{line.direction}）</em> : null}
+                            <span>{line.text}</span>
+                          </li>
+                        ))}
+                      </ol>
+                    </details>
                   ) : null}
                 </td>
                 <td data-label="尺 / BGM">
@@ -314,6 +330,7 @@ export function StoryPanel({
     role: SceneRole;
   } | null>(null);
   const [isAssembling, setIsAssembling] = useState(false);
+  const [scriptSceneId, setScriptSceneId] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
 
@@ -373,6 +390,14 @@ export function StoryPanel({
       ) ?? 0,
     [story],
   );
+
+  const orderedScenes = useMemo(
+    () => [...(story?.scenes ?? [])].sort((left, right) => left.order - right.order),
+    [story],
+  );
+  const scriptTargetId = resolveSceneTarget(story, scriptSceneId);
+  const scriptTarget =
+    orderedScenes.find((scene) => scene.id === scriptTargetId) ?? null;
 
   useEffect(() => {
     setEditPremise(story?.premise ?? "");
@@ -466,13 +491,21 @@ export function StoryPanel({
 
   async function handleExpand(task: string) {
     if (!story || pending) return;
+    if (sceneScopedStages.has(task) && !scriptTargetId) {
+      setError("台詞を書くシーンがありません。先に Scenes を生成してください。");
+      return;
+    }
     setError("");
     setNotice("");
     try {
       const { job_id: jobId } = await expandStory(story.id, {
         task,
         model_id: modelId,
-        params: task === "scene_list" ? { scene_count: 5 } : {},
+        params: sceneScopedStages.has(task)
+          ? { scene_id: scriptTargetId }
+          : task === "scene_list"
+            ? { scene_count: 5 }
+            : {},
       });
       setPending({ task, jobId });
       const status = await awaitJob(jobId);
@@ -484,7 +517,13 @@ export function StoryPanel({
       }
       const nextDetail = await applyStoryResult(story.id, jobId);
       setDetail(nextDetail);
-      setNotice(`${stageResultLabels[task] ?? task}をストーリーへ反映しました。`);
+      setNotice(
+        sceneScopedStages.has(task)
+          ? `${stageResultLabels[task] ?? task}を「${
+              scriptTarget?.heading || scriptTargetId
+            }」へ反映しました。`
+          : `${stageResultLabels[task] ?? task}をストーリーへ反映しました。`,
+      );
       await refreshStories();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -688,14 +727,18 @@ export function StoryPanel({
             {storyStages.map((stage, index) => {
               const isPending = pending?.task === stage.task;
               const isComplete = stageIsComplete(story, stage.task);
-              const isAvailable = stages.has(stage.task);
+              const needsScene = sceneScopedStages.has(stage.task);
+              const isAvailable =
+                stages.has(stage.task) && (!needsScene || Boolean(scriptTargetId));
               const isDisabled = !isAvailable || pending !== null;
               const stateLabel = isPending
                 ? "生成中"
                 : isComplete
                   ? "完了・再生成可能"
                   : isAvailable
-                    ? "生成可能"
+                    ? needsScene
+                      ? `対象 ${scriptTarget?.heading || scriptTargetId}`
+                      : "生成可能"
                     : "前段階の完了待ち";
               return (
                 <li
@@ -725,6 +768,31 @@ export function StoryPanel({
               );
             })}
           </ol>
+
+          {orderedScenes.length > 0 ? (
+            <div className="story-script-target">
+              <label className="field-group field-group--full">
+                <span>Script の対象シーン</span>
+                <select
+                  value={scriptTargetId}
+                  onChange={(event) => setScriptSceneId(event.target.value)}
+                  disabled={pending !== null}
+                  aria-describedby="story-script-target-help"
+                >
+                  {orderedScenes.map((scene, index) => (
+                    <option key={scene.id} value={scene.id}>
+                      {index + 1}. {scene.heading || scene.id}
+                      {(scene.dialogue?.length ?? 0) > 0 ? "（台詞あり）" : ""}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <p id="story-script-target-help" className="section-footnote">
+                Script はこのシーンにだけ台詞を書き込みます。台詞は動画には合成されず、
+                シーンの台本として保存されます。
+              </p>
+            </div>
+          ) : null}
 
           <dl className="story-summary" aria-label="ストーリーの進捗">
             <div>
