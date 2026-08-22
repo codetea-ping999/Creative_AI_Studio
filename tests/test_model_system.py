@@ -8,6 +8,9 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
+import wave
+
+import numpy as np
 
 IMPORT_ERROR: Exception | None = None
 
@@ -200,6 +203,31 @@ class _RandomMusicgenModel(_FakeMusicgenModel):
         return torch.rand((1, 1, 32000), dtype=torch.float32)
 
 
+class _StereoMusicgenModel(_FakeMusicgenModel):
+    """Returns two channels at fixed, distinguishable levels.
+
+    A postprocessing step that flattens (channels, samples) into one
+    concatenated buffer instead of processing per channel would double the
+    frame count and mix these constant levels; both are checked by the test.
+    """
+
+    def generate(self, **kwargs):
+        import torch
+
+        self.calls.append(kwargs)
+        left = torch.full((16000,), 0.5, dtype=torch.float32)
+        right = torch.full((16000,), -0.5, dtype=torch.float32)
+        return torch.stack([left, right], dim=0).unsqueeze(0)
+
+
+class _Bfloat16MusicgenModel(_FakeMusicgenModel):
+    def generate(self, **kwargs):
+        import torch
+
+        self.calls.append(kwargs)
+        return torch.rand((1, 1, 16000), dtype=torch.bfloat16)
+
+
 def _fake_musicgen_load(self, manifest):
     return {
         "stub": False,
@@ -227,6 +255,18 @@ def _fake_musicgen_load(self, manifest):
 def _fake_random_musicgen_load(self, manifest):
     runtime = _fake_musicgen_load(self, manifest)
     runtime["model"] = _RandomMusicgenModel()
+    return runtime
+
+
+def _fake_stereo_musicgen_load(self, manifest):
+    runtime = _fake_musicgen_load(self, manifest)
+    runtime["model"] = _StereoMusicgenModel()
+    return runtime
+
+
+def _fake_bfloat16_musicgen_load(self, manifest):
+    runtime = _fake_musicgen_load(self, manifest)
+    runtime["model"] = _Bfloat16MusicgenModel()
     return runtime
 
 
@@ -1093,6 +1133,100 @@ class ModelSystemTests(unittest.TestCase):
                     params={"postprocess": "false"},
                 )
             )
+
+    def test_audio_generator_rejects_null_postprocess_at_validation_time(self) -> None:
+        # An explicit JSON null is a present key with value None, distinct from
+        # the key being absent; it must fail validate_request (→ 422) rather
+        # than surviving the effective-params merge into a job that fails
+        # later during generation.
+        generator = AudioGenerator(create_default_model_service())
+
+        with self.assertRaisesRegex(ValueError, "postprocess"):
+            generator.validate_request(
+                GenerationRequest(
+                    media_type="audio",
+                    prompt="minimal piano cue",
+                    model_id="musicgen-small",
+                    params={"postprocess": None},
+                )
+            )
+
+    def test_audio_generator_preserves_stereo_channels_during_postprocessing(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir) / "outputs"
+            with (
+                patch(
+                    "core.models.loader.TransformersMusicgenLoader.load",
+                    new=_fake_stereo_musicgen_load,
+                ),
+                patch(
+                    "generators.audio.generator.evaluate_audio_semantics",
+                    return_value={"status": "skipped"},
+                ),
+            ):
+                service = create_default_model_service()
+                generator = AudioGenerator(service, output_dir=output_dir)
+
+                result = generator.run(
+                    GenerationRequest(
+                        media_type="audio",
+                        prompt="stereo pad",
+                        model_id="musicgen-small",
+                        output_format="wav",
+                        params={"duration_seconds": 2},
+                    )
+                )
+
+            self.assertEqual(result.status, "succeeded")
+            self.assertEqual(result.metadata["channels"], 2)
+            output_path = Path(result.outputs[0])
+            with wave.open(str(output_path), "rb") as wav_file:
+                self.assertEqual(wav_file.getnchannels(), 2)
+                frame_count = wav_file.getnframes()
+                frames = wav_file.readframes(frame_count)
+
+            # A channel-flattening bug would report 32000 frames of mono
+            # audio (the two channels concatenated) instead of 16000 stereo
+            # frames, and would not keep the channels at their distinct
+            # levels.
+            self.assertEqual(frame_count, 16000)
+            samples = np.frombuffer(frames, dtype="<i2").reshape(-1, 2)
+            self.assertGreater(int(samples[:, 0].mean()), 0)
+            self.assertLess(int(samples[:, 1].mean()), 0)
+
+    def test_audio_generator_postprocesses_bfloat16_output(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir) / "outputs"
+            with (
+                patch(
+                    "core.models.loader.TransformersMusicgenLoader.load",
+                    new=_fake_bfloat16_musicgen_load,
+                ),
+                patch(
+                    "generators.audio.generator.evaluate_audio_semantics",
+                    return_value={"status": "skipped"},
+                ),
+            ):
+                service = create_default_model_service()
+                generator = AudioGenerator(service, output_dir=output_dir)
+
+                # bfloat16 has no NumPy equivalent; this must not raise
+                # TypeError: Got unsupported ScalarType BFloat16.
+                result = generator.run(
+                    GenerationRequest(
+                        media_type="audio",
+                        prompt="bfloat16 pad",
+                        model_id="musicgen-small",
+                        output_format="wav",
+                        params={"duration_seconds": 2},
+                    )
+                )
+
+            self.assertEqual(result.status, "succeeded")
+            self.assertTrue(result.metadata["audio_postprocess"]["enabled"])
+            self.assertTrue(Path(result.outputs[0]).exists())
 
     def test_audio_generator_reuses_seed_without_unsupported_generator_kwarg(self) -> None:
         with TemporaryDirectory() as tmp_dir:

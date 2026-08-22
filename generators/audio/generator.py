@@ -107,11 +107,10 @@ class AudioGenerator(BaseGenerator):
                 continue
             self._validate_numeric_range(name, value, minimum, maximum)
 
-        postprocess_value = request.params.get(
-            "postprocess", manifest.default_params.get("postprocess")
-        )
-        if postprocess_value is not None:
-            _coerce_postprocess_flag(postprocess_value)
+        if "postprocess" in request.params:
+            _coerce_postprocess_flag(request.params["postprocess"])
+        elif "postprocess" in manifest.default_params:
+            _coerce_postprocess_flag(manifest.default_params["postprocess"])
 
     def _validate_numeric_range(
         self,
@@ -647,22 +646,32 @@ class AudioGenerator(BaseGenerator):
     ) -> tuple[Any, dict[str, Any]]:
         """Apply the shared music post-processing chain to a generated clip.
 
-        Both the transformers and AudioCraft runtimes used here return
-        single-channel audio, so the tensor is flattened to mono for the numpy
-        chain and handed back as a 1D tensor; ``_write_wave_file`` unsqueezes
-        it to the (channels, samples) shape it expects.
+        ``audio_tensor`` is (channels, samples). The chain in
+        core/audio/postprocess.py is mono-only, so each channel is processed
+        independently and the results re-stacked; a stereo checkpoint (e.g. a
+        musicgen-stereo-* variant) keeps both channels instead of being
+        flattened into one channel-concatenated buffer. Channels are cast to
+        float32 before ``.numpy()``: a manifest may run the model in bfloat16
+        or float16 on an accelerator, and NumPy has no bfloat16 type.
         """
 
-        mono = audio_tensor.reshape(-1)
         if enabled:
-            processed_array, report = process_audio(
-                mono.contiguous().numpy(), sampling_rate, preset=MUSIC_PRESET
-            )
-            return torch.from_numpy(processed_array), report
+            processed_channels: list[Any] = []
+            report: dict[str, Any] = {}
+            for channel in audio_tensor:
+                processed_array, report = process_audio(
+                    channel.to(torch.float32).contiguous().numpy(),
+                    sampling_rate,
+                    preset=MUSIC_PRESET,
+                )
+                processed_channels.append(torch.from_numpy(processed_array))
+            return torch.stack(processed_channels, dim=0), report
         report = skipped_processing_report(
-            sampling_rate, preset=MUSIC_PRESET, sample_count=int(mono.numel())
+            sampling_rate,
+            preset=MUSIC_PRESET,
+            sample_count=int(audio_tensor.shape[-1]),
         )
-        return mono.clamp(-1.0, 1.0), report
+        return audio_tensor.clamp(-1.0, 1.0), report
 
     def _write_wave_file(
         self,
