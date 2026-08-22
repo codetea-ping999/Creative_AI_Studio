@@ -44,8 +44,17 @@ _MUSIC_FADE_OUT_SECONDS = 0.5
 def normalize_peak(
     samples: Any,
     target_peak_db: float = -1.0,
+    *,
+    attenuate_only: bool = False,
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    """Scale the buffer so its loudest sample sits at ``target_peak_db``."""
+    """Scale the buffer so its loudest sample sits at ``target_peak_db``.
+
+    ``attenuate_only`` skips the scale-up when the buffer is already quieter
+    than the target. The chain uses this for a buffer whose RMS stage gain
+    was capped: that cap exists specifically to leave anomalously quiet
+    content (model noise, not real signal) too quiet rather than amplifying
+    it, and an uncapped peak boost right after would silently undo it.
+    """
 
     array = _as_mono_float32(samples)
     peak_before = _peak(array)
@@ -65,6 +74,10 @@ def normalize_peak(
         return array, info
 
     gain = _db_to_amplitude(target_peak_db) / peak_before
+    if attenuate_only and gain > 1.0:
+        info["skipped_reason"] = "attenuate_only: buffer is already below target peak"
+        return array, info
+
     processed = _clip(array * gain)
     info["applied"] = True
     info["gain_db"] = round(_gain_to_db(gain), 3)
@@ -361,7 +374,11 @@ def process_audio(
 
     Order matters. Silence is trimmed before the level is measured so leading dead
     air cannot drag the RMS down and provoke a boost, and the peak normalizer runs
-    last so it acts as the safety limiter for whatever the RMS stage did.
+    last so it acts as the safety limiter for whatever the RMS stage did. When the
+    RMS stage's own boost was capped (an explicit signal that the buffer is
+    anomalously quiet, likely model noise rather than real signal), the peak
+    stage only attenuates instead of boosting further — otherwise it would
+    silently amplify exactly the content the RMS cap was protecting.
     """
 
     if preset not in _PRESETS:
@@ -378,17 +395,21 @@ def process_audio(
     if preset == SPEECH_PRESET:
         array, info = trim_silence(array, rate)
         steps.append(info)
-        array, info = normalize_rms(array, target_rms_db=_SPEECH_TARGET_RMS_DB)
-        steps.append(info)
+        array, rms_info = normalize_rms(array, target_rms_db=_SPEECH_TARGET_RMS_DB)
+        steps.append(rms_info)
         array, info = apply_fades(array, rate)
         steps.append(info)
-        array, info = normalize_peak(array, target_peak_db=_SPEECH_TARGET_PEAK_DB)
+        array, info = normalize_peak(
+            array,
+            target_peak_db=_SPEECH_TARGET_PEAK_DB,
+            attenuate_only=bool(rms_info.get("gain_capped")),
+        )
         steps.append(info)
     else:
         # Music keeps its leading and trailing silence: a slow intro or a decaying
         # tail is part of the arrangement, not dead air to cut.
-        array, info = normalize_rms(array, target_rms_db=_MUSIC_TARGET_RMS_DB)
-        steps.append(info)
+        array, rms_info = normalize_rms(array, target_rms_db=_MUSIC_TARGET_RMS_DB)
+        steps.append(rms_info)
         array, info = apply_fades(
             array,
             rate,
@@ -396,18 +417,122 @@ def process_audio(
             fade_out_seconds=_MUSIC_FADE_OUT_SECONDS,
         )
         steps.append(info)
-        array, info = normalize_peak(array, target_peak_db=_MUSIC_TARGET_PEAK_DB)
+        array, info = normalize_peak(
+            array,
+            target_peak_db=_MUSIC_TARGET_PEAK_DB,
+            attenuate_only=bool(rms_info.get("gain_capped")),
+        )
         steps.append(info)
 
     applied: dict[str, Any] = {
         "preset": preset,
         "sample_rate": rate,
+        "enabled": True,
         "chain": [str(step["step"]) for step in steps],
         "steps": steps,
         "duration_seconds_before": duration_before,
         "duration_seconds_after": _duration_seconds(array, rate),
     }
     return array, applied
+
+
+def process_music_channels(
+    channels: Any,
+    sample_rate: int,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Run the music preset across one or more channels with linked gain.
+
+    ``channels`` is (channel_count, samples), or a plain mono buffer. Gain
+    steps (RMS and peak normalization) are measured once against every
+    channel's samples pooled together and the same gain applied to every
+    channel; measuring gain independently per channel would erase a stereo
+    signal's intentional channel-level difference (pan, balance), since each
+    channel would be pulled toward the target level on its own. Fades are a
+    fixed time-based ramp that does not depend on channel content, so each
+    channel keeps its own (identical) fade call. As in ``process_audio()``,
+    the peak stage only attenuates when the RMS stage's own boost was
+    capped, so it cannot un-cap an anomalously quiet (likely noise) buffer.
+    """
+
+    array = np.asarray(channels, dtype=np.float32)
+    single_channel = array.ndim == 1
+    if single_channel:
+        array = array[np.newaxis, :]
+    rate = _require_sample_rate(sample_rate)
+    true_duration = round(array.shape[-1] / rate, 6)
+
+    # Gain is applied without clipping here: the RMS stage's capped boost can
+    # push a sparse track's transients above 1.0, and clipping now would
+    # flatten them together before the peak stage below gets a chance to
+    # measure the true peak and scale everything back down proportionally,
+    # which is what actually preserves their relative dynamics.
+    combined = array.reshape(-1)
+    _, rms_info = normalize_rms(combined, target_rms_db=_MUSIC_TARGET_RMS_DB)
+    array = array * _db_to_amplitude(rms_info["gain_db"])
+
+    fade_results = [
+        apply_fades(
+            channel,
+            rate,
+            fade_in_seconds=_MUSIC_FADE_IN_SECONDS,
+            fade_out_seconds=_MUSIC_FADE_OUT_SECONDS,
+        )
+        for channel in array
+    ]
+    array = np.stack([faded for faded, _ in fade_results], axis=0)
+    fade_info = fade_results[0][1]
+
+    combined = array.reshape(-1)
+    _, peak_info = normalize_peak(
+        combined,
+        target_peak_db=_MUSIC_TARGET_PEAK_DB,
+        attenuate_only=bool(rms_info.get("gain_capped")),
+    )
+    array = _clip(array * _db_to_amplitude(peak_info["gain_db"]))
+
+    applied: dict[str, Any] = {
+        "preset": MUSIC_PRESET,
+        "sample_rate": rate,
+        "enabled": True,
+        "chain": ["normalize_rms", "apply_fades", "normalize_peak"],
+        "steps": [rms_info, fade_info, peak_info],
+        "duration_seconds_before": true_duration,
+        "duration_seconds_after": true_duration,
+    }
+    if single_channel:
+        array = array[0]
+    return array, applied
+
+
+def skipped_processing_report(
+    sample_rate: int,
+    *,
+    preset: str,
+    sample_count: int,
+) -> dict[str, Any]:
+    """Report the same shape as ``process_audio`` for a caller that skipped it.
+
+    Job metadata always carries an ``audio_postprocess`` entry, whether or not
+    the chain actually ran, so a listener does not need a separate null-check
+    to find out why a render sounds different from the usual chain.
+    """
+
+    if preset not in _PRESETS:
+        raise ValueError(
+            f"Unknown audio post-processing preset {preset!r}; "
+            f"expected one of {', '.join(_PRESETS)}."
+        )
+    rate = _require_sample_rate(sample_rate)
+    duration = round(max(0, int(sample_count)) / rate, 6)
+    return {
+        "preset": preset,
+        "sample_rate": rate,
+        "enabled": False,
+        "chain": [],
+        "steps": [],
+        "duration_seconds_before": duration,
+        "duration_seconds_after": duration,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -538,5 +663,7 @@ __all__ = [
     "normalize_peak",
     "normalize_rms",
     "process_audio",
+    "process_music_channels",
+    "skipped_processing_report",
     "trim_silence",
 ]

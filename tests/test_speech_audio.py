@@ -28,6 +28,7 @@ from core.audio import (
     normalize_peak,
     normalize_rms,
     process_audio,
+    process_music_channels,
     trim_silence,
 )
 from core.models import ModelRegistry, create_default_loader_registry
@@ -90,6 +91,24 @@ def test_normalize_peak_skips_empty_and_silent_buffers():
     assert silence_info["applied"] is False
     assert silence_info["skipped_reason"] == "buffer is silent"
     assert np.array_equal(silence, np.zeros(256, dtype=np.float32))
+
+
+def test_normalize_peak_attenuate_only_skips_a_boost_but_still_attenuates():
+    quiet = _sine(0.5, amplitude=0.01)
+    quiet_processed, quiet_info = normalize_peak(
+        quiet, target_peak_db=-1.0, attenuate_only=True
+    )
+    assert quiet_info["applied"] is False
+    assert quiet_info["skipped_reason"] == (
+        "attenuate_only: buffer is already below target peak"
+    )
+    assert np.array_equal(quiet_processed, quiet)
+
+    loud_processed, loud_info = normalize_peak(
+        _sine(0.5, amplitude=0.99), target_peak_db=-1.0, attenuate_only=True
+    )
+    assert loud_info["applied"] is True
+    assert loud_info["peak_db_after"] == pytest.approx(-1.0, abs=0.05)
 
 
 def test_normalize_rms_reaches_the_target_for_a_normal_level():
@@ -368,6 +387,55 @@ def test_process_audio_runs_the_music_chain_without_trimming():
     assert applied["duration_seconds_after"] == pytest.approx(1.0)
 
 
+def test_process_audio_music_chain_does_not_amplify_near_silent_noise_past_the_rms_cap():
+    """A buffer whose RMS boost gets capped must not be un-capped by peak.
+
+    The RMS stage's max_gain_db cap exists specifically to leave anomalously
+    quiet content (model noise, not real signal) too quiet rather than
+    amplifying it. Without the fix, the peak stage running last scales
+    straight up to the peak target regardless of how quiet the RMS stage
+    left the buffer, silently undoing that protection.
+    """
+
+    near_silent = np.full(4_000, 2e-6, dtype=np.float32)
+    processed, applied = process_audio(near_silent, _RATE, preset="music")
+
+    rms_step, _fade_step, peak_step = applied["steps"]
+    assert rms_step["gain_capped"] is True
+    assert peak_step["applied"] is False
+    assert peak_step["skipped_reason"] == (
+        "attenuate_only: buffer is already below target peak"
+    )
+    assert float(np.max(np.abs(processed))) < 0.001
+
+
+def test_process_music_channels_preserves_relative_transient_dynamics_after_a_capped_boost():
+    """A capped RMS boost can push distinct transients above 1.0; clipping
+    right there would flatten them together before the peak stage gets a
+    chance to measure the true peak and scale everything back down
+    proportionally, which is what actually preserves their dynamics.
+    """
+
+    samples = np.zeros(4_000, dtype=np.float32)
+    samples[1_000] = 0.8
+    samples[2_000] = 0.9
+
+    processed, applied = process_music_channels(samples, _RATE)
+
+    rms_step = applied["steps"][0]
+    # -34 dB RMS from these two spikes needs +16 dB to reach the -18 dB
+    # target, exceeding normalize_rms's default 12 dB cap.
+    assert rms_step["gain_capped"] is True
+
+    quieter_peak = float(np.max(np.abs(processed[900:1_100])))
+    louder_peak = float(np.max(np.abs(processed[1_900:2_100])))
+    assert louder_peak == pytest.approx(0.8913, abs=0.01)  # hits the -1 dB target
+    # A premature clip after the RMS boost would flatten both transients to
+    # the same value (ratio 1.0); the ratio should instead track the
+    # original 0.8:0.9 samples.
+    assert louder_peak / quieter_peak == pytest.approx(0.9 / 0.8, abs=0.02)
+
+
 def test_process_audio_handles_empty_and_all_zero_buffers():
     empty, applied = process_audio(np.zeros(0, dtype=np.float32), _RATE, preset="speech")
     assert empty.size == 0
@@ -497,6 +565,9 @@ class _FakeModelService:
         self.resolved_with = (model_id, media_type, task_type)
         return self._manifest, self._runtime_obj
 
+    def get_manifest(self, model_id, media_type, task_type=None):
+        return self._manifest
+
 
 def _kokoro_manifest():
     registry = ModelRegistry()
@@ -583,7 +654,9 @@ def test_speech_generator_writes_a_wav_and_records_the_chain(tmp_path: Path):
     assert metadata["available_voices"] == ["jf_alpha"]
     assert metadata["supports_pitch"] is False
     assert metadata["source_asset_id"] == "ast_123"
+    assert metadata["params"]["postprocess"] is True
     assert metadata["audio_postprocess"]["preset"] == "speech"
+    assert metadata["audio_postprocess"]["enabled"] is True
     assert metadata["audio_postprocess"]["chain"] == [
         "trim_silence",
         "normalize_rms",
@@ -594,6 +667,69 @@ def test_speech_generator_writes_a_wav_and_records_the_chain(tmp_path: Path):
     assert isinstance(metadata["quality_report"]["quality_score"], float)
     # The whole payload is persisted as JSON by the job store.
     assert json.loads(json.dumps(metadata))["chunk_count"] == metadata["chunk_count"]
+
+
+def test_speech_generator_can_disable_postprocessing(tmp_path: Path):
+    runtime = _fake_speech_runtime()
+    generator = SpeechGenerator(
+        _FakeModelService(_kokoro_manifest(), runtime),
+        output_dir=tmp_path,
+    )
+
+    result = generator.run(_speech_request(postprocess=False))
+
+    metadata = result.metadata
+    assert metadata["params"]["postprocess"] is False
+    assert metadata["audio_postprocess"]["preset"] == "speech"
+    assert metadata["audio_postprocess"]["enabled"] is False
+    assert metadata["audio_postprocess"]["chain"] == []
+
+    output_path = Path(result.outputs[0])
+    with wave.open(str(output_path), "rb") as wav_file:
+        assert wav_file.getnframes() > 0
+
+
+def test_speech_generator_rejects_non_boolean_postprocess(tmp_path: Path):
+    runtime = _fake_speech_runtime()
+    generator = SpeechGenerator(
+        _FakeModelService(_kokoro_manifest(), runtime),
+        output_dir=tmp_path,
+    )
+
+    with pytest.raises(ValueError, match="postprocess"):
+        generator.run(_speech_request(postprocess="false"))
+
+
+def test_speech_generator_rejects_invalid_manifest_postprocess_default(tmp_path: Path):
+    # A request that doesn't set postprocess must still catch an invalid
+    # manifest default at validate_request() time rather than only failing
+    # once the worker has resolved the runtime and started the job.
+    manifest = _kokoro_manifest().model_copy(
+        update={"default_params": {"postprocess": "not-a-bool"}}
+    )
+    runtime = _fake_speech_runtime()
+    generator = SpeechGenerator(
+        _FakeModelService(manifest, runtime),
+        output_dir=tmp_path,
+    )
+
+    with pytest.raises(ValueError, match="postprocess"):
+        generator.validate_request(_speech_request())
+
+
+def test_speech_generator_defers_to_generation_time_when_manifest_is_unresolvable(
+    tmp_path: Path,
+):
+    # A model that can't be resolved (unknown, disabled, wrong task type) is
+    # left for resolve_runtime() to reject at generation time, as before;
+    # validate_request() must not raise here just because the lookup failed.
+    class _UnresolvableModelService:
+        def get_manifest(self, model_id, media_type, task_type=None):
+            raise LookupError(f"Model is disabled: {model_id}")
+
+    generator = SpeechGenerator(_UnresolvableModelService(), output_dir=tmp_path)
+
+    generator.validate_request(_speech_request())
 
 
 def test_speech_generator_splits_at_sentences_and_pads_between_chunks(tmp_path: Path):

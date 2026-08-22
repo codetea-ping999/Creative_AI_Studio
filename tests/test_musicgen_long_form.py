@@ -363,6 +363,80 @@ class MusicgenLongFormTests(unittest.TestCase):
             self.assertEqual(result.metadata["segment_count"], 6)
             self.assertEqual(model.params["extend_stride"], 18.0)
 
+    def test_long_form_generation_applies_shared_music_postprocessing(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            model = _FakeAudioCraftModel()
+            service = create_default_model_service(_write_manifest_root(root))
+            generator = AudioGenerator(service, output_dir=root / "audio")
+
+            with (
+                patch(
+                    "core.models.loader.AudioCraftMusicgenLoader.load",
+                    new=lambda _loader, manifest: _runtime_for(manifest, model),
+                ),
+                patch(
+                    "generators.audio.generator.evaluate_audio_semantics",
+                    return_value={"status": "skipped"},
+                ),
+            ):
+                result = generator.run(
+                    GenerationRequest(
+                        media_type="audio",
+                        prompt="evolving orchestral cue",
+                        model_id="musicgen-long-form",
+                        output_format="wav",
+                        params={"duration_seconds": 45},
+                    )
+                )
+
+            audio_postprocess = result.metadata["audio_postprocess"]
+            self.assertEqual(audio_postprocess["preset"], "music")
+            self.assertTrue(audio_postprocess["enabled"])
+            self.assertEqual(
+                audio_postprocess["chain"],
+                ["normalize_rms", "apply_fades", "normalize_peak"],
+            )
+            self.assertEqual(result.metadata["params"]["postprocess"], True)
+            # Music post-processing never trims, so segment duration is unaffected.
+            self.assertAlmostEqual(
+                result.metadata["final_duration_seconds"], 45.0, places=3
+            )
+
+    def test_long_form_generation_can_disable_postprocessing(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            model = _FakeAudioCraftModel()
+            service = create_default_model_service(_write_manifest_root(root))
+            generator = AudioGenerator(service, output_dir=root / "audio")
+
+            with (
+                patch(
+                    "core.models.loader.AudioCraftMusicgenLoader.load",
+                    new=lambda _loader, manifest: _runtime_for(manifest, model),
+                ),
+                patch(
+                    "generators.audio.generator.evaluate_audio_semantics",
+                    return_value={"status": "skipped"},
+                ),
+            ):
+                result = generator.run(
+                    GenerationRequest(
+                        media_type="audio",
+                        prompt="evolving orchestral cue",
+                        model_id="musicgen-long-form",
+                        output_format="wav",
+                        params={"duration_seconds": 45, "postprocess": False},
+                    )
+                )
+
+            audio_postprocess = result.metadata["audio_postprocess"]
+            self.assertEqual(audio_postprocess["preset"], "music")
+            self.assertFalse(audio_postprocess["enabled"])
+            self.assertEqual(audio_postprocess["chain"], [])
+            self.assertEqual(result.metadata["params"]["postprocess"], False)
+            self.assertTrue(Path(result.outputs[0]).exists())
+
     def test_segment_failure_publishes_no_wav_or_gallery_asset(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)

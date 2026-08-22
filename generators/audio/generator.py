@@ -10,6 +10,7 @@ from uuid import uuid4
 import wave
 
 from core.assets import AssetRepository
+from core.audio import MUSIC_PRESET, process_music_channels, skipped_processing_report
 from core.audio_conditioning import prepare_wav_reference
 from core.models import ModelService
 from core.quality import (
@@ -105,6 +106,11 @@ class AudioGenerator(BaseGenerator):
             if value is None:
                 continue
             self._validate_numeric_range(name, value, minimum, maximum)
+
+        if "postprocess" in request.params:
+            _coerce_postprocess_flag(request.params["postprocess"])
+        elif "postprocess" in manifest.default_params:
+            _coerce_postprocess_flag(manifest.default_params["postprocess"])
 
     def _validate_numeric_range(
         self,
@@ -202,6 +208,9 @@ class AudioGenerator(BaseGenerator):
         genre = str(effective_params.pop("genre", "")).strip().lower() or None
         instruments = str(effective_params.pop("instruments", "")).strip() or None
         structure = str(effective_params.pop("structure", "")).strip().lower() or None
+        postprocess_enabled = _coerce_postprocess_flag(
+            effective_params.pop("postprocess", True)
+        )
         conditioning_prompt = self._build_conditioning_prompt(
             request.prompt,
             mood=mood,
@@ -300,13 +309,24 @@ class AudioGenerator(BaseGenerator):
                 audio_values = model.generate(**generation_kwargs)
 
         audio_tensor = audio_values[0].detach().cpu()
+        self._require_finite_audio(
+            audio_tensor, model_label=manifest.public_model_id, torch=torch
+        )
         sampling_rate = int(runtime_obj["sampling_rate"])
+        processed_tensor, postprocess_applied = self._postprocess_music(
+            audio_tensor,
+            sampling_rate,
+            enabled=postprocess_enabled,
+            torch=torch,
+        )
 
         output_id = f"aud_{uuid4().hex}"
         output_path = self.output_dir / f"{output_id}.wav"
-        self._write_wave_file(output_path, audio_tensor, sampling_rate=sampling_rate, torch=torch)
+        self._write_wave_file(
+            output_path, processed_tensor, sampling_rate=sampling_rate, torch=torch
+        )
 
-        output_duration = float(audio_tensor.shape[-1] / sampling_rate)
+        output_duration = float(processed_tensor.shape[-1] / sampling_rate)
         quality_report = evaluate_audio_output(output_path)
         semantic_report = evaluate_audio_semantics(output_path, conditioning_prompt)
         enrich_quality_report(quality_report, semantic_report)
@@ -342,6 +362,7 @@ class AudioGenerator(BaseGenerator):
                 "channels": int(audio_tensor.shape[0] if audio_tensor.ndim > 1 else 1),
                 "default_params": dict(manifest.default_params),
                 "quality_report": quality_report,
+                "audio_postprocess": postprocess_applied,
                 **lineage_metadata,
                 **conditioning_metadata,
                 "params": {
@@ -356,6 +377,7 @@ class AudioGenerator(BaseGenerator):
                     "genre": genre,
                     "instruments": instruments,
                     "structure": structure,
+                    "postprocess": postprocess_enabled,
                     **effective_params,
                 },
                 "duration_seconds_generated": output_duration,
@@ -399,6 +421,9 @@ class AudioGenerator(BaseGenerator):
         genre = str(effective_params.pop("genre", "")).strip().lower() or None
         instruments = str(effective_params.pop("instruments", "")).strip() or None
         structure = str(effective_params.pop("structure", "")).strip().lower() or None
+        postprocess_enabled = _coerce_postprocess_flag(
+            effective_params.pop("postprocess", True)
+        )
         conditioning_prompt = self._build_conditioning_prompt(
             request.prompt,
             mood=mood,
@@ -469,17 +494,26 @@ class AudioGenerator(BaseGenerator):
             progress_callback(1.0, segment_count, segment_count)
 
         audio_tensor = audio_values[0].detach().cpu()
+        self._require_finite_audio(
+            audio_tensor, model_label=manifest.public_model_id, torch=torch
+        )
         sampling_rate = int(runtime_obj["sampling_rate"])
+        processed_tensor, postprocess_applied = self._postprocess_music(
+            audio_tensor,
+            sampling_rate,
+            enabled=postprocess_enabled,
+            torch=torch,
+        )
         output_id = f"aud_{uuid4().hex}"
         output_path = self.output_dir / f"{output_id}.wav"
         self._write_wave_file(
             output_path,
-            audio_tensor,
+            processed_tensor,
             sampling_rate=sampling_rate,
             torch=torch,
         )
 
-        output_duration = float(audio_tensor.shape[-1] / sampling_rate)
+        output_duration = float(processed_tensor.shape[-1] / sampling_rate)
         quality_report = evaluate_audio_output(output_path)
         semantic_report = evaluate_audio_semantics(output_path, conditioning_prompt)
         enrich_quality_report(quality_report, semantic_report)
@@ -512,6 +546,7 @@ class AudioGenerator(BaseGenerator):
                 "channels": int(audio_tensor.shape[0] if audio_tensor.ndim > 1 else 1),
                 "default_params": dict(manifest.default_params),
                 "quality_report": quality_report,
+                "audio_postprocess": postprocess_applied,
                 **lineage_metadata,
                 "params": {
                     "duration_seconds": duration_seconds,
@@ -525,6 +560,7 @@ class AudioGenerator(BaseGenerator):
                     "genre": genre,
                     "instruments": instruments,
                     "structure": structure,
+                    "postprocess": postprocess_enabled,
                     **effective_params,
                 },
                 "duration_seconds_generated": output_duration,
@@ -606,6 +642,61 @@ class AudioGenerator(BaseGenerator):
                 if mps_state is not None and callable(mps_set_state):
                     mps_set_state(mps_state)
 
+    def _require_finite_audio(
+        self,
+        audio_tensor: Any,
+        *,
+        model_label: str,
+        torch: Any,
+    ) -> None:
+        """Reject NaN/Inf model output before it reaches numpy or a WAV file.
+
+        A non-finite sample contaminates the whole channel through the
+        gain-based postprocessing steps (NaN propagates through any
+        multiplication), writes corrupt PCM, and lands NaN/Infinity in the
+        JSON job metadata even though this module's report contract is meant
+        to stay JSON-safe. Speech already rejects this per chunk right after
+        synthesis (generators/audio/speech.py); music needs the same check
+        right after generation, before any further processing.
+        """
+
+        if not bool(torch.isfinite(audio_tensor).all()):
+            raise RuntimeError(
+                f"Model {model_label!r} returned non-finite (NaN/Inf) audio samples."
+            )
+
+    def _postprocess_music(
+        self,
+        audio_tensor: Any,
+        sampling_rate: int,
+        *,
+        enabled: bool,
+        torch: Any,
+    ) -> tuple[Any, dict[str, Any]]:
+        """Apply the shared music post-processing chain to a generated clip.
+
+        ``audio_tensor`` is (channels, samples). ``process_music_channels()``
+        links normalization gain across channels so a stereo checkpoint (e.g.
+        a musicgen-stereo-* variant) keeps its channel-level balance instead
+        of every channel being pulled independently to the same target
+        level. Channels are cast to float32 before ``.numpy()``: a manifest
+        may run the model in bfloat16 or float16 on an accelerator, and
+        NumPy has no bfloat16 type.
+        """
+
+        if enabled:
+            processed_array, report = process_music_channels(
+                audio_tensor.to(torch.float32).contiguous().numpy(),
+                sampling_rate,
+            )
+            return torch.from_numpy(processed_array), report
+        report = skipped_processing_report(
+            sampling_rate,
+            preset=MUSIC_PRESET,
+            sample_count=int(audio_tensor.shape[-1]),
+        )
+        return audio_tensor.clamp(-1.0, 1.0), report
+
     def _write_wave_file(
         self,
         output_path: Path,
@@ -634,6 +725,12 @@ class AudioGenerator(BaseGenerator):
             wav_file.setsampwidth(2)
             wav_file.setframerate(sampling_rate)
             wav_file.writeframes(pcm)
+
+
+def _coerce_postprocess_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    raise ValueError(f"Audio parameter 'postprocess' must be a boolean, got {value!r}.")
 
 
 def _extract_lineage_metadata(params: dict[str, Any]) -> dict[str, Any]:
