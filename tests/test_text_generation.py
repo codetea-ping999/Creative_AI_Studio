@@ -422,6 +422,23 @@ class TextQualityTests(unittest.TestCase):
                 any("placeholder" in check for check in dirty["checks"])
             )
 
+            # The placeholder penalty is already folded into quality_score;
+            # business_readiness_score must not subtract it a second time.
+            expected_business_readiness = round(
+                max(
+                    0.0,
+                    min(
+                        100.0,
+                        dirty["quality_score"] * 0.75
+                        + dirty["metrics"]["structure_completeness"] * 25,
+                    ),
+                ),
+                1,
+            )
+            self.assertEqual(
+                dirty["business_readiness_score"], expected_business_readiness
+            )
+
     def test_incomplete_structured_payload_lowers_completeness(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             path = self._write(Path(root), "# Loglines\n\n1. A girl rewinds a day.\n")

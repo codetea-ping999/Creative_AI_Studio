@@ -106,8 +106,7 @@ def evaluate_text_output(
             min(
                 100.0,
                 technical_quality_score * 0.75
-                + structure_completeness * 25
-                - placeholder_penalty,
+                + structure_completeness * 25,
             ),
         ),
         1,
