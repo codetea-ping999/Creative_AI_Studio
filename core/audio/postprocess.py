@@ -461,9 +461,14 @@ def process_music_channels(
     rate = _require_sample_rate(sample_rate)
     true_duration = round(array.shape[-1] / rate, 6)
 
+    # Gain is applied without clipping here: the RMS stage's capped boost can
+    # push a sparse track's transients above 1.0, and clipping now would
+    # flatten them together before the peak stage below gets a chance to
+    # measure the true peak and scale everything back down proportionally,
+    # which is what actually preserves their relative dynamics.
     combined = array.reshape(-1)
     _, rms_info = normalize_rms(combined, target_rms_db=_MUSIC_TARGET_RMS_DB)
-    array = _clip(array * _db_to_amplitude(rms_info["gain_db"]))
+    array = array * _db_to_amplitude(rms_info["gain_db"])
 
     fade_results = [
         apply_fades(

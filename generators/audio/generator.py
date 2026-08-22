@@ -309,6 +309,9 @@ class AudioGenerator(BaseGenerator):
                 audio_values = model.generate(**generation_kwargs)
 
         audio_tensor = audio_values[0].detach().cpu()
+        self._require_finite_audio(
+            audio_tensor, model_label=manifest.public_model_id, torch=torch
+        )
         sampling_rate = int(runtime_obj["sampling_rate"])
         processed_tensor, postprocess_applied = self._postprocess_music(
             audio_tensor,
@@ -491,6 +494,9 @@ class AudioGenerator(BaseGenerator):
             progress_callback(1.0, segment_count, segment_count)
 
         audio_tensor = audio_values[0].detach().cpu()
+        self._require_finite_audio(
+            audio_tensor, model_label=manifest.public_model_id, torch=torch
+        )
         sampling_rate = int(runtime_obj["sampling_rate"])
         processed_tensor, postprocess_applied = self._postprocess_music(
             audio_tensor,
@@ -635,6 +641,29 @@ class AudioGenerator(BaseGenerator):
             finally:
                 if mps_state is not None and callable(mps_set_state):
                     mps_set_state(mps_state)
+
+    def _require_finite_audio(
+        self,
+        audio_tensor: Any,
+        *,
+        model_label: str,
+        torch: Any,
+    ) -> None:
+        """Reject NaN/Inf model output before it reaches numpy or a WAV file.
+
+        A non-finite sample contaminates the whole channel through the
+        gain-based postprocessing steps (NaN propagates through any
+        multiplication), writes corrupt PCM, and lands NaN/Infinity in the
+        JSON job metadata even though this module's report contract is meant
+        to stay JSON-safe. Speech already rejects this per chunk right after
+        synthesis (generators/audio/speech.py); music needs the same check
+        right after generation, before any further processing.
+        """
+
+        if not bool(torch.isfinite(audio_tensor).all()):
+            raise RuntimeError(
+                f"Model {model_label!r} returned non-finite (NaN/Inf) audio samples."
+            )
 
     def _postprocess_music(
         self,

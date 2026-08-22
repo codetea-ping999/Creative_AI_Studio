@@ -247,6 +247,18 @@ class _NearSilentMusicgenModel(_FakeMusicgenModel):
         return torch.full((1, 1, 16000), 2e-6, dtype=torch.float32)
 
 
+class _NonFiniteMusicgenModel(_FakeMusicgenModel):
+    """Contains a NaN sample: a degenerate/failed generation."""
+
+    def generate(self, **kwargs):
+        import torch
+
+        self.calls.append(kwargs)
+        audio = torch.zeros((1, 1, 16000), dtype=torch.float32)
+        audio[0, 0, 100] = float("nan")
+        return audio
+
+
 def _fake_musicgen_load(self, manifest):
     return {
         "stub": False,
@@ -292,6 +304,12 @@ def _fake_bfloat16_musicgen_load(self, manifest):
 def _fake_near_silent_musicgen_load(self, manifest):
     runtime = _fake_musicgen_load(self, manifest)
     runtime["model"] = _NearSilentMusicgenModel()
+    return runtime
+
+
+def _fake_non_finite_musicgen_load(self, manifest):
+    runtime = _fake_musicgen_load(self, manifest)
+    runtime["model"] = _NonFiniteMusicgenModel()
     return runtime
 
 
@@ -1304,6 +1322,36 @@ class ModelSystemTests(unittest.TestCase):
                 frames = wav_file.readframes(wav_file.getnframes())
             samples = np.frombuffer(frames, dtype="<i2")
             self.assertLess(int(np.max(np.abs(samples))), 100)
+
+    def test_audio_generator_rejects_non_finite_model_output(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir) / "outputs"
+            with (
+                patch(
+                    "core.models.loader.TransformersMusicgenLoader.load",
+                    new=_fake_non_finite_musicgen_load,
+                ),
+                patch(
+                    "generators.audio.generator.evaluate_audio_semantics",
+                    return_value={"status": "skipped"},
+                ),
+            ):
+                service = create_default_model_service()
+                generator = AudioGenerator(service, output_dir=output_dir)
+
+                with self.assertRaisesRegex(RuntimeError, "non-finite"):
+                    generator.run(
+                        GenerationRequest(
+                            media_type="audio",
+                            prompt="corrupt output",
+                            model_id="musicgen-small",
+                            output_format="wav",
+                            params={"duration_seconds": 2},
+                        )
+                    )
+
+            # No WAV should have been written for the rejected generation.
+            self.assertEqual(list(output_dir.glob("*.wav")), [])
 
     def test_audio_generator_reuses_seed_without_unsupported_generator_kwarg(self) -> None:
         with TemporaryDirectory() as tmp_dir:

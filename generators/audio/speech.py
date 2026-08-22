@@ -87,6 +87,22 @@ class SpeechGenerator(BaseGenerator):
             )
         if "postprocess" in request.params:
             _coerce_postprocess_flag(request.params["postprocess"])
+        else:
+            # Best-effort: a manifest that cannot be resolved here (unknown
+            # model, disabled, wrong task type) is left for resolve_runtime()
+            # to reject at generation time as before, so this stays scoped to
+            # catching an invalid postprocess *default* on an otherwise-valid
+            # manifest instead of moving model-availability checks earlier.
+            try:
+                manifest = self.model_service.get_manifest(
+                    request.model_id.strip() or None,
+                    media_type="audio",
+                    task_type=self.task_type,
+                )
+            except LookupError:
+                return
+            if "postprocess" in manifest.default_params:
+                _coerce_postprocess_flag(manifest.default_params["postprocess"])
 
     def prepare(self, request: GenerationRequest) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
