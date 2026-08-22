@@ -3,7 +3,7 @@
 # Creative AI Studio - 初期セットアップスクリプト
 # このスクリプトはプロジェクトの初期化に必要な全てのステップを実行します
 
-set -e
+set -euo pipefail
 
 echo "🚀 Creative AI Studio セットアップを開始します..."
 echo ""
@@ -16,10 +16,40 @@ NC='\033[0m' # No Color
 
 # ステップカウンター
 STEP=1
+CURRENT_PHASE="初期化"
+
+print_failure_context() {
+    local failed_command="$1"
+
+    printf '\n❌ セットアップに失敗しました\n' >&2
+    printf '   フェーズ: %s\n' "$CURRENT_PHASE" >&2
+    printf '   失敗したコマンド: %s\n' "$failed_command" >&2
+}
+
+on_error() {
+    local exit_code="$1"
+    local failed_command="${2%%$'\n'*}"
+
+    trap - ERR
+    print_failure_context "$failed_command"
+    exit "$exit_code"
+}
+
+fail_setup() {
+    local message="$1"
+    local failed_command="$2"
+
+    printf '❌ %s\n' "$message" >&2
+    print_failure_context "$failed_command"
+    exit 1
+}
+
+trap 'on_error "$?" "$BASH_COMMAND"' ERR
 
 print_step() {
+    CURRENT_PHASE="$1"
     echo -e "${BLUE}[ステップ $STEP]${NC} $1"
-    ((STEP++))
+    STEP=$((STEP + 1))
 }
 
 print_success() {
@@ -34,18 +64,21 @@ print_warning() {
 print_step "前提条件を確認しています..."
 
 if ! command -v python3 &> /dev/null; then
-    echo "❌ Python 3.10 以上が必要ですが、Python 3 が見つかりません"
-    exit 1
+    fail_setup "Python 3.10 以上が必要ですが、Python 3 が見つかりません" "command -v python3"
+fi
+if ! PYTHON_VERSION=$(python3 --version); then
+    fail_setup "Python 3 のバージョンを取得できません" "python3 --version"
 fi
 if ! python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)'; then
-    echo "❌ Python 3.10 以上が必要です（検出: $(python3 --version)）"
-    exit 1
+    fail_setup "Python 3.10 以上が必要です（検出: ${PYTHON_VERSION}）" "python3 version check"
 fi
-print_success "Python 3 は インストール済み ($(python3 --version))"
+print_success "Python 3 は インストール済み (${PYTHON_VERSION})"
 
 if ! command -v node &> /dev/null; then
-    echo "❌ Node.js 20.19 以上、または 22.12 以上が必要です"
-    exit 1
+    fail_setup "Node.js 20.19 以上、または 22.12 以上が必要です" "command -v node"
+fi
+if ! NODE_VERSION=$(node --version); then
+    fail_setup "Node.js のバージョンを取得できません" "node --version"
 fi
 if ! node -e '
   const [major, minor] = process.versions.node.split(".").map(Number);
@@ -55,10 +88,9 @@ if ! node -e '
     major > 22;
   process.exit(supported ? 0 : 1);
 '; then
-    echo "❌ Node.js 20.19 以上、または 22.12 以上が必要です（検出: $(node --version)）"
-    exit 1
+    fail_setup "Node.js 20.19 以上、または 22.12 以上が必要です（検出: ${NODE_VERSION}）" "node version check"
 fi
-print_success "Node.js はインストール済み ($(node --version))"
+print_success "Node.js はインストール済み (${NODE_VERSION})"
 
 echo ""
 
