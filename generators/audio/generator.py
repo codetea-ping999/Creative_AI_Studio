@@ -10,7 +10,7 @@ from uuid import uuid4
 import wave
 
 from core.assets import AssetRepository
-from core.audio import MUSIC_PRESET, process_audio, skipped_processing_report
+from core.audio import MUSIC_PRESET, process_music_channels, skipped_processing_report
 from core.audio_conditioning import prepare_wav_reference
 from core.models import ModelService
 from core.quality import (
@@ -646,26 +646,21 @@ class AudioGenerator(BaseGenerator):
     ) -> tuple[Any, dict[str, Any]]:
         """Apply the shared music post-processing chain to a generated clip.
 
-        ``audio_tensor`` is (channels, samples). The chain in
-        core/audio/postprocess.py is mono-only, so each channel is processed
-        independently and the results re-stacked; a stereo checkpoint (e.g. a
-        musicgen-stereo-* variant) keeps both channels instead of being
-        flattened into one channel-concatenated buffer. Channels are cast to
-        float32 before ``.numpy()``: a manifest may run the model in bfloat16
-        or float16 on an accelerator, and NumPy has no bfloat16 type.
+        ``audio_tensor`` is (channels, samples). ``process_music_channels()``
+        links normalization gain across channels so a stereo checkpoint (e.g.
+        a musicgen-stereo-* variant) keeps its channel-level balance instead
+        of every channel being pulled independently to the same target
+        level. Channels are cast to float32 before ``.numpy()``: a manifest
+        may run the model in bfloat16 or float16 on an accelerator, and
+        NumPy has no bfloat16 type.
         """
 
         if enabled:
-            processed_channels: list[Any] = []
-            report: dict[str, Any] = {}
-            for channel in audio_tensor:
-                processed_array, report = process_audio(
-                    channel.to(torch.float32).contiguous().numpy(),
-                    sampling_rate,
-                    preset=MUSIC_PRESET,
-                )
-                processed_channels.append(torch.from_numpy(processed_array))
-            return torch.stack(processed_channels, dim=0), report
+            processed_array, report = process_music_channels(
+                audio_tensor.to(torch.float32).contiguous().numpy(),
+                sampling_rate,
+            )
+            return torch.from_numpy(processed_array), report
         report = skipped_processing_report(
             sampling_rate,
             preset=MUSIC_PRESET,

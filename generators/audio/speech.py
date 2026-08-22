@@ -85,6 +85,8 @@ class SpeechGenerator(BaseGenerator):
                 "SpeechGenerator currently supports wav output only, got "
                 f"{request.output_format!r}."
             )
+        if "postprocess" in request.params:
+            _coerce_postprocess_flag(request.params["postprocess"])
 
     def prepare(self, request: GenerationRequest) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)

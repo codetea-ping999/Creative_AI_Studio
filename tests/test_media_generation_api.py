@@ -77,6 +77,31 @@ class MediaGenerationApiTests(unittest.TestCase):
             self.assertEqual(assembly.asset_path_lookup("asset_visual"), str(source))
             self.assertIsNone(assembly.asset_path_lookup("asset_missing"))
 
+    def test_speech_endpoint_rejects_invalid_postprocess_before_enqueueing(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            services = create_application_services(
+                db_path=root / "jobs.db",
+                output_dir=root / "outputs" / "images",
+            )
+            client = TestClient(create_app(services, start_job_runner=False))
+
+            for invalid_value in (None, "false", 1):
+                with self.subTest(postprocess=invalid_value):
+                    response = client.post(
+                        "/generate/speech",
+                        json={
+                            "prompt": "静かな夜明けだった。",
+                            "model_id": "kokoro-tts-local",
+                            "output_format": "wav",
+                            "params": {"postprocess": invalid_value},
+                        },
+                    )
+                    self.assertEqual(response.status_code, 422, response.text)
+
+            # None of the invalid requests should have reached the job queue.
+            self.assertEqual(services.job_repository.list(), [])
+
     def test_speech_and_assembly_endpoints_bind_jobs_to_a_project(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)

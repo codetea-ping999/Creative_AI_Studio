@@ -204,19 +204,23 @@ class _RandomMusicgenModel(_FakeMusicgenModel):
 
 
 class _StereoMusicgenModel(_FakeMusicgenModel):
-    """Returns two channels at fixed, distinguishable levels.
+    """Returns two channels at different, fixed levels (like a real stereo mix
+    with an intentional pan), long enough to leave a flat middle region once
+    the music preset's fade_in(0.05s)/fade_out(0.5s) ramps are excluded.
 
     A postprocessing step that flattens (channels, samples) into one
-    concatenated buffer instead of processing per channel would double the
-    frame count and mix these constant levels; both are checked by the test.
+    concatenated buffer would double the frame count. A step that measures
+    normalization gain per channel independently would pull both channels to
+    the same target level, destroying the 8:1 ratio between them; linked gain
+    preserves it. Both are checked by the test.
     """
 
     def generate(self, **kwargs):
         import torch
 
         self.calls.append(kwargs)
-        left = torch.full((16000,), 0.5, dtype=torch.float32)
-        right = torch.full((16000,), -0.5, dtype=torch.float32)
+        left = torch.full((64000,), 0.8, dtype=torch.float32)
+        right = torch.full((64000,), 0.1, dtype=torch.float32)
         return torch.stack([left, right], dim=0).unsqueeze(0)
 
 
@@ -226,6 +230,21 @@ class _Bfloat16MusicgenModel(_FakeMusicgenModel):
 
         self.calls.append(kwargs)
         return torch.rand((1, 1, 16000), dtype=torch.bfloat16)
+
+
+class _NearSilentMusicgenModel(_FakeMusicgenModel):
+    """A constant, near-zero (but nonzero) buffer: degenerate model output.
+
+    The RMS stage's boost cap is meant to leave content like this too quiet
+    rather than amplifying it; without a linked cap on the later peak stage,
+    it gets amplified to near full scale anyway.
+    """
+
+    def generate(self, **kwargs):
+        import torch
+
+        self.calls.append(kwargs)
+        return torch.full((1, 1, 16000), 2e-6, dtype=torch.float32)
 
 
 def _fake_musicgen_load(self, manifest):
@@ -267,6 +286,12 @@ def _fake_stereo_musicgen_load(self, manifest):
 def _fake_bfloat16_musicgen_load(self, manifest):
     runtime = _fake_musicgen_load(self, manifest)
     runtime["model"] = _Bfloat16MusicgenModel()
+    return runtime
+
+
+def _fake_near_silent_musicgen_load(self, manifest):
+    runtime = _fake_musicgen_load(self, manifest)
+    runtime["model"] = _NearSilentMusicgenModel()
     return runtime
 
 
@@ -1187,14 +1212,22 @@ class ModelSystemTests(unittest.TestCase):
                 frame_count = wav_file.getnframes()
                 frames = wav_file.readframes(frame_count)
 
-            # A channel-flattening bug would report 32000 frames of mono
-            # audio (the two channels concatenated) instead of 16000 stereo
-            # frames, and would not keep the channels at their distinct
-            # levels.
-            self.assertEqual(frame_count, 16000)
+            # A channel-flattening bug would report 128000 frames of mono
+            # audio (the two channels concatenated) instead of 64000 stereo
+            # frames.
+            self.assertEqual(frame_count, 64000)
             samples = np.frombuffer(frames, dtype="<i2").reshape(-1, 2)
-            self.assertGreater(int(samples[:, 0].mean()), 0)
-            self.assertLess(int(samples[:, 1].mean()), 0)
+            # Sample a frame from the middle, well clear of both the
+            # fade_in(0.05s) and fade_out(0.5s) ramps, where levels are flat.
+            middle = samples[frame_count // 2]
+            self.assertGreater(int(middle[0]), 0)
+            self.assertGreater(int(middle[1]), 0)
+            # Independent per-channel gain would pull both channels to the
+            # same peak target, collapsing this to ~1:1; linked gain keeps
+            # the original 0.8:0.1 = 8:1 ratio between the channels.
+            ratio = middle[0] / middle[1]
+            self.assertGreater(ratio, 6.0)
+            self.assertLess(ratio, 10.0)
 
     def test_audio_generator_postprocesses_bfloat16_output(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -1227,6 +1260,50 @@ class ModelSystemTests(unittest.TestCase):
             self.assertEqual(result.status, "succeeded")
             self.assertTrue(result.metadata["audio_postprocess"]["enabled"])
             self.assertTrue(Path(result.outputs[0]).exists())
+
+    def test_audio_generator_does_not_amplify_near_silent_output_to_full_scale(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir) / "outputs"
+            with (
+                patch(
+                    "core.models.loader.TransformersMusicgenLoader.load",
+                    new=_fake_near_silent_musicgen_load,
+                ),
+                patch(
+                    "generators.audio.generator.evaluate_audio_semantics",
+                    return_value={"status": "skipped"},
+                ),
+            ):
+                service = create_default_model_service()
+                generator = AudioGenerator(service, output_dir=output_dir)
+
+                result = generator.run(
+                    GenerationRequest(
+                        media_type="audio",
+                        prompt="near silent output",
+                        model_id="musicgen-small",
+                        output_format="wav",
+                        params={"duration_seconds": 2},
+                    )
+                )
+
+            self.assertEqual(result.status, "succeeded")
+            rms_step, _fade_step, peak_step = result.metadata["audio_postprocess"][
+                "steps"
+            ]
+            self.assertTrue(rms_step["gain_capped"])
+            # Without the fix, the peak stage would unconditionally scale this
+            # up to the -1 dB target, turning 2e-6 model noise into
+            # near-full-scale audio.
+            self.assertFalse(peak_step["applied"])
+
+            output_path = Path(result.outputs[0])
+            with wave.open(str(output_path), "rb") as wav_file:
+                frames = wav_file.readframes(wav_file.getnframes())
+            samples = np.frombuffer(frames, dtype="<i2")
+            self.assertLess(int(np.max(np.abs(samples))), 100)
 
     def test_audio_generator_reuses_seed_without_unsupported_generator_kwarg(self) -> None:
         with TemporaryDirectory() as tmp_dir:

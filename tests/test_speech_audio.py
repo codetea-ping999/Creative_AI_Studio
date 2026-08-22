@@ -92,6 +92,24 @@ def test_normalize_peak_skips_empty_and_silent_buffers():
     assert np.array_equal(silence, np.zeros(256, dtype=np.float32))
 
 
+def test_normalize_peak_attenuate_only_skips_a_boost_but_still_attenuates():
+    quiet = _sine(0.5, amplitude=0.01)
+    quiet_processed, quiet_info = normalize_peak(
+        quiet, target_peak_db=-1.0, attenuate_only=True
+    )
+    assert quiet_info["applied"] is False
+    assert quiet_info["skipped_reason"] == (
+        "attenuate_only: buffer is already below target peak"
+    )
+    assert np.array_equal(quiet_processed, quiet)
+
+    loud_processed, loud_info = normalize_peak(
+        _sine(0.5, amplitude=0.99), target_peak_db=-1.0, attenuate_only=True
+    )
+    assert loud_info["applied"] is True
+    assert loud_info["peak_db_after"] == pytest.approx(-1.0, abs=0.05)
+
+
 def test_normalize_rms_reaches_the_target_for_a_normal_level():
     processed, info = normalize_rms(_sine(0.5, amplitude=0.4), target_rms_db=-20.0)
 
@@ -366,6 +384,28 @@ def test_process_audio_runs_the_music_chain_without_trimming():
     assert applied["chain"] == ["normalize_rms", "apply_fades", "normalize_peak"]
     assert processed.size == _RATE  # nothing was trimmed away
     assert applied["duration_seconds_after"] == pytest.approx(1.0)
+
+
+def test_process_audio_music_chain_does_not_amplify_near_silent_noise_past_the_rms_cap():
+    """A buffer whose RMS boost gets capped must not be un-capped by peak.
+
+    The RMS stage's max_gain_db cap exists specifically to leave anomalously
+    quiet content (model noise, not real signal) too quiet rather than
+    amplifying it. Without the fix, the peak stage running last scales
+    straight up to the peak target regardless of how quiet the RMS stage
+    left the buffer, silently undoing that protection.
+    """
+
+    near_silent = np.full(4_000, 2e-6, dtype=np.float32)
+    processed, applied = process_audio(near_silent, _RATE, preset="music")
+
+    rms_step, _fade_step, peak_step = applied["steps"]
+    assert rms_step["gain_capped"] is True
+    assert peak_step["applied"] is False
+    assert peak_step["skipped_reason"] == (
+        "attenuate_only: buffer is already below target peak"
+    )
+    assert float(np.max(np.abs(processed))) < 0.001
 
 
 def test_process_audio_handles_empty_and_all_zero_buffers():
