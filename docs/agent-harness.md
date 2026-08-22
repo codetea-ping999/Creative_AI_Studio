@@ -13,11 +13,15 @@
 | --- | --- | --- |
 | 並列エージェントが同じファイルを壊し合った | 全員が同一ワークツリーで作業した | ワークツリー分離と所有権 |
 | 未検証のまま実装がマージされた | 検証エージェントが落ちても実装が進んだ | 検証を独立フェーズにし、単独で再実行可能にする |
+| 検証役が共有 checkout にパッチを適用した | Verify のワークツリー分離が明示されていなかった | Implement と Verify の両方に専用 worktree を要求する |
 | 自動マージが構文エラーを生んだ | 共有ファイルを複数エージェントが同時に編集した | 共有ファイルは統合役だけが触る |
 
 ## 検証ゲート
 
 **これを通らないものを「完了」と呼ばないでください。**
+
+`issue-fleet` の Triage・Implement・Verify はそれぞれ専用 worktree で動きます。
+受け取ったパッチを適用・revert してよいのは、Verify の隔離された worktree だけです。
 
 ```bash
 /Users/toyoharukohyama/Documents/Creative_AI_Studio/venv/bin/python -m pytest -q
@@ -111,18 +115,41 @@ weight が要る検証は、この環境では**できません**。必要な場
 ワークツリーはワークフロー終了時に削除されるため、**壊れたパッチしか残りません**。
 
 ```bash
-mkdir -p /private/tmp/claude-501/harness/patches
-git add -A && git diff --cached --binary > /private/tmp/claude-501/harness/patches/<name>.patch
+PATCH_ROOT=/tmp/creative-ai-studio-harness-patches
+RUN_ID=<workflow が渡した artifact run ID>
+mkdir -p "$PATCH_ROOT"
+artifact_dir="$(mktemp -d "$PATCH_ROOT/$RUN_ID-issue-fleet-<issues>.XXXXXX")"
+patch_path="$artifact_dir/change.patch"
+base_commit="$(git rev-parse HEAD)"
+git add -A
+git diff --cached --binary > "$patch_path"
+changed_files="$(git diff --cached --name-only)"
+patch_bytes="$(wc -c < "$patch_path" | tr -d '[:space:]')"
+patch_sha256="$(shasum -a 256 "$patch_path" | awk '{print $1}')"
 git reset
-wc -c /private/tmp/claude-501/harness/patches/<name>.patch
 ```
 
 - `git add -A` を先に打つのは、**新規ファイルを含めるため**です
 - `--binary` は情報を落とさないため
 - 出力先は**ワークツリーの外**にします。中に置くと消えます
+- `mktemp -d` を使うため、同じ issue の retry や並列 fleet でも成果物を上書きしません
+- 構造化出力の `handoff` に `patch_path`、`patch_bytes`、`patch_sha256`、`base_commit`、
+  `changed_files` を返します。`files_changed` と `handoff.changed_files` は同じ一覧です
+- `patch_path` はその run と cluster 用の
+  `$RUN_ID-issue-fleet-<issues>.<mktemp>/change.patch` でなければなりません。別の一時
+  ファイルや過去 run の成果物は統合対象になりません
 
 書いたら、**自分で受け渡しを検証してください。** 別の場所に `origin/main` のワークツリーを
 作り、そこで `git apply --check` が通ることを確認してから成功と報告します。
+
+Verify は、適用前に base revision・バイト数・SHA-256・変更ファイルを再計測し、
+`git apply --check` を実行します。観測値を `handoff` として返し、実装側の値との不一致、
+空の検証証跡、共有ファイルの編集、または `apply_check: false` のどれかがあれば、
+`ship` と報告しても統合対象には入りません。Verify の issue 番号も、実装側の
+`completed` と完全一致しなければなりません。さらに `ship` には
+`tests_rerun_passed: true` と `red_proof_is_assertion_failure: true` が必須です。
+未達の acceptance criteria または high-severity finding が一つでもあれば、`ship` は
+統合対象になりません。
 
 ## コード規約
 
