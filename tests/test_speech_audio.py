@@ -583,7 +583,9 @@ def test_speech_generator_writes_a_wav_and_records_the_chain(tmp_path: Path):
     assert metadata["available_voices"] == ["jf_alpha"]
     assert metadata["supports_pitch"] is False
     assert metadata["source_asset_id"] == "ast_123"
+    assert metadata["params"]["postprocess"] is True
     assert metadata["audio_postprocess"]["preset"] == "speech"
+    assert metadata["audio_postprocess"]["enabled"] is True
     assert metadata["audio_postprocess"]["chain"] == [
         "trim_silence",
         "normalize_rms",
@@ -594,6 +596,37 @@ def test_speech_generator_writes_a_wav_and_records_the_chain(tmp_path: Path):
     assert isinstance(metadata["quality_report"]["quality_score"], float)
     # The whole payload is persisted as JSON by the job store.
     assert json.loads(json.dumps(metadata))["chunk_count"] == metadata["chunk_count"]
+
+
+def test_speech_generator_can_disable_postprocessing(tmp_path: Path):
+    runtime = _fake_speech_runtime()
+    generator = SpeechGenerator(
+        _FakeModelService(_kokoro_manifest(), runtime),
+        output_dir=tmp_path,
+    )
+
+    result = generator.run(_speech_request(postprocess=False))
+
+    metadata = result.metadata
+    assert metadata["params"]["postprocess"] is False
+    assert metadata["audio_postprocess"]["preset"] == "speech"
+    assert metadata["audio_postprocess"]["enabled"] is False
+    assert metadata["audio_postprocess"]["chain"] == []
+
+    output_path = Path(result.outputs[0])
+    with wave.open(str(output_path), "rb") as wav_file:
+        assert wav_file.getnframes() > 0
+
+
+def test_speech_generator_rejects_non_boolean_postprocess(tmp_path: Path):
+    runtime = _fake_speech_runtime()
+    generator = SpeechGenerator(
+        _FakeModelService(_kokoro_manifest(), runtime),
+        output_dir=tmp_path,
+    )
+
+    with pytest.raises(ValueError, match="postprocess"):
+        generator.run(_speech_request(postprocess="false"))
 
 
 def test_speech_generator_splits_at_sentences_and_pads_between_chunks(tmp_path: Path):

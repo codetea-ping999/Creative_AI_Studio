@@ -647,6 +647,11 @@ output も削除し、部分成功の asset は作成しません。
 }
 ```
 
+`music` / `speech` とも `params.postprocess`（既定 `true`）で正規化・トリム・フェードの
+共有 chain（`core/audio/postprocess.py`）を制御できます。`false` を指定すると chain は
+実行されず、job 結果 metadata の `audio_postprocess` は `enabled: false` / `chain: []`
+になります。適用時の chain・gain・trim 幅は常に `audio_postprocess` に記録されます。
+
 ### POST /generate/speech
 
 `audio` の専用 `text-to-speech` generator にルーティングします。`project_id` の

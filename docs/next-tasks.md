@@ -53,7 +53,7 @@
 | 優先度 | 状態 | タスク | 目的 |
 | --- | --- | --- | --- |
 | P0 | Todo | job lane と media 別常駐上限 | `bootstrap/factories.py`は単一 `JobQueue`/`JobRunner`、`MAX_CACHED_MODELS`もmedia別ではない単一値。text↔image↔audioを1フローで回すと載せ替えが頻発する（#39） |
-| P0 | Todo | 音声後処理を music 生成経路にも適用 | `core/audio/postprocess.py`のnormalize/trim/fade/duckは`generators/audio/speech.py`（narration）のみが使用。`generators/audio/generator.py`（music）は`[-1,1]`clampのみで`MUSIC_PRESET`未適用（#56 残分） |
+| P0 | Done | 音声後処理を music 生成経路にも適用 | `generators/audio/generator.py`のmusic経路（短尺・長尺とも）に`process_audio(..., preset=MUSIC_PRESET)`を接続。`params.postprocess`（既定true）で無効化も可能にし、`speech.py`側にも同じ無効化オプションを追加。結果は`audio_postprocess`に`enabled`/`chain`付きで記録（#56 残分） |
 | P1 | Todo | video 生成の cooperative cancellation 接続 | `core/jobs/context.py`の`GenerationContext`と`core/jobs/cancellation.py`は実装済みで image generator は`raise_if_cancelled()`を複数箇所で呼ぶが、`generators/video/generator.py`は`context`引数を受け取るのみで内部では未使用（#18） |
 | P1 | Todo | バッチ勝者の Bible 反映 | `core/batches/service.py`の`promote()`は`item.promoted=True`を立てるだけで bible への書き込みがない。character sheet batch template（`core/batches/templates.py`）自体は存在する（#49） |
 | P1 | Todo | 参照画像条件付け（identity lock L4） | `core/prompting/composer.py`は`reference_asset_ids`を収集するが、`generators/image/generator.py`はmetadataに記録するのみで img2img / IP-Adapter のpixel conditioning呼び出しがない（#50） |

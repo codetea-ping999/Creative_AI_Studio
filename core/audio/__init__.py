@@ -9,6 +9,7 @@ from .postprocess import (
     normalize_peak,
     normalize_rms,
     process_audio,
+    skipped_processing_report,
     trim_silence,
 )
 
@@ -21,5 +22,6 @@ __all__ = [
     "normalize_peak",
     "normalize_rms",
     "process_audio",
+    "skipped_processing_report",
     "trim_silence",
 ]

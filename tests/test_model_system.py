@@ -1007,7 +1007,92 @@ class ModelSystemTests(unittest.TestCase):
             self.assertEqual(result.metadata["source_asset_id"], "asset-audio-source")
             self.assertEqual(result.metadata["reuse_action"], "variation")
             self.assertEqual(result.metadata["params"]["structure"], "seamless loop")
+            self.assertEqual(result.metadata["params"]["postprocess"], True)
+            self.assertEqual(result.metadata["audio_postprocess"]["preset"], "music")
             self.assertTrue(Path(result.outputs[0]).exists())
+
+    def test_audio_generator_applies_shared_music_postprocessing_by_default(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir) / "outputs"
+            with (
+                patch(
+                    "core.models.loader.TransformersMusicgenLoader.load",
+                    new=_fake_random_musicgen_load,
+                ),
+                patch(
+                    "generators.audio.generator.evaluate_audio_semantics",
+                    return_value={"status": "skipped"},
+                ),
+            ):
+                service = create_default_model_service()
+                generator = AudioGenerator(service, output_dir=output_dir)
+
+                result = generator.run(
+                    GenerationRequest(
+                        media_type="audio",
+                        prompt="warm pad swell",
+                        model_id="musicgen-small",
+                        output_format="wav",
+                        params={"duration_seconds": 2},
+                    )
+                )
+
+            self.assertEqual(result.status, "succeeded")
+            audio_postprocess = result.metadata["audio_postprocess"]
+            self.assertEqual(audio_postprocess["preset"], "music")
+            self.assertTrue(audio_postprocess["enabled"])
+            self.assertEqual(
+                audio_postprocess["chain"],
+                ["normalize_rms", "apply_fades", "normalize_peak"],
+            )
+            self.assertEqual(result.metadata["params"]["postprocess"], True)
+
+    def test_audio_generator_can_disable_music_postprocessing(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir) / "outputs"
+            with (
+                patch(
+                    "core.models.loader.TransformersMusicgenLoader.load",
+                    new=_fake_random_musicgen_load,
+                ),
+                patch(
+                    "generators.audio.generator.evaluate_audio_semantics",
+                    return_value={"status": "skipped"},
+                ),
+            ):
+                service = create_default_model_service()
+                generator = AudioGenerator(service, output_dir=output_dir)
+
+                result = generator.run(
+                    GenerationRequest(
+                        media_type="audio",
+                        prompt="warm pad swell",
+                        model_id="musicgen-small",
+                        output_format="wav",
+                        params={"duration_seconds": 2, "postprocess": False},
+                    )
+                )
+
+            self.assertEqual(result.status, "succeeded")
+            audio_postprocess = result.metadata["audio_postprocess"]
+            self.assertEqual(audio_postprocess["preset"], "music")
+            self.assertFalse(audio_postprocess["enabled"])
+            self.assertEqual(audio_postprocess["chain"], [])
+            self.assertEqual(result.metadata["params"]["postprocess"], False)
+            self.assertTrue(Path(result.outputs[0]).exists())
+
+    def test_audio_generator_rejects_non_boolean_postprocess(self) -> None:
+        generator = AudioGenerator(create_default_model_service())
+
+        with self.assertRaisesRegex(ValueError, "postprocess"):
+            generator.validate_request(
+                GenerationRequest(
+                    media_type="audio",
+                    prompt="minimal piano cue",
+                    model_id="musicgen-small",
+                    params={"postprocess": "false"},
+                )
+            )
 
     def test_audio_generator_reuses_seed_without_unsupported_generator_kwarg(self) -> None:
         with TemporaryDirectory() as tmp_dir:

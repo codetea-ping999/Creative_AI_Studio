@@ -402,12 +402,44 @@ def process_audio(
     applied: dict[str, Any] = {
         "preset": preset,
         "sample_rate": rate,
+        "enabled": True,
         "chain": [str(step["step"]) for step in steps],
         "steps": steps,
         "duration_seconds_before": duration_before,
         "duration_seconds_after": _duration_seconds(array, rate),
     }
     return array, applied
+
+
+def skipped_processing_report(
+    sample_rate: int,
+    *,
+    preset: str,
+    sample_count: int,
+) -> dict[str, Any]:
+    """Report the same shape as ``process_audio`` for a caller that skipped it.
+
+    Job metadata always carries an ``audio_postprocess`` entry, whether or not
+    the chain actually ran, so a listener does not need a separate null-check
+    to find out why a render sounds different from the usual chain.
+    """
+
+    if preset not in _PRESETS:
+        raise ValueError(
+            f"Unknown audio post-processing preset {preset!r}; "
+            f"expected one of {', '.join(_PRESETS)}."
+        )
+    rate = _require_sample_rate(sample_rate)
+    duration = round(max(0, int(sample_count)) / rate, 6)
+    return {
+        "preset": preset,
+        "sample_rate": rate,
+        "enabled": False,
+        "chain": [],
+        "steps": [],
+        "duration_seconds_before": duration,
+        "duration_seconds_after": duration,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -538,5 +570,6 @@ __all__ = [
     "normalize_peak",
     "normalize_rms",
     "process_audio",
+    "skipped_processing_report",
     "trim_silence",
 ]

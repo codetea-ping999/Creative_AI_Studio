@@ -10,7 +10,7 @@ import wave
 
 import numpy as np
 
-from core.audio import SPEECH_PRESET, process_audio
+from core.audio import SPEECH_PRESET, process_audio, skipped_processing_report
 from core.models import ModelService
 from core.quality import evaluate_audio_output
 from core.schemas import GenerationRequest, GenerationResult
@@ -18,7 +18,7 @@ from generators.base import BaseGenerator
 
 # Reused rather than copied so the lineage keys recorded by the music generator and
 # the narration generator cannot drift apart.
-from .generator import _extract_lineage_metadata
+from .generator import _coerce_postprocess_flag, _extract_lineage_metadata
 
 _MAX_INT16 = 32_767
 
@@ -130,6 +130,9 @@ class SpeechGenerator(BaseGenerator):
                 _DEFAULT_CHUNK_GAP_SECONDS,
             ),
         )
+        postprocess_enabled = _coerce_postprocess_flag(
+            effective_params.pop("postprocess", True)
+        )
         _validate_generation_controls(
             speed=speed,
             pitch=pitch,
@@ -193,11 +196,19 @@ class SpeechGenerator(BaseGenerator):
             chunk_gap_seconds,
             max_output_seconds=_MAX_OUTPUT_SECONDS,
         )
-        processed, postprocess_applied = process_audio(
-            joined,
-            sample_rate,
-            preset=SPEECH_PRESET,
-        )
+        if postprocess_enabled:
+            processed, postprocess_applied = process_audio(
+                joined,
+                sample_rate,
+                preset=SPEECH_PRESET,
+            )
+        else:
+            processed = np.clip(joined, -1.0, 1.0).astype(np.float32)
+            postprocess_applied = skipped_processing_report(
+                sample_rate,
+                preset=SPEECH_PRESET,
+                sample_count=int(joined.size),
+            )
 
         output_id = f"spk_{uuid4().hex}"
         output_path = self.output_dir / f"{output_id}.wav"
@@ -259,6 +270,7 @@ class SpeechGenerator(BaseGenerator):
                     "pitch": pitch,
                     "max_chunk_characters": max_chunk_characters,
                     "chunk_gap_seconds": chunk_gap_seconds,
+                    "postprocess": postprocess_enabled,
                     **effective_params,
                 },
                 "duration_seconds_generated": float(processed.size / sample_rate),
