@@ -6,6 +6,7 @@ import {
   type ModelOption,
   type PromptFormSubmitValues,
 } from "./components/PromptForm";
+import { AssemblyTimelinePanel } from "./components/AssemblyTimelinePanel";
 import { AssetDetailPanel, type FeedbackFormValues } from "./components/AssetDetailPanel";
 import { GalleryPanel } from "./components/GalleryPanel";
 import { LatestJobPanel } from "./components/LatestJobPanel";
@@ -1371,6 +1372,8 @@ function App() {
             }}
           />
         </div>
+
+        <AssemblyTimelinePanel projectId={selectedProjectId} />
 
         <ModelsSummaryPanel
           models={activeModels}
