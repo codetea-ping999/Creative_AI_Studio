@@ -115,9 +115,37 @@ def _thumbnail_tone_grid(**overrides: Any) -> BatchSpec:
     return spec.model_copy(update=overrides)
 
 
+# A character sheet exists to prove one identity holds across views, so these
+# are the fields no axis value may set outright. `prompt`/`negative_prompt` can
+# still be *appended to* via a `prompt_suffix`/`negative_suffix` patch key (see
+# PATCH_APPEND_KEYS) — that append is how angle/expression/pose actually reach
+# the render — the lock only stops a full replacement of the base description.
+CHARACTER_SHEET_LOCKED_FIELDS: tuple[str, ...] = (
+    "model_id",
+    "seed",
+    "prompt",
+    "negative_prompt",
+)
+
+# 4 angles x 2 expressions x 2 poses. Declaration order is angle, expression,
+# pose, so angle (the point of a turnaround sheet) varies slowest and a reader
+# scanning the grid sees every expression/pose of one angle before the next.
+CHARACTER_SHEET_ANGLES: tuple[str, ...] = (
+    "front view",
+    "three-quarter view",
+    "profile view",
+    "back view",
+)
+CHARACTER_SHEET_EXPRESSIONS: tuple[str, ...] = ("neutral", "smiling")
+CHARACTER_SHEET_POSES: tuple[str, ...] = ("standing relaxed", "dynamic action pose")
+CHARACTER_SHEET_VARIATION_COUNT = (
+    len(CHARACTER_SHEET_ANGLES)
+    * len(CHARACTER_SHEET_EXPRESSIONS)
+    * len(CHARACTER_SHEET_POSES)
+)
+
+
 def _character_sheet(**overrides: Any) -> BatchSpec:
-    expressions = ["neutral", "smiling", "determined", "surprised"]
-    angles = ["front view", "three-quarter view", "profile view", "back view"]
     spec = BatchSpec(
         name="Character sheet",
         media_type="image",
@@ -127,17 +155,6 @@ def _character_sheet(**overrides: Any) -> BatchSpec:
         params={"width": 832, "height": 1024, "guidance_scale": 7.0},
         axes=[
             Axis(
-                name="expression",
-                values=[
-                    AxisValue(
-                        label=expression,
-                        patch={"prompt_suffix": f"{expression} expression"},
-                        tags=["expression"],
-                    )
-                    for expression in expressions
-                ],
-            ),
-            Axis(
                 name="angle",
                 values=[
                     AxisValue(
@@ -145,15 +162,40 @@ def _character_sheet(**overrides: Any) -> BatchSpec:
                         patch={"prompt_suffix": angle},
                         tags=["angle"],
                     )
-                    for angle in angles
+                    for angle in CHARACTER_SHEET_ANGLES
+                ],
+            ),
+            Axis(
+                name="expression",
+                values=[
+                    AxisValue(
+                        label=expression,
+                        patch={"prompt_suffix": f"{expression} expression"},
+                        tags=["expression"],
+                    )
+                    for expression in CHARACTER_SHEET_EXPRESSIONS
+                ],
+            ),
+            Axis(
+                name="pose",
+                values=[
+                    AxisValue(
+                        label=pose.replace(" ", "-"),
+                        patch={"prompt_suffix": pose},
+                        tags=["pose"],
+                    )
+                    for pose in CHARACTER_SHEET_POSES
                 ],
             ),
         ],
         strategy="grid",
         # A character sheet exists to prove identity holds, so every cell must use
         # the same seed; varying it would confuse "the model drifted" with "the
-        # seed changed".
+        # seed changed". locked_fields backs this up structurally: even a stray
+        # axis patch containing "seed" (or "model_id"/"prompt"/"negative_prompt")
+        # is rejected rather than silently applied.
         seed_policy="shared",
+        locked_fields=list(CHARACTER_SHEET_LOCKED_FIELDS),
         stages=[Stage(name="sheet", param_overrides={"steps": 26})],
         limit=32,
     )
@@ -196,7 +238,8 @@ _TEMPLATES = {
     ),
     "character-sheet": (
         _character_sheet,
-        "4 expressions x 4 angles at a shared seed, to fix a character's look",
+        "4 angles x 2 expressions x 2 poses at a shared seed, to fix a "
+        "character's look across views",
     ),
     "logline-candidates": (
         _logline_candidates,
@@ -256,6 +299,11 @@ def build_batch_template(template_name: str, /, **overrides: Any) -> BatchSpec:
 
 
 __all__ = [
+    "CHARACTER_SHEET_ANGLES",
+    "CHARACTER_SHEET_EXPRESSIONS",
+    "CHARACTER_SHEET_LOCKED_FIELDS",
+    "CHARACTER_SHEET_POSES",
+    "CHARACTER_SHEET_VARIATION_COUNT",
     "PROBE_STAGE_PARAMS",
     "REFINE_STAGE_PARAMS",
     "build_batch_template",

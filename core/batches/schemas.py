@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from core.schemas import GenerationRequest
 from core.schemas.generation import MediaType
@@ -23,6 +23,19 @@ BATCH_STATUS_CANCELLED = "cancelled"
 ITEM_STATUS_PENDING = "pending"
 
 DEFAULT_ITEM_LIMIT = 64
+
+# Patch keys that append to a field instead of replacing it outright. An axis
+# value using one of these can never trip a lock on the field it targets: a
+# character-sheet angle axis is allowed to add "three-quarter view" to the
+# prompt, but a lock still stops it from replacing the character's base
+# description. `core.batches.expansion` is the only other reader of this map,
+# so it stays the single source of truth for the append/replace split.
+PATCH_APPEND_KEYS: dict[str, str] = {
+    "prompt_suffix": "prompt",
+    "prompt_fragment": "prompt",
+    "negative_suffix": "negative_prompt",
+    "negative_fragment": "negative_prompt",
+}
 
 
 class AxisValue(BaseModel):
@@ -42,6 +55,22 @@ class Axis(BaseModel):
 
     name: str = Field(min_length=1)
     values: list[AxisValue] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_unique_labels(self) -> "Axis":
+        # Two values sharing a label would make two different variations look
+        # identical wherever a label stands in for the value (item labels,
+        # exported filenames), so this fails at definition time rather than
+        # producing indistinguishable output later.
+        seen: set[str] = set()
+        for value in self.values:
+            if value.label in seen:
+                raise ValueError(
+                    f"axis {self.name!r} has duplicate value label {value.label!r}; "
+                    "labels must be unique within an axis."
+                )
+            seen.add(value.label)
+        return self
 
 
 class Stage(BaseModel):
@@ -82,11 +111,47 @@ class BatchSpec(BaseModel):
     seed_policy: str = "shared"
     stages: list[Stage] = Field(default_factory=list)
     limit: int = Field(default=DEFAULT_ITEM_LIMIT, ge=1)
+    # Top-level request fields (or generic param keys) an axis value patch may
+    # never set outright — e.g. a character sheet locks model_id/seed/prompt/
+    # negative_prompt so that varying angle, expression, or pose cannot also
+    # silently swap the model, reseed a cell, or overwrite the character's base
+    # description. A key in PATCH_APPEND_KEYS is exempt from its target's lock
+    # since it appends rather than replaces (see core.batches.expansion).
+    locked_fields: list[str] = Field(default_factory=list)
 
     def resolved_stages(self) -> list[Stage]:
         """Return the stages to run, defaulting to a single unnamed pass."""
 
         return self.stages or [Stage(name="single")]
+
+    @model_validator(mode="after")
+    def _validate_axes(self) -> "BatchSpec":
+        seen_names: set[str] = set()
+        for axis in self.axes:
+            if axis.name in seen_names:
+                raise ValueError(
+                    f"duplicate axis name {axis.name!r}; axis names must be "
+                    "unique within a batch, since axis_values is keyed by name "
+                    "and a repeat would silently drop one axis's value."
+                )
+            seen_names.add(axis.name)
+
+        if not self.locked_fields:
+            return self
+        locked = set(self.locked_fields)
+        for axis in self.axes:
+            for value in axis.values:
+                for key in value.patch:
+                    if key in PATCH_APPEND_KEYS or key not in locked:
+                        continue
+                    raise ValueError(
+                        f"axis {axis.name!r} value {value.label!r} sets locked "
+                        f"field {key!r}; {key!r} is in locked_fields and an axis "
+                        "value cannot override it. Use one of "
+                        f"{sorted(PATCH_APPEND_KEYS)} to append instead, or drop "
+                        f"{key!r} from locked_fields."
+                    )
+        return self
 
 
 class BatchItem(BaseModel):
@@ -153,6 +218,7 @@ __all__ = [
     "BATCH_STRATEGIES",
     "DEFAULT_ITEM_LIMIT",
     "ITEM_STATUS_PENDING",
+    "PATCH_APPEND_KEYS",
     "SEED_POLICIES",
     "Axis",
     "AxisValue",

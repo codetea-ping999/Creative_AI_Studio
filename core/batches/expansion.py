@@ -12,16 +12,7 @@ from typing import Any
 
 from core.schemas import GenerationRequest
 
-from .schemas import Axis, BatchItem, BatchSpec, Stage
-
-# Patch keys that append to a text field instead of replacing it. This is how a
-# structure axis and a tone axis stack onto one base prompt.
-_SUFFIX_KEYS: dict[str, str] = {
-    "prompt_suffix": "prompt",
-    "prompt_fragment": "prompt",
-    "negative_suffix": "negative_prompt",
-    "negative_fragment": "negative_prompt",
-}
+from .schemas import Axis, BatchItem, BatchSpec, PATCH_APPEND_KEYS, Stage
 
 _TOP_LEVEL_KEYS = frozenset(
     {"prompt", "negative_prompt", "model_id", "seed", "output_format", "task_type"}
@@ -143,6 +134,7 @@ def _build_request(
         "params": _deep_copy(spec.params),
     }
 
+    locked_fields = frozenset(spec.locked_fields)
     applied_axis_patches: dict[str, Any] = {}
     for axis_name, value_label in axis_values.items():
         axis = _axis_by_name(spec, axis_name)
@@ -153,7 +145,13 @@ def _build_request(
         )
         if value is None:
             continue
-        _apply_patch(payload, value.patch)
+        _apply_patch(
+            payload,
+            value.patch,
+            locked_fields=locked_fields,
+            axis_name=axis_name,
+            value_label=value_label,
+        )
         applied_axis_patches[axis_name] = _deep_copy(value.patch)
 
     if stage.param_overrides:
@@ -197,10 +195,26 @@ def _build_label(
     return "__".join(axis_values[name] for name in axis_values)
 
 
-def _apply_patch(payload: dict[str, Any], patch: dict[str, Any]) -> None:
+def _apply_patch(
+    payload: dict[str, Any],
+    patch: dict[str, Any],
+    *,
+    locked_fields: frozenset[str] = frozenset(),
+    axis_name: str = "",
+    value_label: str = "",
+) -> None:
     for key, value in patch.items():
-        if key in _SUFFIX_KEYS:
-            target = _SUFFIX_KEYS[key]
+        # BatchSpec's own validator already rejects this at construction time;
+        # this check is what actually stops it, since `model_copy(update=...)` —
+        # how every template applies caller overrides — skips validators.
+        if key not in PATCH_APPEND_KEYS and key in locked_fields:
+            raise ValueError(
+                f"Axis {axis_name!r} value {value_label!r} sets locked field "
+                f"{key!r}; {key!r} is in this batch's locked_fields and cannot "
+                "be overridden by an axis value."
+            )
+        if key in PATCH_APPEND_KEYS:
+            target = PATCH_APPEND_KEYS[key]
             existing = payload.get(target) or ""
             payload[target] = f"{existing}, {value}".strip(", ") if existing else value
             continue
