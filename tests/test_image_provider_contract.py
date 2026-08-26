@@ -25,9 +25,18 @@ from generators.image.providers import (
     ImageProvider,
     ImageProviderCapabilities,
     ImageProviderIdentity,
+    ImageProviderPreflightDisclosure,
+    ImageProviderReferenceAsset,
     ImageProviderResult,
     LocalDiffusersImageProvider,
+    RemoteImageProviderOptInRequiredError,
     UnsupportedImageParameterError,
+    build_image_provider_preflight,
+    cloud_image_provider_opt_in_granted,
+    ensure_image_provider_opt_in,
+    is_local_image_provider,
+    run_image_provider_request,
+    summarize_prompt_for_preflight,
     validate_capabilities,
 )
 
@@ -304,6 +313,188 @@ class ImageGeneratorRoutesThroughContractTest(unittest.TestCase):
             self.assertEqual(
                 pipeline.calls, [], "pipeline must not be invoked when size is rejected"
             )
+
+
+class IsLocalImageProviderTest(unittest.TestCase):
+    """Local-vs-remote classification drives every other guard in this module."""
+
+    def test_local_diffusers_provider_id_is_local(self) -> None:
+        self.assertTrue(is_local_image_provider("local-diffusers"))
+
+    def test_a_remote_looking_provider_id_is_not_local(self) -> None:
+        self.assertFalse(is_local_image_provider("fake-cloud"))
+        self.assertFalse(is_local_image_provider("midjourney"))
+
+
+class CloudImageProviderOptInTest(unittest.TestCase):
+    """`ALLOW_CLOUD_PROVIDERS` and the per-provider variant, in isolation."""
+
+    def test_default_closed_with_no_env_grants_nothing(self) -> None:
+        self.assertFalse(cloud_image_provider_opt_in_granted("fake-cloud", env={}))
+
+    def test_global_flag_grants_any_remote_provider(self) -> None:
+        env = {"ALLOW_CLOUD_PROVIDERS": "true"}
+        self.assertTrue(cloud_image_provider_opt_in_granted("fake-cloud", env=env))
+        self.assertTrue(cloud_image_provider_opt_in_granted("another-vendor", env=env))
+
+    def test_provider_specific_flag_grants_only_that_provider(self) -> None:
+        env = {"ALLOW_CLOUD_PROVIDER_FAKE_CLOUD": "true"}
+        self.assertTrue(cloud_image_provider_opt_in_granted("fake-cloud", env=env))
+        self.assertFalse(cloud_image_provider_opt_in_granted("other-cloud", env=env))
+
+    def test_non_true_values_do_not_grant(self) -> None:
+        env = {"ALLOW_CLOUD_PROVIDERS": "1", "ALLOW_CLOUD_PROVIDER_FAKE_CLOUD": "yes"}
+        self.assertFalse(cloud_image_provider_opt_in_granted("fake-cloud", env=env))
+
+    def test_reads_process_environ_when_env_omitted(self) -> None:
+        with patch.dict("os.environ", {"ALLOW_CLOUD_PROVIDERS": "true"}, clear=False):
+            self.assertTrue(cloud_image_provider_opt_in_granted("fake-cloud"))
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertFalse(cloud_image_provider_opt_in_granted("fake-cloud"))
+
+
+class EnsureImageProviderOptInTest(unittest.TestCase):
+    """The guard a caller runs before any transport call is reachable."""
+
+    def test_local_provider_is_always_allowed_with_no_env(self) -> None:
+        ensure_image_provider_opt_in("local-diffusers", env={})  # must not raise
+
+    def test_remote_provider_without_opt_in_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            RemoteImageProviderOptInRequiredError, "fake-cloud"
+        ) as ctx:
+            ensure_image_provider_opt_in("fake-cloud", env={})
+        # Actionable: names the env vars an operator would set.
+        self.assertIn("ALLOW_CLOUD_PROVIDERS", str(ctx.exception))
+        self.assertIn("ALLOW_CLOUD_PROVIDER_FAKE_CLOUD", str(ctx.exception))
+
+    def test_remote_provider_with_global_opt_in_is_allowed(self) -> None:
+        ensure_image_provider_opt_in(
+            "fake-cloud", env={"ALLOW_CLOUD_PROVIDERS": "true"}
+        )  # must not raise
+
+    def test_remote_provider_with_provider_specific_opt_in_is_allowed(self) -> None:
+        ensure_image_provider_opt_in(
+            "fake-cloud", env={"ALLOW_CLOUD_PROVIDER_FAKE_CLOUD": "true"}
+        )  # must not raise
+
+    def test_provider_specific_opt_in_does_not_leak_to_other_providers(self) -> None:
+        env = {"ALLOW_CLOUD_PROVIDER_FAKE_CLOUD": "true"}
+        with self.assertRaises(RemoteImageProviderOptInRequiredError):
+            ensure_image_provider_opt_in("other-cloud", env=env)
+
+
+class SummarizePromptForPreflightTest(unittest.TestCase):
+    def test_short_prompt_is_returned_unchanged_aside_from_whitespace(self) -> None:
+        self.assertEqual(
+            summarize_prompt_for_preflight("a  fox\nin   a field"), "a fox in a field"
+        )
+
+    def test_long_prompt_is_truncated_with_an_ellipsis(self) -> None:
+        prompt = "a " * 200
+        summary = summarize_prompt_for_preflight(prompt, max_chars=20)
+        self.assertEqual(len(summary), 20)
+        self.assertTrue(summary.endswith("…"))
+        self.assertTrue(prompt.startswith(summary[:-1]))
+
+
+class BuildImageProviderPreflightTest(unittest.TestCase):
+    """The disclosure available before any request submission (issue #256)."""
+
+    def test_local_provider_preflight_reports_local_destination(self) -> None:
+        disclosure = build_image_provider_preflight(
+            _spec(), provider_id="local-diffusers", model_id="sdxl"
+        )
+        self.assertIsInstance(disclosure, ImageProviderPreflightDisclosure)
+        self.assertEqual(disclosure.destination, "local")
+        self.assertEqual(disclosure.provider_id, "local-diffusers")
+        self.assertEqual(disclosure.model_id, "sdxl")
+        self.assertEqual(disclosure.reference_assets, ())
+        self.assertEqual(disclosure.estimated_request_count, 1)
+
+    def test_remote_provider_preflight_reports_remote_destination(self) -> None:
+        disclosure = build_image_provider_preflight(
+            _spec(), provider_id="fake-cloud", model_id="fake-model"
+        )
+        self.assertEqual(disclosure.destination, "remote")
+
+    def test_preflight_carries_reference_assets_and_their_roles(self) -> None:
+        reference_assets = [
+            ImageProviderReferenceAsset(asset_id="asset_1", role="style-reference"),
+            ImageProviderReferenceAsset(asset_id="asset_2", role="character-reference"),
+        ]
+        disclosure = build_image_provider_preflight(
+            _spec(),
+            provider_id="fake-cloud",
+            model_id="fake-model",
+            reference_assets=reference_assets,
+        )
+        self.assertEqual(disclosure.reference_assets, tuple(reference_assets))
+        self.assertEqual(
+            [asset.role for asset in disclosure.reference_assets],
+            ["style-reference", "character-reference"],
+        )
+
+    def test_preflight_estimated_request_count_reflects_batch_size(self) -> None:
+        disclosure = build_image_provider_preflight(
+            _spec(batch_size=4), provider_id="fake-cloud", model_id="fake-model"
+        )
+        self.assertEqual(disclosure.estimated_request_count, 4)
+
+    def test_preflight_does_not_require_opt_in_to_build(self) -> None:
+        # Building the disclosure must succeed even with no opt-in granted --
+        # a caller needs to be able to show a human what would be sent
+        # *before* that human decides whether to opt in.
+        with patch.dict("os.environ", {}, clear=True):
+            disclosure = build_image_provider_preflight(
+                _spec(), provider_id="fake-cloud", model_id="fake-model"
+            )
+        self.assertEqual(disclosure.destination, "remote")
+
+
+class RunImageProviderRequestTest(unittest.TestCase):
+    """Proves the opt-in guard executes before transport is ever reached."""
+
+    def test_local_provider_reaches_transport_with_no_env_set(self) -> None:
+        calls: list[str] = []
+        disclosure, result = run_image_provider_request(
+            _spec(),
+            provider_id="local-diffusers",
+            model_id="sdxl",
+            transport=lambda: calls.append("called") or "ok",
+            env={},
+        )
+        self.assertEqual(calls, ["called"])
+        self.assertEqual(result, "ok")
+        self.assertEqual(disclosure.destination, "local")
+
+    def test_remote_provider_without_opt_in_never_reaches_transport(self) -> None:
+        calls: list[str] = []
+        with self.assertRaises(RemoteImageProviderOptInRequiredError):
+            run_image_provider_request(
+                _spec(),
+                provider_id="fake-cloud",
+                model_id="fake-model",
+                transport=lambda: calls.append("called"),
+                env={},
+            )
+        self.assertEqual(
+            calls, [], "transport must not be invoked when opt-in is missing"
+        )
+
+    def test_remote_provider_with_opt_in_reaches_transport_exactly_once(self) -> None:
+        calls: list[str] = []
+        disclosure, result = run_image_provider_request(
+            _spec(),
+            provider_id="fake-cloud",
+            model_id="fake-model",
+            transport=lambda: calls.append("called") or "sent",
+            env={"ALLOW_CLOUD_PROVIDERS": "true"},
+        )
+        self.assertEqual(calls, ["called"])
+        self.assertEqual(result, "sent")
+        self.assertEqual(disclosure.destination, "remote")
+        self.assertEqual(disclosure.provider_id, "fake-cloud")
 
 
 if __name__ == "__main__":
