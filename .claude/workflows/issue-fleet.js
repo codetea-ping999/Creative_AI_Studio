@@ -24,9 +24,12 @@ const PY = `${REPO}/venv/bin/python`
 // an artifact from another run.
 const PATCH_ROOT = '/tmp/creative-ai-studio-harness-patches'
 // The run ID is part of the expected path, so a well-formed artifact from an
-// earlier fleet cannot be mistaken for this run's handoff.
-const artifactNonce = Math.random().toString(36).slice(2, 10).padEnd(8, '0')
-const ARTIFACT_RUN = `run-${Date.now().toString(36)}-${artifactNonce}`
+// earlier fleet cannot be mistaken for this run's handoff. Defined below, once
+// the requested issue numbers are known (Date.now()/Math.random() throw in
+// this sandbox, so it cannot be time- or randomness-based -- the real
+// collision guarantee comes from mktemp -d's own suffix; this prefix only
+// needs to scope a run to the issue set it was invoked for).
+let ARTIFACT_RUN
 
 // Files where parallel work collides. Only the integrator touches these; agents
 // that need wiring describe it instead of doing it. This is the rule that stops
@@ -99,17 +102,20 @@ const hasExpectedArtifactPath = (patchPath, cluster) => {
 // such text in an explicit, single-use-nonce delimiter and tells the reading
 // agent to treat it as data only.
 //
-// The nonce is minted FRESH on every call, not shared for the whole run: a
-// stage that has already seen a nonce (e.g. Implement sees the nonce wrapping
-// Triage's title in its own prompt) must not be able to predict the nonce that
-// will later wrap ITS OWN output when spliced into the Verify prompt -- that
-// would let a compromised agent forge a matching fake closing marker ahead of
-// time. A monotonic call counter is folded in alongside two random segments so
-// two calls in the same tick can never collide.
+// The nonce is minted FRESH on every call, not shared for the whole run, so a
+// stage that has already seen one nonce (e.g. Implement sees the nonce
+// wrapping Triage's title in its own prompt) cannot reuse it to forge the
+// close marker around ITS OWN output later. This sandbox has no entropy
+// source at all -- Math.random()/Date.now()/new Date() all throw here (they
+// would break resume) -- so the nonce is a monotonic per-run call counter, not
+// a cryptographically unpredictable value: it guarantees no two calls in one
+// run ever share a nonce, but a sophisticated attacker who can count how many
+// untrusted() calls precede theirs could compute a future one. See
+// docs/agent-harness.md for what this does and does not defend against.
 let untrustedCallSequence = 0
 const untrusted = (label, text) => {
   untrustedCallSequence += 1
-  const nonce = `${Math.random().toString(36).slice(2, 10)}${Math.random().toString(36).slice(2, 10)}${untrustedCallSequence.toString(36)}`
+  const nonce = `n${untrustedCallSequence.toString(36)}`
   const value = text == null ? '' : String(text)
   return [
     `<<<UNTRUSTED DATA label="${label}" nonce=${nonce}>>>`,
@@ -227,6 +233,7 @@ if (issues.length === 0) {
 if (issues.length !== requestedArgs.length) {
   throw new Error('Pass each issue number exactly once as an integer, e.g. {args: [103, 104, 105]}')
 }
+ARTIFACT_RUN = `run-issue-fleet-${issues.join('-')}`
 
 // Measured, not assumed: a fresh worktree is a clean checkout of origin/main, so
 // every gitignored artifact is absent. Stating "deps are installed" here is how an
