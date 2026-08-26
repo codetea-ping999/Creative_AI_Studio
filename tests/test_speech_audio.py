@@ -42,6 +42,7 @@ from core.models.audio_runtimes import (
 )
 from core.schemas import GenerationRequest
 from generators.audio import SpeechGenerator, split_into_chunks, split_into_sentences
+from generators.audio.providers import AudioProviderError
 
 _RATE = 1_000
 _FAKE_TTS_RATE = 24_000
@@ -729,6 +730,43 @@ def test_speech_generator_defers_to_generation_time_when_manifest_is_unresolvabl
 
     generator = SpeechGenerator(_UnresolvableModelService(), output_dir=tmp_path)
 
+    generator.validate_request(_speech_request())
+
+
+def test_speech_generator_rejects_a_cloud_manifest_missing_the_speech_capability(
+    tmp_path: Path,
+):
+    # #234's cloud-provider capability guard (AudioGenerator, music) had no
+    # equivalent on SpeechGenerator, so a provider: cloud manifest that never
+    # declared support was silently accepted for narration. Mirrors
+    # AudioGenerator's own guard: reject before generate() resolves anything.
+    manifest = _kokoro_manifest().model_copy(
+        update={"provider": "cloud", "default_params": {}}
+    )
+    generator = SpeechGenerator(
+        _FakeModelService(manifest, _fake_speech_runtime()),
+        output_dir=tmp_path,
+    )
+
+    with pytest.raises(AudioProviderError, match="capabilit"):
+        generator.validate_request(_speech_request())
+
+
+def test_speech_generator_accepts_a_cloud_manifest_declaring_the_speech_capability(
+    tmp_path: Path,
+):
+    manifest = _kokoro_manifest().model_copy(
+        update={
+            "provider": "cloud",
+            "default_params": {"capabilities": ["text-to-speech"]},
+        }
+    )
+    generator = SpeechGenerator(
+        _FakeModelService(manifest, _fake_speech_runtime()),
+        output_dir=tmp_path,
+    )
+
+    # Must not raise.
     generator.validate_request(_speech_request())
 
 

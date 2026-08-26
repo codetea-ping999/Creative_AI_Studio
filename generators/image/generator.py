@@ -122,7 +122,12 @@ class ImageGenerator(BaseGenerator):
             width=width,
             height=height,
             seed=base_seed,
-            batch_size=variation_count,
+            # One call below produces exactly one image (`replace(request_spec,
+            # seed=...)` is called once per variation, inside the loop) --
+            # batch_size describes that single call, not the job-wide
+            # variation_count. A provider with an honestly small max_batch
+            # would otherwise reject every multi-variation request.
+            batch_size=1,
             lora_path=str(spec_lora_path) if spec_lora_path is not None else None,
             lora_scale=(
                 float(cast(float, spec_lora_scale)) if spec_lora_scale is not None else 1.0
