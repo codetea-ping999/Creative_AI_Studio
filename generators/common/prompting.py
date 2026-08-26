@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from core.prompting import ComposedPrompt, PromptComposer, PromptSpec
+from core.reference_capabilities import ReferenceImageInput
 from core.schemas import GenerationRequest
 
 # Params consumed by resolution rather than passed to the model.
@@ -35,6 +36,7 @@ class ResolvedPrompt:
     seed: int | None
     lora: dict[str, Any] | None = None
     reference_asset_ids: list[str] = field(default_factory=list)
+    resolved_references: list[ReferenceImageInput] = field(default_factory=list)
     composition: dict[str, Any] | None = None
 
 
@@ -94,6 +96,7 @@ def resolve_generation_prompt(
         seed=composed.seed,
         lora=composed.lora,
         reference_asset_ids=composed.reference_asset_ids,
+        resolved_references=composed.resolved_references,
         composition=composition,
     )
 

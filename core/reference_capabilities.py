@@ -140,6 +140,20 @@ class UnsupportedReferenceError(ValueError):
     """Raised when a request asks for reference conditioning a model cannot honor."""
 
 
+class MissingReferenceAssetError(ValueError):
+    """Raised when a reference points at an asset that cannot supply an image.
+
+    Distinct from `UnsupportedReferenceError`: that one means "the chosen model
+    can't honor this reference type or strength"; this one means the reference
+    itself is broken -- the asset id does not resolve (deleted, never existed,
+    or a typo) or resolves to a non-image asset. An unknown Bible entry id
+    degrades to a warning so one bad axis value cannot fail a whole batch, but
+    a Bible entry that names a since-deleted reference asset must stop
+    generation outright: silently dropping identity/location conditioning
+    would produce a wrong-looking result without any signal that it happened.
+    """
+
+
 def validate_reference_inputs(
     references: list[ReferenceImageInput],
     *,
@@ -194,6 +208,7 @@ __all__ = [
     "DEFAULT_REFERENCE_STRENGTH",
     "MAX_REFERENCE_STRENGTH",
     "MIN_REFERENCE_STRENGTH",
+    "MissingReferenceAssetError",
     "REFERENCE_CONDITIONING_MODES",
     "REFERENCE_PREPROCESSING_MODES",
     "REFERENCE_ROLES",

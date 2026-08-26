@@ -11,6 +11,7 @@ from apps.api.dependencies import get_services
 from bootstrap import ApplicationServices
 from core.bible import BIBLE_KINDS, BibleEntry
 from core.prompting import PromptSpec, get_axis_catalog, list_axis_catalogs
+from core.reference_capabilities import MissingReferenceAssetError, ReferenceImageInput
 
 router = APIRouter(prefix="/bible", tags=["bible"])
 
@@ -111,6 +112,10 @@ class PromptPreviewResponse(BaseModel):
     seed: int | None
     lora: dict[str, Any] | None
     reference_asset_ids: list[str]
+    # #199: same asset ids as above, but with the character/location role and
+    # strength a generation request would carry -- lets the preview surface
+    # what reference conditioning would actually be requested.
+    resolved_references: list[ReferenceImageInput] = Field(default_factory=list)
     palette: list[str]
     attributes: dict[str, str]
     applied: list[dict[str, Any]]
@@ -181,7 +186,16 @@ def preview_prompt(
     request: PromptPreviewRequest,
     services: ApplicationServices = Depends(get_services),
 ) -> PromptPreviewResponse:
-    composed = services.prompt_composer.compose(PromptSpec(**request.model_dump()))
+    try:
+        composed = services.prompt_composer.compose(PromptSpec(**request.model_dump()))
+    except MissingReferenceAssetError as exc:
+        # #199: a broken Bible reference (deleted/incompatible asset) must
+        # surface here, in the dry-run the UI calls before generating,
+        # exactly the way an unsupported reference already fails at job
+        # creation (see UnsupportedReferenceError in generate.py/jobs.py).
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
     return PromptPreviewResponse(**composed.model_dump(mode="json"))
 
 

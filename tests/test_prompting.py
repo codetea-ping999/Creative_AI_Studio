@@ -9,6 +9,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from core.assets import Asset, AssetRepository  # noqa: E402
 from core.bible import BibleRepository  # noqa: E402
 from core.prompting import (  # noqa: E402
     PromptComposer,
@@ -16,6 +17,12 @@ from core.prompting import (  # noqa: E402
     get_axis_catalog,
     list_axis_catalogs,
 )
+from core.reference_capabilities import (  # noqa: E402
+    DEFAULT_REFERENCE_STRENGTH,
+    MissingReferenceAssetError,
+)
+from core.schemas import GenerationRequest  # noqa: E402
+from generators.common import resolve_generation_prompt  # noqa: E402
 
 
 class PromptCompositionTests(unittest.TestCase):
@@ -239,6 +246,147 @@ class PromptCompositionTests(unittest.TestCase):
         self.assertIn("axis:tone", sources)
         self.assertIn("extra", sources)
         self.assertIn("template", sources)
+
+
+class BibleReferenceResolutionTests(unittest.TestCase):
+    """#199: resolve Bible character/location references into generation inputs.
+
+    Uses real, file-backed `BibleRepository`/`AssetRepository` fixtures (not
+    mocks) so the tests exercise the same repository code paths generation
+    actually runs through.
+    """
+
+    def setUp(self) -> None:
+        self._temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temporary.cleanup)
+        root = Path(self._temporary.name)
+        self.bible_repository = BibleRepository(root / "bible")
+        self.asset_repository = AssetRepository(root / "assets")
+        self.composer = PromptComposer(self.bible_repository, self.asset_repository)
+
+    def _make_asset(self, asset_id: str, *, media_type: str = "image") -> Asset:
+        asset = Asset(
+            id=asset_id,
+            job_id="job_fixture",
+            project_id=None,
+            media_type=media_type,
+            kind="output",
+            title="reference fixture",
+            prompt="a reference image",
+            model_id="sdxl",
+            path=f"outputs/{asset_id}.png",
+        )
+        self.asset_repository.create_or_update(asset)
+        return asset
+
+    def test_character_and_location_references_resolve_with_role_and_strength(
+        self,
+    ) -> None:
+        self._make_asset("asset_char_1")
+        self._make_asset("asset_loc_1")
+        character = self.bible_repository.create(
+            kind="character", name="Mina", reference_asset_ids=["asset_char_1"]
+        )
+        location = self.bible_repository.create(
+            kind="location", name="Rooftop", reference_asset_ids=["asset_loc_1"]
+        )
+        composed = self.composer.compose(
+            PromptSpec(bible_refs=[character.id, location.id])
+        )
+        by_asset = {ref.asset_id: ref for ref in composed.resolved_references}
+        self.assertEqual(by_asset["asset_char_1"].role, "character")
+        self.assertEqual(by_asset["asset_loc_1"].role, "location")
+        self.assertEqual(by_asset["asset_char_1"].strength, DEFAULT_REFERENCE_STRENGTH)
+        self.assertEqual(by_asset["asset_loc_1"].strength, DEFAULT_REFERENCE_STRENGTH)
+        self.assertEqual(composed.conflicts, [])
+
+    def test_resolution_is_deterministic(self) -> None:
+        self._make_asset("asset_char_1")
+        character = self.bible_repository.create(
+            kind="character", name="Mina", reference_asset_ids=["asset_char_1"]
+        )
+        spec = PromptSpec(bible_refs=[character.id])
+        first = self.composer.compose(spec)
+        second = self.composer.compose(spec)
+        self.assertEqual(first.resolved_references, second.resolved_references)
+
+    def test_style_references_stay_out_of_resolved_references(self) -> None:
+        self._make_asset("asset_style_1")
+        style = self.bible_repository.create(
+            kind="style", name="Noir", reference_asset_ids=["asset_style_1"]
+        )
+        composed = self.composer.compose(PromptSpec(bible_refs=[style.id]))
+        self.assertEqual(composed.resolved_references, [])
+        # The pre-#199 flat list is unaffected -- a style entry's reference
+        # assets still flow through it, just without a role.
+        self.assertEqual(composed.reference_asset_ids, ["asset_style_1"])
+
+    def test_missing_reference_asset_raises_an_actionable_error(self) -> None:
+        character = self.bible_repository.create(
+            kind="character", name="Mina", reference_asset_ids=["asset_missing"]
+        )
+        with self.assertRaises(MissingReferenceAssetError) as ctx:
+            self.composer.compose(PromptSpec(bible_refs=[character.id]))
+        message = str(ctx.exception)
+        self.assertIn("Mina", message)
+        self.assertIn("asset_missing", message)
+        self.assertIn("character", message)
+
+    def test_incompatible_reference_asset_raises_before_resolving(self) -> None:
+        self._make_asset("asset_audio_1", media_type="audio")
+        character = self.bible_repository.create(
+            kind="character", name="Mina", reference_asset_ids=["asset_audio_1"]
+        )
+        with self.assertRaises(MissingReferenceAssetError) as ctx:
+            self.composer.compose(PromptSpec(bible_refs=[character.id]))
+        self.assertIn("audio", str(ctx.exception))
+
+    def test_without_an_asset_repository_references_are_collected_but_unvalidated(
+        self,
+    ) -> None:
+        character = self.bible_repository.create(
+            kind="character", name="Mina", reference_asset_ids=["asset_missing"]
+        )
+        composer_without_assets = PromptComposer(self.bible_repository)
+        composed = composer_without_assets.compose(
+            PromptSpec(bible_refs=[character.id])
+        )
+        self.assertEqual(len(composed.resolved_references), 1)
+        self.assertEqual(composed.resolved_references[0].asset_id, "asset_missing")
+
+    def test_duplicate_asset_and_role_across_entries_is_not_duplicated(self) -> None:
+        self._make_asset("asset_char_1")
+        first = self.bible_repository.create(
+            kind="character", name="Mina", reference_asset_ids=["asset_char_1"]
+        )
+        second = self.bible_repository.create(
+            kind="character", name="Mina Alt", reference_asset_ids=["asset_char_1"]
+        )
+        composed = self.composer.compose(
+            PromptSpec(bible_refs=[first.id, second.id])
+        )
+        self.assertEqual(len(composed.resolved_references), 1)
+
+    def test_resolved_references_reach_generators_through_resolve_generation_prompt(
+        self,
+    ) -> None:
+        self._make_asset("asset_char_1")
+        character = self.bible_repository.create(
+            kind="character", name="Mina", reference_asset_ids=["asset_char_1"]
+        )
+        request = GenerationRequest(
+            media_type="image", prompt="rooftop at dawn", model_id="sdxl"
+        )
+        params: dict[str, object] = {"bible_refs": [character.id]}
+        resolved = resolve_generation_prompt(
+            request, params, composer=self.composer, template="image"
+        )
+        self.assertEqual(len(resolved.resolved_references), 1)
+        self.assertEqual(resolved.resolved_references[0].asset_id, "asset_char_1")
+        self.assertEqual(resolved.resolved_references[0].role, "character")
+        # Resolution keys are consumed from params so they never reach a
+        # pipeline call that would reject an unknown keyword argument.
+        self.assertNotIn("bible_refs", params)
 
 
 class AxisCatalogTests(unittest.TestCase):

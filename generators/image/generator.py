@@ -251,6 +251,14 @@ class ImageGenerator(BaseGenerator):
                 "requested_prompt": request.prompt,
                 "prompt_composition": resolved_prompt.composition,
                 "reference_asset_ids": resolved_prompt.reference_asset_ids,
+                # #199: which asset, role (character/location), and strength a
+                # Bible reference resolved to -- recorded even though nothing
+                # downstream conditions on it yet (#201), so a job's metadata
+                # is a complete audit trail of what was asked for.
+                "resolved_references": [
+                    reference.model_dump(mode="json")
+                    for reference in resolved_prompt.resolved_references
+                ],
                 "requested_model_id": requested_model_id,
                 "model_id": manifest.public_model_id,
                 "manifest_id": manifest.id,

@@ -375,9 +375,13 @@ def create_application_services(
         max_cached_models=resolved_max_cached_models,
     )
     bible_repository = BibleRepository(resolved_db_path.parent / "bible")
-    prompt_composer = PromptComposer(bible_repository)
     job_repository = JobRepository(resolved_db_path)
     asset_repository = AssetRepository(resolved_db_path.parent / "assets")
+    # asset_repository must exist before the composer so bible-derived
+    # character/location references can be checked against the real asset
+    # store (#199) -- without it, MissingReferenceAssetError never fires in
+    # the running app even though it's fully implemented and tested.
+    prompt_composer = PromptComposer(bible_repository, asset_repository)
     generator_registry = create_default_generator_registry(
         model_service=model_service,
         asset_repository=asset_repository,

@@ -184,6 +184,30 @@ class BibleApiTests(unittest.TestCase):
                 any("locked attribute" in message for message in preview["conflicts"])
             )
 
+    def test_preview_rejects_a_bible_entry_referencing_a_missing_asset(self) -> None:
+        # #199: PromptComposer's asset resolution is wired only if
+        # bootstrap/factories.py constructs it with an asset_repository.
+        # This drives the real app (create_application_services), not a
+        # hand-built PromptComposer, so it would have passed silently (no
+        # 422, references dropped) if that wiring were ever missing again.
+        with TemporaryDirectory() as tmp_dir:
+            studio = _Studio(Path(tmp_dir))
+            entry = self._create_entry(
+                studio, reference_asset_ids=["asset_does_not_exist"]
+            )
+
+            response = studio.client.post(
+                "/bible/preview",
+                json={
+                    "base_prompt": "rooftop at dawn",
+                    "bible_refs": [entry["id"]],
+                    "template": "image",
+                },
+            )
+
+            self.assertEqual(response.status_code, 422, response.text)
+            self.assertIn("asset_does_not_exist", response.text)
+
     def test_axis_catalogs_are_served(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             studio = _Studio(Path(tmp_dir))
