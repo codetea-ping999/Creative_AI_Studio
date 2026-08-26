@@ -21,6 +21,12 @@ from core.quality import (
 from core.schemas import GenerationRequest, GenerationResult
 from generators.base import BaseGenerator
 
+from .providers import (
+    AudioProviderCapability,
+    ensure_capabilities_declared,
+    manifest_declared_capabilities,
+)
+
 _MAX_INT16 = 32_767
 _AUDIO_PARAM_RANGES = {
     "guidance_scale": (1.0, 10.0),
@@ -71,6 +77,8 @@ class AudioGenerator(BaseGenerator):
             task_type=self.task_type,
         )
         is_long_form = "long-form" in manifest.tags
+        if manifest.provider == "cloud":
+            self._validate_cloud_capabilities(manifest, request, is_long_form=is_long_form)
         duration_minimum, duration_maximum = (
             _LONG_DURATION_RANGE if is_long_form else _SHORT_DURATION_RANGE
         )
@@ -127,6 +135,39 @@ class AudioGenerator(BaseGenerator):
             raise ValueError(
                 f"Audio parameter '{name}' must be between {minimum:g} and {maximum:g}."
             )
+
+    def _validate_cloud_capabilities(
+        self,
+        manifest: Any,
+        request: GenerationRequest,
+        *,
+        is_long_form: bool,
+    ) -> None:
+        """Reject a `provider: cloud` request the manifest never advertised.
+
+        Runs from validate_request(), strictly before generate() would
+        resolve any runtime/adapter, so an unsupported capability never
+        reaches a network call (see generators/audio/providers.py, #234).
+        Local (non-cloud) manifests never call this, so their behavior is
+        unchanged.
+        """
+
+        required = {AudioProviderCapability.TEXT_TO_MUSIC}
+        if is_long_form:
+            required.add(AudioProviderCapability.LONG_FORM)
+        if str(request.params.get("reuse_action") or "") == "melody":
+            required.add(AudioProviderCapability.MELODY_CONDITIONING)
+
+        manifest_label = f"Model {manifest.public_model_id!r}"
+        declared = manifest_declared_capabilities(
+            manifest.default_params,
+            manifest_label=manifest_label,
+        )
+        ensure_capabilities_declared(
+            declared,
+            frozenset(required),
+            manifest_label=manifest_label,
+        )
 
     def prepare(self, request: GenerationRequest) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
