@@ -14,7 +14,7 @@ CORE_IMPORT_ERROR: Exception | None = None
 try:
     from bootstrap import create_application_services
     from core.jobs import CancellationRegistry, EventBus, JobQueue, JobRunner, JobService
-    from core.jobs.context import GenerationCancelled, GenerationContext
+    from core.jobs.context import GenerationContext
     from core.schemas import GenerationRequest, GenerationResult
     from core.storage.repositories.job_repository import JobRepository
     from generators.base import BaseGenerator
@@ -505,6 +505,196 @@ class JobPipelineTests(unittest.TestCase):
             self.assertEqual(skipped_job.status, "cancelled")
             self.assertFalse((root / "outputs" / "audio" / "stub.wav").exists())
 
+    @unittest.skipIf(API_IMPORT_ERROR is not None, f"missing dependency: {API_IMPORT_ERROR}")
+    def test_cancel_endpoint_moves_a_running_job_to_cancel_requested(self) -> None:
+        """#207: `POST /jobs/{id}/cancel` against an in-flight job reports
+        `cancel_requested`, not `cancelled` -- and a repeated call is a
+        no-op that keeps reporting the same state."""
+
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            services = create_application_services(
+                db_path=root / "jobs.db",
+                output_dir=root / "outputs" / "images",
+            )
+            client = TestClient(create_app(services, start_job_runner=False))
+            job = services.job_service.create_job(
+                GenerationRequest(
+                    media_type="audio",
+                    prompt="cancel this running job",
+                    model_id="",
+                    output_format="wav",
+                    params={},
+                )
+            )
+            services.job_repository.update_status(job.id, "running")
+
+            response = client.post(f"/jobs/{job.id}/cancel")
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["status"], "cancel_requested")
+
+            get_response = client.get(f"/jobs/{job.id}")
+            self.assertEqual(get_response.json()["status"], "cancel_requested")
+
+            # Repeated cancel requests remain idempotent (#206/#207): no error,
+            # and the status does not change again.
+            second_response = client.post(f"/jobs/{job.id}/cancel")
+            self.assertEqual(second_response.status_code, 200)
+            self.assertEqual(second_response.json()["status"], "cancel_requested")
+
+    def test_cancel_service_transitions_queued_job_directly_to_cancelled(self) -> None:
+        """#207: a queued job has nothing in-flight to interrupt, so cancel
+        resolves immediately to the terminal `cancelled` state."""
+
+        with TemporaryDirectory() as tmp_dir:
+            repository = JobRepository(Path(tmp_dir) / "jobs.db")
+            queue = JobQueue()
+            service = JobService(repository, queue)
+            job = service.create_job(
+                GenerationRequest(
+                    media_type="audio",
+                    prompt="queued cancel",
+                    model_id="",
+                    output_format="wav",
+                    params={},
+                )
+            )
+
+            cancelled = service.cancel_job(job.id)
+
+            self.assertIsNotNone(cancelled)
+            assert cancelled is not None
+            self.assertEqual(cancelled.status, "cancelled")
+
+    def test_cancel_service_moves_running_like_jobs_to_cancel_requested_not_cancelled(
+        self,
+    ) -> None:
+        """#207: preparing/running/postprocessing cannot be discarded
+        synchronously -- cancel must move them to `cancel_requested`, not
+        straight to the terminal `cancelled` state."""
+
+        for running_like_status in ("preparing", "running", "postprocessing"):
+            with self.subTest(status=running_like_status):
+                with TemporaryDirectory() as tmp_dir:
+                    repository = JobRepository(Path(tmp_dir) / "jobs.db")
+                    queue = JobQueue()
+                    service = JobService(repository, queue)
+                    job = service.create_job(
+                        GenerationRequest(
+                            media_type="audio",
+                            prompt="in-flight cancel",
+                            model_id="",
+                            output_format="wav",
+                            params={},
+                        )
+                    )
+                    repository.update_status(job.id, running_like_status)
+
+                    cancelled = service.cancel_job(job.id)
+
+                    self.assertIsNotNone(cancelled)
+                    assert cancelled is not None
+                    self.assertEqual(cancelled.status, "cancel_requested")
+                    self.assertNotEqual(cancelled.status, "cancelled")
+                    persisted = repository.get(job.id)
+                    assert persisted is not None
+                    self.assertEqual(persisted.status, "cancel_requested")
+
+    def test_cancel_service_leaves_terminal_jobs_unchanged(self) -> None:
+        """#207: succeeded/failed/cancelled jobs must not be touched by a
+        (possibly late-arriving) cancel request."""
+
+        for terminal_status in ("succeeded", "failed", "cancelled"):
+            with self.subTest(status=terminal_status):
+                with TemporaryDirectory() as tmp_dir:
+                    repository = JobRepository(Path(tmp_dir) / "jobs.db")
+                    queue = JobQueue()
+                    service = JobService(repository, queue)
+                    job = service.create_job(
+                        GenerationRequest(
+                            media_type="audio",
+                            prompt="already finished",
+                            model_id="",
+                            output_format="wav",
+                            params={},
+                        )
+                    )
+                    repository.update_status(job.id, terminal_status)
+
+                    result = service.cancel_job(job.id)
+
+                    self.assertIsNotNone(result)
+                    assert result is not None
+                    self.assertEqual(result.status, terminal_status)
+
+    def test_cancel_service_is_idempotent_for_repeated_requests(self) -> None:
+        """#207: cancelling an already `cancel_requested` job again must be a
+        no-op, not an error and not a new transition."""
+
+        with TemporaryDirectory() as tmp_dir:
+            repository = JobRepository(Path(tmp_dir) / "jobs.db")
+            queue = JobQueue()
+            service = JobService(repository, queue)
+            job = service.create_job(
+                GenerationRequest(
+                    media_type="audio",
+                    prompt="cancel twice",
+                    model_id="",
+                    output_format="wav",
+                    params={},
+                )
+            )
+            repository.update_status(job.id, "running")
+
+            first = service.cancel_job(job.id)
+            second = service.cancel_job(job.id)
+
+            self.assertIsNotNone(first)
+            self.assertIsNotNone(second)
+            assert first is not None and second is not None
+            self.assertEqual(first.status, "cancel_requested")
+            self.assertEqual(second.status, "cancel_requested")
+
+    def test_mark_succeeded_refuses_a_cancel_requested_job(self) -> None:
+        """#207: a generation that races a cancel request must never be
+        reported as a success, even if something calls `mark_succeeded`
+        directly against a `cancel_requested` job."""
+
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            repository = JobRepository(root / "jobs.db")
+            queue = JobQueue()
+            service = JobService(repository, queue)
+            job = service.create_job(
+                GenerationRequest(
+                    media_type="audio",
+                    prompt="races a cancel",
+                    model_id="",
+                    output_format="wav",
+                    params={},
+                )
+            )
+            repository.update_status(job.id, "running")
+            service.cancel_job(job.id)
+
+            result = service.mark_succeeded(
+                job.id,
+                GenerationResult(
+                    job_id=job.id,
+                    status="succeeded",
+                    outputs=[],
+                    previews=[],
+                    metadata={},
+                    error_message=None,
+                ),
+            )
+
+            self.assertIsNotNone(result)
+            assert result is not None
+            self.assertEqual(result.status, "cancel_requested")
+            self.assertNotEqual(result.status, "succeeded")
+
     def test_runner_honors_cancellation_that_lands_during_generation(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -624,7 +814,7 @@ class JobPipelineTests(unittest.TestCase):
                 cancellation_registry=cancellation_registry,
             )
 
-            job = service.create_job(
+            service.create_job(
                 GenerationRequest(
                     media_type="audio",
                     prompt="watch me climb",

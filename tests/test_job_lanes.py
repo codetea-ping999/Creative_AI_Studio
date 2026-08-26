@@ -1,10 +1,11 @@
-"""Tests for JOB_LANES configuration parsing and lane assignment (#179)."""
+"""Tests for JOB_LANES configuration/assignment (#179) and lane routing (#180)."""
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
 import sys
+from tempfile import TemporaryDirectory
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -19,6 +20,38 @@ from core.jobs.lanes import (  # noqa: E402
     parse_job_lanes,
     resolve_lane,
 )
+from core.jobs.queue import JobQueue  # noqa: E402
+from core.jobs.runner import JobRunner  # noqa: E402
+from core.jobs.service import JobService  # noqa: E402
+from core.schemas import GenerationRequest  # noqa: E402
+from core.storage.repositories.job_repository import JobRepository  # noqa: E402
+from generators.base import BaseGenerator  # noqa: E402
+from generators.registry import GeneratorRegistry  # noqa: E402
+
+
+class _ImmediateGenerator(BaseGenerator):
+    """Minimal generator that succeeds without touching the filesystem."""
+
+    def validate_request(self, request: GenerationRequest) -> None:
+        return None
+
+    def prepare(self, request: GenerationRequest) -> None:
+        return None
+
+    def generate(self, request: GenerationRequest, context=None):
+        from core.schemas import GenerationResult
+
+        return GenerationResult(
+            job_id="lane-stub",
+            status="succeeded",
+            outputs=[],
+            previews=[],
+            metadata={"media_type": request.media_type},
+            error_message=None,
+        )
+
+    def cleanup(self, request: GenerationRequest) -> None:
+        return None
 
 
 class ParseJobLanesTests(unittest.TestCase):
@@ -193,6 +226,233 @@ class PackageExportsTests(unittest.TestCase):
         self.assertIs(jobs_package.assign_lane, assign_lane)
         self.assertIs(jobs_package.parse_job_lanes, parse_job_lanes)
         self.assertIs(jobs_package.resolve_lane, resolve_lane)
+
+
+class JobQueueLaneRoutingTests(unittest.TestCase):
+    """Tests for `core/jobs/queue.py`'s lane-partitioned FIFO (#180)."""
+
+    def test_default_construction_is_single_lane_and_backward_compatible(self) -> None:
+        # No `lanes` argument at all: enqueue/dequeue/size take no lane
+        # argument, exactly as before #180 -- this is the "single-lane
+        # configuration matches current behavior" acceptance criterion.
+        queue = JobQueue()
+        self.assertTrue(queue.is_single_lane)
+        self.assertEqual(queue.size(), 0)
+
+        queue.enqueue("job-1")
+        queue.enqueue("job-2")
+        self.assertEqual(queue.size(), 2)
+        self.assertEqual(queue.dequeue(), "job-1")
+        self.assertEqual(queue.dequeue(), "job-2")
+        self.assertIsNone(queue.dequeue())
+
+    def test_multi_lane_queues_preserve_fifo_independently(self) -> None:
+        queue = JobQueue(lanes=(LANE_HEAVY, LANE_LIGHT))
+
+        queue.enqueue("heavy-1", lane=LANE_HEAVY)
+        queue.enqueue("light-1", lane=LANE_LIGHT)
+        queue.enqueue("heavy-2", lane=LANE_HEAVY)
+        queue.enqueue("light-2", lane=LANE_LIGHT)
+
+        # Each lane's own FIFO order is unaffected by activity in the other
+        # lane -- a long run of heavy jobs never reorders light jobs (or vice
+        # versa).
+        self.assertEqual(queue.dequeue(lane=LANE_HEAVY), "heavy-1")
+        self.assertEqual(queue.dequeue(lane=LANE_LIGHT), "light-1")
+        self.assertEqual(queue.dequeue(lane=LANE_HEAVY), "heavy-2")
+        self.assertEqual(queue.dequeue(lane=LANE_LIGHT), "light-2")
+
+    def test_a_job_enqueued_to_one_lane_cannot_be_consumed_from_another(self) -> None:
+        queue = JobQueue(lanes=(LANE_HEAVY, LANE_LIGHT))
+        queue.enqueue("heavy-only", lane=LANE_HEAVY)
+
+        # The job is not visible to the light lane at all...
+        self.assertIsNone(queue.dequeue(lane=LANE_LIGHT))
+        # ...and dequeuing it from its actual lane returns it exactly once.
+        self.assertEqual(queue.dequeue(lane=LANE_HEAVY), "heavy-only")
+        self.assertIsNone(queue.dequeue(lane=LANE_HEAVY))
+        self.assertIsNone(queue.dequeue(lane=LANE_LIGHT))
+
+    def test_enqueuing_the_same_job_into_a_different_lane_raises(self) -> None:
+        queue = JobQueue(lanes=(LANE_HEAVY, LANE_LIGHT))
+        queue.enqueue("job-1", lane=LANE_HEAVY)
+
+        with self.assertRaises(ValueError) as ctx:
+            queue.enqueue("job-1", lane=LANE_LIGHT)
+        message = str(ctx.exception)
+        self.assertIn("job-1", message)
+        self.assertIn(LANE_HEAVY, message)
+        self.assertIn(LANE_LIGHT, message)
+
+        # The job must still be consumable exactly once, from its original
+        # lane -- the rejected call must not have partially mutated state.
+        self.assertIsNone(queue.dequeue(lane=LANE_LIGHT))
+        self.assertEqual(queue.dequeue(lane=LANE_HEAVY), "job-1")
+
+    def test_enqueuing_the_same_job_into_the_same_lane_twice_is_idempotent(self) -> None:
+        queue = JobQueue(lanes=(LANE_HEAVY, LANE_LIGHT))
+        queue.enqueue("job-1", lane=LANE_HEAVY)
+        queue.enqueue("job-1", lane=LANE_HEAVY)
+
+        self.assertEqual(queue.size(lane=LANE_HEAVY), 1)
+        self.assertEqual(queue.dequeue(lane=LANE_HEAVY), "job-1")
+        self.assertIsNone(queue.dequeue(lane=LANE_HEAVY))
+
+    def test_dequeue_without_a_lane_on_a_multi_lane_queue_raises_actionable_error(
+        self,
+    ) -> None:
+        queue = JobQueue(lanes=(LANE_HEAVY, LANE_LIGHT))
+        with self.assertRaises(ValueError) as ctx:
+            queue.dequeue()
+        message = str(ctx.exception)
+        self.assertIn(LANE_HEAVY, message)
+        self.assertIn(LANE_LIGHT, message)
+
+    def test_enqueue_without_a_lane_on_a_multi_lane_queue_raises_actionable_error(
+        self,
+    ) -> None:
+        queue = JobQueue(lanes=(LANE_HEAVY, LANE_LIGHT))
+        with self.assertRaises(ValueError):
+            queue.enqueue("job-1")
+
+    def test_unknown_lane_raises_actionable_error(self) -> None:
+        queue = JobQueue(lanes=(LANE_HEAVY, LANE_LIGHT))
+        with self.assertRaises(ValueError) as ctx:
+            queue.enqueue("job-1", lane="mystery")
+        self.assertIn("mystery", str(ctx.exception))
+
+    def test_size_reports_per_lane_and_aggregate(self) -> None:
+        queue = JobQueue(lanes=(LANE_HEAVY, LANE_LIGHT))
+        queue.enqueue("heavy-1", lane=LANE_HEAVY)
+        queue.enqueue("heavy-2", lane=LANE_HEAVY)
+        queue.enqueue("light-1", lane=LANE_LIGHT)
+
+        self.assertEqual(queue.size(lane=LANE_HEAVY), 2)
+        self.assertEqual(queue.size(lane=LANE_LIGHT), 1)
+        self.assertEqual(queue.size(), 3)
+
+    def test_duplicate_lane_names_raise_at_construction(self) -> None:
+        with self.assertRaises(ValueError):
+            JobQueue(lanes=(LANE_HEAVY, LANE_HEAVY))
+
+
+class JobServiceLaneRoutingTests(unittest.TestCase):
+    """Tests that `JobService.enqueue_job` applies the lane assignment
+    contract without duplication (#180)."""
+
+    def test_enqueue_job_without_lane_config_uses_the_queues_implicit_lane(
+        self,
+    ) -> None:
+        # No `lane_config` at all -- must reproduce pre-#180 JobService
+        # behavior exactly, since this is what every existing caller
+        # (bootstrap/factories.py, most tests) still does.
+        with TemporaryDirectory() as tmp_dir:
+            repository = JobRepository(Path(tmp_dir) / "jobs.db")
+            queue = JobQueue()
+            service = JobService(repository, queue)
+
+            job = service.create_job(
+                GenerationRequest(media_type="text", prompt="a story beat", model_id="")
+            )
+
+            self.assertEqual(queue.size(), 1)
+            self.assertEqual(queue.dequeue(), job.id)
+
+    def test_enqueue_job_with_a_single_lane_config_collapses_onto_the_implicit_lane(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            repository = JobRepository(Path(tmp_dir) / "jobs.db")
+            queue = JobQueue()
+            service = JobService(repository, queue, lane_config=parse_job_lanes("heavy:1"))
+
+            image_job = service.create_job(
+                GenerationRequest(media_type="image", prompt="a skyline", model_id="sdxl")
+            )
+            text_job = service.create_job(
+                GenerationRequest(media_type="text", prompt="a beat", model_id="")
+            )
+
+            # Both land in the queue's one implicit lane, in FIFO order.
+            self.assertEqual(queue.size(), 2)
+            self.assertEqual(queue.dequeue(), image_job.id)
+            self.assertEqual(queue.dequeue(), text_job.id)
+
+    def test_enqueue_job_with_a_multi_lane_config_routes_without_duplication(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            repository = JobRepository(Path(tmp_dir) / "jobs.db")
+            queue = JobQueue(lanes=(LANE_HEAVY, LANE_LIGHT))
+            service = JobService(
+                repository, queue, lane_config=parse_job_lanes(DEFAULT_JOB_LANES)
+            )
+
+            image_job = service.create_job(
+                GenerationRequest(media_type="image", prompt="a skyline", model_id="sdxl")
+            )
+            text_job = service.create_job(
+                GenerationRequest(media_type="text", prompt="a beat", model_id="")
+            )
+            speech_job = service.create_job(
+                GenerationRequest(
+                    media_type="audio",
+                    prompt="narration",
+                    model_id="",
+                    task_type="text-to-speech",
+                )
+            )
+
+            self.assertEqual(queue.size(lane=LANE_HEAVY), 1)
+            self.assertEqual(queue.size(lane=LANE_LIGHT), 2)
+
+            # Each job is consumable from exactly the lane it was routed to,
+            # never both -- proving no job is duplicated across lanes.
+            self.assertEqual(queue.dequeue(lane=LANE_HEAVY), image_job.id)
+            self.assertIsNone(queue.dequeue(lane=LANE_HEAVY))
+            self.assertEqual(queue.dequeue(lane=LANE_LIGHT), text_job.id)
+            self.assertEqual(queue.dequeue(lane=LANE_LIGHT), speech_job.id)
+            self.assertIsNone(queue.dequeue(lane=LANE_LIGHT))
+
+
+class JobRunnerLaneRoutingTests(unittest.TestCase):
+    """End-to-end proof that a lane-routed job is processed by exactly one
+    lane's worker (#180)."""
+
+    def test_run_once_scoped_to_a_lane_only_drains_that_lanes_jobs(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            repository = JobRepository(Path(tmp_dir) / "jobs.db")
+            queue = JobQueue(lanes=(LANE_HEAVY, LANE_LIGHT))
+            lane_config = parse_job_lanes(DEFAULT_JOB_LANES)
+            service = JobService(repository, queue, lane_config=lane_config)
+            registry = GeneratorRegistry(
+                {"image": _ImmediateGenerator(), "text": _ImmediateGenerator()}
+            )
+            runner = JobRunner(repository, queue, registry)
+
+            heavy_job = service.create_job(
+                GenerationRequest(media_type="image", prompt="a skyline", model_id="sdxl")
+            )
+            light_job = service.create_job(
+                GenerationRequest(media_type="text", prompt="a beat", model_id="")
+            )
+
+            # Draining the light lane must not touch the heavy job.
+            light_result = runner.run_once(lane=LANE_LIGHT)
+            self.assertIsNotNone(light_result)
+            assert light_result is not None
+            self.assertEqual(light_result.id, light_job.id)
+            self.assertEqual(light_result.status, "succeeded")
+            self.assertIsNone(runner.run_once(lane=LANE_LIGHT))
+
+            # The heavy job is still pending, untouched by the light drain,
+            # and only the heavy lane can produce it.
+            self.assertIsNone(runner.run_once(lane=LANE_LIGHT))
+            heavy_result = runner.run_once(lane=LANE_HEAVY)
+            self.assertIsNotNone(heavy_result)
+            assert heavy_result is not None
+            self.assertEqual(heavy_result.id, heavy_job.id)
+            self.assertEqual(heavy_result.status, "succeeded")
 
 
 if __name__ == "__main__":
