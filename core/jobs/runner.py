@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from .queue import JobQueue
 from .schemas import JobRecord
 from .statuses import (
+    JOB_STATUS_CANCEL_REQUESTED,
     JOB_STATUS_CANCELLED,
     JOB_STATUS_POSTPROCESSING,
     JOB_STATUS_PREPARING,
@@ -67,8 +68,15 @@ class JobRunner:
             asset_repository=asset_repository,
         )
 
-    def run_once(self) -> JobRecord | None:
-        job_id = self.job_queue.dequeue()
+    def run_once(self, lane: str | None = None) -> JobRecord | None:
+        # #180: `lane=None` dequeues from the queue's implicit single lane,
+        # exactly as before lane routing existed -- required for every
+        # existing single-lane caller (bootstrap/factories.py, tests) to keep
+        # working unchanged. Pulling from a *specific* lane (for independent
+        # per-lane workers) is #181's concern, not this one; this parameter
+        # only exposes the queue's own lane addressing to a caller that wants
+        # it, it does not add any concurrency or fairness policy here.
+        job_id = self.job_queue.dequeue(lane=lane)
         if job_id is None:
             return None
         return self.process_job(job_id)
@@ -78,11 +86,12 @@ class JobRunner:
         *,
         poll_interval_seconds: float = 0.1,
         stop_event: Event | None = None,
+        lane: str | None = None,
     ) -> None:
         while True:
             if stop_event is not None and stop_event.is_set():
                 return
-            job = self.run_once()
+            job = self.run_once(lane=lane)
             if job is None:
                 if stop_event is None:
                     time.sleep(poll_interval_seconds)
@@ -108,10 +117,10 @@ class JobRunner:
         try:
             try:
                 if self._update_status(job_id, JOB_STATUS_PREPARING, progress=0.0) is None:
-                    return self.job_repository.get(job_id)
+                    return self._finalize_cancellation(job_id)
                 generator = self.generator_registry.get(job.media_type, job.request.task_type)
                 if self._update_status(job_id, JOB_STATUS_RUNNING, progress=0.1) is None:
-                    return self.job_repository.get(job_id)
+                    return self._finalize_cancellation(job_id)
                 controlled_run = getattr(generator, "run_with_control", None)
                 if callable(controlled_run):
                     # Long-form audio opts into segment-level progress/cancel
@@ -135,24 +144,49 @@ class JobRunner:
                     # cancellation being honored only at the boundary below.
                     result = generator.run(job.request, context)
             except GenerationCancelled:
-                return self.job_repository.get(job_id)
+                # A generator raises this after observing cancellation via
+                # `context.raise_if_cancelled()` / `cancel_requested()`; the
+                # job is `cancel_requested` at this point (#207), so resolve
+                # it to the terminal `cancelled` state.
+                return self._finalize_cancellation(job_id)
             except Exception as exc:
                 if self._is_cancelled(job_id):
-                    return self.job_repository.get(job_id)
+                    return self._finalize_cancellation(job_id)
                 return self.job_service.mark_failed(job_id, str(exc))
 
             if self._is_cancelled(job_id):
-                return self.job_repository.get(job_id)
+                return self._finalize_cancellation(job_id)
             if self._update_status(job_id, JOB_STATUS_POSTPROCESSING, progress=0.9) is None:
-                return self.job_repository.get(job_id)
+                return self._finalize_cancellation(job_id)
             return self.job_service.mark_succeeded(job_id, result)
         finally:
             if self.cancellation_registry is not None:
                 self.cancellation_registry.end(job_id)
 
     def _is_cancelled(self, job_id: str) -> bool:
+        # `cancel_requested` (in-flight job, cooperative shutdown pending) and
+        # `cancelled` (queued job, or shutdown already finalized) both mean
+        # "stop doing forward-progress work on this job" from the runner's
+        # and a generator's point of view (#207); only `_finalize_cancellation`
+        # distinguishes between them for persistence purposes.
         current = self.job_repository.get(job_id)
-        return current is not None and current.status == JOB_STATUS_CANCELLED
+        return current is not None and current.status in (
+            JOB_STATUS_CANCEL_REQUESTED,
+            JOB_STATUS_CANCELLED,
+        )
+
+    def _finalize_cancellation(self, job_id: str) -> JobRecord | None:
+        """Resolve a possibly-`cancel_requested` job to `cancelled` and return it.
+
+        Safe to call at any "this might be a cancellation" bail-out point in
+        `process_job`: a `cancel_requested` job is moved to the terminal
+        `cancelled` state; any other status (already `cancelled`, or -- in the
+        single-worker case -- unrelated) is simply re-read and returned
+        unchanged, matching the pre-#207 fallback of reading the current
+        record.
+        """
+
+        return self.job_service.finalize_cancellation(job_id)
 
     def _begin_context(self, job_id: str) -> GenerationContext | None:
         cancellation_registry = self.cancellation_registry

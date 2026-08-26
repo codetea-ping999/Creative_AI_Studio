@@ -12,11 +12,21 @@ Two properties matter more than cleverness here:
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from core.bible import BibleEntry, BibleRepository
+from core.reference_capabilities import (
+    DEFAULT_REFERENCE_STRENGTH,
+    MissingReferenceAssetError,
+    REFERENCE_ROLES,
+    ReferenceImageInput,
+    ReferenceRole,
+)
+
+if TYPE_CHECKING:
+    from core.assets import AssetRepository
 
 # Short quality tails per template. They go last because they are the least
 # specific part of the prompt and should not compete with the subject.
@@ -61,6 +71,7 @@ class ComposedPrompt(BaseModel):
     seed: int | None
     lora: dict[str, Any] | None
     reference_asset_ids: list[str] = Field(default_factory=list)
+    resolved_references: list[ReferenceImageInput] = Field(default_factory=list)
     palette: list[str] = Field(default_factory=list)
     attributes: dict[str, str] = Field(default_factory=dict)
     applied: list[dict[str, Any]] = Field(default_factory=list)
@@ -70,8 +81,17 @@ class ComposedPrompt(BaseModel):
 class PromptComposer:
     """Compose prompts from a spec, resolving bible references when available."""
 
-    def __init__(self, bible_repository: BibleRepository | None = None) -> None:
+    def __init__(
+        self,
+        bible_repository: BibleRepository | None = None,
+        asset_repository: "AssetRepository | None" = None,
+    ) -> None:
         self.bible_repository = bible_repository
+        # Optional: without it, bible-derived character/location references are
+        # still collected (role + default strength) but their asset ids are not
+        # checked against the asset store, so a deleted/incompatible asset would
+        # only surface once a generator tried to load it. See #199.
+        self.asset_repository = asset_repository
 
     def compose(self, spec: PromptSpec) -> ComposedPrompt:
         applied: list[dict[str, Any]] = []
@@ -83,6 +103,8 @@ class PromptComposer:
         attribute_owners: dict[str, str] = {}
         locked_attributes: dict[str, str] = {}
         reference_asset_ids: list[str] = []
+        resolved_references: list[ReferenceImageInput] = []
+        seen_resolved_references: set[tuple[str, str]] = set()
         palette: list[str] = []
         lora: dict[str, Any] | None = None
         lora_owner: str | None = None
@@ -122,6 +144,27 @@ class PromptComposer:
             for asset_id in entry.reference_asset_ids:
                 if asset_id not in reference_asset_ids:
                     reference_asset_ids.append(asset_id)
+            # Only character/location kinds map onto a ReferenceRole (#198); a
+            # style/brand/prop entry's reference_asset_ids still feed the flat
+            # list above (unchanged, pre-#199 behavior) but cannot become a
+            # role-bearing generation input.
+            if entry.kind in REFERENCE_ROLES:
+                role = cast(ReferenceRole, entry.kind)
+                for asset_id in entry.reference_asset_ids:
+                    dedupe_key = (asset_id, role)
+                    if dedupe_key in seen_resolved_references:
+                        continue
+                    seen_resolved_references.add(dedupe_key)
+                    self._resolve_reference_asset(
+                        asset_id, role=role, entry_name=entry.name
+                    )
+                    resolved_references.append(
+                        ReferenceImageInput(
+                            asset_id=asset_id,
+                            role=role,
+                            strength=DEFAULT_REFERENCE_STRENGTH,
+                        )
+                    )
             for color in entry.palette:
                 if color not in palette:
                     palette.append(color)
@@ -225,6 +268,7 @@ class PromptComposer:
             seed=seed,
             lora=lora,
             reference_asset_ids=reference_asset_ids,
+            resolved_references=resolved_references,
             palette=palette,
             attributes=attributes,
             applied=applied,
@@ -284,6 +328,38 @@ class PromptComposer:
         attribute_owners[slot] = owner_name
         if is_locked:
             locked_attributes[slot] = value
+
+    def _resolve_reference_asset(
+        self, asset_id: str, *, role: ReferenceRole, entry_name: str
+    ) -> None:
+        """Reject a bible-derived reference before it reaches a generator.
+
+        Silent here is `self.asset_repository is None`: composing a prompt
+        without an asset store configured (unit tests, `PromptComposer()`
+        with no arguments) still needs to produce a `ComposedPrompt`, so we
+        cannot validate existence -- only that the request would carry this
+        reference. When an asset repository is configured, a missing or
+        non-image asset is a data-integrity problem, not a decoration that
+        can be dropped, so it raises rather than degrading into `conflicts`
+        the way an unknown bible entry id does.
+        """
+
+        if self.asset_repository is None:
+            return
+        asset = self.asset_repository.get(asset_id)
+        if asset is None:
+            raise MissingReferenceAssetError(
+                f"Bible entry {entry_name!r} names {asset_id!r} as a {role} "
+                "reference, but no asset with that id exists (missing or "
+                "deleted); update the Bible entry's reference_asset_ids or "
+                "restore the asset before generating."
+            )
+        if asset.media_type != "image":
+            raise MissingReferenceAssetError(
+                f"Bible entry {entry_name!r} names {asset_id!r} as a {role} "
+                f"reference, but that asset is {asset.media_type!r}, not "
+                "image; reference-image conditioning requires an image asset."
+            )
 
 
 def _normalize_axis_patch(
