@@ -7,6 +7,8 @@ from uuid import uuid4
 
 from typing import TYPE_CHECKING
 
+from core.models import ModelService
+from core.reference_capabilities import validate_reference_inputs
 from core.schemas import GenerationRequest, GenerationResult, GenerationStatus
 
 from .events import EventBus
@@ -49,18 +51,35 @@ class JobService:
         event_bus: EventBus | None = None,
         asset_repository: AssetRepository | None = None,
         cancellation_registry: "CancellationRegistry | None" = None,
+        model_service: ModelService | None = None,
     ) -> None:
         self.job_repository = job_repository
         self.job_queue = job_queue
         self.event_bus = event_bus
         self.asset_repository = asset_repository
         self.cancellation_registry = cancellation_registry
+        self.model_service = model_service
 
     def create_job(
         self,
         request: GenerationRequest,
         project_id: str | None = None,
     ) -> JobRecord:
+        # #198/#50: a request carrying reference images must fail here, before a
+        # job is ever persisted or queued, if the resolved model can't honor
+        # them -- not silently once a generator that ignores `references`
+        # reaches the front of the queue. model_service is optional (some
+        # tests construct JobService without one); without it we cannot
+        # resolve a manifest, so there is nothing to validate against.
+        if request.references and self.model_service is not None:
+            manifest = self.model_service.get_manifest(
+                request.model_id, request.media_type, request.task_type
+            )
+            validate_reference_inputs(
+                request.references,
+                capability=manifest.reference_capability,
+                model_id=request.model_id or manifest.public_model_id,
+            )
         now = datetime.now(timezone.utc)
         job = JobRecord(
             id=f"job_{uuid4().hex}",

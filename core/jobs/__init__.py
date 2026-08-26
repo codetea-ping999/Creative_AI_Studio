@@ -17,6 +17,9 @@ from .runner import JobRunner
 from .schemas import JobRecord
 from .service import JobService
 from .statuses import (
+    ACTIVE_JOB_STATUSES,
+    ALLOWED_TRANSITIONS,
+    JOB_STATUS_CANCEL_REQUESTED,
     JOB_STATUS_CANCELLED,
     JOB_STATUS_FAILED,
     JOB_STATUS_POSTPROCESSING,
@@ -26,9 +29,13 @@ from .statuses import (
     JOB_STATUS_SUCCEEDED,
     JOB_STATUSES,
     TERMINAL_JOB_STATUSES,
+    is_terminal_status,
+    is_valid_transition,
 )
 
 __all__ = [
+    "ACTIVE_JOB_STATUSES",
+    "ALLOWED_TRANSITIONS",
     "CancellationRegistry",
     "DEFAULT_JOB_LANES",
     "EventBus",
@@ -39,6 +46,7 @@ __all__ = [
     "JobRecord",
     "JobRunner",
     "JobService",
+    "JOB_STATUS_CANCEL_REQUESTED",
     "JOB_STATUS_CANCELLED",
     "JOB_STATUS_FAILED",
     "JOB_STATUS_POSTPROCESSING",
@@ -52,6 +60,8 @@ __all__ = [
     "LaneConfig",
     "TERMINAL_JOB_STATUSES",
     "assign_lane",
+    "is_terminal_status",
+    "is_valid_transition",
     "parse_job_lanes",
     "resolve_lane",
 ]

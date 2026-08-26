@@ -395,6 +395,7 @@ def create_application_services(
         event_bus,
         asset_repository=asset_repository,
         cancellation_registry=cancellation_registry,
+        model_service=model_service,
     )
     job_runner = JobRunner(
         job_repository,

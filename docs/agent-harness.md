@@ -84,6 +84,13 @@ npm --prefix apps/web run build
 - **既存のテストを「通すために」書き換えない。** 落ちたテストは仕様の主張です。
   仕様の方が誤っていると判断した場合は、変更せずに報告へ根拠を書いてください
 - **`main` に直接触らない**
+- **`git stash` を使わない。** `refs/stash` は1つの repository の全 worktree で共有されます
+  （`git rev-parse --git-common-dir` は全 worktree で同じ `.git` を指す）。実測した事故です:
+  並行実行中の2つの Implement worktree がそれぞれ独立に `git stash` / `git stash pop` を
+  使ったところ、片方の `pop` がもう片方の stash を取り込んでしまい、後者の未コミット差分が
+  stash 一覧から消失しました。ビフォー/アフターの比較が必要な場合は、`git diff` を
+  一時ファイルに保存する、または対象ファイルだけ `git stash` の代わりに `cp` で退避するなど、
+  worktree ローカルな手段を使ってください
 
 ## 実行環境の前提
 

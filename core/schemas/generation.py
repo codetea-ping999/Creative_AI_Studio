@@ -6,12 +6,15 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from core.reference_capabilities import ReferenceImageInput
+
 MediaType = Literal["image", "video", "audio", "text"]
 GenerationStatus = Literal[
     "queued",
     "preparing",
     "running",
     "postprocessing",
+    "cancel_requested",
     "succeeded",
     "failed",
     "cancelled",
@@ -49,6 +52,15 @@ class GenerationRequest(BaseModel):
         default_factory=dict,
         description="Media-specific generation parameters.",
     )
+    references: list[ReferenceImageInput] = Field(
+        default_factory=list,
+        description=(
+            "Character/location reference images for identity- and location-locking "
+            "conditioning. Only honored by models whose manifest advertises a "
+            "reference_capability for the requested role; see "
+            "core.reference_capabilities.validate_reference_inputs."
+        ),
+    )
 
 
 class GenerationResult(BaseModel):
@@ -82,4 +94,5 @@ __all__ = [
     "GenerationResult",
     "GenerationStatus",
     "MediaType",
+    "ReferenceImageInput",
 ]

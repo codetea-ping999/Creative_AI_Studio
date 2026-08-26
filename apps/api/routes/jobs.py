@@ -9,6 +9,7 @@ from apps.api.dependencies import get_job_service, get_services
 from bootstrap import ApplicationServices
 from core.jobs import JobRecord, JobService
 from core.projects import ProjectRepository
+from core.reference_capabilities import UnsupportedReferenceError
 from core.schemas import GenerationRequest
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
@@ -57,7 +58,12 @@ def create_job(
     request: GenerationRequest,
     job_service: JobService = Depends(get_job_service),
 ) -> CreateJobResponse:
-    job = job_service.create_job(request)
+    try:
+        job = job_service.create_job(request)
+    except UnsupportedReferenceError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
     return CreateJobResponse(job_id=job.id, status=job.status)
 
 
