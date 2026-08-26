@@ -14,6 +14,7 @@ GenerationStatus = Literal[
     "preparing",
     "running",
     "postprocessing",
+    "cancel_requested",
     "succeeded",
     "failed",
     "cancelled",
