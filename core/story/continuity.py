@@ -14,10 +14,11 @@ the reader still owed" (unresolved threads). Collapsing them would make it
 impossible to, for example, inject only unresolved threads into an outline pass
 while omitting full prose summaries.
 
-This module defines the contract only. Turning a ``StoryDocument`` into a
-``ContinuityMemory``, and turning a ``ContinuityMemory`` into prompt text, are
-deliberately out of scope here (see parent issue #46) so the schema can be
-reviewed and tested on its own.
+This module defines the contract only. Building/updating a ``ContinuityMemory``
+from a completed chapter lives in ``core.story.continuity_builder``; turning a
+``ContinuityMemory`` into prompt text is deliberately out of scope for both
+modules (see parent issue #46) — the schema needed to be reviewable and
+testable on its own before either consumer was built on top of it.
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ MAX_CHAPTER_SUMMARIES = 200
 MAX_CANON_FACTS = 500
 MAX_TIMELINE_FACTS = 500
 MAX_UNRESOLVED_THREADS = 200
+MAX_RESOLVED_THREADS = 200
 
 # Per-entry text ceilings. A summary is allowed to be a paragraph; a fact or
 # thread description is a single claim and stays short so the memory does not
@@ -87,6 +89,28 @@ class UnresolvedThread(BaseModel):
     introduced_chapter_id: str | None = None
 
 
+class ResolvedThread(BaseModel):
+    """A thread that has been paid off, kept for provenance after removal.
+
+    ``UnresolvedThread`` entries are removed from ``ContinuityMemory`` once a
+    chapter resolves them (see the "still owed" framing above): a resolved
+    thread has nothing left for a chapter-writing prompt to act on. But
+    "removed from the reader-facing list" must not mean "the fact that it
+    existed and when it was closed is lost" — an editor asking "wait, did we
+    ever explain the letter?" needs a traceable answer. This record is that
+    answer: the same identity and description the thread had while open, plus
+    the chapter that closed it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1)
+    description: str = Field(min_length=1, max_length=MAX_FACT_CHARS)
+    order: int = Field(ge=0)
+    introduced_chapter_id: str | None = None
+    resolved_chapter_id: str | None = None
+
+
 def _require_unique(items: list, key: str, list_name: str) -> None:
     seen: set[str] = set()
     for item in items:
@@ -125,6 +149,9 @@ class ContinuityMemory(BaseModel):
     unresolved_threads: list[UnresolvedThread] = Field(
         default_factory=list, max_length=MAX_UNRESOLVED_THREADS
     )
+    resolved_threads: list[ResolvedThread] = Field(
+        default_factory=list, max_length=MAX_RESOLVED_THREADS
+    )
     created_at: datetime
     updated_at: datetime
 
@@ -142,6 +169,7 @@ class ContinuityMemory(BaseModel):
         _require_unique(self.canon_facts, "id", "canon_facts")
         _require_unique(self.timeline_facts, "id", "timeline_facts")
         _require_unique(self.unresolved_threads, "id", "unresolved_threads")
+        _require_unique(self.resolved_threads, "id", "resolved_threads")
         return self
 
     def ordered_chapter_summaries(self) -> list[ChapterSummary]:
@@ -165,17 +193,22 @@ class ContinuityMemory(BaseModel):
     def ordered_unresolved_threads(self) -> list[UnresolvedThread]:
         return sorted(self.unresolved_threads, key=lambda item: (item.order, item.id))
 
+    def ordered_resolved_threads(self) -> list[ResolvedThread]:
+        return sorted(self.resolved_threads, key=lambda item: (item.order, item.id))
+
 
 __all__ = [
     "MAX_CANON_FACTS",
     "MAX_CHAPTER_SUMMARIES",
     "MAX_FACT_CHARS",
+    "MAX_RESOLVED_THREADS",
     "MAX_SUMMARY_CHARS",
     "MAX_TIMELINE_FACTS",
     "MAX_UNRESOLVED_THREADS",
     "CanonFact",
     "ChapterSummary",
     "ContinuityMemory",
+    "ResolvedThread",
     "TimelineFact",
     "UnresolvedThread",
 ]
