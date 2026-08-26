@@ -19,6 +19,11 @@ from generators.base import BaseGenerator
 # Reused rather than copied so the lineage keys recorded by the music generator and
 # the narration generator cannot drift apart.
 from .generator import _coerce_postprocess_flag, _extract_lineage_metadata
+from .providers import (
+    AudioProviderCapability,
+    ensure_capabilities_declared,
+    manifest_declared_capabilities,
+)
 
 _MAX_INT16 = 32_767
 
@@ -87,22 +92,44 @@ class SpeechGenerator(BaseGenerator):
             )
         if "postprocess" in request.params:
             _coerce_postprocess_flag(request.params["postprocess"])
-        else:
-            # Best-effort: a manifest that cannot be resolved here (unknown
-            # model, disabled, wrong task type) is left for resolve_runtime()
-            # to reject at generation time as before, so this stays scoped to
-            # catching an invalid postprocess *default* on an otherwise-valid
-            # manifest instead of moving model-availability checks earlier.
-            try:
-                manifest = self.model_service.get_manifest(
-                    request.model_id.strip() or None,
-                    media_type="audio",
-                    task_type=self.task_type,
-                )
-            except LookupError:
-                return
-            if "postprocess" in manifest.default_params:
-                _coerce_postprocess_flag(manifest.default_params["postprocess"])
+        # Best-effort: a manifest that cannot be resolved here (unknown model,
+        # disabled, wrong task type) is left for resolve_runtime() to reject
+        # at generation time as before, so this stays scoped to catching an
+        # invalid postprocess *default* and an unsupported cloud capability
+        # on an otherwise-valid manifest, instead of moving model-availability
+        # checks earlier.
+        try:
+            manifest = self.model_service.get_manifest(
+                request.model_id.strip() or None,
+                media_type="audio",
+                task_type=self.task_type,
+            )
+        except LookupError:
+            return
+        if "postprocess" not in request.params and "postprocess" in manifest.default_params:
+            _coerce_postprocess_flag(manifest.default_params["postprocess"])
+        if manifest.provider == "cloud":
+            self._validate_cloud_capabilities(manifest)
+
+    def _validate_cloud_capabilities(self, manifest: Any) -> None:
+        """Reject a `provider: cloud` request the manifest never advertised.
+
+        Mirrors AudioGenerator._validate_cloud_capabilities (#234) for the
+        text-to-speech path: runs from validate_request(), strictly before
+        generate() would resolve any runtime/adapter, so an unsupported
+        capability never reaches a network call.
+        """
+
+        manifest_label = f"Model {manifest.public_model_id!r}"
+        declared = manifest_declared_capabilities(
+            manifest.default_params,
+            manifest_label=manifest_label,
+        )
+        ensure_capabilities_declared(
+            declared,
+            frozenset({AudioProviderCapability.TEXT_TO_SPEECH}),
+            manifest_label=manifest_label,
+        )
 
     def prepare(self, request: GenerationRequest) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
