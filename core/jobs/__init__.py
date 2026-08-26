@@ -3,6 +3,15 @@
 from .cancellation import CancellationRegistry
 from .context import GenerationCancelled, GenerationContext
 from .events import EventBus, JobEvent
+from .lanes import (
+    DEFAULT_JOB_LANES,
+    LANE_HEAVY,
+    LANE_LIGHT,
+    LaneConfig,
+    assign_lane,
+    parse_job_lanes,
+    resolve_lane,
+)
 from .queue import JobQueue
 from .runner import JobRunner
 from .schemas import JobRecord
@@ -21,6 +30,7 @@ from .statuses import (
 
 __all__ = [
     "CancellationRegistry",
+    "DEFAULT_JOB_LANES",
     "EventBus",
     "GenerationCancelled",
     "GenerationContext",
@@ -37,5 +47,11 @@ __all__ = [
     "JOB_STATUS_RUNNING",
     "JOB_STATUS_SUCCEEDED",
     "JOB_STATUSES",
+    "LANE_HEAVY",
+    "LANE_LIGHT",
+    "LaneConfig",
     "TERMINAL_JOB_STATUSES",
+    "assign_lane",
+    "parse_job_lanes",
+    "resolve_lane",
 ]

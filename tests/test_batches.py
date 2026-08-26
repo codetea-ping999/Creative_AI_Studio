@@ -7,6 +7,8 @@ import sys
 import tempfile
 import unittest
 
+from pydantic import ValidationError
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.batches import (  # noqa: E402
@@ -20,6 +22,14 @@ from core.batches import (  # noqa: E402
     expand_items,
     list_batch_templates,
     resolve_max_items_limit,
+)
+from core.batches.schemas import PATCH_APPEND_KEYS  # noqa: E402
+from core.batches.templates import (  # noqa: E402
+    CHARACTER_SHEET_ANGLES,
+    CHARACTER_SHEET_EXPRESSIONS,
+    CHARACTER_SHEET_LOCKED_FIELDS,
+    CHARACTER_SHEET_POSES,
+    CHARACTER_SHEET_VARIATION_COUNT,
 )
 from core.jobs import EventBus, JobQueue, JobService  # noqa: E402
 from core.schemas import GenerationResult  # noqa: E402
@@ -535,6 +545,67 @@ class TemplateTests(unittest.TestCase):
         self.assertEqual(len(items), 16)
         self.assertEqual({item.request.seed for item in items}, {99})
 
+    def test_character_sheet_defines_angle_expression_and_pose_axes_in_order(
+        self,
+    ) -> None:
+        spec = build_batch_template("character-sheet", prompt="mina")
+        self.assertEqual(
+            [axis.name for axis in spec.axes], ["angle", "expression", "pose"]
+        )
+        self.assertEqual(len(spec.axes[0].values), len(CHARACTER_SHEET_ANGLES))
+        self.assertEqual(len(spec.axes[1].values), len(CHARACTER_SHEET_EXPRESSIONS))
+        self.assertEqual(len(spec.axes[2].values), len(CHARACTER_SHEET_POSES))
+
+    def test_character_sheet_variation_count_is_documented_and_in_range(self) -> None:
+        # Acceptance criterion: "a default 9-16 variation matrix".
+        self.assertTrue(9 <= CHARACTER_SHEET_VARIATION_COUNT <= 16)
+        spec = build_batch_template("character-sheet", prompt="mina", seed=1)
+        items = expand_items(spec, stage=spec.resolved_stages()[0], stage_index=0)
+        self.assertEqual(len(items), CHARACTER_SHEET_VARIATION_COUNT)
+        entry = next(
+            row for row in list_batch_templates() if row["name"] == "character-sheet"
+        )
+        self.assertEqual(entry["first_stage_items"], CHARACTER_SHEET_VARIATION_COUNT)
+
+    def test_character_sheet_locks_identity_fields(self) -> None:
+        spec = build_batch_template("character-sheet", prompt="mina")
+        self.assertEqual(set(spec.locked_fields), set(CHARACTER_SHEET_LOCKED_FIELDS))
+        self.assertIn("model_id", spec.locked_fields)
+        self.assertIn("seed", spec.locked_fields)
+        self.assertIn("prompt", spec.locked_fields)
+        self.assertIn("negative_prompt", spec.locked_fields)
+
+    def test_character_sheet_base_identity_persists_in_every_variation(self) -> None:
+        # The locked prompt is only ever appended to, never replaced, so "mina"
+        # (the character) must survive in every one of the 16 cells.
+        spec = build_batch_template("character-sheet", prompt="mina", seed=1)
+        items = expand_items(spec, stage=spec.resolved_stages()[0], stage_index=0)
+        for item in items:
+            self.assertTrue(item.request.prompt.startswith("mina"))
+            self.assertEqual(item.request.model_id, spec.model_id)
+            self.assertEqual(item.request.seed, 1)
+
+    def test_character_sheet_expansion_is_deterministic_across_runs(self) -> None:
+        # Acceptance criterion: axis ordering and generated variation IDs are
+        # reproducible for the same request.
+        def build() -> list[tuple[str, str, dict[str, str], str]]:
+            spec = build_batch_template("character-sheet", prompt="mina", seed=7)
+            items = expand_items(spec, stage=spec.resolved_stages()[0], stage_index=0)
+            return [
+                (item.id, item.label, item.axis_values, item.request.prompt)
+                for item in items
+            ]
+
+        first_run = build()
+        second_run = build()
+        self.assertEqual(first_run, second_run)
+        # IDs are assigned by position, so the same axis-declaration order must
+        # keep producing the same id -> axis_values mapping run after run.
+        self.assertEqual(
+            [entry[0] for entry in first_run],
+            [f"item_0_{index:03d}" for index in range(CHARACTER_SHEET_VARIATION_COUNT)],
+        )
+
     def test_logline_template_targets_text(self) -> None:
         spec = build_batch_template("logline-candidates", prompt="a premise")
         self.assertEqual(spec.media_type, "text")
@@ -559,6 +630,134 @@ class TemplateTests(unittest.TestCase):
         self.assertEqual(templates["thumbnail-tone-grid"]["first_stage_items"], 30)
         self.assertEqual(
             templates["logo-30"]["stages"][0], {"name": "probe", "keep_top_n": 6}
+        )
+
+
+class LockedFieldValidationTests(unittest.TestCase):
+    """Locked-field enforcement is generic BatchSpec behavior; the character
+    sheet template is one caller of it (see TemplateTests for that coverage)."""
+
+    def _spec_with_axis_patch(self, patch: dict, **overrides) -> dict:
+        base = {
+            "name": "locked-field probe",
+            "media_type": "image",
+            "model_id": "sdxl",
+            "prompt": "a locked character",
+            "locked_fields": ["model_id", "seed", "prompt", "negative_prompt"],
+            "axes": [
+                Axis(name="variant", values=[AxisValue(label="v1", patch=patch)])
+            ],
+        }
+        base.update(overrides)
+        return base
+
+    def test_axis_value_cannot_set_a_locked_field_at_construction(self) -> None:
+        with self.assertRaises(ValidationError) as ctx:
+            BatchSpec(**self._spec_with_axis_patch({"model_id": "other-model"}))
+        message = str(ctx.exception)
+        self.assertIn("model_id", message)
+        self.assertIn("locked_fields", message)
+
+    def test_axis_value_cannot_replace_seed(self) -> None:
+        with self.assertRaises(ValidationError):
+            BatchSpec(**self._spec_with_axis_patch({"seed": 5}))
+
+    def test_axis_value_cannot_replace_prompt_outright(self) -> None:
+        with self.assertRaises(ValidationError):
+            BatchSpec(**self._spec_with_axis_patch({"prompt": "a different character"}))
+
+    def test_prompt_suffix_append_is_exempt_from_the_prompt_lock(self) -> None:
+        # Locking "prompt" must not block the append-only patch keys, since that
+        # append is how an axis value is supposed to reach a locked prompt.
+        spec = BatchSpec(**self._spec_with_axis_patch({"prompt_suffix": "smiling"}))
+        items = expand_items(spec, stage=Stage(name="single"), stage_index=0)
+        self.assertEqual(items[0].request.prompt, "a locked character, smiling")
+
+    def test_locked_field_is_still_enforced_when_validators_are_bypassed(self) -> None:
+        # build_batch_template applies caller overrides via model_copy(update=...),
+        # which does not re-run BatchSpec validators. expand_items is therefore
+        # the enforcement point that actually runs on every real request path, so
+        # it must reject the same violation the constructor does.
+        valid_spec = BatchSpec(
+            **self._spec_with_axis_patch({"prompt_suffix": "smiling"})
+        )
+        bypassed_spec = valid_spec.model_copy(
+            update={
+                "axes": [
+                    Axis(
+                        name="variant",
+                        values=[
+                            AxisValue(label="v1", patch={"model_id": "other-model"})
+                        ],
+                    )
+                ]
+            }
+        )
+        with self.assertRaises(ValueError) as ctx:
+            expand_items(bypassed_spec, stage=Stage(name="single"), stage_index=0)
+        self.assertIn("model_id", str(ctx.exception))
+
+    def test_unlocked_spec_allows_axis_values_to_set_top_level_fields(self) -> None:
+        # Without locked_fields, overriding model_id per axis value is a
+        # legitimate, existing capability (e.g. an A/B-model comparison batch).
+        spec = _spec(
+            axes=[
+                Axis(
+                    name="model",
+                    values=[
+                        AxisValue(label="a", patch={"model_id": "model-a"}),
+                        AxisValue(label="b", patch={"model_id": "model-b"}),
+                    ],
+                )
+            ]
+        )
+        items = expand_items(spec, stage=Stage(name="single"), stage_index=0)
+        self.assertEqual(
+            {item.request.model_id for item in items}, {"model-a", "model-b"}
+        )
+
+
+class AxisConfigurationValidationTests(unittest.TestCase):
+    def test_empty_axis_values_fails_clearly(self) -> None:
+        with self.assertRaises(ValidationError) as ctx:
+            Axis(name="angle", values=[])
+        self.assertIn("values", str(ctx.exception))
+
+    def test_empty_axis_name_fails_clearly(self) -> None:
+        with self.assertRaises(ValidationError):
+            Axis(name="", values=[AxisValue(label="front")])
+
+    def test_duplicate_value_labels_within_an_axis_fail_clearly(self) -> None:
+        with self.assertRaises(ValidationError) as ctx:
+            Axis(
+                name="angle",
+                values=[AxisValue(label="front"), AxisValue(label="front")],
+            )
+        message = str(ctx.exception)
+        self.assertIn("angle", message)
+        self.assertIn("front", message)
+
+    def test_duplicate_axis_names_fail_clearly(self) -> None:
+        with self.assertRaises(ValidationError) as ctx:
+            _spec(
+                axes=[
+                    Axis(name="angle", values=[AxisValue(label="front")]),
+                    Axis(name="angle", values=[AxisValue(label="side")]),
+                ]
+            )
+        self.assertIn("angle", str(ctx.exception))
+
+    def test_patch_append_keys_is_the_single_shared_source_of_truth(self) -> None:
+        # core.batches.expansion imports PATCH_APPEND_KEYS from schemas rather
+        # than keeping its own copy, so the two modules cannot silently drift.
+        self.assertEqual(
+            set(PATCH_APPEND_KEYS),
+            {
+                "prompt_suffix",
+                "prompt_fragment",
+                "negative_suffix",
+                "negative_fragment",
+            },
         )
 
 

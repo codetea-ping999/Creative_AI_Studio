@@ -2954,3 +2954,100 @@ pre,
 .story-assemble-row > button {
   justify-self: start;
 }
+
+/* Assembly timeline panel (#244: read-only scene order + media assignments) */
+
+.assembly-timeline-panel {
+  display: grid;
+  gap: 16px;
+  align-content: start;
+}
+
+.assembly-timeline-panel__header {
+  margin-bottom: 0;
+}
+
+.assembly-timeline-panel__header .section-footnote {
+  max-width: 52ch;
+  margin: 0;
+  text-align: right;
+}
+
+.assembly-timeline-error {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+/* Roles render as a compact stack rather than table columns so each one's
+   glyph + name + status stays readable at tablet widths without truncating. */
+.assembly-timeline-roles {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.assembly-timeline-role {
+  display: grid;
+  grid-template-columns: 18px auto minmax(0, 1fr);
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+  font-size: 12px;
+}
+
+.assembly-timeline-role__glyph {
+  font-weight: 700;
+  text-align: center;
+}
+
+.assembly-timeline-role__name {
+  color: var(--text-dim);
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.assembly-timeline-role__status {
+  overflow-wrap: anywhere;
+  color: var(--text-soft);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+/* Color is a reinforcement here, not the only cue: the glyph and status text
+   already differ per state (see AssemblyTimelinePanel.tsx roleStatusGlyphs). */
+.assembly-timeline-role--assigned {
+  border-color: var(--success);
+}
+
+.assembly-timeline-role--assigned .assembly-timeline-role__glyph {
+  color: var(--success);
+}
+
+.assembly-timeline-role--missing {
+  border-color: var(--danger);
+}
+
+.assembly-timeline-role--missing .assembly-timeline-role__glyph {
+  color: var(--danger);
+}
+
+.assembly-timeline-role--optional .assembly-timeline-role__glyph {
+  color: var(--text-dim);
+}
+
+@media (max-width: 768px) {
+  .assembly-timeline-role {
+    grid-template-columns: 18px auto;
+  }
+
+  .assembly-timeline-role__status {
+    grid-column: 1 / -1;
+  }
+}
