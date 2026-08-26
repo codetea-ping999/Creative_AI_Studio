@@ -56,6 +56,12 @@ MAX_REFERENCE_STRENGTH = 1.0
 DEFAULT_REFERENCE_STRENGTH = 0.6
 
 
+def _default_supported_preprocessing() -> list[ReferencePreprocessing]:
+    # A plain `["none"]` default_factory lambda returns `list[str]`, which mypy
+    # cannot narrow to the Literal-typed field below; a typed function fixes that.
+    return ["none"]
+
+
 class ReferenceImageInput(BaseModel):
     """One character/location reference image attached to a generation request."""
 
@@ -103,7 +109,7 @@ class ReferenceCapability(BaseModel):
         description="Reference roles (character/location) this model can honor.",
     )
     supported_preprocessing: list[ReferencePreprocessing] = Field(
-        default_factory=lambda: ["none"],
+        default_factory=_default_supported_preprocessing,
         description="Preprocessing modes this model can honor for a reference image.",
     )
     min_strength: float = Field(default=MIN_REFERENCE_STRENGTH, ge=0.0, le=1.0)
