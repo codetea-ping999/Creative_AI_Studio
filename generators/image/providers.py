@@ -219,13 +219,30 @@ class LocalDiffusersImageProvider:
         pipeline_kwargs: dict[str, Any] | None = None,
     ) -> ImageProviderResult:
         validate_capabilities(self._capabilities, spec)
-        call_kwargs = dict(pipeline_kwargs) if pipeline_kwargs is not None else {
-            "prompt": spec.prompt,
-            "negative_prompt": spec.negative_prompt,
-            "width": spec.width,
-            "height": spec.height,
-            **spec.extra_params,
-        }
+        if pipeline_kwargs is None:
+            # This fallback cannot honor spec.seed/lora_path/lora_scale: a
+            # diffusers pipeline expects seed as a `torch.Generator`, not a
+            # raw int, and LoRA is applied via a pre-call
+            # `pipeline.load_lora_weights(...)`, not a kwarg -- neither
+            # translation belongs in this generic contract. Silently dropping
+            # a requested seed or LoRA would be a correctness bug the caller
+            # would never see, so fail clearly instead of guessing.
+            if spec.seed is not None or spec.lora_path is not None:
+                raise UnsupportedImageParameterError(
+                    "LocalDiffusersImageProvider cannot honor spec.seed or "
+                    "spec.lora_path without explicit pipeline_kwargs (seed needs "
+                    "a torch.Generator, LoRA needs a pre-call load_lora_weights); "
+                    "pass pipeline_kwargs built the same way ImageGenerator does."
+                )
+            call_kwargs: dict[str, Any] = {
+                "prompt": spec.prompt,
+                "negative_prompt": spec.negative_prompt,
+                "width": spec.width,
+                "height": spec.height,
+                **spec.extra_params,
+            }
+        else:
+            call_kwargs = dict(pipeline_kwargs)
         pipeline_output = self._pipeline(**call_kwargs)
         image = pipeline_output.images[0]
         identity = ImageProviderIdentity(

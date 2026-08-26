@@ -238,6 +238,46 @@ class LocalDiffusersImageProviderTest(unittest.TestCase):
                 pipeline_kwargs={"prompt": "a fox"},
             )
 
+    def test_default_fallback_kwargs_are_used_when_pipeline_kwargs_is_omitted(
+        self,
+    ) -> None:
+        pipeline = _RecordingPipeline()
+        provider = LocalDiffusersImageProvider(model_id="sdxl", pipeline=pipeline)
+
+        result = provider.generate_image(_spec(), request_id="img_abc_v1")
+
+        self.assertEqual(
+            pipeline.calls,
+            [
+                {
+                    "prompt": "a fox in a field",
+                    "negative_prompt": None,
+                    "width": 64,
+                    "height": 64,
+                }
+            ],
+        )
+        self.assertEqual(result.identity.request_id, "img_abc_v1")
+
+    def test_default_fallback_rejects_a_seed_it_cannot_honor(self) -> None:
+        pipeline = _RecordingPipeline()
+        provider = LocalDiffusersImageProvider(model_id="sdxl", pipeline=pipeline)
+
+        with self.assertRaisesRegex(UnsupportedImageParameterError, "pipeline_kwargs"):
+            provider.generate_image(_spec(seed=7), request_id="img_abc_v1")
+        self.assertEqual(pipeline.calls, [])
+
+    def test_default_fallback_rejects_a_lora_it_cannot_honor(self) -> None:
+        pipeline = _RecordingPipeline()
+        provider = LocalDiffusersImageProvider(model_id="sdxl", pipeline=pipeline)
+
+        with self.assertRaisesRegex(UnsupportedImageParameterError, "pipeline_kwargs"):
+            provider.generate_image(
+                _spec(lora_path="/models/lora/style.safetensors"),
+                request_id="img_abc_v1",
+            )
+        self.assertEqual(pipeline.calls, [])
+
         self.assertEqual(pipeline.calls, [], "pipeline must not be invoked when rejected")
 
 
