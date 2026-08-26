@@ -6,6 +6,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from core.reference_capabilities import ReferenceCapability
 from core.schemas.generation import MediaType
 
 
@@ -35,6 +36,13 @@ class ModelManifest(BaseModel):
     tags: list[str] = Field(default_factory=list)
     is_default: bool = False
     enabled: bool = True
+    reference_capability: ReferenceCapability | None = Field(
+        default=None,
+        description=(
+            "Reference-image conditioning (character/location) this model supports, "
+            "if any. Absent means unsupported — never inferred from id/provider/tags."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_manifest(self) -> "ModelManifest":
