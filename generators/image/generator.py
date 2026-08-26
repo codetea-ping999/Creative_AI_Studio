@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import inspect
 from pathlib import Path
 import secrets
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
 from core.models import ModelService
@@ -18,6 +19,7 @@ from core.quality import (
 from core.schemas import GenerationRequest, GenerationResult
 from generators.base import BaseGenerator
 from generators.common import resolve_generation_prompt
+from generators.image.providers import ImageGenerationSpec, LocalDiffusersImageProvider
 
 if TYPE_CHECKING:
     from core.jobs.context import GenerationContext
@@ -103,6 +105,30 @@ class ImageGenerator(BaseGenerator):
             if resolved_prompt.seed is not None
             else secrets.randbits(63)
         )
+        # Route the pipeline call through the provider-neutral contract
+        # (generators/image/providers.py) so this local diffusers path and a
+        # future cloud provider are invoked and validated the same way; the
+        # kwargs passed to `pipeline` below are unchanged from before this
+        # contract existed, so behavior is identical to a direct call.
+        provider = LocalDiffusersImageProvider(
+            model_id=manifest.public_model_id,
+            pipeline=pipeline,
+        )
+        spec_lora_path = lora_metadata["path"]
+        spec_lora_scale = lora_metadata["scale"]
+        request_spec = ImageGenerationSpec(
+            prompt=resolved_prompt.prompt,
+            negative_prompt=resolved_prompt.negative_prompt,
+            width=width,
+            height=height,
+            seed=base_seed,
+            batch_size=variation_count,
+            lora_path=str(spec_lora_path) if spec_lora_path is not None else None,
+            lora_scale=(
+                float(cast(float, spec_lora_scale)) if spec_lora_scale is not None else 1.0
+            ),
+            reference_image_path=None,
+        )
         common_generation_kwargs = {
             "prompt": resolved_prompt.prompt,
             "negative_prompt": resolved_prompt.negative_prompt,
@@ -141,8 +167,13 @@ class ImageGenerator(BaseGenerator):
                 if step_callback is not None:
                     generation_kwargs["callback_on_step_end"] = step_callback
 
+                variation_request_id = f"{batch_id}_v{variation_index + 1}"
                 with torch.inference_mode():
-                    pipeline_output = pipeline(**generation_kwargs)
+                    provider_result = provider.generate_image(
+                        replace(request_spec, seed=variation_seed),
+                        request_id=variation_request_id,
+                        pipeline_kwargs=generation_kwargs,
+                    )
 
                 if context is not None:
                     context.raise_if_cancelled()
@@ -151,7 +182,7 @@ class ImageGenerator(BaseGenerator):
                     if variation_count == 1
                     else f"{batch_id}_v{variation_index + 1}.png"
                 )
-                image = pipeline_output.images[0]
+                image = provider_result.image
                 image.save(output_path)
                 output_paths.append(str(output_path))
 
@@ -181,6 +212,8 @@ class ImageGenerator(BaseGenerator):
                         "preview_path": str(output_path),
                         "params": variation_params,
                         "quality_report": quality_report,
+                        "provider_id": provider_result.identity.provider_id,
+                        "provider_request_id": provider_result.identity.request_id,
                     }
                 )
                 if context is not None and step_callback is None:
@@ -221,6 +254,7 @@ class ImageGenerator(BaseGenerator):
                 "requested_model_id": requested_model_id,
                 "model_id": manifest.public_model_id,
                 "manifest_id": manifest.id,
+                "image_provider_id": provider.provider_id,
                 "model_display_name": manifest.display_name,
                 "model_runtime": manifest.runtime,
                 "model_provider": manifest.provider,
