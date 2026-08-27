@@ -237,11 +237,29 @@ def _scene_list_prompt(params: dict[str, Any]) -> str:
 
 def _prose_prompt(params: dict[str, Any]) -> str:
     target_words = _clamp_int(params.get("target_words", 800), low=80, high=8000)
-    return "\n".join(
+    lines = [
+        f"Write this scene as prose of about {target_words} words.",
+        "Return markdown in prose_markdown with paragraph breaks, and a chapter title.",
+        "Stay in the requested point of view and tense throughout.",
+    ]
+    # Continuity memory (issue #190): POST /stories/{id}/expand injects this
+    # automatically for the "prose" task when the story has one, so the next
+    # chapter is written with what already happened in view instead of
+    # contradicting or re-explaining it. Rendered as its own section, not
+    # folded into `_brief`, because it is prose describing prior chapters
+    # rather than a single-line field/value fact.
+    continuity_block = str(params.get("continuity_context", "")).strip()
+    if continuity_block:
+        lines.extend(
+            [
+                "",
+                "Stay consistent with the continuity memory below; do not "
+                "contradict or silently re-resolve any of it.",
+                continuity_block,
+            ]
+        )
+    lines.extend(
         [
-            f"Write this scene as prose of about {target_words} words.",
-            "Return markdown in prose_markdown with paragraph breaks, and a chapter title.",
-            "Stay in the requested point of view and tense throughout.",
             "",
             _brief(
                 {
@@ -258,6 +276,7 @@ def _prose_prompt(params: dict[str, Any]) -> str:
             ),
         ]
     )
+    return "\n".join(lines)
 
 
 def _script_prompt(params: dict[str, Any]) -> str:

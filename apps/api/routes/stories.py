@@ -12,16 +12,25 @@ from apps.api.dependencies import get_services
 from apps.api.routes.generate import resolve_timeline_assets
 from apps.api.routes.jobs import CreateJobResponse
 from bootstrap import ApplicationServices
+from core.jobs import JobRecord
 from core.schemas import GenerationRequest
 from core.story import (
+    DEFAULT_CONTEXT_CHARACTER_BUDGET,
     SCENE_ASSET_ROLES,
+    SCENE_ID_PARAM,
+    SCENE_ROLE_PARAM,
     STORY_FORMATS,
+    STORY_ID_PARAM,
     SUPPORTED_TASKS,
+    ContinuityRepository,
     Scene,
     StoryDocument,
     apply_text_result,
+    build_continuity_context,
     build_timeline,
     missing_scene_assets,
+    render_continuity_prompt_block,
+    required_scene_roles,
     scene_binding_params,
 )
 
@@ -30,8 +39,20 @@ router = APIRouter(prefix="/stories", tags=["stories"])
 # Tasks that write into one named scene rather than into the story as a whole.
 SCENE_SCOPED_TASKS: frozenset[str] = frozenset({"script"})
 
+# Tasks that carry continuity memory forward automatically (issue #190). Kept
+# as an explicit set rather than "every task" because only chapter prose
+# plausibly needs to stay consistent with what a reader has already been told.
+CONTINUITY_INJECTED_TASKS: frozenset[str] = frozenset({"prose"})
+
 # The tracks whose entries reference an asset the UI may want to preview.
 _PREVIEWABLE_TRACKS = ("visual", "narration", "music")
+
+# Job statuses that mean "still working on it" for a scene asset role — every
+# non-terminal state a job can hold before it either succeeds (and binds) or
+# fails.
+_ACTIVE_JOB_STATUSES = frozenset(
+    {"queued", "preparing", "running", "postprocessing", "cancel_requested"}
+)
 
 
 class StorySummaryResponse(BaseModel):
@@ -77,11 +98,34 @@ class StoryListResponse(BaseModel):
     formats: list[str] = Field(default_factory=lambda: list(STORY_FORMATS))
 
 
+class SceneAssetStatusEntry(BaseModel):
+    """One scene/role's generation status, for pre-export review (issue #245).
+
+    ``scene.job_ids`` only ever records a job once it succeeds (see
+    ``SceneBinder.bind_job``), so a role that is still generating — or whose
+    only attempt failed — never shows up there. ``state`` is computed instead
+    from the most recent job queued for this exact (story, scene, role), so a
+    role that has never been attempted (``missing``/``optional``) is
+    distinguishable from one that is actively being generated or that failed.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    scene_id: str
+    role: str
+    state: str
+    required: bool
+    asset_id: str | None = None
+    job_id: str | None = None
+    error_message: str | None = None
+
+
 class StoryDetailResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     story: dict[str, Any]
     missing_assets: list[dict[str, str]]
+    asset_status: list[SceneAssetStatusEntry] = Field(default_factory=list)
 
 
 class CreateStoryRequest(BaseModel):
@@ -149,6 +193,114 @@ def _get_story(services: ApplicationServices, story_id: str) -> StoryDocument:
             status_code=status.HTTP_404_NOT_FOUND, detail="Story not found"
         )
     return story
+
+
+def _continuity_repository(services: ApplicationServices) -> ContinuityRepository:
+    """Build the continuity repository beside the story repository's data dir.
+
+    Not threaded through ``ApplicationServices`` (that requires wiring a new
+    constructor argument through ``bootstrap/factories.py``, which is the
+    integration phase's file, not this route's); deriving the directory from
+    the already-injected story repository keeps continuity data wherever the
+    rest of story data lives without a bootstrap change. See this agent's
+    handoff for the one-line wiring the integrator may prefer instead.
+    """
+
+    return ContinuityRepository(
+        services.story_repository.story_dir.parent / "continuity"
+    )
+
+
+def _inject_continuity_context(
+    services: ApplicationServices, story: StoryDocument, params: dict[str, Any]
+) -> None:
+    """Add the next-chapter continuity context to ``params``, in place (issue #190).
+
+    A caller-supplied ``continuity_context``/``continuity_snapshot`` is left
+    untouched: an explicit override should not be clobbered by what is on
+    disk. When the story has no continuity memory yet (its first chapter),
+    the built context is empty and nothing is added — there is nothing to
+    inject, not an error.
+    """
+
+    if "continuity_context" in params or "continuity_snapshot" in params:
+        return
+    memory = _continuity_repository(services).get_for_story(story.id)
+    context = build_continuity_context(
+        memory,
+        story_id=story.id,
+        character_budget=DEFAULT_CONTEXT_CHARACTER_BUDGET,
+    )
+    if context.is_empty():
+        return
+    params["continuity_context"] = render_continuity_prompt_block(context)
+    params["continuity_snapshot"] = context.model_dump(mode="json")
+
+
+def _latest_jobs_by_scene_role(
+    services: ApplicationServices, story_id: str
+) -> dict[tuple[str, str], JobRecord]:
+    """Map each (scene_id, role) to its most recently queued job, for ``story_id``.
+
+    ``JobRepository.list()`` orders newest first, so the first job seen for a
+    given pair is already its most recent attempt; every candidate after that
+    is an older attempt and is skipped via ``setdefault``.
+    """
+
+    latest: dict[tuple[str, str], JobRecord] = {}
+    for job in services.job_repository.list():
+        params = job.request.params if isinstance(job.request.params, dict) else {}
+        if params.get(STORY_ID_PARAM) != story_id:
+            continue
+        scene_id = params.get(SCENE_ID_PARAM)
+        role = params.get(SCENE_ROLE_PARAM)
+        if not isinstance(scene_id, str) or role not in SCENE_ASSET_ROLES:
+            continue
+        latest.setdefault((scene_id, role), job)
+    return latest
+
+
+def _scene_asset_statuses(
+    services: ApplicationServices, story: StoryDocument
+) -> list[SceneAssetStatusEntry]:
+    """Per-scene, per-role generation status for pre-export review (issue #245)."""
+
+    latest_jobs = _latest_jobs_by_scene_role(services, story.id)
+    entries: list[SceneAssetStatusEntry] = []
+    for scene in story.scenes_in_order():
+        required_roles = set(required_scene_roles(scene))
+        for role in SCENE_ASSET_ROLES:
+            asset_id = scene.asset_ids.get(role)
+            required = role in required_roles
+            job = latest_jobs.get((scene.id, role))
+
+            if asset_id:
+                state = "assigned"
+            elif job is not None and job.status in _ACTIVE_JOB_STATUSES:
+                state = "generating"
+            elif job is not None and job.status == "failed":
+                state = "failed"
+            elif required:
+                state = "missing"
+            else:
+                state = "optional"
+
+            entries.append(
+                SceneAssetStatusEntry(
+                    scene_id=scene.id,
+                    role=role,
+                    state=state,
+                    required=required,
+                    asset_id=asset_id,
+                    job_id=job.id if job is not None else None,
+                    error_message=(
+                        job.error_message
+                        if job is not None and state == "failed"
+                        else None
+                    ),
+                )
+            )
+    return entries
 
 
 def _scene_brief(scene: Scene) -> str:
@@ -282,6 +434,7 @@ def get_story(
     return StoryDetailResponse(
         story=story.model_dump(mode="json"),
         missing_assets=missing_scene_assets(story),
+        asset_status=_scene_asset_statuses(services, story),
     )
 
 
@@ -351,6 +504,8 @@ def expand_story(
         params["beats"] = [beat.model_dump(mode="json") for beat in story.beats]
     if request.task in SCENE_SCOPED_TASKS:
         _bind_task_to_scene(story, params)
+    if request.task in CONTINUITY_INJECTED_TASKS:
+        _inject_continuity_context(services, story, params)
 
     generation_request = GenerationRequest(
         media_type="text",
@@ -447,6 +602,7 @@ def apply_story_result(
     return StoryDetailResponse(
         story=saved.model_dump(mode="json"),
         missing_assets=missing_scene_assets(saved),
+        asset_status=_scene_asset_statuses(services, saved),
     )
 
 

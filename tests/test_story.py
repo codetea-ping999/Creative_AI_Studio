@@ -17,6 +17,7 @@ from core.story import (  # noqa: E402
     build_timeline,
     count_words,
     missing_scene_assets,
+    required_scene_roles,
     split_subtitle_lines,
 )
 
@@ -379,9 +380,29 @@ class TimelineTests(unittest.TestCase):
         missing = missing_scene_assets(story)
         self.assertIn({"scene_id": "scene_01", "role": "visual"}, missing)
         self.assertIn({"scene_id": "scene_01", "role": "narration"}, missing)
+        # Both fixture scenes name a bgm_mood, so a missing music asset is
+        # reported too (issue #245) — the same "did the writer ask for this
+        # role" rule narration already used.
+        self.assertIn({"scene_id": "scene_01", "role": "music"}, missing)
+        self.assertIn({"scene_id": "scene_02", "role": "music"}, missing)
 
         ready = self._ready_story()
         self.assertEqual(missing_scene_assets(ready), [])
+
+    def test_required_scene_roles_music_depends_on_bgm_mood(self) -> None:
+        scored = apply_text_result(_story(), "scene_list", _SCENE_PAYLOAD).scenes[0]
+        self.assertEqual(scored.bgm_mood, "hopeful")
+        self.assertEqual(
+            required_scene_roles(scored), ("visual", "narration", "music")
+        )
+
+        silent_and_unscored = scored.model_copy(
+            update={"narration": "", "bgm_mood": ""}
+        )
+        # Visual is always required; narration/music are not when the scene
+        # never asked for them — a silent, unscored shot is a legitimate
+        # authorial choice, not a defect to flag.
+        self.assertEqual(required_scene_roles(silent_and_unscored), ("visual",))
 
 
 class TextUtilsTests(unittest.TestCase):

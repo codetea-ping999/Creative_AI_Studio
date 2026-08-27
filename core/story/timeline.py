@@ -72,19 +72,34 @@ def normalize_motion(
     return default_motion, True
 
 
-def missing_scene_assets(story: StoryDocument) -> list[dict[str, str]]:
-    """List the assets a story still needs before it can be assembled.
+def required_scene_roles(scene: Scene) -> tuple[str, ...]:
+    """Which asset roles ``scene`` must fill before it can be assembled.
 
-    A scene always needs a visual. It needs narration audio only when it has
-    narration text, because a silent establishing shot is a legitimate choice.
+    Visual is always required — a scene renders as nothing without one.
+    Narration and music are required only when the scene actually asks for
+    them (narration text, a named ``bgm_mood``): a silent establishing shot,
+    or a scene with no scored mood, is a legitimate authorial choice rather
+    than a defect to flag. This mirrors the same "did the writer ask for
+    this role" check ``_scene_generation_request`` uses to decide whether a
+    role can even be generated for a scene.
     """
+
+    required = ["visual"]
+    if scene.narration.strip():
+        required.append("narration")
+    if scene.bgm_mood.strip():
+        required.append("music")
+    return tuple(required)
+
+
+def missing_scene_assets(story: StoryDocument) -> list[dict[str, str]]:
+    """List the assets a story still needs before it can be assembled."""
 
     missing: list[dict[str, str]] = []
     for scene in story.scenes_in_order():
-        if not scene.asset_ids.get("visual"):
-            missing.append({"scene_id": scene.id, "role": "visual"})
-        if scene.narration.strip() and not scene.asset_ids.get("narration"):
-            missing.append({"scene_id": scene.id, "role": "narration"})
+        for role in required_scene_roles(scene):
+            if not scene.asset_ids.get(role):
+                missing.append({"scene_id": scene.id, "role": role})
     return missing
 
 
@@ -280,4 +295,9 @@ def _with_path(
     return entry
 
 
-__all__ = ["DEFAULT_MUSIC_GAIN_DB", "build_timeline", "missing_scene_assets"]
+__all__ = [
+    "DEFAULT_MUSIC_GAIN_DB",
+    "build_timeline",
+    "missing_scene_assets",
+    "required_scene_roles",
+]

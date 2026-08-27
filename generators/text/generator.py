@@ -93,11 +93,26 @@ class TextGenerator(BaseGenerator):
         ):
             effective_params.pop(runtime_key, None)
 
+        # Continuity memory (issue #190): POST /stories/{id}/expand injects
+        # `continuity_context` (the rendered prompt block) and
+        # `continuity_snapshot` (the exact ContinuityContext used, for
+        # reproducibility) into params for the "prose" task. Popped here so
+        # neither is echoed into metadata["params"] below, which is about
+        # generation knobs, not story content — the snapshot gets its own
+        # metadata field instead, so it is inspectable without re-parsing the
+        # resolved prompt.
+        continuity_context_text = str(
+            effective_params.pop("continuity_context", "") or ""
+        ).strip()
+        continuity_snapshot = effective_params.pop("continuity_snapshot", None)
+
         task_params = {
             "premise": request.prompt,
             "subject": request.prompt,
             **effective_params,
         }
+        if continuity_context_text:
+            task_params["continuity_context"] = continuity_context_text
         prompt = task.build_prompt(task_params)
         json_schema = task.json_schema()
 
@@ -167,6 +182,12 @@ class TextGenerator(BaseGenerator):
                 "generation_attempts": attempts,
                 "default_params": dict(manifest.default_params),
                 "quality_report": quality_report,
+                # Inspectable, reproducible record of what continuity memory
+                # (if any) was injected for this chapter (issue #190). Both
+                # are `None`/absent-shaped when no continuity applied, e.g. a
+                # story's first chapter or a non-"prose" task.
+                "continuity_context": continuity_context_text or None,
+                "continuity_snapshot": continuity_snapshot,
                 **_extract_lineage_metadata(request.params),
                 "params": {
                     "task": task.name,

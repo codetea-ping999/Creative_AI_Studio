@@ -30,6 +30,14 @@ from .continuity_builder import (
     ProposedTimelineFact,
     update_continuity_memory,
 )
+from .continuity_context import (
+    CONTINUITY_PROMPT_HEADING,
+    DEFAULT_CONTEXT_CHARACTER_BUDGET,
+    ContinuityContext,
+    build_continuity_context,
+    render_continuity_prompt_block,
+)
+from .continuity_repository import ContinuityRepository
 from .merge import DEFAULT_SCENE_DURATION_SECONDS, SUPPORTED_TASKS, apply_text_result
 from .repository import StoryRepository
 from .schemas import (
@@ -48,6 +56,7 @@ from .timeline import (
     build_timeline,
     missing_scene_assets,
     normalize_motion,
+    required_scene_roles,
 )
 from .visual_manifest import (
     DEFAULT_ASPECT_RATIO,
@@ -60,13 +69,17 @@ from .visual_manifest import (
 __all__ = [
     "Beat",
     "BibleSnapshotRef",
+    "CONTINUITY_PROMPT_HEADING",
     "CanonFact",
     "Chapter",
     "ChapterCompletion",
     "ChapterSummary",
+    "ContinuityContext",
     "ContinuityMemory",
+    "ContinuityRepository",
     "ContinuityUpdateResult",
     "DEFAULT_ASPECT_RATIO",
+    "DEFAULT_CONTEXT_CHARACTER_BUDGET",
     "DEFAULT_MUSIC_GAIN_DB",
     "DEFAULT_SCENE_DURATION_SECONDS",
     "DialogueLine",
@@ -97,12 +110,15 @@ __all__ = [
     "TimelineFact",
     "UnresolvedThread",
     "apply_text_result",
+    "build_continuity_context",
     "build_timeline",
     "build_visual_manifest",
     "scene_binding_params",
     "count_words",
     "missing_scene_assets",
     "normalize_motion",
+    "render_continuity_prompt_block",
+    "required_scene_roles",
     "split_subtitle_lines",
     "update_continuity_memory",
 ]

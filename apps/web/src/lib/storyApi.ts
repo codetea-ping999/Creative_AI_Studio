@@ -72,9 +72,36 @@ export type StoryDocument = {
 
 export type MissingAsset = { scene_id: string; role: string };
 
+/**
+ * Per-scene, per-role generation status (issue #245).
+ *
+ * `missing_assets` only ever named "not yet assigned"; this carries the
+ * fuller state a job can be in — including one that is actively generating,
+ * or that failed — so the timeline can show that instead of a plain,
+ * unexplained blank.
+ */
+export type SceneAssetState = "assigned" | "missing" | "optional" | "generating" | "failed";
+
+export type SceneAssetStatusEntry = {
+  scene_id: string;
+  role: SceneRole;
+  state: SceneAssetState;
+  required: boolean;
+  asset_id?: string | null;
+  job_id?: string | null;
+  error_message?: string | null;
+};
+
 export type StoryDetail = {
   story: StoryDocument;
   missing_assets: MissingAsset[];
+  /**
+   * Absent on responses from before issue #245 (or a test fixture that only
+   * sets `missing_assets`) — always read through `sceneAssetStatusLookup`,
+   * which degrades to `missing_assets` in that case, rather than indexing
+   * this array directly.
+   */
+  asset_status?: SceneAssetStatusEntry[];
 };
 
 export type StoryListResponse = {
@@ -335,4 +362,40 @@ export function isReadyToAssemble(detail: StoryDetail | null): boolean {
   return Boolean(
     detail && detail.story.scenes.length > 0 && detail.missing_assets.length === 0,
   );
+}
+
+/** Index `detail.asset_status` by scene id, then role, for O(1) row lookups. */
+export function sceneAssetStatusLookup(
+  detail: StoryDetail | null,
+): Map<string, Map<SceneRole, SceneAssetStatusEntry>> {
+  const bySceneId = new Map<string, Map<SceneRole, SceneAssetStatusEntry>>();
+  for (const entry of detail?.asset_status ?? []) {
+    const byRole = bySceneId.get(entry.scene_id) ?? new Map<SceneRole, SceneAssetStatusEntry>();
+    byRole.set(entry.role, entry);
+    bySceneId.set(entry.scene_id, byRole);
+  }
+  return bySceneId;
+}
+
+/**
+ * How many scene/role slots sit in each state, across the whole timeline.
+ *
+ * The timeline-level summary is derived from exactly this count so it can
+ * never drift from what each scene row shows (issue #245's "timeline-level
+ * summary matches per-scene status").
+ */
+export function countSceneAssetStates(
+  detail: StoryDetail | null,
+): Record<SceneAssetState, number> {
+  const counts: Record<SceneAssetState, number> = {
+    assigned: 0,
+    missing: 0,
+    optional: 0,
+    generating: 0,
+    failed: 0,
+  };
+  for (const entry of detail?.asset_status ?? []) {
+    counts[entry.state] += 1;
+  }
+  return counts;
 }

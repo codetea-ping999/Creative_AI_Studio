@@ -1,8 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
 import {
+  countSceneAssetStates,
   getStory,
   listStories,
+  sceneAssetStatusLookup,
   sceneRoleLabels,
+  type SceneAssetState,
+  type SceneAssetStatusEntry,
   type SceneRole,
   type StoryDetail,
   type StoryScene,
@@ -19,18 +23,19 @@ type LoadState = "loading" | "ready" | "error";
 const roleOrder: SceneRole[] = ["visual", "narration", "music"];
 
 /**
- * Whether one scene/role pair is filled, still needed, or genuinely optional.
- *
- * `missing` only ever applies to roles the story API flagged in
- * `missing_assets` — a silent establishing shot with no narration is a valid
- * scene, not a defect, so it renders as `optional` rather than `missing`.
+ * Whether one scene/role pair is filled, still needed, actively generating,
+ * failed, or genuinely optional (issue #245 adds the middle two: without
+ * them a role mid-generation or one whose only attempt failed looked
+ * identical to one nobody has touched yet).
  */
-type RoleStatus = "assigned" | "missing" | "optional";
+type RoleStatus = SceneAssetState;
 
 const roleStatusLabels: Record<RoleStatus, string> = {
   assigned: "割り当て済み",
   missing: "未割り当て",
   optional: "未設定（任意）",
+  generating: "生成中",
+  failed: "生成失敗",
 };
 
 // A glyph carries the state on its own so the badge still reads correctly for
@@ -40,17 +45,31 @@ const roleStatusGlyphs: Record<RoleStatus, string> = {
   assigned: "✓",
   missing: "!",
   optional: "–",
+  generating: "…",
+  failed: "✕",
 };
 
 function formatSeconds(value: number): string {
   return `${value.toFixed(1)} 秒`;
 }
 
+/**
+ * Resolve one scene/role's status.
+ *
+ * `statusEntry` (from `detail.asset_status`) is preferred when present since
+ * it also knows about in-flight and failed generation jobs; a `detail` that
+ * predates issue #245 (or a fixture that only sets `missing_assets`) falls
+ * back to the original assigned/missing/optional derivation.
+ */
 function roleStatusOf(
   scene: StoryScene,
   role: SceneRole,
   missingRoles: Set<SceneRole>,
+  statusEntry: SceneAssetStatusEntry | undefined,
 ): RoleStatus {
+  if (statusEntry) {
+    return statusEntry.state;
+  }
   if (scene.asset_ids[role]) {
     return "assigned";
   }
@@ -83,6 +102,28 @@ function AssemblyTimelineScenes({ detail }: { detail: StoryDetail }) {
     roles.add(entry.role as SceneRole);
     missingByScene.set(entry.scene_id, roles);
   }
+  const statusByScene = sceneAssetStatusLookup(detail);
+
+  // `detail.asset_status` is the single source both the per-scene rows and
+  // this summary read from, so the two can never disagree (issue #245).
+  // A `detail` with no `asset_status` at all (predates #245) falls back to
+  // `missing_assets` alone, matching this panel's original #244 summary.
+  const hasAssetStatus = (detail.asset_status?.length ?? 0) > 0;
+  const stateCounts = countSceneAssetStates(detail);
+  const missingCount = hasAssetStatus ? stateCounts.missing : detail.missing_assets.length;
+  const summaryParts: string[] = [];
+  if (missingCount > 0) {
+    summaryParts.push(`不足素材 ${missingCount} 件`);
+  }
+  if (stateCounts.generating > 0) {
+    summaryParts.push(`生成中 ${stateCounts.generating} 件`);
+  }
+  if (stateCounts.failed > 0) {
+    summaryParts.push(`失敗 ${stateCounts.failed} 件`);
+  }
+  const summarySuffix = summaryParts.length > 0
+    ? ` — ${summaryParts.join(" / ")}`
+    : " — 素材はすべて揃っています";
 
   if (scenes.length === 0) {
     return (
@@ -113,9 +154,7 @@ function AssemblyTimelineScenes({ detail }: { detail: StoryDetail }) {
       <table className="story-scene-table assembly-timeline-table">
         <caption>
           {scenes.length} シーン / 合計 {formatSeconds(totalDuration)}
-          {detail.missing_assets.length > 0
-            ? ` — 不足素材 ${detail.missing_assets.length} 件`
-            : " — 素材はすべて揃っています"}
+          {summarySuffix}
         </caption>
         <thead>
           <tr>
@@ -128,6 +167,7 @@ function AssemblyTimelineScenes({ detail }: { detail: StoryDetail }) {
         <tbody>
           {rows.map(({ scene, startSeconds, endSeconds }, index) => {
             const missingRoles = missingByScene.get(scene.id) ?? new Set<SceneRole>();
+            const sceneStatus = statusByScene.get(scene.id);
             return (
               <tr key={scene.id}>
                 <td data-label="順番">{index + 1}</td>
@@ -151,7 +191,8 @@ function AssemblyTimelineScenes({ detail }: { detail: StoryDetail }) {
                 <td data-label="素材の割り当て">
                   <ul className="assembly-timeline-roles">
                     {roleOrder.map((role) => {
-                      const status = roleStatusOf(scene, role, missingRoles);
+                      const statusEntry = sceneStatus?.get(role);
+                      const status = roleStatusOf(scene, role, missingRoles, statusEntry);
                       const assetId = scene.asset_ids[role];
                       return (
                         <li
@@ -169,6 +210,12 @@ function AssemblyTimelineScenes({ detail }: { detail: StoryDetail }) {
                               ? `${roleStatusLabels[status]}（${assetId}）`
                               : roleStatusLabels[status]}
                           </span>
+                          {status === "failed" && statusEntry?.error_message ? (
+                            <details className="assembly-timeline-role__reason">
+                              <summary>失敗の理由</summary>
+                              <p>{statusEntry.error_message}</p>
+                            </details>
+                          ) : null}
                         </li>
                       );
                     })}
