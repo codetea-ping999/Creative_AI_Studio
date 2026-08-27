@@ -25,11 +25,15 @@ def apply_text_result(
     structured: dict[str, Any],
     *,
     job_id: str | None = None,
+    continuity_as_of_chapter_id: str | None = None,
 ) -> StoryDocument:
     """Return a new document with ``structured`` merged in for ``task``.
 
     Pure: the input document is never mutated, so a caller can compare before and
     after, or discard a merge it does not like.
+
+    ``continuity_as_of_chapter_id`` is only meaningful for ``task == "prose"``
+    (see ``_merge_prose``); every other task ignores it.
     """
 
     if task not in SUPPORTED_TASKS:
@@ -38,7 +42,14 @@ def apply_text_result(
             f"expected one of {', '.join(SUPPORTED_TASKS)}"
         )
 
-    updates = _MERGERS[task](story, structured)
+    if task == "prose":
+        updates = _merge_prose(
+            story,
+            structured,
+            continuity_as_of_chapter_id=continuity_as_of_chapter_id,
+        )
+    else:
+        updates = _MERGERS[task](story, structured)
 
     source_job_ids = list(story.source_job_ids)
     if job_id is not None and job_id not in source_job_ids:
@@ -137,6 +148,8 @@ def _merge_scene_list(
 def _merge_prose(
     story: StoryDocument,
     structured: dict[str, Any],
+    *,
+    continuity_as_of_chapter_id: str | None = None,
 ) -> dict[str, Any]:
     prose_markdown = str(structured.get("prose_markdown", "")).strip()
     if not prose_markdown:
@@ -162,10 +175,30 @@ def _merge_prose(
         title=title,
         prose_markdown=prose_markdown,
         word_count=count_words(prose_markdown),
+        continuity_as_of_chapter_id=continuity_as_of_chapter_id,
+        # A (re)written chapter is the new authoritative version of itself, so
+        # it starts unflagged even if the chapter it is replacing had been
+        # marked stale by some earlier regeneration.
+        stale_after_chapter_id=None,
     )
     if existing_index is None:
         chapters.append(chapter)
     else:
+        # Regenerating an existing chapter means every later chapter may have
+        # been written continuing from, or summarizing, the OLD prose this
+        # replaces — the exact "downstream chapters depend on the prior state"
+        # scenario issue #191 asks to catch. They are flagged, never silently
+        # rewritten (automatic regeneration of every downstream chapter is an
+        # explicit non-goal), so an editor sees the warning and decides what,
+        # if anything, to redo.
+        chapters = [
+            (
+                existing.model_copy(update={"stale_after_chapter_id": chapter.id})
+                if existing.order > order
+                else existing
+            )
+            for existing in chapters
+        ]
         chapters[existing_index] = chapter
     return {"chapters": chapters}
 

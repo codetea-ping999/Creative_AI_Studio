@@ -817,5 +817,167 @@ class ContinuityInjectionApiTests(unittest.TestCase):
         self.assertNotIn("無視されるはずの要約", job["result"]["metadata"]["resolved_prompt"])
 
 
+class ChapterRegenerationStaleWarningApiTests(unittest.TestCase):
+    """Regenerating an earlier chapter flags downstream chapters (issue #191)."""
+
+    def setUp(self) -> None:
+        self._temporary = TemporaryDirectory()
+        self.addCleanup(self._temporary.cleanup)
+        root = Path(self._temporary.name)
+        self.services = create_application_services(
+            db_path=root / "jobs.db", output_dir=root / "outputs"
+        )
+        self.client = TestClient(create_app(self.services, start_job_runner=False))
+        self.story_id = self.client.post(
+            "/stories", json={"title": "五章物語", "premise": "五章にわたる物語"}
+        ).json()["id"]
+
+    def _drain(self, limit: int = 32) -> None:
+        processed = 0
+        while processed < limit and self.services.job_runner.run_once() is not None:
+            processed += 1
+
+    def _write_chapter(self, title: str) -> dict:
+        """Queue and apply a "prose" job that (re)writes the chapter titled ``title``.
+
+        The deterministic template runtime's "title" field template is
+        ``"{subject}"`` (see ``core.models.text_runtimes._FIELD_PHRASES``), and
+        ``subject`` defaults to the story's premise unless overridden — so
+        ``subject`` is set explicitly to ``title`` here to get a distinct,
+        predictable title back. That title is what
+        ``core.story.merge._merge_prose`` matches an existing chapter on, so
+        calling this twice with the same title regenerates that chapter
+        instead of appending a new one.
+        """
+
+        job_id = self.client.post(
+            f"/stories/{self.story_id}/expand",
+            json={
+                "task": "prose",
+                "model_id": "template-writer",
+                "params": {"title": title, "subject": title},
+            },
+        ).json()["job_id"]
+        self._drain()
+        job = self.client.get(f"/jobs/{job_id}").json()
+        self.assertEqual(job["status"], "succeeded", job)
+
+        response = self.client.post(
+            f"/stories/{self.story_id}/apply", json={"job_id": job_id}
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()
+
+    def _write_five_chapters(self) -> None:
+        for index in range(1, 6):
+            self._write_chapter(f"第{index}章")
+
+    def test_regenerating_an_earlier_chapter_warns_about_downstream_chapters(
+        self,
+    ) -> None:
+        self._write_five_chapters()
+        fresh = self.client.get(f"/stories/{self.story_id}").json()
+        self.assertEqual(fresh["stale_chapter_warnings"], [])
+
+        result = self._write_chapter("第1章")
+        chapters = result["story"]["chapters"]
+        chapter_one_id = next(c["id"] for c in chapters if c["title"] == "第1章")
+
+        # The warning names both the changed chapter and the affected range.
+        warnings = result["stale_chapter_warnings"]
+        self.assertEqual(len(warnings), 4)
+        self.assertEqual(
+            {warning["stale_after_chapter_id"] for warning in warnings},
+            {chapter_one_id},
+        )
+        self.assertEqual(
+            sorted(warning["order"] for warning in warnings), [1, 2, 3, 4]
+        )
+
+        # Later chapters were flagged, not silently rewritten.
+        untouched = {c["title"]: c["prose_markdown"] for c in chapters[1:]}
+        self.assertEqual(
+            {c["title"]: c["prose_markdown"] for c in fresh["story"]["chapters"][1:]},
+            untouched,
+        )
+
+        # The warning is not just a one-shot response: it is still visible on
+        # a later plain read.
+        reread = self.client.get(f"/stories/{self.story_id}").json()
+        self.assertEqual(len(reread["stale_chapter_warnings"]), 4)
+
+    def test_regenerating_a_stale_chapter_clears_its_own_warning(self) -> None:
+        self._write_five_chapters()
+        self._write_chapter("第1章")
+
+        result = self._write_chapter("第2章")
+        warnings = {w["order"]: w for w in result["stale_chapter_warnings"]}
+        # Chapter 2 (order 1) regenerated itself clean; chapters 3-5 are now
+        # flagged against the new chapter 2 instead of the old chapter 1.
+        self.assertNotIn(1, warnings)
+        self.assertEqual(sorted(warnings), [2, 3, 4])
+        chapter_two_id = next(
+            c["id"] for c in result["story"]["chapters"] if c["title"] == "第2章"
+        )
+        self.assertTrue(
+            all(w["stale_after_chapter_id"] == chapter_two_id for w in warnings.values())
+        )
+
+    def test_acknowledging_a_stale_chapter_clears_it_without_rewriting_it(
+        self,
+    ) -> None:
+        self._write_five_chapters()
+        result = self._write_chapter("第3章")
+        chapter_four = next(
+            c for c in result["story"]["chapters"] if c["title"] == "第4章"
+        )
+        self.assertIsNotNone(chapter_four["stale_after_chapter_id"])
+        prose_before = chapter_four["prose_markdown"]
+
+        ack = self.client.post(
+            f"/stories/{self.story_id}/chapters/{chapter_four['id']}/acknowledge-stale"
+        )
+        self.assertEqual(ack.status_code, 200, ack.text)
+        acked_chapter = next(
+            c for c in ack.json()["story"]["chapters"] if c["id"] == chapter_four["id"]
+        )
+        self.assertIsNone(acked_chapter["stale_after_chapter_id"])
+        # Acknowledging clears the flag only, never the prose.
+        self.assertEqual(acked_chapter["prose_markdown"], prose_before)
+        self.assertEqual(
+            [w["chapter_id"] for w in ack.json()["stale_chapter_warnings"]],
+            [c["id"] for c in ack.json()["story"]["chapters"] if c["title"] == "第5章"],
+        )
+
+        # Acknowledging an already-clear chapter is a no-op, not an error.
+        second_ack = self.client.post(
+            f"/stories/{self.story_id}/chapters/{chapter_four['id']}/acknowledge-stale"
+        )
+        self.assertEqual(second_ack.status_code, 200, second_ack.text)
+
+    def test_acknowledging_an_unknown_chapter_is_a_404(self) -> None:
+        response = self.client.post(
+            f"/stories/{self.story_id}/chapters/does-not-exist/acknowledge-stale"
+        )
+        self.assertEqual(response.status_code, 404, response.text)
+
+    def test_apply_records_the_continuity_snapshot_used_on_the_chapter(self) -> None:
+        # Issue #191 task 1: the exact continuity state (issue #190) a chapter
+        # was written against travels with the chapter itself.
+        continuity_dir = self.services.story_repository.story_dir.parent / "continuity"
+        memory = update_continuity_memory(
+            None,
+            ChapterCompletion(chapter_id="chapter_01", order=0, summary="第一章の要約"),
+            story_id=self.story_id,
+        ).memory
+        ContinuityRepository(continuity_dir).save(memory)
+
+        result = self._write_chapter("第2章")
+        chapter = next(
+            c for c in result["story"]["chapters"] if c["title"] == "第2章"
+        )
+        self.assertEqual(chapter["continuity_as_of_chapter_id"], "chapter_01")
+
+
 if __name__ == "__main__":
     unittest.main()
