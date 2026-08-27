@@ -14,6 +14,7 @@ import json
 import logging
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import time
 from typing import Any
 import unittest
 from unittest.mock import patch
@@ -28,21 +29,31 @@ from generators.image.generator import ImageGenerator
 from generators.image.providers import (
     ImageGenerationSpec,
     ImageProvider,
+    ImageProviderAuthError,
+    ImageProviderCallError,
     ImageProviderCapabilities,
     ImageProviderCredential,
     ImageProviderCredentialUnavailableError,
+    ImageProviderErrorCategory,
     ImageProviderIdentity,
     ImageProviderMisconfiguredError,
+    ImageProviderPermanentError,
     ImageProviderPreflightDisclosure,
+    ImageProviderRateLimitError,
     ImageProviderReferenceAsset,
     ImageProviderResult,
+    ImageProviderRetryPolicy,
+    ImageProviderTimeoutError,
+    ImageProviderTransientError,
     LocalDiffusersImageProvider,
     RemoteImageProviderOptInRequiredError,
     UnsupportedImageParameterError,
     build_image_provider_preflight,
+    call_image_provider_with_retry,
     cloud_image_provider_opt_in_granted,
     ensure_image_provider_opt_in,
     is_local_image_provider,
+    is_retryable_image_provider_error_category,
     redact_provider_error,
     redact_provider_metadata,
     redact_secrets,
@@ -549,6 +560,373 @@ class RunImageProviderRequestTest(unittest.TestCase):
         self.assertEqual(result, "sent")
         self.assertEqual(disclosure.destination, "remote")
         self.assertEqual(disclosure.provider_id, "fake-cloud")
+
+
+class ImageProviderErrorCategoryTest(unittest.TestCase):
+    """The five stable categories (issue #258) and which ones are retryable."""
+
+    def test_timeout_rate_limit_and_transient_are_retryable(self) -> None:
+        for category in (
+            ImageProviderErrorCategory.TIMEOUT,
+            ImageProviderErrorCategory.RATE_LIMIT,
+            ImageProviderErrorCategory.TRANSIENT,
+        ):
+            self.assertTrue(is_retryable_image_provider_error_category(category))
+
+    def test_auth_and_permanent_are_not_retryable(self) -> None:
+        for category in (
+            ImageProviderErrorCategory.AUTH,
+            ImageProviderErrorCategory.PERMANENT,
+        ):
+            self.assertFalse(is_retryable_image_provider_error_category(category))
+
+    def test_error_subclasses_carry_the_matching_category_and_retryable_flag(self) -> None:
+        cases = [
+            (ImageProviderTimeoutError, ImageProviderErrorCategory.TIMEOUT, True),
+            (ImageProviderRateLimitError, ImageProviderErrorCategory.RATE_LIMIT, True),
+            (ImageProviderTransientError, ImageProviderErrorCategory.TRANSIENT, True),
+            (ImageProviderAuthError, ImageProviderErrorCategory.AUTH, False),
+            (ImageProviderPermanentError, ImageProviderErrorCategory.PERMANENT, False),
+        ]
+        for error_cls, expected_category, expected_retryable in cases:
+            error = error_cls("boom", provider_id="fake-cloud")
+            self.assertIsInstance(error, ImageProviderCallError)
+            self.assertEqual(error.category, expected_category)
+            self.assertEqual(error.retryable, expected_retryable)
+            self.assertIsNone(error.provider_request_id)
+            self.assertIsNone(error.retry_after_seconds)
+
+    def test_error_preserves_provider_request_id_and_retry_after(self) -> None:
+        error = ImageProviderRateLimitError(
+            "slow down",
+            provider_id="fake-cloud",
+            provider_request_id="vendor-req-42",
+            retry_after_seconds=2.5,
+        )
+        self.assertEqual(error.provider_request_id, "vendor-req-42")
+        self.assertEqual(error.retry_after_seconds, 2.5)
+
+
+class ImageProviderRetryPolicyTest(unittest.TestCase):
+    """Retry count and timeout must be finite/configurable within safe bounds."""
+
+    def test_default_policy_is_within_safe_bounds(self) -> None:
+        policy = ImageProviderRetryPolicy()  # must not raise
+        self.assertGreaterEqual(policy.max_retries, 0)
+        self.assertGreater(policy.timeout_seconds, 0)
+
+    def test_negative_max_retries_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "max_retries"):
+            ImageProviderRetryPolicy(max_retries=-1)
+
+    def test_max_retries_above_the_safe_ceiling_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "max_retries"):
+            ImageProviderRetryPolicy(max_retries=10_000)
+
+    def test_non_positive_timeout_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "timeout_seconds"):
+            ImageProviderRetryPolicy(timeout_seconds=0)
+
+    def test_timeout_above_the_safe_ceiling_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "timeout_seconds"):
+            ImageProviderRetryPolicy(timeout_seconds=10_000)
+
+    def test_negative_backoff_base_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "backoff_base_seconds"):
+            ImageProviderRetryPolicy(backoff_base_seconds=-1)
+
+    def test_backoff_multiplier_below_one_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "backoff_multiplier"):
+            ImageProviderRetryPolicy(backoff_multiplier=0.5)
+
+    def test_max_backoff_above_the_safe_ceiling_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "max_backoff_seconds"):
+            ImageProviderRetryPolicy(max_backoff_seconds=10_000)
+
+
+class _FlakyFakeCloudProvider:
+    """Fails `failures_before_success` times with a given categorized error,
+    then succeeds -- used to exercise retry-then-recover behavior without any
+    real network call (issue #258's "fake-provider tests")."""
+
+    def __init__(
+        self,
+        *,
+        error_factory: Any,
+        failures_before_success: int = 0,
+        sleep_seconds: float | None = None,
+    ) -> None:
+        self._error_factory = error_factory
+        self._failures_before_success = failures_before_success
+        self._sleep_seconds = sleep_seconds
+        self.call_count = 0
+
+    def __call__(self) -> str:
+        self.call_count += 1
+        if self._sleep_seconds is not None:
+            time.sleep(self._sleep_seconds)
+        if self.call_count <= self._failures_before_success:
+            raise self._error_factory()
+        return f"ok-after-{self.call_count}-calls"
+
+
+class CallImageProviderWithRetryTest(unittest.TestCase):
+    """`call_image_provider_with_retry`: success, timeout, rate limit,
+    transient recovery, and permanent failure (issue #258)."""
+
+    def test_a_successful_call_returns_immediately_with_no_retry(self) -> None:
+        sleeps: list[float] = []
+        provider = _FlakyFakeCloudProvider(
+            error_factory=lambda: ImageProviderTransientError("boom", provider_id="fake-cloud")
+        )
+
+        result = call_image_provider_with_retry(
+            provider, provider_id="fake-cloud", sleep=sleeps.append
+        )
+
+        self.assertEqual(result, "ok-after-1-calls")
+        self.assertEqual(provider.call_count, 1)
+        self.assertEqual(sleeps, [])
+
+    def test_timeout_raises_when_transport_exceeds_the_per_attempt_deadline(self) -> None:
+        provider = _FlakyFakeCloudProvider(
+            error_factory=lambda: RuntimeError("unused"), sleep_seconds=0.3
+        )
+        policy = ImageProviderRetryPolicy(max_retries=0, timeout_seconds=0.05)
+
+        with self.assertRaises(ImageProviderTimeoutError) as ctx:
+            call_image_provider_with_retry(
+                provider, provider_id="fake-cloud", retry_policy=policy, sleep=lambda seconds: None
+            )
+        self.assertIn("fake-cloud", str(ctx.exception))
+        self.assertEqual(ctx.exception.category, ImageProviderErrorCategory.TIMEOUT)
+
+    def test_rate_limit_is_retried_and_recovers(self) -> None:
+        sleeps: list[float] = []
+        provider = _FlakyFakeCloudProvider(
+            error_factory=lambda: ImageProviderRateLimitError(
+                "slow down", provider_id="fake-cloud", retry_after_seconds=1.0
+            ),
+            failures_before_success=2,
+        )
+        policy = ImageProviderRetryPolicy(max_retries=2)
+
+        result = call_image_provider_with_retry(
+            provider, provider_id="fake-cloud", retry_policy=policy, sleep=sleeps.append
+        )
+
+        self.assertEqual(result, "ok-after-3-calls")
+        self.assertEqual(provider.call_count, 3)
+        self.assertEqual(sleeps, [1.0, 1.0])  # honors the vendor's retry_after_seconds hint
+
+    def test_transient_error_recovers_after_one_retry(self) -> None:
+        sleeps: list[float] = []
+        provider = _FlakyFakeCloudProvider(
+            error_factory=lambda: ImageProviderTransientError("hiccup", provider_id="fake-cloud"),
+            failures_before_success=1,
+        )
+
+        result = call_image_provider_with_retry(
+            provider, provider_id="fake-cloud", sleep=sleeps.append
+        )
+
+        self.assertEqual(result, "ok-after-2-calls")
+        self.assertEqual(provider.call_count, 2)
+        self.assertEqual(sleeps, [0.5])  # default backoff_base_seconds
+
+    def test_permanent_error_is_never_retried(self) -> None:
+        sleeps: list[float] = []
+        provider = _FlakyFakeCloudProvider(
+            error_factory=lambda: ImageProviderPermanentError(
+                "bad request", provider_id="fake-cloud"
+            ),
+            failures_before_success=999,
+        )
+
+        with self.assertRaises(ImageProviderPermanentError):
+            call_image_provider_with_retry(provider, provider_id="fake-cloud", sleep=sleeps.append)
+
+        self.assertEqual(provider.call_count, 1)
+        self.assertEqual(sleeps, [])
+
+    def test_auth_error_is_never_retried(self) -> None:
+        sleeps: list[float] = []
+        provider = _FlakyFakeCloudProvider(
+            error_factory=lambda: ImageProviderAuthError("bad key", provider_id="fake-cloud"),
+            failures_before_success=999,
+        )
+
+        with self.assertRaises(ImageProviderAuthError):
+            call_image_provider_with_retry(provider, provider_id="fake-cloud", sleep=sleeps.append)
+
+        self.assertEqual(provider.call_count, 1)
+        self.assertEqual(sleeps, [])
+
+    def test_an_unclassified_exception_is_never_retried(self) -> None:
+        sleeps: list[float] = []
+        provider = _FlakyFakeCloudProvider(
+            error_factory=lambda: ValueError("not a provider error"), failures_before_success=999
+        )
+
+        with self.assertRaises(ValueError):
+            call_image_provider_with_retry(provider, provider_id="fake-cloud", sleep=sleeps.append)
+
+        self.assertEqual(provider.call_count, 1)
+        self.assertEqual(sleeps, [])
+
+    def test_retries_are_exhausted_and_the_final_error_propagates(self) -> None:
+        sleeps: list[float] = []
+        provider = _FlakyFakeCloudProvider(
+            error_factory=lambda: ImageProviderTransientError(
+                "still down", provider_id="fake-cloud"
+            ),
+            failures_before_success=999,
+        )
+        policy = ImageProviderRetryPolicy(max_retries=2)
+
+        with self.assertRaises(ImageProviderTransientError):
+            call_image_provider_with_retry(
+                provider, provider_id="fake-cloud", retry_policy=policy, sleep=sleeps.append
+            )
+
+        self.assertEqual(provider.call_count, 3)  # 1 initial + 2 retries
+        self.assertEqual(len(sleeps), 2)
+
+    def test_retry_after_seconds_is_clamped_to_max_backoff(self) -> None:
+        sleeps: list[float] = []
+        provider = _FlakyFakeCloudProvider(
+            error_factory=lambda: ImageProviderRateLimitError(
+                "slow down", provider_id="fake-cloud", retry_after_seconds=999.0
+            ),
+            failures_before_success=1,
+        )
+        policy = ImageProviderRetryPolicy(max_backoff_seconds=3.0)
+
+        call_image_provider_with_retry(
+            provider, provider_id="fake-cloud", retry_policy=policy, sleep=sleeps.append
+        )
+
+        self.assertEqual(sleeps, [3.0])
+
+    def test_exponential_backoff_grows_and_is_capped(self) -> None:
+        sleeps: list[float] = []
+        provider = _FlakyFakeCloudProvider(
+            error_factory=lambda: ImageProviderTransientError("hiccup", provider_id="fake-cloud"),
+            failures_before_success=3,
+        )
+        policy = ImageProviderRetryPolicy(
+            max_retries=3,
+            backoff_base_seconds=1.0,
+            backoff_multiplier=2.0,
+            max_backoff_seconds=3.0,
+        )
+
+        call_image_provider_with_retry(
+            provider, provider_id="fake-cloud", retry_policy=policy, sleep=sleeps.append
+        )
+
+        self.assertEqual(sleeps, [1.0, 2.0, 3.0])  # 1, 2, 4-capped-to-3
+
+
+class RunImageProviderRequestRetryIntegrationTest(unittest.TestCase):
+    """`run_image_provider_request` applies bounded retry/timeout to a remote
+    provider automatically, and never wraps a local provider (issue #258)."""
+
+    def test_remote_provider_transient_failure_recovers_through_run_image_provider_request(
+        self,
+    ) -> None:
+        sleeps: list[float] = []
+        provider = _FlakyFakeCloudProvider(
+            error_factory=lambda: ImageProviderTransientError("hiccup", provider_id="fake-cloud"),
+            failures_before_success=1,
+        )
+
+        disclosure, result = run_image_provider_request(
+            _spec(),
+            provider_id="fake-cloud",
+            model_id="fake-model",
+            transport=provider,
+            env={"ALLOW_CLOUD_PROVIDERS": "true"},
+            sleep=sleeps.append,
+        )
+
+        self.assertEqual(result, "ok-after-2-calls")
+        self.assertEqual(provider.call_count, 2)
+        self.assertEqual(disclosure.destination, "remote")
+
+    def test_remote_provider_permanent_failure_is_not_retried(self) -> None:
+        provider = _FlakyFakeCloudProvider(
+            error_factory=lambda: ImageProviderPermanentError(
+                "bad request", provider_id="fake-cloud"
+            ),
+            failures_before_success=999,
+        )
+
+        with self.assertRaises(ImageProviderPermanentError):
+            run_image_provider_request(
+                _spec(),
+                provider_id="fake-cloud",
+                model_id="fake-model",
+                transport=provider,
+                env={"ALLOW_CLOUD_PROVIDERS": "true"},
+                sleep=lambda seconds: None,
+            )
+
+        self.assertEqual(provider.call_count, 1)
+
+    def test_local_provider_is_never_wrapped_even_when_a_retry_policy_is_given(self) -> None:
+        # A local transport can legitimately run past any bounded remote
+        # deadline (e.g. slow CPU inference); a retry_policy passed in must
+        # be ignored entirely for a local provider_id.
+        provider = _FlakyFakeCloudProvider(
+            error_factory=lambda: RuntimeError("unused"), sleep_seconds=0.2
+        )
+        tight_policy = ImageProviderRetryPolicy(max_retries=0, timeout_seconds=0.01)
+
+        disclosure, result = run_image_provider_request(
+            _spec(),
+            provider_id="local-diffusers",
+            model_id="sdxl",
+            transport=provider,
+            env={},
+            retry_policy=tight_policy,
+        )
+
+        self.assertEqual(result, "ok-after-1-calls")
+        self.assertEqual(disclosure.destination, "local")
+
+
+class RedactProviderErrorPreservesCallErrorMetadataTest(unittest.TestCase):
+    """Redaction must not discard category/provenance fields (issue #258)."""
+
+    def test_redaction_preserves_category_provider_id_and_retry_after(self) -> None:
+        original = ImageProviderRateLimitError(
+            f"slow down, key {_SENTINEL_SECRET} is over quota",
+            provider_id="fake-cloud",
+            provider_request_id="vendor-req-42",
+            retry_after_seconds=1.5,
+        )
+
+        redacted = redact_provider_error(original, [_SENTINEL_SECRET])
+
+        self.assertIsInstance(redacted, ImageProviderRateLimitError)
+        self.assertNotIn(_SENTINEL_SECRET, str(redacted))
+        self.assertEqual(redacted.category, ImageProviderErrorCategory.RATE_LIMIT)
+        self.assertEqual(redacted.provider_id, "fake-cloud")
+        self.assertEqual(redacted.provider_request_id, "vendor-req-42")
+        self.assertEqual(redacted.retry_after_seconds, 1.5)
+
+    def test_redaction_also_scrubs_a_secret_embedded_in_the_provider_request_id(self) -> None:
+        original = ImageProviderTransientError(
+            "hiccup",
+            provider_id="fake-cloud",
+            provider_request_id=f"vendor-req-{_SENTINEL_SECRET}",
+        )
+
+        redacted = redact_provider_error(original, [_SENTINEL_SECRET])
+
+        assert isinstance(redacted, ImageProviderTransientError)
+        self.assertNotIn(_SENTINEL_SECRET, redacted.provider_request_id or "")
 
 
 def _cloud_manifest(*, default_params: dict[str, object]) -> ModelManifest:
