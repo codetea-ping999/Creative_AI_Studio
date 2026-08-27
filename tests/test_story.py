@@ -197,6 +197,116 @@ class ApplyTextResultTests(unittest.TestCase):
         self.assertEqual(len(story.chapters), 2)
         self.assertEqual(story.chapters[1].order, 1)
 
+    def _five_chapter_story(self) -> StoryDocument:
+        story = _story()
+        for index in range(5):
+            story = apply_text_result(
+                story,
+                "prose",
+                {
+                    "title": f"第{index + 1}章",
+                    "prose_markdown": f"第{index + 1}章の本文。",
+                },
+            )
+        return story
+
+    def test_prose_records_the_continuity_snapshot_it_was_written_against(
+        self,
+    ) -> None:
+        # Issue #191 task 1: track which continuity-memory snapshot fed each
+        # chapter, so a later regeneration can be understood in terms of what
+        # it invalidates.
+        merged = apply_text_result(
+            _story(),
+            "prose",
+            {"title": "第一章", "prose_markdown": "本文。"},
+            continuity_as_of_chapter_id="chapter_00",
+        )
+        self.assertEqual(
+            merged.chapters[0].continuity_as_of_chapter_id, "chapter_00"
+        )
+        self.assertIsNone(merged.chapters[0].stale_after_chapter_id)
+
+    def test_regenerating_chapter_one_flags_every_downstream_chapter(self) -> None:
+        # Issue #191 acceptance: regenerating chapter 1 of a five-chapter story
+        # identifies chapters 2-5 as depending on the prior state.
+        story = self._five_chapter_story()
+        self.assertTrue(
+            all(chapter.stale_after_chapter_id is None for chapter in story.chapters)
+        )
+        original_downstream_prose = [
+            chapter.prose_markdown for chapter in story.chapters[1:]
+        ]
+
+        story = apply_text_result(
+            story,
+            "prose",
+            {"title": "第1章", "prose_markdown": "第1章の書き直された本文。"},
+        )
+
+        self.assertEqual(len(story.chapters), 5)
+        self.assertIsNone(story.chapters[0].stale_after_chapter_id)
+        self.assertEqual(
+            [chapter.stale_after_chapter_id for chapter in story.chapters[1:]],
+            [story.chapters[0].id] * 4,
+        )
+        # Later chapters are flagged, never silently rewritten.
+        self.assertEqual(
+            [chapter.prose_markdown for chapter in story.chapters[1:]],
+            original_downstream_prose,
+        )
+
+    def test_regenerating_chapter_three_flags_only_later_chapters(self) -> None:
+        # Issue #191 acceptance: regenerating chapter 3 of a five-chapter story
+        # identifies chapters 4-5 as the affected range, leaving 1-2 alone.
+        story = self._five_chapter_story()
+
+        story = apply_text_result(
+            story,
+            "prose",
+            {"title": "第3章", "prose_markdown": "第3章の書き直された本文。"},
+        )
+
+        self.assertEqual(
+            [chapter.stale_after_chapter_id for chapter in story.chapters[:3]],
+            [None, None, None],
+        )
+        self.assertEqual(
+            [chapter.stale_after_chapter_id for chapter in story.chapters[3:]],
+            [story.chapters[2].id] * 2,
+        )
+
+    def test_regenerating_a_flagged_chapter_clears_its_own_flag(self) -> None:
+        # Issue #191 acceptance: the stale state can be cleared by downstream
+        # regeneration, without an editor having to touch it directly.
+        story = self._five_chapter_story()
+        story = apply_text_result(
+            story, "prose", {"title": "第1章", "prose_markdown": "改稿1。"}
+        )
+        self.assertIsNotNone(story.chapters[1].stale_after_chapter_id)
+
+        story = apply_text_result(
+            story, "prose", {"title": "第2章", "prose_markdown": "改稿2。"}
+        )
+
+        self.assertIsNone(story.chapters[1].stale_after_chapter_id)
+        # Regenerating chapter 2 re-flags 3-5 against the new chapter 2, while
+        # chapter 1 (already before it) is left untouched.
+        self.assertIsNone(story.chapters[0].stale_after_chapter_id)
+        self.assertEqual(
+            [chapter.stale_after_chapter_id for chapter in story.chapters[2:]],
+            [story.chapters[1].id] * 3,
+        )
+
+    def test_appending_a_new_chapter_flags_nothing(self) -> None:
+        story = self._five_chapter_story()
+        story = apply_text_result(
+            story, "prose", {"title": "第6章", "prose_markdown": "本文6。"}
+        )
+        self.assertTrue(
+            all(chapter.stale_after_chapter_id is None for chapter in story.chapters)
+        )
+
     def test_script_attaches_dialogue_to_named_scene(self) -> None:
         story = apply_text_result(_story(), "scene_list", _SCENE_PAYLOAD)
         merged = apply_text_result(

@@ -36,20 +36,37 @@ branch on provider/model name to know what a request may safely ask for:
   strip resolved credential values out of any string, exception, or
   diagnostics mapping before it could reach a log line or persisted
   job/asset/request data (issue #257).
+- `ImageProviderErrorCategory` gives every provider call failure one of five
+  stable, vendor-neutral categories (timeout / rate limit / transient /
+  auth / permanent); `ImageProviderCallError` and its five subclasses carry
+  that category plus an optional vendor `provider_request_id` for
+  support/provenance. `ImageProviderRetryPolicy` bounds retry count, backoff,
+  and per-attempt timeout to safe ceilings, and `call_image_provider_with_retry`
+  retries only the categories that are actually retryable, with backoff --
+  `run_image_provider_request` applies this automatically to a *remote*
+  provider's transport call (issue #258). Local providers are never wrapped
+  in a timeout or retried: local compute has no vendor-side timeout/rate-limit
+  concept and can legitimately run far longer than any bounded remote
+  deadline, matching the local/remote gating `ensure_image_provider_opt_in`
+  and `resolve_image_provider_credential` already apply.
 
-Retries, cost estimation, and the actual outbound transport call remain out
-of scope here (see the sibling micro-issues under #66); this module fixes
-the shape the local path and a future cloud path both implement, the
-opt-in/disclosure gate every remote call must pass through, and the secret
-resolution/redaction contract a future transport implementation must use --
-not the transport call itself.
+Cost estimation and the actual outbound transport call remain out of scope
+here (see the sibling micro-issues under #66); this module fixes the shape
+the local path and a future cloud path both implement, the opt-in/disclosure
+gate every remote call must pass through, the secret resolution/redaction
+contract a future transport implementation must use, and the bounded
+timeout/retry/error-normalization contract that transport implementation's
+raised errors must be translated into -- not the transport call itself.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from enum import Enum
 import os
+import threading
+import time
 from typing import Any, Protocol, TypeVar, runtime_checkable
 
 from core.models.manifest import reject_literal_credential_fields
@@ -57,21 +74,31 @@ from core.models.manifest import reject_literal_credential_fields
 __all__ = [
     "ImageGenerationSpec",
     "ImageProvider",
+    "ImageProviderAuthError",
+    "ImageProviderCallError",
     "ImageProviderCapabilities",
     "ImageProviderCredential",
     "ImageProviderCredentialUnavailableError",
+    "ImageProviderErrorCategory",
     "ImageProviderIdentity",
     "ImageProviderMisconfiguredError",
+    "ImageProviderPermanentError",
     "ImageProviderPreflightDisclosure",
+    "ImageProviderRateLimitError",
     "ImageProviderReferenceAsset",
     "ImageProviderResult",
+    "ImageProviderRetryPolicy",
+    "ImageProviderTimeoutError",
+    "ImageProviderTransientError",
     "LocalDiffusersImageProvider",
     "RemoteImageProviderOptInRequiredError",
     "UnsupportedImageParameterError",
     "build_image_provider_preflight",
+    "call_image_provider_with_retry",
     "cloud_image_provider_opt_in_granted",
     "ensure_image_provider_opt_in",
     "is_local_image_provider",
+    "is_retryable_image_provider_error_category",
     "redact_provider_error",
     "redact_provider_metadata",
     "redact_secrets",
@@ -316,6 +343,8 @@ def run_image_provider_request(
     transport: Callable[[], _T],
     reference_assets: Sequence[ImageProviderReferenceAsset] = (),
     env: Mapping[str, str] | None = None,
+    retry_policy: ImageProviderRetryPolicy | None = None,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> tuple[ImageProviderPreflightDisclosure, _T]:
     """Disclose, then authorize, then invoke `transport` -- in that order.
 
@@ -324,6 +353,19 @@ def run_image_provider_request(
     #257+): it guarantees `transport` is unreachable for a remote provider
     lacking opt-in, so the guard demonstrably runs before transport rather
     than relying on each call site to order the two checks itself.
+
+    For a *remote* provider, `transport` additionally runs under a bounded
+    per-attempt timeout and bounded, backed-off retries of only the
+    retryable error categories (issue #258) -- see
+    :func:`call_image_provider_with_retry` for the mechanics. `retry_policy`
+    defaults to `ImageProviderRetryPolicy()` (its own docstring documents
+    the safe bounds); pass an explicit policy to override it. A *local*
+    provider's `transport` always runs unwrapped exactly once regardless of
+    what `retry_policy` is set to: local compute has no vendor-side
+    timeout/rate-limit concept and can legitimately run far longer than any
+    bounded remote deadline (the same local/remote split
+    :func:`ensure_image_provider_opt_in` and
+    :func:`resolve_image_provider_credential` already apply).
     """
 
     disclosure = build_image_provider_preflight(
@@ -333,7 +375,272 @@ def run_image_provider_request(
         reference_assets=reference_assets,
     )
     ensure_image_provider_opt_in(provider_id, env=env)
-    return disclosure, transport()
+    if is_local_image_provider(provider_id):
+        return disclosure, transport()
+    effective_policy = retry_policy if retry_policy is not None else ImageProviderRetryPolicy()
+    result = call_image_provider_with_retry(
+        transport,
+        provider_id=provider_id,
+        retry_policy=effective_policy,
+        sleep=sleep,
+    )
+    return disclosure, result
+
+
+class ImageProviderErrorCategory(str, Enum):
+    """Stable, vendor-neutral classification for a provider call failure.
+
+    Every vendor SDK/HTTP error shape (status code, exception type, message
+    format -- all of it vendor-specific) must be translated into exactly one
+    of these five categories by whatever raises an
+    :class:`ImageProviderCallError`, so a caller (retry logic, logging,
+    user-facing error surfacing) never has to branch on a vendor's own error
+    taxonomy (issue #258's "independent of vendor-specific error formats").
+    """
+
+    TIMEOUT = "timeout"
+    RATE_LIMIT = "rate_limit"
+    TRANSIENT = "transient"
+    AUTH = "auth"
+    PERMANENT = "permanent"
+
+
+_RETRYABLE_IMAGE_PROVIDER_ERROR_CATEGORIES = frozenset(
+    {
+        ImageProviderErrorCategory.TIMEOUT,
+        ImageProviderErrorCategory.RATE_LIMIT,
+        ImageProviderErrorCategory.TRANSIENT,
+    }
+)
+
+
+def is_retryable_image_provider_error_category(category: ImageProviderErrorCategory) -> bool:
+    """Whether `category` is safe to retry at all (before backoff/limits apply).
+
+    Only timeout, rate limit, and transient are retryable -- auth and
+    permanent are, by definition, not going to succeed on an identical
+    retry, so retrying them would just repeat a doomed request (issue #258:
+    "Permanent/auth/request errors are not retried blindly").
+    """
+
+    return category in _RETRYABLE_IMAGE_PROVIDER_ERROR_CATEGORIES
+
+
+class ImageProviderCallError(RuntimeError):
+    """Base for every categorized image-provider call failure.
+
+    Never raise this base class directly -- raise one of the five category
+    subclasses below (`ImageProviderTimeoutError`, `ImageProviderRateLimitError`,
+    `ImageProviderTransientError`, `ImageProviderAuthError`,
+    `ImageProviderPermanentError`) so `category` cannot drift from the type.
+    `provider_request_id` carries the *vendor's* own request/trace id for a
+    failed call when the vendor supplied one -- distinct from
+    `ImageProviderIdentity.request_id`, which is this codebase's own id --
+    so a failure can still be handed to vendor support/provenance tooling
+    (issue #258: "Preserve provider request IDs where safely available").
+    `retry_after_seconds` carries a vendor-supplied wait hint (e.g. a rate
+    limit's `Retry-After`); `call_image_provider_with_retry` honors it but
+    always clamps it to `ImageProviderRetryPolicy.max_backoff_seconds`, so a
+    vendor cannot force an effectively-unbounded wait.
+    """
+
+    category: ImageProviderErrorCategory
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider_id: str,
+        provider_request_id: str | None = None,
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.provider_id = provider_id
+        self.provider_request_id = provider_request_id
+        self.retry_after_seconds = retry_after_seconds
+
+    @property
+    def retryable(self) -> bool:
+        return is_retryable_image_provider_error_category(self.category)
+
+
+class ImageProviderTimeoutError(ImageProviderCallError):
+    """The call did not complete within its bounded per-attempt deadline."""
+
+    category = ImageProviderErrorCategory.TIMEOUT
+
+
+class ImageProviderRateLimitError(ImageProviderCallError):
+    """The provider rejected the call for exceeding a rate limit."""
+
+    category = ImageProviderErrorCategory.RATE_LIMIT
+
+
+class ImageProviderTransientError(ImageProviderCallError):
+    """A provider-side failure that is expected to clear up on retry (e.g. a 5xx)."""
+
+    category = ImageProviderErrorCategory.TRANSIENT
+
+
+class ImageProviderAuthError(ImageProviderCallError):
+    """The provider rejected the call's credential or configuration.
+
+    Distinct from :class:`ImageProviderCredentialUnavailableError`: that one
+    fires locally, before any transport call, when a credential cannot even
+    be resolved from the environment. This one is raised from a transport
+    implementation's own translation of a vendor's 401/403-shaped response
+    -- the credential *was* sent, but the vendor rejected it.
+    """
+
+    category = ImageProviderErrorCategory.AUTH
+
+
+class ImageProviderPermanentError(ImageProviderCallError):
+    """The request itself is invalid in a way retrying cannot fix (e.g. a 400)."""
+
+    category = ImageProviderErrorCategory.PERMANENT
+
+
+_MAX_ALLOWED_IMAGE_PROVIDER_RETRIES = 5
+_MAX_ALLOWED_IMAGE_PROVIDER_TIMEOUT_SECONDS = 120.0
+_MAX_ALLOWED_IMAGE_PROVIDER_BACKOFF_SECONDS = 30.0
+
+
+@dataclass(frozen=True)
+class ImageProviderRetryPolicy:
+    """Bounded, explicit retry/timeout configuration for one provider call.
+
+    Every field is validated in `__post_init__` against a hard safe-bound
+    ceiling, so a caller cannot configure effectively-unbounded retries or an
+    effectively-unbounded per-attempt timeout (issue #258 acceptance
+    criterion: "Retry count and timeout are finite/configurable within safe
+    bounds"). The defaults are deliberately modest (a handful of quick
+    retries, not an aggressive retry storm against a struggling provider).
+    """
+
+    max_retries: int = 2
+    timeout_seconds: float = 30.0
+    backoff_base_seconds: float = 0.5
+    backoff_multiplier: float = 2.0
+    max_backoff_seconds: float = 8.0
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.max_retries <= _MAX_ALLOWED_IMAGE_PROVIDER_RETRIES):
+            raise ValueError(
+                f"max_retries={self.max_retries} must be within "
+                f"[0, {_MAX_ALLOWED_IMAGE_PROVIDER_RETRIES}]."
+            )
+        if not (0 < self.timeout_seconds <= _MAX_ALLOWED_IMAGE_PROVIDER_TIMEOUT_SECONDS):
+            raise ValueError(
+                f"timeout_seconds={self.timeout_seconds} must be within "
+                f"(0, {_MAX_ALLOWED_IMAGE_PROVIDER_TIMEOUT_SECONDS}]."
+            )
+        if self.backoff_base_seconds < 0:
+            raise ValueError(
+                f"backoff_base_seconds={self.backoff_base_seconds} must not be negative."
+            )
+        if self.backoff_multiplier < 1:
+            raise ValueError(
+                f"backoff_multiplier={self.backoff_multiplier} must be >= 1."
+            )
+        if not (0 <= self.max_backoff_seconds <= _MAX_ALLOWED_IMAGE_PROVIDER_BACKOFF_SECONDS):
+            raise ValueError(
+                f"max_backoff_seconds={self.max_backoff_seconds} must be within "
+                f"[0, {_MAX_ALLOWED_IMAGE_PROVIDER_BACKOFF_SECONDS}]."
+            )
+
+
+def _image_provider_backoff_seconds(
+    error: ImageProviderCallError, policy: ImageProviderRetryPolicy, attempt: int
+) -> float:
+    """Seconds to wait before the retry attempt after `attempt` (0-indexed).
+
+    Prefers a vendor-supplied `retry_after_seconds` when present (a rate
+    limit response usually names exactly how long to wait), otherwise backs
+    off exponentially from `backoff_base_seconds`. Either way the result is
+    clamped to `max_backoff_seconds` -- a vendor hint is a hint, not a
+    license to block the caller indefinitely.
+    """
+
+    if error.retry_after_seconds is not None:
+        return max(0.0, min(error.retry_after_seconds, policy.max_backoff_seconds))
+    exponential = policy.backoff_base_seconds * (policy.backoff_multiplier**attempt)
+    return min(exponential, policy.max_backoff_seconds)
+
+
+def _run_image_provider_transport_with_timeout(
+    transport: Callable[[], _T],
+    *,
+    provider_id: str,
+    timeout_seconds: float,
+) -> _T:
+    """Run `transport` on a daemon thread, bounded by `timeout_seconds`.
+
+    Python cannot safely interrupt an arbitrary synchronous call, so a
+    timed-out `transport` may keep running in the background on its thread;
+    this bounds *how long the caller waits*, not how long the underlying
+    call itself keeps executing. That is still a real, useful guarantee: it
+    is what keeps a hung remote provider from hanging its caller forever.
+    """
+
+    outcome: list[_T] = []
+    failure: list[BaseException] = []
+
+    def _target() -> None:
+        try:
+            outcome.append(transport())
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread below
+            failure.append(exc)
+
+    worker = threading.Thread(target=_target, daemon=True)
+    worker.start()
+    worker.join(timeout_seconds)
+    if worker.is_alive():
+        raise ImageProviderTimeoutError(
+            f"Image provider {provider_id!r} request exceeded its "
+            f"{timeout_seconds}s timeout.",
+            provider_id=provider_id,
+        )
+    if failure:
+        raise failure[0]
+    return outcome[0]
+
+
+def call_image_provider_with_retry(
+    transport: Callable[[], _T],
+    *,
+    provider_id: str,
+    retry_policy: ImageProviderRetryPolicy | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> _T:
+    """Run `transport` under a bounded per-attempt timeout and bounded retries.
+
+    Each attempt is individually bounded by `retry_policy.timeout_seconds`
+    (see :func:`_run_image_provider_transport_with_timeout`). Only a raised
+    `ImageProviderCallError` whose category is retryable
+    (:func:`is_retryable_image_provider_error_category`) triggers another
+    attempt, and only up to `retry_policy.max_retries` times, sleeping a
+    bounded backoff between attempts
+    (:func:`_image_provider_backoff_seconds`). An auth- or permanent-category
+    error, or any exception `transport` raises that was never translated
+    into an `ImageProviderCallError` in the first place, propagates
+    immediately on the attempt that raised it -- an unclassified exception
+    cannot be assumed retryable (issue #258: "Permanent/auth/request errors
+    are not retried blindly").
+    """
+
+    policy = retry_policy if retry_policy is not None else ImageProviderRetryPolicy()
+    attempt = 0
+    while True:
+        try:
+            return _run_image_provider_transport_with_timeout(
+                transport, provider_id=provider_id, timeout_seconds=policy.timeout_seconds
+            )
+        except ImageProviderCallError as exc:
+            if not exc.retryable or attempt >= policy.max_retries:
+                raise
+            sleep(_image_provider_backoff_seconds(exc, policy, attempt))
+            attempt += 1
 
 
 class ImageProviderMisconfiguredError(RuntimeError):
@@ -449,14 +756,31 @@ def redact_provider_error(
 ) -> BaseException:
     """Return an equivalent error with every `secrets` occurrence redacted.
 
-    Preserves `type(error)` where its constructor accepts a single message
-    argument (true for every stdlib exception and every error class in this
-    module); falls back to `RuntimeError` when reconstructing the original
-    type fails, so a redaction failure can never re-raise the original
-    (still secret-bearing) exception.
+    An `ImageProviderCallError` (issue #258) is reconstructed with its
+    `category`-defining type, `provider_id`, `retry_after_seconds`, and a
+    redacted `provider_request_id` preserved -- a caller further up the
+    stack (retry logic, job/asset metadata, support tooling) still needs
+    those after sanitization, and this is the one place that sanitization
+    happens. Any other exception type is preserved where its constructor
+    accepts a single message argument (true for every stdlib exception and
+    every other error class in this module); falls back to `RuntimeError`
+    when reconstructing the original type fails, so a redaction failure can
+    never re-raise the original (still secret-bearing) exception.
     """
 
     redacted_message = redact_secrets(str(error), secrets)
+    if isinstance(error, ImageProviderCallError):
+        redacted_provider_request_id = (
+            redact_secrets(error.provider_request_id, secrets)
+            if error.provider_request_id is not None
+            else None
+        )
+        return type(error)(
+            redacted_message,
+            provider_id=error.provider_id,
+            provider_request_id=redacted_provider_request_id,
+            retry_after_seconds=error.retry_after_seconds,
+        )
     try:
         return type(error)(redacted_message)
     except Exception:  # noqa: BLE001 - constructing the original type failed; never re-raise the original

@@ -59,6 +59,7 @@ http://127.0.0.1:8000
 | Stories | `DELETE` | `/stories/{story_id}` | 削除 |
 | Stories | `POST` | `/stories/{story_id}/expand` | 次の執筆段階の text job を起動 |
 | Stories | `POST` | `/stories/{story_id}/apply` | 完了した text job をマージ |
+| Stories | `POST` | `/stories/{story_id}/chapters/{chapter_id}/acknowledge-stale` | 章の stale flag をレビュー後に解除 |
 | Stories | `POST` | `/stories/{story_id}/scenes/{scene_id}/generate` | シーン 1 カットの素材を生成（結果は自動で紐付く） |
 | Stories | `GET` | `/stories/{story_id}/timeline` | assembly 用 timeline を取得 |
 | Stories | `POST` | `/stories/{story_id}/assemble` | scene から timeline を組んで MP4 を書き出す |
@@ -200,6 +201,28 @@ story を読み直すだけで、素材の紐付けを自分で管理する必�
 
 `Scene.dialogue` は台本として保存されるだけで、動画には合成されません。
 `build_timeline` が音声・字幕に使うのは `Scene.narration` のみです。
+
+### 章の再生成と stale 警告（issue #191）
+
+`prose` task の `POST /stories/{id}/apply` が既存の章（`title` 一致）を置き換える
+とき、それより後ろの章（`order` が大きい章）は、置き換え前の内容を前提に書かれた
+可能性があるため `stale_after_chapter_id`（置き換えた章の id）を持ちます。
+`prose_markdown` 自体は書き換えません — 警告するだけで、自動で書き直しません。
+
+`stale_after_chapter_id` を持つ章は `GET /stories/{id}` と
+`POST /stories/{id}/apply` の応答の `stale_chapter_warnings` に列挙され、
+どの章が変わって（`stale_after_chapter_id`）、どの章が影響を受けたか
+（`chapter_id` / `order` / `title`）を示します。
+
+| 解除する方法 | 効果 |
+| --- | --- |
+| その章を `prose` task で再生成する | その章自身の flag は自動で消える（新しい章の内容が正になるため）。その章より後ろの章は、新しい版に対して改めて stale になる |
+| `POST /stories/{id}/chapters/{chapter_id}/acknowledge-stale` | 書き直さずに flag だけ解除する（レビュー済みで実害が無いと判断した場合）。flag が無い章に対しても 200 を返す（冪等） |
+
+Chapter は生成時に使われた継続性メモリのスナップショット
+（`ContinuityContext.as_of_chapter_id`、issue #190）も
+`continuity_as_of_chapter_id` として保持します。継続性メモリを使わずに書かれた章
+（story 最初の章など）では `null` です。
 
 ### timeline と assemble
 

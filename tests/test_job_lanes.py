@@ -1,4 +1,5 @@
-"""Tests for JOB_LANES configuration/assignment (#179) and lane routing (#180)."""
+"""Tests for JOB_LANES configuration/assignment (#179), lane routing (#180),
+and independent per-lane worker threads (#181)."""
 
 from __future__ import annotations
 
@@ -6,6 +7,8 @@ import os
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
+from threading import Event, Lock
+import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -23,10 +26,29 @@ from core.jobs.lanes import (  # noqa: E402
 from core.jobs.queue import JobQueue  # noqa: E402
 from core.jobs.runner import JobRunner  # noqa: E402
 from core.jobs.service import JobService  # noqa: E402
+from core.jobs.worker_pool import WorkerPool  # noqa: E402
 from core.schemas import GenerationRequest  # noqa: E402
 from core.storage.repositories.job_repository import JobRepository  # noqa: E402
 from generators.base import BaseGenerator  # noqa: E402
 from generators.registry import GeneratorRegistry  # noqa: E402
+
+
+def _wait_until(predicate, *, timeout: float = 2.0, interval: float = 0.01) -> bool:
+    """Poll `predicate` until it is truthy or `timeout` elapses.
+
+    Used throughout the `WorkerPool` tests below instead of a fixed `sleep`:
+    the pool's workers run on real background threads, so the only
+    deterministic way to observe "has this happened yet" is to poll for it.
+    Returns whether `predicate` ever became truthy, so callers can assert on
+    the outcome instead of trusting that the timeout was long enough.
+    """
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return bool(predicate())
 
 
 class _ImmediateGenerator(BaseGenerator):
@@ -52,6 +74,76 @@ class _ImmediateGenerator(BaseGenerator):
 
     def cleanup(self, request: GenerationRequest) -> None:
         return None
+
+
+class _BlockingGenerator(BaseGenerator):
+    """Generator whose `generate()` blocks until the test releases it.
+
+    Stands in for a long-running heavy job (a real SDXL/video/music render)
+    without actually taking that long -- the test controls exactly when it
+    finishes via `release`, and can observe that it has actually started via
+    `started`.
+    """
+
+    def __init__(self) -> None:
+        self.started = Event()
+        self.release = Event()
+
+    def validate_request(self, request: GenerationRequest) -> None:
+        return None
+
+    def prepare(self, request: GenerationRequest) -> None:
+        return None
+
+    def generate(self, request: GenerationRequest, context=None):
+        from core.schemas import GenerationResult
+
+        self.started.set()
+        released = self.release.wait(timeout=5.0)
+        if not released:
+            raise AssertionError("_BlockingGenerator was never released by the test")
+        return GenerationResult(
+            job_id="lane-stub-heavy",
+            status="succeeded",
+            outputs=[],
+            previews=[],
+            metadata={"media_type": request.media_type},
+            error_message=None,
+        )
+
+    def cleanup(self, request: GenerationRequest) -> None:
+        return None
+
+
+class _FlakyRunner:
+    """Test double for `JobRunner` whose `run_once` raises N times per lane.
+
+    `WorkerPool` only ever calls `job_runner.run_once(lane=...)`, so a
+    minimal double is enough to test its own failure-isolation contract in
+    isolation from `JobRunner`/`process_job` internals (which already swallow
+    generator errors into `mark_failed` and never let them reach `run_once`'s
+    caller -- see `core/jobs/runner.py`). This simulates the failure modes
+    that *do* still propagate out of `run_once` (e.g. a repository error on
+    dequeue).
+    """
+
+    def __init__(self, fail_times: dict[str | None, int]) -> None:
+        self._fail_remaining = dict(fail_times)
+        self.calls: list[str | None] = []
+        self._lock = Lock()
+
+    def run_once(self, lane: str | None = None):
+        with self._lock:
+            self.calls.append(lane)
+            remaining = self._fail_remaining.get(lane, 0)
+            if remaining > 0:
+                self._fail_remaining[lane] = remaining - 1
+                raise RuntimeError(f"simulated failure on lane {lane!r}")
+        return None
+
+    def call_count(self, lane: str | None) -> int:
+        with self._lock:
+            return sum(1 for recorded in self.calls if recorded == lane)
 
 
 class ParseJobLanesTests(unittest.TestCase):
@@ -453,6 +545,254 @@ class JobRunnerLaneRoutingTests(unittest.TestCase):
             assert heavy_result is not None
             self.assertEqual(heavy_result.id, heavy_job.id)
             self.assertEqual(heavy_result.status, "succeeded")
+
+
+class WorkerPoolTests(unittest.TestCase):
+    """Tests for `core/jobs/worker_pool.py`'s independent lane workers (#181)."""
+
+    def _make_multi_lane_stack(self):
+        tmp_dir = TemporaryDirectory()
+        self.addCleanup(tmp_dir.cleanup)
+        repository = JobRepository(Path(tmp_dir.name) / "jobs.db")
+        queue = JobQueue(lanes=(LANE_HEAVY, LANE_LIGHT))
+        lane_config = parse_job_lanes(DEFAULT_JOB_LANES)
+        service = JobService(repository, queue, lane_config=lane_config)
+        heavy_generator = _BlockingGenerator()
+        light_generator = _ImmediateGenerator()
+        registry = GeneratorRegistry({"image": heavy_generator, "text": light_generator})
+        runner = JobRunner(repository, queue, registry, job_service=service)
+        return repository, service, runner, lane_config, heavy_generator
+
+    def test_heavy_job_in_flight_does_not_block_a_light_job_from_completing(self) -> None:
+        repository, service, runner, lane_config, heavy_generator = (
+            self._make_multi_lane_stack()
+        )
+        pool = WorkerPool(runner, lane_config, poll_interval_seconds=0.01)
+        pool.start()
+        self.addCleanup(pool.stop)
+
+        heavy_job = service.create_job(
+            GenerationRequest(media_type="image", prompt="a skyline", model_id="sdxl")
+        )
+        self.assertTrue(
+            _wait_until(heavy_generator.started.is_set),
+            "heavy worker never picked up the heavy job",
+        )
+
+        light_job = service.create_job(
+            GenerationRequest(media_type="text", prompt="a beat", model_id="")
+        )
+
+        def light_succeeded() -> bool:
+            current = repository.get(light_job.id)
+            return current is not None and current.status == "succeeded"
+
+        self.assertTrue(
+            _wait_until(light_succeeded, timeout=3.0),
+            "light job never completed while the heavy job was still in flight",
+        )
+
+        # The heavy job is still blocked in `generate()` at this point -- the
+        # light job's completion did not, and could not have, waited on it.
+        heavy_still_running = repository.get(heavy_job.id)
+        assert heavy_still_running is not None
+        self.assertIn(heavy_still_running.status, ("preparing", "running"))
+
+        heavy_generator.release.set()
+        self.assertTrue(
+            _wait_until(
+                lambda: (repository.get(heavy_job.id) or heavy_still_running).status
+                == "succeeded",
+                timeout=3.0,
+            ),
+            "heavy job never completed after being released",
+        )
+
+    def test_start_spawns_the_configured_worker_count_per_lane(self) -> None:
+        _repository, _service, runner, lane_config, _heavy_generator = (
+            self._make_multi_lane_stack()
+        )
+        custom_config = parse_job_lanes("heavy:2,light:1")
+        pool = WorkerPool(runner, custom_config, poll_interval_seconds=0.01)
+
+        pool.start()
+        try:
+            self.assertEqual(len(pool.worker_names), 3)
+            heavy_workers = [name for name in pool.worker_names if "heavy" in name]
+            light_workers = [name for name in pool.worker_names if "light" in name]
+            self.assertEqual(len(heavy_workers), 2)
+            self.assertEqual(len(light_workers), 1)
+        finally:
+            pool.stop()
+
+    def test_start_twice_raises_and_does_not_create_duplicate_consumers(self) -> None:
+        _repository, _service, runner, lane_config, _heavy_generator = (
+            self._make_multi_lane_stack()
+        )
+        pool = WorkerPool(runner, lane_config, poll_interval_seconds=0.01)
+        pool.start()
+        try:
+            names_before = pool.worker_names
+            with self.assertRaises(RuntimeError):
+                pool.start()
+            self.assertEqual(pool.worker_names, names_before)
+        finally:
+            pool.stop()
+
+    def test_stop_leaves_no_dangling_worker_threads(self) -> None:
+        _repository, _service, runner, lane_config, _heavy_generator = (
+            self._make_multi_lane_stack()
+        )
+        pool = WorkerPool(runner, lane_config, poll_interval_seconds=0.01)
+        pool.start()
+        threads = list(pool._threads)  # noqa: SLF001 -- asserting internal cleanup
+        self.assertTrue(all(thread.is_alive() for thread in threads))
+
+        pool.stop()
+
+        self.assertFalse(pool.is_running)
+        self.assertEqual(pool.worker_names, ())
+        self.assertTrue(
+            _wait_until(lambda: all(not thread.is_alive() for thread in threads)),
+            "a worker thread was still alive after stop() joined it",
+        )
+
+    def test_stop_without_start_is_a_no_op(self) -> None:
+        _repository, _service, runner, lane_config, _heavy_generator = (
+            self._make_multi_lane_stack()
+        )
+        pool = WorkerPool(runner, lane_config)
+        pool.stop()  # must not raise
+        self.assertFalse(pool.is_running)
+
+    def test_restart_after_stop_spawns_a_fresh_set_of_workers_and_still_works(
+        self,
+    ) -> None:
+        repository, service, runner, lane_config, _heavy_generator = (
+            self._make_multi_lane_stack()
+        )
+        pool = WorkerPool(runner, lane_config, poll_interval_seconds=0.01)
+
+        pool.start()
+        pool.stop()
+        pool.start()
+        try:
+            light_job = service.create_job(
+                GenerationRequest(media_type="text", prompt="a beat", model_id="")
+            )
+
+            def light_succeeded() -> bool:
+                current = repository.get(light_job.id)
+                return current is not None and current.status == "succeeded"
+
+            self.assertTrue(_wait_until(light_succeeded))
+        finally:
+            pool.stop()
+
+    def test_none_lane_config_reproduces_single_thread_legacy_behavior(self) -> None:
+        # No LaneConfig at all -- this is the shape every pre-#181 caller
+        # uses today (`JobQueue()` + a single `JobRunner.run_forever()`
+        # thread in `apps/api/main.py`), so it must keep behaving that way.
+        with TemporaryDirectory() as tmp_dir:
+            repository = JobRepository(Path(tmp_dir) / "jobs.db")
+            queue = JobQueue()
+            service = JobService(repository, queue)
+            registry = GeneratorRegistry({"text": _ImmediateGenerator()})
+            runner = JobRunner(repository, queue, registry, job_service=service)
+
+            pool = WorkerPool(runner, poll_interval_seconds=0.01)
+            pool.start()
+            try:
+                self.assertEqual(len(pool.worker_names), 1)
+
+                job = service.create_job(
+                    GenerationRequest(media_type="text", prompt="a beat", model_id="")
+                )
+
+                def succeeded() -> bool:
+                    current = repository.get(job.id)
+                    return current is not None and current.status == "succeeded"
+
+                self.assertTrue(_wait_until(succeeded))
+            finally:
+                pool.stop()
+
+    def test_single_lane_config_collapses_onto_the_implicit_lane_like_job_service(
+        self,
+    ) -> None:
+        # `JobService.enqueue_job` collapses a single-lane `LaneConfig` onto
+        # the queue's implicit lane (no explicit lane name) -- a `WorkerPool`
+        # built from the same single-lane config must dequeue the same way,
+        # or jobs enqueued by the service would never be seen by any worker.
+        with TemporaryDirectory() as tmp_dir:
+            repository = JobRepository(Path(tmp_dir) / "jobs.db")
+            queue = JobQueue()
+            single_lane_config = parse_job_lanes("heavy:2")
+            service = JobService(repository, queue, lane_config=single_lane_config)
+            registry = GeneratorRegistry(
+                {"image": _ImmediateGenerator(), "text": _ImmediateGenerator()}
+            )
+            runner = JobRunner(repository, queue, registry, job_service=service)
+
+            pool = WorkerPool(runner, single_lane_config, poll_interval_seconds=0.01)
+            pool.start()
+            try:
+                self.assertEqual(len(pool.worker_names), 2)
+
+                image_job = service.create_job(
+                    GenerationRequest(media_type="image", prompt="a skyline", model_id="sdxl")
+                )
+                text_job = service.create_job(
+                    GenerationRequest(media_type="text", prompt="a beat", model_id="")
+                )
+
+                def both_succeeded() -> bool:
+                    a = repository.get(image_job.id)
+                    b = repository.get(text_job.id)
+                    return (
+                        a is not None
+                        and a.status == "succeeded"
+                        and b is not None
+                        and b.status == "succeeded"
+                    )
+
+                self.assertTrue(_wait_until(both_succeeded))
+            finally:
+                pool.stop()
+
+    def test_worker_failures_are_logged_and_do_not_stop_the_lane_or_other_lanes(
+        self,
+    ) -> None:
+        flaky = _FlakyRunner(fail_times={LANE_HEAVY: 3})
+        pool = WorkerPool(
+            flaky,
+            parse_job_lanes(DEFAULT_JOB_LANES),
+            poll_interval_seconds=0.01,
+            error_backoff_seconds=0.01,
+        )
+
+        with self.assertLogs("core.jobs.worker_pool", level="ERROR") as log_ctx:
+            pool.start()
+            try:
+                # The light lane must keep being polled the whole time, even
+                # while the heavy lane is repeatedly failing -- proving the
+                # failure is isolated to the heavy lane's worker.
+                self.assertTrue(
+                    _wait_until(lambda: flaky.call_count(LANE_LIGHT) >= 2)
+                )
+                # The heavy worker must keep retrying past its failures
+                # rather than dying after the first one.
+                self.assertTrue(
+                    _wait_until(lambda: flaky.call_count(LANE_HEAVY) >= 4)
+                )
+            finally:
+                pool.stop()
+
+        self.assertTrue(
+            any(LANE_HEAVY in message for message in log_ctx.output),
+            log_ctx.output,
+        )
+        self.assertEqual(len(log_ctx.records), 3)
 
 
 if __name__ == "__main__":

@@ -72,6 +72,23 @@ class Chapter(BaseModel):
     title: str = ""
     prose_markdown: str = ""
     word_count: int = 0
+    # The continuity memory's `as_of_chapter_id` at the moment this chapter's
+    # prose was written (see `core.story.continuity_context.ContinuityContext`),
+    # i.e. which prior chapter's state this chapter was written to be
+    # consistent with. `None` when the chapter was written with no continuity
+    # memory yet (a story's first chapter) or outside the continuity-injected
+    # flow. This is what makes it possible to say, later, exactly what state a
+    # chapter assumed (issue #191).
+    continuity_as_of_chapter_id: str | None = None
+    # Set to an earlier chapter's id when regenerating that earlier chapter may
+    # have invalidated this chapter's continuity assumptions (issue #191); this
+    # chapter's prose is never rewritten automatically as a result — only
+    # flagged, so an editor decides what to do. `None` means "not flagged
+    # stale". Cleared automatically when this chapter is itself regenerated
+    # (see `core.story.merge._merge_prose`), and can also be cleared directly
+    # by `POST /stories/{story_id}/chapters/{chapter_id}/acknowledge-stale`
+    # after a human review that finds nothing actually broke.
+    stale_after_chapter_id: str | None = None
 
 
 class StoryDocument(BaseModel):
@@ -111,6 +128,25 @@ class StoryDocument(BaseModel):
         """Return scenes sorted by ``order`` without mutating the document."""
 
         return sorted(self.scenes, key=lambda scene: scene.order)
+
+    def chapters_in_order(self) -> list[Chapter]:
+        """Return chapters sorted by ``order`` without mutating the document."""
+
+        return sorted(self.chapters, key=lambda chapter: chapter.order)
+
+    def stale_chapters(self) -> list[Chapter]:
+        """Chapters flagged as potentially inconsistent with a later regeneration.
+
+        See ``Chapter.stale_after_chapter_id`` (issue #191): non-empty exactly
+        for chapters an editor has not yet regenerated or acknowledged since an
+        earlier chapter changed under them.
+        """
+
+        return [
+            chapter
+            for chapter in self.chapters_in_order()
+            if chapter.stale_after_chapter_id
+        ]
 
     def total_duration_seconds(self) -> float:
         """Return the sum of scene durations, the length of the assembled video."""

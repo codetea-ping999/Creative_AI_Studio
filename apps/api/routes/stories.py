@@ -22,6 +22,7 @@ from core.story import (
     STORY_FORMATS,
     STORY_ID_PARAM,
     SUPPORTED_TASKS,
+    Chapter,
     ContinuityRepository,
     Scene,
     StoryDocument,
@@ -120,12 +121,51 @@ class SceneAssetStatusEntry(BaseModel):
     error_message: str | None = None
 
 
+class StaleChapterWarning(BaseModel):
+    """One chapter flagged as potentially inconsistent with an earlier regeneration.
+
+    Regenerating ``stale_after_chapter_id`` may have changed facts, tone, or
+    events this chapter was written to be consistent with (issue #191); this
+    chapter's own prose is untouched, so the entry is a warning to review, not
+    a record of a change already made.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    chapter_id: str
+    order: int
+    title: str
+    stale_after_chapter_id: str
+
+
+def _stale_chapter_warnings(story: StoryDocument) -> list[StaleChapterWarning]:
+    warnings: list[StaleChapterWarning] = []
+    for chapter in story.stale_chapters():
+        # stale_chapters() only returns entries with this field set; the
+        # explicit check narrows it from `str | None` for the model below.
+        if chapter.stale_after_chapter_id is None:
+            continue
+        warnings.append(
+            StaleChapterWarning(
+                chapter_id=chapter.id,
+                order=chapter.order,
+                title=chapter.title,
+                stale_after_chapter_id=chapter.stale_after_chapter_id,
+            )
+        )
+    return warnings
+
+
 class StoryDetailResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     story: dict[str, Any]
     missing_assets: list[dict[str, str]]
     asset_status: list[SceneAssetStatusEntry] = Field(default_factory=list)
+    # Chapters an earlier chapter's regeneration may have invalidated, most
+    # recent trigger last so a caller reading top-to-bottom sees the oldest
+    # unresolved warning first (issue #191). Empty when nothing is flagged.
+    stale_chapter_warnings: list[StaleChapterWarning] = Field(default_factory=list)
 
 
 class CreateStoryRequest(BaseModel):
@@ -435,6 +475,7 @@ def get_story(
         story=story.model_dump(mode="json"),
         missing_assets=missing_scene_assets(story),
         asset_status=_scene_asset_statuses(services, story),
+        stale_chapter_warnings=_stale_chapter_warnings(story),
     )
 
 
@@ -575,6 +616,17 @@ def apply_story_result(
             detail="Job result does not carry a structured story payload.",
         )
 
+    # Which continuity state (issue #190) this chapter was written against, if
+    # any, travels with it on the story document (issue #191) so a later
+    # regeneration can be understood in terms of what it invalidates rather
+    # than only what job produced it.
+    continuity_as_of_chapter_id: str | None = None
+    continuity_snapshot = job.result.metadata.get("continuity_snapshot")
+    if isinstance(continuity_snapshot, dict):
+        raw_as_of_chapter_id = continuity_snapshot.get("as_of_chapter_id")
+        if isinstance(raw_as_of_chapter_id, str):
+            continuity_as_of_chapter_id = raw_as_of_chapter_id
+
     if task in SCENE_SCOPED_TASKS:
         # The scene was chosen when the job was queued; the model's payload has
         # no way to name it, so the target is restored from the request here.
@@ -592,7 +644,13 @@ def apply_story_result(
             )
 
     try:
-        merged = apply_text_result(story, task, structured, job_id=job.id)
+        merged = apply_text_result(
+            story,
+            task,
+            structured,
+            job_id=job.id,
+            continuity_as_of_chapter_id=continuity_as_of_chapter_id,
+        )
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
@@ -603,6 +661,57 @@ def apply_story_result(
         story=saved.model_dump(mode="json"),
         missing_assets=missing_scene_assets(saved),
         asset_status=_scene_asset_statuses(services, saved),
+        stale_chapter_warnings=_stale_chapter_warnings(saved),
+    )
+
+
+def _find_chapter(story: StoryDocument, chapter_id: str) -> Chapter:
+    chapter = next((entry for entry in story.chapters if entry.id == chapter_id), None)
+    if chapter is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Chapter not found: {chapter_id}",
+        )
+    return chapter
+
+
+@router.post(
+    "/{story_id}/chapters/{chapter_id}/acknowledge-stale",
+    response_model=StoryDetailResponse,
+)
+def acknowledge_stale_chapter(
+    story_id: str,
+    chapter_id: str,
+    services: ApplicationServices = Depends(get_services),
+) -> StoryDetailResponse:
+    """Clear one chapter's stale flag after a human reviews it (issue #191).
+
+    Regenerating the flagged chapter already clears its own flag as a side
+    effect of being rewritten (``core.story.merge._merge_prose``); this route
+    is for the other path the acceptance criteria calls out explicitly — an
+    editor reads the flagged chapter, decides nothing actually broke, and
+    dismisses the warning without writing new prose. A chapter that is not
+    currently flagged is left as-is rather than treated as an error, so a
+    caller can call this idempotently without first checking state.
+    """
+
+    story = _get_story(services, story_id)
+    chapter = _find_chapter(story, chapter_id)
+
+    if chapter.stale_after_chapter_id is not None:
+        chapters = [
+            entry.model_copy(update={"stale_after_chapter_id": None})
+            if entry.id == chapter_id
+            else entry
+            for entry in story.chapters
+        ]
+        story = services.story_repository.update(story_id, chapters=chapters) or story
+
+    return StoryDetailResponse(
+        story=story.model_dump(mode="json"),
+        missing_assets=missing_scene_assets(story),
+        asset_status=_scene_asset_statuses(services, story),
+        stale_chapter_warnings=_stale_chapter_warnings(story),
     )
 
 
