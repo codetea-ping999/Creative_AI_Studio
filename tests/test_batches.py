@@ -11,6 +11,7 @@ from pydantic import ValidationError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from core.assets import AssetRepository  # noqa: E402
 from core.batches import (  # noqa: E402
     Axis,
     AxisValue,
@@ -31,9 +32,11 @@ from core.batches.templates import (  # noqa: E402
     CHARACTER_SHEET_POSES,
     CHARACTER_SHEET_VARIATION_COUNT,
 )
-from core.jobs import EventBus, JobQueue, JobService  # noqa: E402
-from core.schemas import GenerationResult  # noqa: E402
+from core.jobs import EventBus, JobQueue, JobRunner, JobService  # noqa: E402
+from core.schemas import GenerationRequest, GenerationResult  # noqa: E402
 from core.storage.repositories.job_repository import JobRepository  # noqa: E402
+from generators.base import BaseGenerator  # noqa: E402
+from generators.registry import GeneratorRegistry  # noqa: E402
 
 
 def _spec(**overrides) -> BatchSpec:
@@ -498,6 +501,164 @@ class BatchServiceTests(unittest.TestCase):
         self.assertEqual(len(self.service.list_batches()), 1)
 
 
+class _FakeImageGenerator(BaseGenerator):
+    """A deterministic stand-in for a real image model.
+
+    Fails any request whose ``angle`` axis value is ``profile-view`` so tests
+    can exercise partial success/failure without depending on model weights
+    (none are available in this environment). Every accepted request is
+    recorded so tests can assert on exactly what the batch handed the
+    generator, not just what came back.
+    """
+
+    def __init__(self, output_dir: Path) -> None:
+        self.output_dir = output_dir
+        self.seen_requests: list[GenerationRequest] = []
+
+    def validate_request(self, request: GenerationRequest) -> None:
+        return None
+
+    def prepare(self, request: GenerationRequest) -> None:
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def generate(self, request: GenerationRequest, context=None) -> GenerationResult:
+        self.seen_requests.append(request)
+        axis_labels = request.params.get("batch_axis_labels", {})
+        if axis_labels.get("angle") == "profile-view":
+            raise RuntimeError("stub render failure: profile-view")
+
+        output_path = self.output_dir / f"item-{len(self.seen_requests):03d}.png"
+        output_path.write_bytes(b"\x89PNG\r\n\x1a\nstub")
+        return GenerationResult(
+            job_id="pending",
+            status="succeeded",
+            outputs=[str(output_path)],
+            previews=[str(output_path)],
+            metadata={"quality_report": {"quality_score": 75.0}},
+        )
+
+    def cleanup(self, request: GenerationRequest) -> None:
+        return None
+
+
+class CharacterSheetBatchIntegrationTests(unittest.TestCase):
+    """End-to-end coverage for #194: character-sheet template -> BatchService
+    -> JobRunner -> a fake generator, with no real model weights involved.
+    """
+
+    def setUp(self) -> None:
+        self._temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temporary.cleanup)
+        root = Path(self._temporary.name)
+
+        self.job_repository = JobRepository(root / "jobs.db")
+        self.job_queue = JobQueue()
+        self.event_bus = EventBus()
+        self.asset_repository = AssetRepository(root / "assets")
+        self.job_service = JobService(
+            self.job_repository,
+            self.job_queue,
+            self.event_bus,
+            asset_repository=self.asset_repository,
+        )
+        self.batch_repository = BatchRepository(root / "batches")
+        self.service = BatchService(
+            self.batch_repository,
+            self.job_service,
+            self.job_repository,
+            event_bus=self.event_bus,
+        )
+        self.generator = _FakeImageGenerator(root / "outputs")
+        self.runner = JobRunner(
+            self.job_repository,
+            self.job_queue,
+            GeneratorRegistry({"image": self.generator}),
+            event_bus=self.event_bus,
+            asset_repository=self.asset_repository,
+            job_service=self.job_service,
+        )
+
+    def _run_all_queued(self) -> None:
+        while self.job_queue.size():
+            self.runner.run_once()
+
+    def test_one_request_launches_and_tracks_every_variation_through_a_fake_generator(
+        self,
+    ) -> None:
+        spec = build_batch_template(
+            "character-sheet",
+            prompt="mina, a red-haired adventurer",
+            model_id="sdxl",
+            seed=42,
+            bible_refs=["bible_mina"],
+        )
+        record = self.service.create_batch(spec)
+
+        # Acceptance criterion: one request launches the expected 9-16 child jobs.
+        self.assertEqual(len(record.items), CHARACTER_SHEET_VARIATION_COUNT)
+        self.assertTrue(9 <= len(record.items) <= 16)
+        self.assertTrue(all(item.job_id for item in record.items))
+
+        self._run_all_queued()
+        reconciled = self.service.get_batch(record.id)
+
+        # Acceptance criterion: every child stores its axis values and the
+        # shared Bible snapshot (seed, model, and params all travel with it too).
+        for item in reconciled.items:
+            job = self.job_repository.get(item.job_id)
+            self.assertIsNotNone(job)
+            self.assertEqual(item.axis_values, job.request.params["batch_axis_labels"])
+            self.assertEqual(set(item.axis_values), {"angle", "expression", "pose"})
+            self.assertEqual(job.request.model_id, "sdxl")
+            self.assertEqual(job.request.seed, 42)
+            self.assertEqual(job.request.params["bible_refs"], ["bible_mina"])
+
+        # Acceptance criterion: partial failures do not discard successful
+        # variations. One of four angles (profile-view) always fails, so 4 of
+        # the 16 cells fail and 12 succeed.
+        failing_count = sum(
+            1 for item in reconciled.items if item.axis_values["angle"] == "profile-view"
+        )
+        self.assertEqual(failing_count, 4)
+        self.assertEqual(reconciled.aggregate.failed, failing_count)
+        self.assertEqual(
+            reconciled.aggregate.succeeded, len(reconciled.items) - failing_count
+        )
+        self.assertEqual(reconciled.status, "partial")
+
+        # Acceptance criterion: the batch result exposes each generated
+        # asset/job for selection.
+        for item in reconciled.items:
+            if item.axis_values["angle"] == "profile-view":
+                self.assertEqual(item.status, "failed")
+                self.assertIsNotNone(item.error_message)
+                self.assertIsNone(item.output_path)
+                self.assertEqual(self.asset_repository.get_by_job(item.job_id), [])
+                continue
+            self.assertEqual(item.status, "succeeded")
+            self.assertIsNotNone(item.output_path)
+            assets = self.asset_repository.get_by_job(item.job_id)
+            self.assertEqual(len(assets), 1)
+            self.assertEqual(assets[0].path, item.output_path)
+            # The synced asset's request snapshot is the per-item batch
+            # context this test is asserting on, not just a bare prompt.
+            snapshot = assets[0].metadata["request_snapshot"]
+            self.assertEqual(snapshot["seed"], 42)
+            self.assertEqual(snapshot["model_id"], "sdxl")
+            self.assertEqual(snapshot["params"]["bible_refs"], ["bible_mina"])
+            self.assertEqual(
+                snapshot["params"]["batch_axis_labels"], item.axis_values
+            )
+
+        # The generator itself never saw a request that violated the
+        # character sheet's locked fields.
+        self.assertEqual(len(self.generator.seen_requests), CHARACTER_SHEET_VARIATION_COUNT)
+        for seen in self.generator.seen_requests:
+            self.assertTrue(seen.prompt.startswith("mina, a red-haired adventurer"))
+            self.assertEqual(seen.model_id, "sdxl")
+            self.assertEqual(seen.seed, 42)
+
+
 class LimitResolutionTests(unittest.TestCase):
     def test_env_override(self) -> None:
         import os
@@ -612,7 +773,10 @@ class TemplateTests(unittest.TestCase):
         items = expand_items(spec, stage=spec.resolved_stages()[0], stage_index=0)
         self.assertEqual(len(items), 5)
         self.assertEqual(items[0].request.params["task"], "logline")
-        self.assertIn(items[0].request.params["tone"], {"hopeful", "melancholic", "tense", "playful", "epic"})
+        self.assertIn(
+            items[0].request.params["tone"],
+            {"hopeful", "melancholic", "tense", "playful", "epic"},
+        )
 
     def test_overrides_are_applied(self) -> None:
         spec = build_batch_template("logo-30", name="custom", limit=40)
