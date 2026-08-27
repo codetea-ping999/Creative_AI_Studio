@@ -32,6 +32,7 @@ from .statuses import (
     is_terminal_status,
     is_valid_transition,
 )
+from .worker_pool import WorkerPool
 
 __all__ = [
     "ACTIVE_JOB_STATUSES",
@@ -59,6 +60,7 @@ __all__ = [
     "LANE_LIGHT",
     "LaneConfig",
     "TERMINAL_JOB_STATUSES",
+    "WorkerPool",
     "assign_lane",
     "is_terminal_status",
     "is_valid_transition",
