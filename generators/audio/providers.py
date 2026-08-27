@@ -16,8 +16,22 @@ resolved first. This is what lets a generator's ``validate_request()`` reject
 an unsupported cloud request before ``generate()`` would otherwise resolve a
 runtime and reach the network.
 
-Explicitly out of scope here (see the microtask order on #57):
-- Egress opt-in (`ALLOW_CLOUD_PROVIDERS`, per-provider enable flags) -- #235.
+Egress opt-in is enforced (issue #235, see below):
+- `cloud_audio_provider_opt_in_granted` / `ensure_cloud_audio_provider_opt_in`
+  gate every cloud audio request on two independent env vars, *both*
+  required: `ALLOW_CLOUD_PROVIDERS=true` globally, plus a provider-specific
+  `ALLOW_CLOUD_PROVIDER_<NAME>=true`. This intentionally differs from the
+  image provider's either-suffices convention
+  (`generators/image/providers.py`, #256): the parent issue's own scope
+  ("`ALLOW_CLOUD_PROVIDERS=true` と provider ごとの明示設定がない限り送信し
+  ない", #57) requires *both*, so flipping the global switch alone opts in
+  zero providers until each is also vetted and enabled by name.
+- `run_cloud_audio_provider` calls `ensure_cloud_audio_provider_opt_in`
+  after `ensure_capability_supported` and strictly before
+  `adapter.generate()`, so a disabled/not-opted-in request never reaches a
+  network call and never constructs/sends prompt or audio payload data.
+
+Still explicitly out of scope here (see the microtask order on #57):
 - Resolving API keys from environment variables and redacting them from logs
   -- #236, following the existing `default_params.api_key_env` convention
   used by `core/models/text_runtimes.py`'s `openai_compatible_text_loader`.
@@ -30,6 +44,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from enum import Enum
+import os
 from typing import Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -103,6 +118,20 @@ class UnsupportedCapabilityError(AudioProviderError):
     """
 
 
+class CloudAudioProviderOptInRequiredError(AudioProviderError, PermissionError):
+    """Raised before any transport call when explicit cloud egress opt-in is missing.
+
+    Distinct from :class:`ProviderUnavailableError`: this is not about an
+    adapter's own reported state, it is about authorization to send
+    anything at all to a cloud provider. Both a global switch and a
+    provider-specific switch must be granted -- neither is sufficient alone
+    (issue #235; see :func:`cloud_audio_provider_opt_in_granted`). Always
+    raised before :meth:`CloudAudioProviderAdapter.generate` is reachable --
+    see :func:`ensure_cloud_audio_provider_opt_in` and
+    :func:`run_cloud_audio_provider`.
+    """
+
+
 class CloudAudioProviderRequest(BaseModel):
     """Normalized input to a cloud audio provider adapter.
 
@@ -160,7 +189,9 @@ class CloudAudioProviderAdapter(Protocol):
     ) -> CloudAudioProviderResult:
         """Perform the (network) generation call.
 
-        Only reachable once :func:`ensure_capability_supported` has passed.
+        Only reachable once :func:`ensure_capability_supported` and
+        :func:`ensure_cloud_audio_provider_opt_in` have both passed -- see
+        :func:`run_cloud_audio_provider`.
         """
         ...
 
@@ -192,18 +223,102 @@ def ensure_capability_supported(
         )
 
 
+_GLOBAL_CLOUD_OPT_IN_ENV_VAR = "ALLOW_CLOUD_PROVIDERS"
+
+
+def _provider_specific_opt_in_env_var(provider_name: str) -> str:
+    """Env var name that additionally enables exactly one provider.
+
+    E.g. ``"elevenlabs"`` -> ``"ALLOW_CLOUD_PROVIDER_ELEVENLABS"``.
+    """
+
+    suffix = "".join(
+        character if character.isalnum() else "_" for character in provider_name.upper()
+    )
+    return f"ALLOW_CLOUD_PROVIDER_{suffix}"
+
+
+def cloud_audio_provider_opt_in_granted(
+    provider_name: str,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> bool:
+    """Whether cloud audio provider `provider_name` has explicit opt-in right now.
+
+    Two independent switches, *both* required -- unlike the image
+    provider's either-suffices convention (`generators/image/providers.py`,
+    #256):
+
+    - `ALLOW_CLOUD_PROVIDERS=true` enables cloud egress globally.
+    - `ALLOW_CLOUD_PROVIDER_<NAME>=true` additionally enables this specific
+      provider.
+
+    The global switch alone is deliberately insufficient: flipping it opts
+    in zero providers until each is also vetted and enabled by name, which
+    is what stops one blanket switch from silently authorizing a provider
+    nobody individually reviewed (issue #235 acceptance criteria). Both are
+    default-closed: unset, empty, or any value other than the literal
+    string ``"true"`` counts as not granted, matching
+    `ALLOW_REMOTE_TEXT_ENDPOINTS` (`core/models/text_runtimes.py`) and
+    `ALLOW_REMOTE_AUDIO_ENDPOINTS` (`core/models/audio_runtimes.py`).
+    """
+
+    source = env if env is not None else os.environ
+    global_enabled = (
+        str(source.get(_GLOBAL_CLOUD_OPT_IN_ENV_VAR, "")).strip().lower() == "true"
+    )
+    if not global_enabled:
+        return False
+    provider_env_var = _provider_specific_opt_in_env_var(provider_name)
+    return str(source.get(provider_env_var, "")).strip().lower() == "true"
+
+
+def ensure_cloud_audio_provider_opt_in(
+    provider_name: str,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> None:
+    """Raise before any transport call unless both opt-in switches are granted.
+
+    Reading `env` only touches process state already present, so this check
+    itself never performs network I/O -- safe to call unconditionally ahead
+    of a transport invocation. :func:`run_cloud_audio_provider` calls this
+    strictly before ``adapter.generate()`` is ever reachable, which is what
+    guarantees a disabled request fails before any prompt/audio payload data
+    would be sent.
+    """
+
+    if cloud_audio_provider_opt_in_granted(provider_name, env=env):
+        return
+    global_var = _GLOBAL_CLOUD_OPT_IN_ENV_VAR
+    provider_var = _provider_specific_opt_in_env_var(provider_name)
+    raise CloudAudioProviderOptInRequiredError(
+        f"Cloud audio provider {provider_name!r} requires explicit opt-in: "
+        f"set both {global_var}=true and {provider_var}=true. Setting only "
+        f"{global_var}=true is not sufficient."
+    )
+
+
 def run_cloud_audio_provider(
     adapter: CloudAudioProviderAdapter,
     request: CloudAudioProviderRequest,
+    *,
+    env: Mapping[str, str] | None = None,
 ) -> CloudAudioProviderResult:
-    """Validate, then run, a cloud provider request.
+    """Validate, authorize, then run, a cloud provider request.
 
-    The one call sequence a caller needs so ``generate()`` is unreachable for
-    an unsupported request -- callers should not call ``adapter.generate()``
-    directly.
+    The one call sequence a caller needs so ``generate()`` is unreachable
+    for an unsupported, unavailable, or not-opted-in request -- callers
+    should not call ``adapter.generate()`` directly.
+    Capability/availability are checked first (unchanged since #234) so
+    those failures keep their own specific error type; egress opt-in
+    (#235) is checked immediately after, still strictly before
+    ``adapter.generate()`` is reachable, so construction/sending of any
+    provider request is guarded before it can happen.
     """
 
     ensure_capability_supported(adapter, request.capability)
+    ensure_cloud_audio_provider_opt_in(adapter.provider_name, env=env)
     return adapter.generate(request)
 
 
@@ -260,14 +375,17 @@ __all__ = [
     "AudioProviderCapability",
     "AudioProviderError",
     "CloudAudioProviderAdapter",
+    "CloudAudioProviderOptInRequiredError",
     "CloudAudioProviderRequest",
     "CloudAudioProviderResult",
     "ProviderAvailability",
     "ProviderMisconfiguredError",
     "ProviderUnavailableError",
     "UnsupportedCapabilityError",
+    "cloud_audio_provider_opt_in_granted",
     "ensure_capabilities_declared",
     "ensure_capability_supported",
+    "ensure_cloud_audio_provider_opt_in",
     "manifest_declared_capabilities",
     "run_cloud_audio_provider",
 ]
