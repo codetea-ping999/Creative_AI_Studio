@@ -9,6 +9,9 @@ through that contract.
 
 from __future__ import annotations
 
+from dataclasses import asdict
+import json
+import logging
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -16,15 +19,20 @@ import unittest
 from unittest.mock import patch
 
 from PIL import Image
+from pydantic import ValidationError
 
 from bootstrap import create_default_model_service
+from core.models.manifest import ModelManifest
 from core.schemas import GenerationRequest
 from generators.image.generator import ImageGenerator
 from generators.image.providers import (
     ImageGenerationSpec,
     ImageProvider,
     ImageProviderCapabilities,
+    ImageProviderCredential,
+    ImageProviderCredentialUnavailableError,
     ImageProviderIdentity,
+    ImageProviderMisconfiguredError,
     ImageProviderPreflightDisclosure,
     ImageProviderReferenceAsset,
     ImageProviderResult,
@@ -35,10 +43,16 @@ from generators.image.providers import (
     cloud_image_provider_opt_in_granted,
     ensure_image_provider_opt_in,
     is_local_image_provider,
+    redact_provider_error,
+    redact_provider_metadata,
+    redact_secrets,
+    resolve_image_provider_credential,
     run_image_provider_request,
     summarize_prompt_for_preflight,
     validate_capabilities,
 )
+
+_SENTINEL_SECRET = "sk-sentinel-1234567890abcdef"  # never a real credential
 
 
 def _spec(**overrides: object) -> ImageGenerationSpec:
@@ -535,6 +549,265 @@ class RunImageProviderRequestTest(unittest.TestCase):
         self.assertEqual(result, "sent")
         self.assertEqual(disclosure.destination, "remote")
         self.assertEqual(disclosure.provider_id, "fake-cloud")
+
+
+def _cloud_manifest(*, default_params: dict[str, object]) -> ModelManifest:
+    return ModelManifest(
+        id="cloud-image-test",
+        public_id="cloud-image",
+        display_name="Fake Cloud Image Provider",
+        media_type="image",
+        task_type="text-to-image",
+        provider="cloud",
+        runtime="cloud_test",
+        remote_ref="https://cloud-image-provider.example/v1",
+        loader="cloud_test_loader",
+        default_params=default_params,
+        is_default=False,
+        enabled=True,
+    )
+
+
+class RejectLiteralCredentialFieldsTest(unittest.TestCase):
+    """Manifests must never carry a literal credential (issue #257)."""
+
+    def test_manifest_construction_rejects_a_literal_api_key(self) -> None:
+        with self.assertRaisesRegex(ValidationError, "literal credential"):
+            _cloud_manifest(default_params={"api_key": _SENTINEL_SECRET})
+
+    def test_manifest_construction_rejects_a_nested_literal_secret(self) -> None:
+        with self.assertRaisesRegex(ValidationError, "literal credential"):
+            _cloud_manifest(
+                default_params={"auth": {"token": _SENTINEL_SECRET}}
+            )
+
+    def test_manifest_construction_accepts_the_api_key_env_indirection(self) -> None:
+        manifest = _cloud_manifest(default_params={"api_key_env": "ACME_IMAGE_API_KEY"})
+        self.assertEqual(manifest.default_params["api_key_env"], "ACME_IMAGE_API_KEY")
+
+    def test_manifest_error_never_contains_the_secret_value(self) -> None:
+        with self.assertRaises(ValidationError) as ctx:
+            _cloud_manifest(default_params={"api_key": _SENTINEL_SECRET})
+        self.assertNotIn(_SENTINEL_SECRET, str(ctx.exception))
+
+
+class ResolveImageProviderCredentialTest(unittest.TestCase):
+    """`resolve_image_provider_credential` (issue #257)."""
+
+    def test_local_provider_never_needs_a_credential_even_if_env_is_set(self) -> None:
+        credential = resolve_image_provider_credential(
+            {"api_key_env": "ACME_IMAGE_API_KEY"},
+            provider_id="local-diffusers",
+            manifest_label="sdxl-local",
+            env={"ACME_IMAGE_API_KEY": _SENTINEL_SECRET},
+        )
+        self.assertIsNone(credential)
+
+    def test_remote_provider_with_no_api_key_env_needs_no_credential(self) -> None:
+        credential = resolve_image_provider_credential(
+            {},
+            provider_id="fake-cloud",
+            manifest_label="cloud-image-test",
+            env={},
+        )
+        self.assertIsNone(credential)
+
+    def test_remote_provider_resolves_the_credential_from_the_named_env_var(self) -> None:
+        credential = resolve_image_provider_credential(
+            {"api_key_env": "ACME_IMAGE_API_KEY"},
+            provider_id="fake-cloud",
+            manifest_label="cloud-image-test",
+            env={"ACME_IMAGE_API_KEY": _SENTINEL_SECRET},
+        )
+        assert credential is not None
+        self.assertEqual(credential.env_var, "ACME_IMAGE_API_KEY")
+        self.assertEqual(credential.value, _SENTINEL_SECRET)
+
+    def test_remote_provider_missing_the_named_env_var_raises_actionable_error(self) -> None:
+        with self.assertRaises(ImageProviderCredentialUnavailableError) as ctx:
+            resolve_image_provider_credential(
+                {"api_key_env": "ACME_IMAGE_API_KEY"},
+                provider_id="fake-cloud",
+                manifest_label="cloud-image-test",
+                env={},
+            )
+        message = str(ctx.exception)
+        self.assertIn("ACME_IMAGE_API_KEY", message)
+        self.assertIn("fake-cloud", message)
+
+    def test_remote_provider_empty_env_var_is_treated_as_missing(self) -> None:
+        with self.assertRaises(ImageProviderCredentialUnavailableError):
+            resolve_image_provider_credential(
+                {"api_key_env": "ACME_IMAGE_API_KEY"},
+                provider_id="fake-cloud",
+                manifest_label="cloud-image-test",
+                env={"ACME_IMAGE_API_KEY": ""},
+            )
+
+    def test_literal_credential_in_default_params_is_rejected_before_env_lookup(self) -> None:
+        with self.assertRaises(ImageProviderMisconfiguredError):
+            resolve_image_provider_credential(
+                {"api_key": _SENTINEL_SECRET},
+                provider_id="fake-cloud",
+                manifest_label="cloud-image-test",
+                env={},
+            )
+
+    def test_reads_process_environ_when_env_omitted(self) -> None:
+        with patch.dict(
+            "os.environ", {"ACME_IMAGE_API_KEY": _SENTINEL_SECRET}, clear=False
+        ):
+            credential = resolve_image_provider_credential(
+                {"api_key_env": "ACME_IMAGE_API_KEY"},
+                provider_id="fake-cloud",
+                manifest_label="cloud-image-test",
+            )
+        assert credential is not None
+        self.assertEqual(credential.value, _SENTINEL_SECRET)
+
+
+class ImageProviderCredentialReprTest(unittest.TestCase):
+    """The credential's own repr/str must never leak `.value` (issue #257)."""
+
+    def test_repr_omits_the_value(self) -> None:
+        credential = ImageProviderCredential(env_var="ACME_IMAGE_API_KEY", value=_SENTINEL_SECRET)
+        self.assertNotIn(_SENTINEL_SECRET, repr(credential))
+        self.assertIn("ACME_IMAGE_API_KEY", repr(credential))
+
+    def test_logging_the_credential_object_does_not_leak_the_value(self) -> None:
+        credential = ImageProviderCredential(env_var="ACME_IMAGE_API_KEY", value=_SENTINEL_SECRET)
+        with self.assertLogs("test.image.providers", level="INFO") as ctx:
+            logging.getLogger("test.image.providers").info("resolved %r", credential)
+        self.assertNotIn(_SENTINEL_SECRET, "\n".join(ctx.output))
+
+
+class RedactSecretsTest(unittest.TestCase):
+    def test_redacts_every_occurrence(self) -> None:
+        text = f"Authorization: Bearer {_SENTINEL_SECRET} (retry with {_SENTINEL_SECRET})"
+        redacted = redact_secrets(text, [_SENTINEL_SECRET])
+        self.assertNotIn(_SENTINEL_SECRET, redacted)
+        self.assertEqual(redacted.count("<redacted>"), 2)
+
+    def test_ignores_none_and_empty_secrets(self) -> None:
+        text = "no secrets here"
+        self.assertEqual(redact_secrets(text, [None, ""]), text)
+
+    def test_leaves_unrelated_text_untouched(self) -> None:
+        text = "a fox in a field"
+        self.assertEqual(redact_secrets(text, [_SENTINEL_SECRET]), text)
+
+
+class RedactProviderErrorTest(unittest.TestCase):
+    """A caught provider error must never propagate a secret (issue #257)."""
+
+    def test_redacts_the_secret_from_the_error_message(self) -> None:
+        original = RuntimeError(f"upstream rejected key {_SENTINEL_SECRET}")
+        self.assertIn(_SENTINEL_SECRET, str(original))  # the test is not vacuous
+
+        redacted = redact_provider_error(original, [_SENTINEL_SECRET])
+
+        self.assertNotIn(_SENTINEL_SECRET, str(redacted))
+        self.assertIsInstance(redacted, RuntimeError)
+
+    def test_preserves_a_custom_exception_type_with_a_single_message_constructor(self) -> None:
+        original = ImageProviderCredentialUnavailableError(f"leaked {_SENTINEL_SECRET}")
+        redacted = redact_provider_error(original, [_SENTINEL_SECRET])
+        self.assertIsInstance(redacted, ImageProviderCredentialUnavailableError)
+        self.assertNotIn(_SENTINEL_SECRET, str(redacted))
+
+    def test_falls_back_to_runtime_error_when_the_type_cannot_be_reconstructed(self) -> None:
+        class _WeirdError(Exception):
+            def __init__(self, code: int, message: str) -> None:  # two required args
+                super().__init__(message)
+                self.code = code
+
+        original = _WeirdError(42, f"failed with {_SENTINEL_SECRET}")
+        redacted = redact_provider_error(original, [_SENTINEL_SECRET])
+        self.assertIsInstance(redacted, RuntimeError)
+        self.assertNotIn(_SENTINEL_SECRET, str(redacted))
+
+
+class RedactProviderMetadataTest(unittest.TestCase):
+    """Diagnostics/metadata dicts must never carry a secret through (issue #257)."""
+
+    def test_redacts_a_top_level_string_value(self) -> None:
+        sanitized = redact_provider_metadata(
+            {"note": f"used key {_SENTINEL_SECRET}"}, [_SENTINEL_SECRET]
+        )
+        self.assertNotIn(_SENTINEL_SECRET, json.dumps(sanitized))
+
+    def test_redacts_nested_dicts_and_lists(self) -> None:
+        metadata = {
+            "request": {"headers": {"Authorization": f"Bearer {_SENTINEL_SECRET}"}},
+            "warnings": [f"retrying with {_SENTINEL_SECRET}", "no secret here"],
+        }
+        sanitized = redact_provider_metadata(metadata, [_SENTINEL_SECRET])
+        self.assertNotIn(_SENTINEL_SECRET, json.dumps(sanitized))
+        self.assertEqual(sanitized["warnings"][1], "no secret here")
+
+    def test_non_string_values_pass_through_unchanged(self) -> None:
+        sanitized = redact_provider_metadata({"request_count": 3, "ok": True}, [_SENTINEL_SECRET])
+        self.assertEqual(sanitized, {"request_count": 3, "ok": True})
+
+
+class SentinelSecretPersistenceTest(unittest.TestCase):
+    """The sentinel must never survive into request/job/asset-shaped data
+    (issue #257 acceptance criterion: "Provider credentials never appear in
+    persisted job/asset/request data")."""
+
+    def test_credential_resolution_never_touches_the_generation_spec(self) -> None:
+        resolve_image_provider_credential(
+            {"api_key_env": "ACME_IMAGE_API_KEY"},
+            provider_id="fake-cloud",
+            manifest_label="cloud-image-test",
+            env={"ACME_IMAGE_API_KEY": _SENTINEL_SECRET},
+        )
+        spec = _spec()
+        self.assertNotIn(_SENTINEL_SECRET, json.dumps(asdict(spec)))
+
+    def test_preflight_disclosure_never_carries_the_credential(self) -> None:
+        # The preflight disclosure (job/request-facing) is built from the
+        # spec/provider/model id alone -- a resolved credential is never an
+        # input to it, so it structurally cannot leak into what a caller
+        # would attach to job metadata or a request snapshot.
+        resolve_image_provider_credential(
+            {"api_key_env": "ACME_IMAGE_API_KEY"},
+            provider_id="fake-cloud",
+            manifest_label="cloud-image-test",
+            env={"ACME_IMAGE_API_KEY": _SENTINEL_SECRET},
+        )
+        disclosure = build_image_provider_preflight(
+            _spec(), provider_id="fake-cloud", model_id="fake-model"
+        )
+        self.assertNotIn(_SENTINEL_SECRET, json.dumps(asdict(disclosure)))
+
+    def test_provider_result_metadata_sanitized_before_it_would_reach_job_metadata(
+        self,
+    ) -> None:
+        # Simulates a vendor SDK echoing the credential back in a response
+        # field -- a caller must run the result's metadata through
+        # `redact_provider_metadata` before attaching it to job/asset
+        # metadata (this is the "job metadata" / "asset metadata" leg of the
+        # acceptance criterion).
+        identity = ImageProviderIdentity(
+            provider_id="fake-cloud", model_id="fake-model", request_id="req-1"
+        )
+        result = ImageProviderResult(
+            identity=identity,
+            image=None,
+            metadata={"debug_request_headers": {"Authorization": f"Bearer {_SENTINEL_SECRET}"}},
+        )
+        sanitized_metadata = redact_provider_metadata(result.metadata, [_SENTINEL_SECRET])
+        self.assertNotIn(_SENTINEL_SECRET, json.dumps(sanitized_metadata))
+
+    def test_logging_a_redacted_provider_error_never_emits_the_secret(self) -> None:
+        original = RuntimeError(f"upstream rejected key {_SENTINEL_SECRET}")
+        redacted = redact_provider_error(original, [_SENTINEL_SECRET])
+
+        with self.assertLogs("test.image.providers", level="ERROR") as ctx:
+            logging.getLogger("test.image.providers").error("provider call failed: %s", redacted)
+
+        self.assertNotIn(_SENTINEL_SECRET, "\n".join(ctx.output))
 
 
 if __name__ == "__main__":
