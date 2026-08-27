@@ -1,6 +1,6 @@
-"""Cloud audio provider adapter and capability contract (#234, #235).
+"""Cloud audio provider adapter and capability contract (#234, #235, #236).
 
-Covers the acceptance criteria on both issues directly:
+Covers the acceptance criteria on all three issues directly:
 
 #234:
 - Cloud provider capability can be represented without vendor-specific route
@@ -22,20 +22,34 @@ Covers the acceptance criteria on both issues directly:
 - A disabled/not-opted-in request fails before ``generate()`` -- i.e.
   before any prompt/audio payload data would be sent.
 - Positive and negative opt-in cases are both covered.
+
+#236 (resolve cloud provider secrets from the environment, redact logs):
+- Credentials are resolved only from an env var named by
+  `default_params.api_key_env`, never from a literal manifest field.
+- A manifest holding a literal credential is rejected, both at
+  `ModelManifest` construction time and again by
+  `resolve_cloud_audio_provider_credential`.
+- A sentinel secret value never survives into a credential's `repr()`/
+  `str()`, a redacted error, or redacted provider metadata.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 import unittest
 from unittest.mock import patch
 
 import pytest
+from pydantic import ValidationError
 
 from core.models.manifest import ModelManifest
 from core.schemas import GenerationRequest
 from generators.audio.generator import AudioGenerator
 from generators.audio.providers import (
     AudioProviderCapability,
+    AudioProviderCredential,
+    AudioProviderCredentialUnavailableError,
     CloudAudioProviderOptInRequiredError,
     CloudAudioProviderRequest,
     CloudAudioProviderResult,
@@ -47,6 +61,10 @@ from generators.audio.providers import (
     ensure_capabilities_declared,
     ensure_cloud_audio_provider_opt_in,
     manifest_declared_capabilities,
+    redact_provider_error,
+    redact_provider_metadata,
+    redact_secrets,
+    resolve_cloud_audio_provider_credential,
     run_cloud_audio_provider,
 )
 
@@ -54,6 +72,8 @@ _OPT_IN_GRANTED_ENV = {
     "ALLOW_CLOUD_PROVIDERS": "true",
     "ALLOW_CLOUD_PROVIDER_FAKE_CLOUD": "true",
 }
+
+_SENTINEL_SECRET = "sk-sentinel-1234567890abcdef"  # never a real credential
 
 
 class _FakeCloudAudioProviderAdapter:
@@ -369,7 +389,12 @@ class _FakeModelService:
         return self._manifest
 
 
-def _cloud_manifest(*, capabilities: list[str], tags: list[str] | None = None) -> ModelManifest:
+def _cloud_manifest(
+    *,
+    capabilities: list[str],
+    tags: list[str] | None = None,
+    extra_default_params: dict[str, object] | None = None,
+) -> ModelManifest:
     return ModelManifest(
         id="cloud-music-test",
         public_id="cloud-music",
@@ -380,7 +405,11 @@ def _cloud_manifest(*, capabilities: list[str], tags: list[str] | None = None) -
         runtime="cloud_test",
         remote_ref="https://cloud-provider.example/v1/audio",
         loader="cloud_test_loader",
-        default_params={"duration_seconds": 8, "capabilities": capabilities},
+        default_params={
+            "duration_seconds": 8,
+            "capabilities": capabilities,
+            **(extra_default_params or {}),
+        },
         tags=tags or ["audio", "music"],
         is_default=False,
         enabled=True,
@@ -459,3 +488,230 @@ def test_local_provider_manifest_is_unaffected_by_cloud_validation() -> None:
         model_id="musicgen-small",
     )
     generator.validate_request(request)  # must not raise
+
+
+# --- Credential resolution and redaction (#236) -----------------------------------
+
+
+class RejectLiteralCredentialFieldsForCloudAudioManifestsTest(unittest.TestCase):
+    """A `provider: cloud` audio manifest must never carry a literal credential."""
+
+    def test_manifest_construction_rejects_a_literal_api_key(self) -> None:
+        with self.assertRaisesRegex(ValidationError, "literal credential"):
+            _cloud_manifest(
+                capabilities=["text-to-music"],
+                extra_default_params={"api_key": _SENTINEL_SECRET},
+            )
+
+    def test_manifest_construction_accepts_the_api_key_env_indirection(self) -> None:
+        manifest = _cloud_manifest(
+            capabilities=["text-to-music"],
+            extra_default_params={"api_key_env": "ACME_AUDIO_API_KEY"},
+        )
+        self.assertEqual(manifest.default_params["api_key_env"], "ACME_AUDIO_API_KEY")
+
+    def test_manifest_error_never_contains_the_secret_value(self) -> None:
+        with self.assertRaises(ValidationError) as ctx:
+            _cloud_manifest(
+                capabilities=["text-to-music"],
+                extra_default_params={"api_key": _SENTINEL_SECRET},
+            )
+        self.assertNotIn(_SENTINEL_SECRET, str(ctx.exception))
+
+
+class ResolveCloudAudioProviderCredentialTest(unittest.TestCase):
+    """`resolve_cloud_audio_provider_credential` (issue #236)."""
+
+    def test_no_api_key_env_declared_needs_no_credential(self) -> None:
+        credential = resolve_cloud_audio_provider_credential(
+            {"capabilities": ["text-to-music"]},
+            provider_name="fake-cloud",
+            manifest_label="cloud-music-test",
+            env={"ACME_AUDIO_API_KEY": _SENTINEL_SECRET},
+        )
+        self.assertIsNone(credential)
+
+    def test_resolves_the_credential_from_the_named_env_var(self) -> None:
+        credential = resolve_cloud_audio_provider_credential(
+            {"api_key_env": "ACME_AUDIO_API_KEY"},
+            provider_name="fake-cloud",
+            manifest_label="cloud-music-test",
+            env={"ACME_AUDIO_API_KEY": _SENTINEL_SECRET},
+        )
+        assert credential is not None
+        self.assertEqual(credential.env_var, "ACME_AUDIO_API_KEY")
+        self.assertEqual(credential.value, _SENTINEL_SECRET)
+
+    def test_raises_actionable_error_naming_the_env_var_when_unset(self) -> None:
+        with self.assertRaises(AudioProviderCredentialUnavailableError) as ctx:
+            resolve_cloud_audio_provider_credential(
+                {"api_key_env": "ACME_AUDIO_API_KEY"},
+                provider_name="fake-cloud",
+                manifest_label="cloud-music-test",
+                env={},
+            )
+        message = str(ctx.exception)
+        self.assertIn("ACME_AUDIO_API_KEY", message)
+        self.assertIn("fake-cloud", message)
+
+    def test_raises_when_the_env_var_is_set_but_empty(self) -> None:
+        with self.assertRaises(AudioProviderCredentialUnavailableError):
+            resolve_cloud_audio_provider_credential(
+                {"api_key_env": "ACME_AUDIO_API_KEY"},
+                provider_name="fake-cloud",
+                manifest_label="cloud-music-test",
+                env={"ACME_AUDIO_API_KEY": ""},
+            )
+
+    def test_literal_credential_in_default_params_is_rejected_before_env_lookup(self) -> None:
+        with self.assertRaises(ProviderMisconfiguredError):
+            resolve_cloud_audio_provider_credential(
+                {"api_key": _SENTINEL_SECRET},
+                provider_name="fake-cloud",
+                manifest_label="cloud-music-test",
+                env={},
+            )
+
+    def test_reads_process_environ_when_env_omitted(self) -> None:
+        with patch.dict("os.environ", {"ACME_AUDIO_API_KEY": _SENTINEL_SECRET}, clear=False):
+            credential = resolve_cloud_audio_provider_credential(
+                {"api_key_env": "ACME_AUDIO_API_KEY"},
+                provider_name="fake-cloud",
+                manifest_label="cloud-music-test",
+            )
+        assert credential is not None
+        self.assertEqual(credential.value, _SENTINEL_SECRET)
+
+
+class AudioProviderCredentialReprTest(unittest.TestCase):
+    """The credential's own repr/str must never leak `.value` (issue #236)."""
+
+    def test_repr_omits_the_value(self) -> None:
+        credential = AudioProviderCredential(env_var="ACME_AUDIO_API_KEY", value=_SENTINEL_SECRET)
+        self.assertNotIn(_SENTINEL_SECRET, repr(credential))
+        self.assertIn("ACME_AUDIO_API_KEY", repr(credential))
+
+    def test_logging_the_credential_object_does_not_leak_the_value(self) -> None:
+        credential = AudioProviderCredential(env_var="ACME_AUDIO_API_KEY", value=_SENTINEL_SECRET)
+        with self.assertLogs("test.audio.providers", level="INFO") as ctx:
+            logging.getLogger("test.audio.providers").info("resolved %r", credential)
+        self.assertNotIn(_SENTINEL_SECRET, "\n".join(ctx.output))
+
+
+class RedactSecretsTest(unittest.TestCase):
+    def test_redacts_every_occurrence(self) -> None:
+        text = f"Authorization: Bearer {_SENTINEL_SECRET} (retry with {_SENTINEL_SECRET})"
+        redacted = redact_secrets(text, [_SENTINEL_SECRET])
+        self.assertNotIn(_SENTINEL_SECRET, redacted)
+        self.assertEqual(redacted.count("<redacted>"), 2)
+
+    def test_ignores_none_and_empty_secrets(self) -> None:
+        text = "no secrets here"
+        self.assertEqual(redact_secrets(text, [None, ""]), text)
+
+    def test_leaves_unrelated_text_untouched(self) -> None:
+        text = "a calm piano piece"
+        self.assertEqual(redact_secrets(text, [_SENTINEL_SECRET]), text)
+
+
+class RedactProviderErrorTest(unittest.TestCase):
+    """A caught provider error must never propagate a secret (issue #236)."""
+
+    def test_redacts_the_secret_from_the_error_message(self) -> None:
+        original = RuntimeError(f"upstream rejected key {_SENTINEL_SECRET}")
+        self.assertIn(_SENTINEL_SECRET, str(original))  # the test is not vacuous
+
+        redacted = redact_provider_error(original, [_SENTINEL_SECRET])
+
+        self.assertNotIn(_SENTINEL_SECRET, str(redacted))
+        self.assertIsInstance(redacted, RuntimeError)
+
+    def test_preserves_a_custom_exception_type_with_a_single_message_constructor(self) -> None:
+        original = AudioProviderCredentialUnavailableError(f"leaked {_SENTINEL_SECRET}")
+        redacted = redact_provider_error(original, [_SENTINEL_SECRET])
+        self.assertIsInstance(redacted, AudioProviderCredentialUnavailableError)
+        self.assertNotIn(_SENTINEL_SECRET, str(redacted))
+
+    def test_falls_back_to_runtime_error_when_the_type_cannot_be_reconstructed(self) -> None:
+        class _WeirdError(Exception):
+            def __init__(self, code: int, message: str) -> None:  # two required args
+                super().__init__(message)
+                self.code = code
+
+        original = _WeirdError(42, f"failed with {_SENTINEL_SECRET}")
+        redacted = redact_provider_error(original, [_SENTINEL_SECRET])
+        self.assertIsInstance(redacted, RuntimeError)
+        self.assertNotIn(_SENTINEL_SECRET, str(redacted))
+
+
+class RedactProviderMetadataTest(unittest.TestCase):
+    """Diagnostics/metadata dicts must never carry a secret through (issue #236)."""
+
+    def test_redacts_a_top_level_string_value(self) -> None:
+        sanitized = redact_provider_metadata(
+            {"note": f"used key {_SENTINEL_SECRET}"}, [_SENTINEL_SECRET]
+        )
+        self.assertNotIn(_SENTINEL_SECRET, json.dumps(sanitized))
+
+    def test_redacts_nested_dicts_and_lists(self) -> None:
+        metadata = {
+            "request": {"headers": {"Authorization": f"Bearer {_SENTINEL_SECRET}"}},
+            "warnings": [f"retrying with {_SENTINEL_SECRET}", "no secret here"],
+        }
+        sanitized = redact_provider_metadata(metadata, [_SENTINEL_SECRET])
+        self.assertNotIn(_SENTINEL_SECRET, json.dumps(sanitized))
+        self.assertEqual(sanitized["warnings"][1], "no secret here")
+
+    def test_non_string_values_pass_through_unchanged(self) -> None:
+        sanitized = redact_provider_metadata({"request_count": 3, "ok": True}, [_SENTINEL_SECRET])
+        self.assertEqual(sanitized, {"request_count": 3, "ok": True})
+
+
+class SentinelSecretPersistenceTest(unittest.TestCase):
+    """The sentinel must never survive into request/job/asset-shaped data.
+
+    Issue #236 acceptance criterion: "Sentinel secret values do not appear
+    in logs, errors, or job metadata."
+    """
+
+    def test_credential_resolution_never_touches_the_provider_request(self) -> None:
+        resolve_cloud_audio_provider_credential(
+            {"api_key_env": "ACME_AUDIO_API_KEY"},
+            provider_name="fake-cloud",
+            manifest_label="cloud-music-test",
+            env={"ACME_AUDIO_API_KEY": _SENTINEL_SECRET},
+        )
+        request = _request(AudioProviderCapability.TEXT_TO_MUSIC)
+        self.assertNotIn(_SENTINEL_SECRET, request.model_dump_json())
+
+    def test_provider_result_metadata_sanitized_before_it_would_reach_job_metadata(
+        self,
+    ) -> None:
+        # Simulates a vendor SDK echoing the credential back in a response
+        # field -- a caller must run the result's provider_metadata through
+        # `redact_provider_metadata` before attaching it to job/asset
+        # metadata (the "job metadata" leg of the acceptance criterion).
+        result = CloudAudioProviderResult(
+            audio_bytes=b"\x00\x00",
+            sample_rate=32_000,
+            channels=1,
+            output_format="wav",
+            provider_metadata={
+                "debug_request_headers": {"Authorization": f"Bearer {_SENTINEL_SECRET}"}
+            },
+        )
+        sanitized_metadata = redact_provider_metadata(
+            result.provider_metadata, [_SENTINEL_SECRET]
+        )
+        self.assertNotIn(_SENTINEL_SECRET, json.dumps(sanitized_metadata))
+
+    def test_logging_a_redacted_provider_error_never_emits_the_secret(self) -> None:
+        original = RuntimeError(f"upstream rejected key {_SENTINEL_SECRET}")
+        redacted = redact_provider_error(original, [_SENTINEL_SECRET])
+
+        with self.assertLogs("test.audio.providers", level="ERROR") as ctx:
+            logging.getLogger("test.audio.providers").error(
+                "provider call failed: %s", redacted
+            )
+
+        self.assertNotIn(_SENTINEL_SECRET, "\n".join(ctx.output))

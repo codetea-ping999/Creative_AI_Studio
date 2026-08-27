@@ -31,10 +31,24 @@ Egress opt-in is enforced (issue #235, see below):
   `adapter.generate()`, so a disabled/not-opted-in request never reaches a
   network call and never constructs/sends prompt or audio payload data.
 
+Credential resolution and log/error/metadata redaction (issue #236):
+- `resolve_cloud_audio_provider_credential` resolves a cloud provider's API
+  key from the environment variable named in `default_params.api_key_env` --
+  never from the manifest itself -- following the same convention
+  `core.models.text_runtimes.build_openai_compatible_runtime` established
+  and `generators.image.providers.resolve_image_provider_credential` (#257)
+  already reuses. It rejects a manifest holding a literal credential instead
+  of the `*_env` indirection (via
+  `core.models.manifest.reject_literal_credential_fields`, the same check
+  `ModelManifest` already runs at construction time) and raises an
+  actionable, non-secret-bearing error when a configured credential is
+  missing.
+- `redact_secrets` / `redact_provider_error` / `redact_provider_metadata`
+  strip resolved credential values out of any string, exception, or
+  diagnostics mapping before it could reach a log line or persisted
+  job/asset/request data.
+
 Still explicitly out of scope here (see the microtask order on #57):
-- Resolving API keys from environment variables and redacting them from logs
-  -- #236, following the existing `default_params.api_key_env` convention
-  used by `core/models/text_runtimes.py`'s `openai_compatible_text_loader`.
 - A real vendor adapter -- #237.
 - Recording egress provenance in job metadata and surfacing it in the UI --
   #238.
@@ -42,12 +56,15 @@ Still explicitly out of scope here (see the microtask order on #57):
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from enum import Enum
 import os
 from typing import Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
+
+from core.models.manifest import reject_literal_credential_fields
 
 
 class AudioProviderCapability(str, Enum):
@@ -129,6 +146,16 @@ class CloudAudioProviderOptInRequiredError(AudioProviderError, PermissionError):
     raised before :meth:`CloudAudioProviderAdapter.generate` is reachable --
     see :func:`ensure_cloud_audio_provider_opt_in` and
     :func:`run_cloud_audio_provider`.
+    """
+
+
+class AudioProviderCredentialUnavailableError(AudioProviderError):
+    """Raised when a cloud audio provider is missing its required credential.
+
+    Always actionable: names the environment variable an operator needs to
+    set. Never includes a credential value -- there is none to include, the
+    whole point of this error is that the value was absent. See
+    :func:`resolve_cloud_audio_provider_credential`.
     """
 
 
@@ -322,6 +349,136 @@ def run_cloud_audio_provider(
     return adapter.generate(request)
 
 
+@dataclass(frozen=True)
+class AudioProviderCredential:
+    """A credential resolved from the environment for one provider call.
+
+    ``repr()``/``str()`` deliberately omit `value` so an accidental
+    ``logger.info("resolved %r", credential)`` or an exception message built
+    from this object cannot leak the secret. Only `.value` carries it, and
+    callers should place `.value` nowhere but a request's auth header/param
+    -- never in `CloudAudioProviderRequest.params`,
+    `CloudAudioProviderResult.provider_metadata`, or any other field that
+    could reach job/asset/request persistence.
+    """
+
+    env_var: str
+    value: str
+
+    def __repr__(self) -> str:
+        return f"AudioProviderCredential(env_var={self.env_var!r}, value=<redacted>)"
+
+
+def resolve_cloud_audio_provider_credential(
+    default_params: Mapping[str, Any],
+    *,
+    provider_name: str,
+    manifest_label: str,
+    env: Mapping[str, str] | None = None,
+) -> AudioProviderCredential | None:
+    """Resolve the credential `provider_name` needs, never from the manifest itself.
+
+    Mirrors the `api_key_env` convention `openai_compatible_text_loader`
+    established (`core/models/text_runtimes.py`) and
+    `generators.image.providers.resolve_image_provider_credential` already
+    reuses (#257): a manifest names the *environment variable* that holds a
+    credential, never the credential value, so nothing committed under
+    `models/manifests/` can ever carry a secret.
+
+    Returns ``None`` when `default_params` declares no `api_key_env` at all
+    -- some cloud endpoints need no separate credential (e.g. an
+    already-authenticated self-hosted gateway).
+
+    Raises :class:`ProviderMisconfiguredError` if `default_params` itself
+    holds a literal credential value instead of the env-var-name indirection
+    (reuses `core.models.manifest.reject_literal_credential_fields` rather
+    than re-implementing the same field-name check -- every `provider:
+    cloud` manifest already runs this check once at `ModelManifest`
+    construction time; this is the same check re-applied at request time).
+    Raises :class:`AudioProviderCredentialUnavailableError` -- an actionable
+    message naming the missing environment variable, never a value -- if
+    `api_key_env` is declared but that variable is unset or empty.
+    """
+
+    try:
+        reject_literal_credential_fields(default_params, manifest_label=manifest_label)
+    except ValueError as exc:
+        raise ProviderMisconfiguredError(str(exc)) from exc
+
+    api_key_env = default_params.get("api_key_env")
+    if not api_key_env:
+        return None
+
+    source = env if env is not None else os.environ
+    value = source.get(str(api_key_env), "")
+    if not value:
+        raise AudioProviderCredentialUnavailableError(
+            f"Cloud audio provider {provider_name!r} ({manifest_label}) requires a "
+            f"credential, but environment variable {api_key_env!r} is not set. Set "
+            f"{api_key_env} to a valid credential before using this provider."
+        )
+    return AudioProviderCredential(env_var=str(api_key_env), value=value)
+
+
+def redact_secrets(text: str, secrets: Iterable[str | None]) -> str:
+    """Replace every occurrence of a non-empty secret in `text` with a marker.
+
+    Used to sanitize a provider error message or diagnostics string before it
+    reaches a log line or persisted job/asset/request data -- the credential
+    value itself must never survive into any of those.
+    """
+
+    redacted = text
+    for secret in secrets:
+        if secret:
+            redacted = redacted.replace(secret, "<redacted>")
+    return redacted
+
+
+def redact_provider_error(
+    error: BaseException, secrets: Iterable[str | None]
+) -> BaseException:
+    """Return an equivalent error with every `secrets` occurrence redacted.
+
+    Preserves `type(error)` where its constructor accepts a single message
+    argument (true for every stdlib exception and every error class in this
+    module); falls back to `RuntimeError` when reconstructing the original
+    type fails, so a redaction failure can never re-raise the original
+    (still secret-bearing) exception.
+    """
+
+    redacted_message = redact_secrets(str(error), secrets)
+    try:
+        return type(error)(redacted_message)
+    except Exception:  # noqa: BLE001 - constructing the original type failed; never re-raise the original
+        return RuntimeError(redacted_message)
+
+
+def redact_provider_metadata(
+    metadata: Mapping[str, Any], secrets: Iterable[str | None]
+) -> dict[str, Any]:
+    """Recursively redact `secrets` occurrences from a diagnostics/metadata mapping.
+
+    Applied to anything derived from a provider call before it is attached to
+    job/asset metadata or a request snapshot, so a credential a vendor SDK
+    happened to echo back in a response field (or accidentally included in a
+    diagnostic string) cannot persist alongside the generation record.
+    """
+
+    secret_list = [secret for secret in secrets if secret]
+
+    def _walk(node: Any) -> Any:
+        if isinstance(node, Mapping):
+            return {key: _walk(value) for key, value in node.items()}
+        if isinstance(node, list):
+            return [_walk(item) for item in node]
+        if isinstance(node, str):
+            return redact_secrets(node, secret_list)
+        return node
+
+    return _walk(dict(metadata))
+
+
 def manifest_declared_capabilities(
     default_params: Mapping[str, Any],
     *,
@@ -373,6 +530,8 @@ def ensure_capabilities_declared(
 
 __all__ = [
     "AudioProviderCapability",
+    "AudioProviderCredential",
+    "AudioProviderCredentialUnavailableError",
     "AudioProviderError",
     "CloudAudioProviderAdapter",
     "CloudAudioProviderOptInRequiredError",
@@ -387,5 +546,9 @@ __all__ = [
     "ensure_capability_supported",
     "ensure_cloud_audio_provider_opt_in",
     "manifest_declared_capabilities",
+    "redact_provider_error",
+    "redact_provider_metadata",
+    "redact_secrets",
+    "resolve_cloud_audio_provider_credential",
     "run_cloud_audio_provider",
 ]
