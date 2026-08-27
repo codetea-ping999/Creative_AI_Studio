@@ -6,7 +6,7 @@ from core.model_readiness import (
     evaluate_manifest_readiness,
 )
 
-from .cache import ModelRuntimeCache
+from .cache import ModelRuntimeCache, resolve_media_cache_limits
 from .cleanup import release_runtime
 from .loader import (
     AudioCraftMusicgenLoader,
@@ -45,4 +45,5 @@ __all__ = [
     "evaluate_manifest_payload",
     "evaluate_manifest_readiness",
     "release_runtime",
+    "resolve_media_cache_limits",
 ]
