@@ -459,5 +459,130 @@ class SceneGenerationApiTests(unittest.TestCase):
             self.assertEqual(scene["asset_ids"], {})
 
 
+@unittest.skipIf(IMPORT_ERROR is not None, f"missing dependency: {IMPORT_ERROR}")
+class SceneAssetStatusApiTests(unittest.TestCase):
+    """``asset_status`` on GET /stories/{id}: missing/generating/failed (issue #245)."""
+
+    def setUp(self) -> None:
+        self._temporary = TemporaryDirectory()
+        self.addCleanup(self._temporary.cleanup)
+        root = Path(self._temporary.name)
+        self.services = create_application_services(
+            db_path=root / "jobs.db", output_dir=root / "outputs" / "images"
+        )
+        self.client = TestClient(create_app(self.services, start_job_runner=False))
+
+        self.story_id = self.client.post(
+            "/stories", json={"title": "Rewind", "premise": "p"}
+        ).json()["id"]
+        story = self.services.story_repository.get(self.story_id)
+        self.services.story_repository.save(
+            apply_text_result(story, "scene_list", _SCENES)
+        )
+
+    def _entry(self, detail: dict, scene_id: str, role: str) -> dict:
+        matches = [
+            entry
+            for entry in detail["asset_status"]
+            if entry["scene_id"] == scene_id and entry["role"] == role
+        ]
+        self.assertEqual(len(matches), 1, f"expected exactly one {scene_id}/{role} entry")
+        return matches[0]
+
+    def _queue_scene_job(self, scene_id: str, role: str) -> str:
+        job = self.services.job_service.create_job(
+            GenerationRequest(
+                media_type="image" if role == "visual" else "audio",
+                prompt="x",
+                model_id="sdxl" if role == "visual" else "template-writer",
+                params=scene_binding_params(self.story_id, scene_id, role),
+            )
+        )
+        return job.id
+
+    def test_never_attempted_roles_are_missing_or_optional(self) -> None:
+        detail = self.client.get(f"/stories/{self.story_id}").json()
+
+        # scene_01 (_SCENES) has narration text and a bgm_mood: all three
+        # roles are required and none has been attempted yet.
+        for role in ("visual", "narration", "music"):
+            entry = self._entry(detail, "scene_01", role)
+            self.assertEqual(entry["state"], "missing")
+            self.assertTrue(entry["required"])
+            self.assertIsNone(entry["job_id"])
+            self.assertIsNone(entry["error_message"])
+
+        # scene_02 has no narration text, so that role is merely optional,
+        # not missing — a silent cut is a legitimate choice.
+        narration_entry = self._entry(detail, "scene_02", "narration")
+        self.assertEqual(narration_entry["state"], "optional")
+        self.assertFalse(narration_entry["required"])
+
+    def test_assigned_role_is_reported_from_the_scene_asset_id(self) -> None:
+        job_id = self._queue_scene_job("scene_01", "visual")
+        self.services.job_service.mark_succeeded(
+            job_id,
+            GenerationResult(
+                job_id=job_id,
+                status="succeeded",
+                outputs=["outputs/images/a.png"],
+                previews=["outputs/images/a.png"],
+                metadata={},
+            ),
+        )
+
+        detail = self.client.get(f"/stories/{self.story_id}").json()
+        entry = self._entry(detail, "scene_01", "visual")
+        self.assertEqual(entry["state"], "assigned")
+        self.assertTrue(entry["asset_id"])
+        self.assertNotIn(
+            {"scene_id": "scene_01", "role": "visual"}, detail["missing_assets"]
+        )
+
+    def test_queued_job_reports_generating(self) -> None:
+        job_id = self._queue_scene_job("scene_01", "narration")
+
+        detail = self.client.get(f"/stories/{self.story_id}").json()
+        entry = self._entry(detail, "scene_01", "narration")
+        self.assertEqual(entry["state"], "generating")
+        self.assertEqual(entry["job_id"], job_id)
+        self.assertIsNone(entry["error_message"])
+        # Still generating: no asset yet, so it is unresolved from the scene's
+        # own point of view too.
+        self.assertEqual(
+            self.services.story_repository.get(self.story_id).scenes[0].asset_ids, {}
+        )
+
+    def test_failed_job_reports_failed_with_the_reason(self) -> None:
+        job_id = self._queue_scene_job("scene_01", "music")
+        self.services.job_service.mark_failed(job_id, "no MusicGen weights installed")
+
+        detail = self.client.get(f"/stories/{self.story_id}").json()
+        entry = self._entry(detail, "scene_01", "music")
+        self.assertEqual(entry["state"], "failed")
+        self.assertEqual(entry["job_id"], job_id)
+        self.assertEqual(entry["error_message"], "no MusicGen weights installed")
+
+        # A failed job is never bound to its scene (SceneBinder.bind_job only
+        # ever acts on a succeeded job) — the whole reason `asset_status` looks
+        # at the job repository directly rather than at `scene.job_ids`.
+        scene = self.services.story_repository.get(self.story_id).scenes[0]
+        self.assertNotIn(job_id, scene.job_ids)
+        self.assertEqual(scene.asset_ids, {})
+
+    def test_a_later_retry_supersedes_an_earlier_failure(self) -> None:
+        first_job_id = self._queue_scene_job("scene_01", "visual")
+        self.services.job_service.mark_failed(first_job_id, "first attempt failed")
+
+        second_job_id = self._queue_scene_job("scene_01", "visual")
+
+        detail = self.client.get(f"/stories/{self.story_id}").json()
+        entry = self._entry(detail, "scene_01", "visual")
+        # The most recent attempt (still in flight) is what is reported, not
+        # the earlier failure it superseded.
+        self.assertEqual(entry["state"], "generating")
+        self.assertEqual(entry["job_id"], second_job_id)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -17,6 +17,7 @@ from core.models import (
     ModelService,
     create_default_loader_registry,
     release_runtime,
+    resolve_media_cache_limits,
 )
 from core.feedback import FeedbackRepository
 from core.projects import ProjectRepository
@@ -139,6 +140,7 @@ def create_default_model_service(
     loader_registry = create_default_loader_registry()
     runtime_cache = ModelRuntimeCache(
         max_entries=resolved_max_cached_models,
+        media_limits=resolve_media_cache_limits(),
         on_evict=release_runtime,
     )
     return ModelService(

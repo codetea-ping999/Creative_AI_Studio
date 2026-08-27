@@ -211,4 +211,181 @@ describe("AssemblyTimelinePanel", () => {
     expect(screen.getByText(/2 シーン \/ 合計 11\.0 秒/)).toBeTruthy();
     expect(screen.getByText(/不足素材 1 件/)).toBeTruthy();
   });
+
+  it("reports a complete timeline as fully ready with no outstanding state", async () => {
+    const story = makeStory({
+      scenes: [
+        {
+          id: "scene_01",
+          order: 0,
+          heading: "屋上の朝",
+          summary: "",
+          narration: "朝の光が街を照らしていた。",
+          image_prompt: "rooftop at dawn",
+          image_negative: "",
+          bgm_mood: "hopeful",
+          duration_seconds: 5,
+          camera: "",
+          asset_ids: {
+            visual: "asset_visual_1",
+            narration: "asset_narration_1",
+            music: "asset_music_1",
+          },
+        },
+      ],
+    });
+    stubFetch([
+      [
+        "/stories/story_1",
+        {
+          story,
+          missing_assets: [],
+          asset_status: [
+            { scene_id: "scene_01", role: "visual", state: "assigned", required: true, asset_id: "asset_visual_1" },
+            { scene_id: "scene_01", role: "narration", state: "assigned", required: true, asset_id: "asset_narration_1" },
+            { scene_id: "scene_01", role: "music", state: "assigned", required: true, asset_id: "asset_music_1" },
+          ],
+        },
+      ],
+      ["/stories", { items: [{ id: "story_1", title: "Rewind", scene_count: 1 }] }],
+    ]);
+
+    const user = userEvent.setup();
+    render(<AssemblyTimelinePanel />);
+    await waitFor(() => {
+      expect(screen.getByRole("option", { name: /Rewind/ })).toBeTruthy();
+    });
+    await user.selectOptions(screen.getByLabelText("表示するストーリー"), "story_1");
+
+    await screen.findByRole("table");
+    expect(screen.getByText(/素材はすべて揃っています/)).toBeTruthy();
+    expect(screen.queryByText(/不足素材/)).toBeNull();
+    expect(screen.queryByText(/生成中/)).toBeNull();
+    expect(screen.queryByText(/失敗/)).toBeNull();
+  });
+
+  it("distinguishes a still-generating role from one that has never been attempted", async () => {
+    const story = makeStory({
+      scenes: [
+        {
+          id: "scene_01",
+          order: 0,
+          heading: "屋上の朝",
+          summary: "",
+          narration: "朝の光が街を照らしていた。",
+          image_prompt: "rooftop at dawn",
+          image_negative: "",
+          bgm_mood: "hopeful",
+          duration_seconds: 5,
+          camera: "",
+          asset_ids: { visual: "asset_visual_1" },
+        },
+      ],
+    });
+    stubFetch([
+      [
+        "/stories/story_1",
+        {
+          story,
+          missing_assets: [
+            { scene_id: "scene_01", role: "narration" },
+            { scene_id: "scene_01", role: "music" },
+          ],
+          asset_status: [
+            { scene_id: "scene_01", role: "visual", state: "assigned", required: true, asset_id: "asset_visual_1" },
+            { scene_id: "scene_01", role: "narration", state: "generating", required: true, job_id: "job_narration" },
+            { scene_id: "scene_01", role: "music", state: "missing", required: true },
+          ],
+        },
+      ],
+      ["/stories", { items: [{ id: "story_1", title: "Rewind", scene_count: 1 }] }],
+    ]);
+
+    const user = userEvent.setup();
+    render(<AssemblyTimelinePanel />);
+    await waitFor(() => {
+      expect(screen.getByRole("option", { name: /Rewind/ })).toBeTruthy();
+    });
+    await user.selectOptions(screen.getByLabelText("表示するストーリー"), "story_1");
+
+    const table = await screen.findByRole("table");
+    const row = within(table).getAllByRole("row")[1];
+
+    expect(within(row).getByText("生成中")).toBeTruthy();
+    expect(within(row).getByText("…")).toBeTruthy();
+    expect(within(row).getByText("未割り当て")).toBeTruthy();
+    expect(within(row).getByText("!")).toBeTruthy();
+
+    // The timeline-level summary counts both states, matching the per-scene
+    // rows rather than collapsing them into one "missing" bucket.
+    expect(screen.getByText(/不足素材 1 件/)).toBeTruthy();
+    expect(screen.getByText(/生成中 1 件/)).toBeTruthy();
+  });
+
+  it("surfaces a failed generation with an accessible, collapsed reason", async () => {
+    const story = makeStory({
+      scenes: [
+        {
+          id: "scene_01",
+          order: 0,
+          heading: "屋上の朝",
+          summary: "",
+          narration: "朝の光が街を照らしていた。",
+          image_prompt: "rooftop at dawn",
+          image_negative: "",
+          bgm_mood: "hopeful",
+          duration_seconds: 5,
+          camera: "",
+          asset_ids: {},
+        },
+      ],
+    });
+    stubFetch([
+      [
+        "/stories/story_1",
+        {
+          story,
+          missing_assets: [
+            { scene_id: "scene_01", role: "visual" },
+            { scene_id: "scene_01", role: "narration" },
+          ],
+          asset_status: [
+            {
+              scene_id: "scene_01",
+              role: "visual",
+              state: "failed",
+              required: true,
+              job_id: "job_visual",
+              error_message: "no MusicGen weights installed",
+            },
+            { scene_id: "scene_01", role: "narration", state: "missing", required: true },
+            { scene_id: "scene_01", role: "music", state: "missing", required: true },
+          ],
+        },
+      ],
+      ["/stories", { items: [{ id: "story_1", title: "Rewind", scene_count: 1 }] }],
+    ]);
+
+    const user = userEvent.setup();
+    render(<AssemblyTimelinePanel />);
+    await waitFor(() => {
+      expect(screen.getByRole("option", { name: /Rewind/ })).toBeTruthy();
+    });
+    await user.selectOptions(screen.getByLabelText("表示するストーリー"), "story_1");
+
+    const table = await screen.findByRole("table");
+    const row = within(table).getAllByRole("row")[1];
+
+    expect(within(row).getByText("生成失敗")).toBeTruthy();
+    expect(within(row).getByText("✕")).toBeTruthy();
+    expect(screen.getByText(/失敗 1 件/)).toBeTruthy();
+
+    // The reason is present but collapsed by default — it does not
+    // overwhelm the row — and reachable via the native, keyboard-operable
+    // <details>/<summary> disclosure rather than a bespoke widget.
+    const disclosure = within(row).getByText("失敗の理由").closest("details");
+    expect(disclosure).toBeTruthy();
+    expect(disclosure?.hasAttribute("open")).toBe(false);
+    expect(within(row).getByText("no MusicGen weights installed")).toBeTruthy();
+  });
 });

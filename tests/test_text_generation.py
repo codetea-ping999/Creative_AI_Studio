@@ -126,6 +126,24 @@ class StoryTaskTests(unittest.TestCase):
         self.assertIn("kishotenketsu", prompt)
         self.assertIn("ten (twist)", prompt)
 
+    def test_prose_prompt_includes_continuity_context_when_given(self) -> None:
+        continuity_block = (
+            "### CONTINUITY MEMORY\nPrevious chapter summary: she found a key."
+        )
+        prompt = get_story_task("prose").build_prompt(
+            {
+                "subject": "a girl who rewinds time",
+                "continuity_context": continuity_block,
+            }
+        )
+        self.assertIn("### CONTINUITY MEMORY", prompt)
+        self.assertIn("she found a key.", prompt)
+        self.assertIn("do not", prompt.lower())
+
+    def test_prose_prompt_omits_the_continuity_section_when_absent(self) -> None:
+        prompt = get_story_task("prose").build_prompt({"subject": "a fresh start"})
+        self.assertNotIn("CONTINUITY MEMORY", prompt)
+
 
 class JsonExtractionTests(unittest.TestCase):
     def test_plain_object(self) -> None:
@@ -311,6 +329,43 @@ class TextGeneratorTests(unittest.TestCase):
             result = _generator(Path(root)).run(_request("logline"))
             self.assertNotIn("context_window", result.metadata["resolved_prompt"])
             self.assertNotIn("context_window", result.metadata["params"])
+
+    def test_continuity_metadata_defaults_to_none_when_not_injected(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            result = _generator(Path(root)).run(_request("prose"))
+            self.assertIsNone(result.metadata["continuity_context"])
+            self.assertIsNone(result.metadata["continuity_snapshot"])
+
+    def test_continuity_context_reaches_the_prompt_and_its_own_metadata_field(
+        self,
+    ) -> None:
+        # issue #190: POST /stories/{id}/expand is what actually builds these
+        # two params; this test exercises the generator's side of the
+        # contract directly, without needing a story or continuity memory.
+        continuity_block = (
+            "### CONTINUITY MEMORY\nPrevious chapter summary: she found a key."
+        )
+        with tempfile.TemporaryDirectory() as root:
+            result = _generator(Path(root)).run(
+                _request(
+                    "prose",
+                    continuity_context=continuity_block,
+                    continuity_snapshot={"story_id": "story_1", "chapter_summary": None},
+                )
+            )
+            self.assertIn(
+                "### CONTINUITY MEMORY", result.metadata["resolved_prompt"]
+            )
+            self.assertEqual(
+                result.metadata["continuity_context"], continuity_block
+            )
+            self.assertEqual(
+                result.metadata["continuity_snapshot"],
+                {"story_id": "story_1", "chapter_summary": None},
+            )
+            # The generation-knobs dict is not where story content belongs —
+            # it has its own metadata field instead, so it is not duplicated.
+            self.assertNotIn("continuity_snapshot", result.metadata["params"])
 
 
 class EndpointGuardTests(unittest.TestCase):

@@ -114,6 +114,80 @@ resolve("sdxl-local") -> manifest "sdxl-local"
 9. internal manifest id は model-system layer の内部識別子として扱う
 10. 「利用可能」の判定は `core/model_readiness.py` だけが持ち、API・loader・script は同じ関数を呼ぶ
 
+## Runtime Cache Residency（Issue #182）
+
+`ModelRuntimeCache` は既定で 1 つの共有バジェットしか持ちません
+（`max_entries`、既定値は `.env` の `MAX_CACHED_MODELS=1`）。media type ごとに
+独立したバジェットを与えたい場合は `media_limits` を渡します。
+
+```python
+cache = ModelRuntimeCache(
+    max_entries=1,
+    media_limits={"text": 1, "image": 1},
+    on_evict=release_runtime,
+)
+```
+
+- `media_limits` に載っている media type は、その media type だけの独立した
+  bucket として扱われる。bucket 内の追い出しは
+  least-recently-used（最も長くアクセスされていない entry から）で決定的
+- `media_limits` に載っていない media type（あるいは `put()` に
+  `media_type` を渡さない呼び出し）は共有の default bucket に入り、
+  `max_entries` を上限とする。これは #182 以前と完全に同じ挙動であり、
+  「per-media 設定が無ければ既存挙動のまま」という後方互換の要件を満たす
+- `ModelService.resolve_runtime()` は解決済みの `media_type` を
+  `runtime_cache.put(manifest.id, runtime_obj, media_type=media_type)` へ
+  そのまま渡す。generator 側の呼び出しは変更不要
+- `core.models.cache.resolve_media_cache_limits(env)` が
+  `MAX_CACHED_MODELS_{MEDIA}`（`MAX_CACHED_MODELS_TEXT` /
+  `MAX_CACHED_MODELS_IMAGE` / `MAX_CACHED_MODELS_AUDIO` /
+  `MAX_CACHED_MODELS_VIDEO`）を読み、`media_limits` に渡す dict を組み立てる。
+  値が未設定・非整数・1 未満の media type は結果から除外され、その media
+  type は default bucket に留まる
+
+設定手順・推奨メモリバジェットは `docs/configuration.md` の
+「per-media runtime cache（#182）」節を参照してください。
+
+## Image Provider Credentials（Issue #257）
+
+`generators/image/providers.py` はクラウド image provider の credential を、
+text runtime の `api_key_env` 規約（`core/models/text_runtimes.py`）と同じ
+方法で扱います。manifest には credential の値そのものではなく、値を保持する
+**環境変数名**だけを書きます。
+
+```json
+{
+  "provider": "cloud",
+  "default_params": {
+    "api_key_env": "ACME_IMAGE_API_KEY"
+  }
+}
+```
+
+- `core.models.manifest.reject_literal_credential_fields` が
+  `ModelManifest` の parse 時点（`model_validator`）で `default_params` を
+  再帰的に検査し、`api_key` / `secret` / `token` / `password` /
+  `credential` などの名前に literal な値が入っていたら
+  manifest 自体を拒否します（`*_env` で終わるキーは環境変数名の参照なので
+  除外されます）。これにより、リポジトリへ commit された manifest に
+  secret が紛れ込むことは構造的にありません
+- `generators.image.providers.resolve_image_provider_credential` が
+  実際の値を解決します。ローカル provider（`is_local_image_provider`）は
+  常に `None` を返す（credential 不要）。リモート provider で
+  `api_key_env` が manifest に無ければ同じく `None`。`api_key_env` は
+  あるが対応する環境変数が未設定/空なら
+  `ImageProviderCredentialUnavailableError` を投げる。メッセージは
+  「どの環境変数を設定すべきか」だけを含み、値は決して含まない
+- `redact_secrets` / `redact_provider_error` / `redact_provider_metadata`
+  が、解決済み credential の値をエラーメッセージ・diagnostics dict から
+  除去する。実際の transport 呼び出し（sibling issue、未実装）は、
+  provider から返ってきたエラーやメタデータをログ・job/asset metadata へ
+  渡す前に必ずこれらを通すこと
+- `ImageProviderCredential.__repr__` は `value` を含まない。`.value` を
+  request の auth header/param 以外（`ImageGenerationSpec.extra_params` や
+  `ImageProviderResult.metadata` など、job/asset/request へ永続化されうる
+  フィールド）へ絶対に置かないこと
+
 ## Learned Video Runtime Contract
 
 - `models/video/learned-runtime/runtime.py` は `load_runtime(manifest)` を公開します

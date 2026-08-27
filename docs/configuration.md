@@ -115,6 +115,44 @@ OUTPUT_AUDIO_DIR=./outputs/audio
 | `MODELS_MANIFEST_ROOT` | `./models/manifests` | manifest 探索先 |
 | `LORA_ROOT` | `./models/loras` | LoRA catalog 探索先 |
 | `MAX_CACHED_MODELS` | `1` | runtime cache の最大保持数。上限を超えて追い出された runtime は LoRA 解除・CPU 退避・参照解放・accelerator cache 解放（`torch.cuda.empty_cache()` / `torch.mps.empty_cache()`）まで行ってから破棄される（`core/models/cleanup.py`）。`unload_model` / `unload_all` も同じ解放経路を通る |
+| `MAX_CACHED_MODELS_IMAGE` | 未設定 | image runtime だけの独立した保持数上限（#182）。未設定ならこの media type も `MAX_CACHED_MODELS` の共有 budget を使う |
+| `MAX_CACHED_MODELS_AUDIO` | 未設定 | audio runtime だけの独立した保持数上限（#182）。同上 |
+| `MAX_CACHED_MODELS_VIDEO` | 未設定 | video runtime だけの独立した保持数上限（#182）。同上 |
+| `MAX_CACHED_MODELS_TEXT` | 未設定 | text runtime だけの独立した保持数上限（#182）。同上 |
+
+### per-media runtime cache（#182）
+
+`MAX_CACHED_MODELS` は全 media type が共有する 1 つの保持数上限です。
+`MAX_CACHED_MODELS_{MEDIA}`（`IMAGE` / `AUDIO` / `VIDEO` / `TEXT`）を設定すると、
+その media type だけ独立した保持数上限を持てます。たとえば text と image を
+同時に常駐させたい場合:
+
+```dotenv
+MAX_CACHED_MODELS_TEXT=1
+MAX_CACHED_MODELS_IMAGE=1
+```
+
+これで text runtime を 1 件、image runtime を 1 件、それぞれ独立に保持できます
+（片方をロードしてももう片方が追い出されない）。`MAX_CACHED_MODELS_*` を
+設定しない media type は、これまで通り `MAX_CACHED_MODELS` の共有 budget に
+従います。値が未設定・非整数・1 未満の場合もその media type は共有 budget に
+留まります（`core/models/cache.py` の `resolve_media_cache_limits`）。
+
+各 bucket 内の追い出しは least-recently-used（最も長くアクセスされていない
+runtime から）で決定的です。詳細な eviction の仕組みは
+`docs/model-system.md` の「Runtime Cache Residency（Issue #182）」を参照。
+
+#### 推奨メモリバジェット（参照環境）
+
+| 環境 | 推奨設定 | 理由 |
+| --- | --- | --- |
+| Apple M1 Max 64GB（unified memory、主環境） | `MAX_CACHED_MODELS_IMAGE=1` / `MAX_CACHED_MODELS_TEXT=1` / `MAX_CACHED_MODELS_AUDIO=1` | unified memory なので image（SDXL 系）と text（GGUF）を同時常駐させても runtime 間の再ロード（thrashing）を避けられる。ただし image を複数常駐させると unified memory を圧迫するため、image 自体の上限は 1 のままにする |
+| RTX 3090（24GB VRAM） | `MAX_CACHED_MODELS_IMAGE=1` | SDXL 系 1 本で VRAM の大半を使うため、image は 1 常駐が実質的な上限 |
+| RTX 4070 Ti Super（16GB VRAM） | `MAX_CACHED_MODELS_IMAGE=1`（他は既定のまま） | VRAM が相対的に小さく、image + 他 media type の同時常駐は避ける |
+
+どの環境でも既定値（`MAX_CACHED_MODELS=1` のみ、per-media 設定なし）は
+そのまま安全に動作する。per-media 設定は、text/image を交互に切り替える
+頻度が高い運用でだけ有効化すれば十分。
 
 ### 実装上の優先順
 

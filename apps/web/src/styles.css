@@ -3042,6 +3042,45 @@ pre,
   color: var(--text-dim);
 }
 
+/* Still generating (issue #245): amber, distinct from both "not started"
+   (missing) and "done" (assigned) so a scene mid-render doesn't read as
+   either. */
+.assembly-timeline-role--generating {
+  border-color: var(--warning);
+}
+
+.assembly-timeline-role--generating .assembly-timeline-role__glyph {
+  color: var(--warning);
+}
+
+/* Failed shares "missing"'s red (both mean "this role still needs
+   attention") but a distinct glyph (✕ vs !) and label keep the two apart
+   without relying on color alone. */
+.assembly-timeline-role--failed {
+  border-color: var(--danger);
+}
+
+.assembly-timeline-role--failed .assembly-timeline-role__glyph {
+  color: var(--danger);
+}
+
+.assembly-timeline-role__reason {
+  grid-column: 1 / -1;
+  margin-top: 2px;
+}
+
+.assembly-timeline-role__reason summary {
+  cursor: pointer;
+  color: var(--text-dim);
+  font-weight: 650;
+}
+
+.assembly-timeline-role__reason p {
+  margin: 4px 0 0;
+  color: var(--text-soft);
+  overflow-wrap: anywhere;
+}
+
 @media (max-width: 768px) {
   .assembly-timeline-role {
     grid-template-columns: 18px auto;

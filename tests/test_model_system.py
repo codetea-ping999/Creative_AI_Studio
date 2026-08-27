@@ -31,6 +31,7 @@ try:
         create_default_loader_registry,
         release_runtime,
     )
+    from core.models.cache import resolve_media_cache_limits
     from core.schemas import GenerationRequest
     from generators.audio import AudioGenerator
     from generators.image import ImageGenerator
@@ -514,6 +515,80 @@ class ModelSystemTests(unittest.TestCase):
         cache.unload("model-b")  # must not raise
         self.assertEqual(cache.loaded_ids(), [])
 
+    def test_runtime_cache_rejects_non_positive_media_limit(self) -> None:
+        with self.assertRaisesRegex(ValueError, "media_limits\\['text'\\]"):
+            ModelRuntimeCache(media_limits={"text": 0})
+
+    def test_runtime_cache_media_limits_stay_resident_independently(self) -> None:
+        # Issue #182 acceptance criterion: "Text and image runtimes can
+        # remain resident independently when configured."
+        cache = ModelRuntimeCache(max_entries=1, media_limits={"text": 1, "image": 1})
+
+        cache.put("text-a", {"id": "text-a"}, media_type="text")
+        cache.put("image-a", {"id": "image-a"}, media_type="image")
+
+        self.assertTrue(cache.has("text-a"))
+        self.assertTrue(cache.has("image-a"))
+        self.assertEqual(set(cache.loaded_ids()), {"text-a", "image-a"})
+
+    def test_runtime_cache_evicts_within_a_media_budget_deterministically(self) -> None:
+        evicted: list[str] = []
+        cache = ModelRuntimeCache(
+            max_entries=1,
+            media_limits={"text": 1},
+            on_evict=lambda model_id, runtime_obj: evicted.append(model_id),
+        )
+        cache.put("text-a", {"id": "text-a"}, media_type="text")
+        cache.put("text-b", {"id": "text-b"}, media_type="text")  # evicts text-a
+
+        self.assertEqual(evicted, ["text-a"])
+        self.assertEqual(cache.loaded_ids(), ["text-b"])
+
+    def test_runtime_cache_media_type_absent_from_limits_uses_default_bucket(self) -> None:
+        # A media type with no configured budget falls back to the shared
+        # `max_entries` budget, alongside entries that never pass
+        # `media_type` at all -- this is the "missing per-media settings
+        # retain backward-compatible behavior" acceptance criterion.
+        cache = ModelRuntimeCache(max_entries=1, media_limits={"text": 5})
+
+        cache.put("audio-a", {"id": "audio-a"}, media_type="audio")
+        cache.put("no-media-b", {"id": "no-media-b"})  # evicts audio-a
+
+        self.assertFalse(cache.has("audio-a"))
+        self.assertTrue(cache.has("no-media-b"))
+
+    def test_runtime_cache_put_without_media_type_matches_pre_182_behavior(self) -> None:
+        # Callers that never pass `media_type` (e.g. code written before
+        # #182) must see byte-for-byte the same eviction behavior as before.
+        cache = ModelRuntimeCache(max_entries=1, media_limits={"text": 5, "image": 5})
+        cache.put("model-a", {"id": "model-a"})
+        cache.put("model-b", {"id": "model-b"})
+
+        self.assertFalse(cache.has("model-a"))
+        self.assertTrue(cache.has("model-b"))
+
+    def test_resolve_media_cache_limits_reads_per_media_env_vars(self) -> None:
+        env = {"MAX_CACHED_MODELS_TEXT": "3", "MAX_CACHED_MODELS_IMAGE": "2"}
+        self.assertEqual(
+            resolve_media_cache_limits(env),
+            {"text": 3, "image": 2},
+        )
+
+    def test_resolve_media_cache_limits_omits_unset_media_types(self) -> None:
+        self.assertEqual(resolve_media_cache_limits({"MAX_CACHED_MODELS_TEXT": "3"}), {"text": 3})
+
+    def test_resolve_media_cache_limits_ignores_invalid_values(self) -> None:
+        env = {
+            "MAX_CACHED_MODELS_TEXT": "not-a-number",
+            "MAX_CACHED_MODELS_IMAGE": "0",
+            "MAX_CACHED_MODELS_AUDIO": "-1",
+        }
+        self.assertEqual(resolve_media_cache_limits(env), {})
+
+    def test_resolve_media_cache_limits_reads_process_environ_when_env_omitted(self) -> None:
+        with patch.dict(os.environ, {"MAX_CACHED_MODELS_VIDEO": "4"}, clear=True):
+            self.assertEqual(resolve_media_cache_limits(), {"video": 4})
+
     def test_release_runtime_resets_lora_moves_pipeline_and_drops_references(self) -> None:
         pipeline = _FakePipeline()
         runtime_obj = {
@@ -651,6 +726,31 @@ class ModelSystemTests(unittest.TestCase):
             self.assertEqual(services.model_service.registry.manifest_root, manifest_root)
             self.assertEqual(services.model_service.runtime_cache.max_entries, 2)
             self.assertEqual(services.job_repository._db_path, db_path)
+
+    def test_application_services_wires_per_media_cache_limits_from_env(self) -> None:
+        # #182: resolve_media_cache_limits() is fully implemented and unit
+        # tested on its own, but create_default_model_service() never called
+        # it -- MAX_CACHED_MODELS_IMAGE/_TEXT had zero effect in the running
+        # app. This drives the real factory, not ModelRuntimeCache directly.
+        with TemporaryDirectory() as tmp_dir:
+            with patch.dict(
+                os.environ,
+                {
+                    "MODELS_MANIFEST_ROOT": str(Path(tmp_dir) / "manifests"),
+                    "OUTPUT_DIR": str(Path(tmp_dir) / "outputs"),
+                    "DB_PATH": str(Path(tmp_dir) / "jobs.db"),
+                    "MAX_CACHED_MODELS": "1",
+                    "MAX_CACHED_MODELS_IMAGE": "3",
+                    "MAX_CACHED_MODELS_TEXT": "2",
+                },
+                clear=False,
+            ):
+                services = create_application_services()
+
+            self.assertEqual(
+                services.model_service.runtime_cache.media_limits,
+                {"image": 3, "text": 2},
+            )
 
     def test_image_generator_uses_model_service_runtime(self) -> None:
         with TemporaryDirectory() as tmp_dir:
