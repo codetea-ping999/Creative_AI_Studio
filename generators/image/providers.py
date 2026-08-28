@@ -50,20 +50,63 @@ branch on provider/model name to know what a request may safely ask for:
   deadline, matching the local/remote gating `ensure_image_provider_opt_in`
   and `resolve_image_provider_credential` already apply.
 
-Cost estimation and the actual outbound transport call remain out of scope
-here (see the sibling micro-issues under #66); this module fixes the shape
-the local path and a future cloud path both implement, the opt-in/disclosure
-gate every remote call must pass through, the secret resolution/redaction
-contract a future transport implementation must use, and the bounded
+- `ImageProviderCostEstimate` is a provider/model cost-estimate hook's return
+  shape: either a known `[low, high]` range in a stated currency, or an
+  explicit "this provider cannot supply pricing metadata" (`is_known=False`)
+  -- never a silently-omitted or zero-defaulted cost that could be misread as
+  free. `unknown_image_provider_cost_estimate` builds the latter.
+  `ImageProviderCostEstimator` is the hook's shape
+  (`Callable[[ImageGenerationSpec, model_id], ImageProviderCostEstimate]`);
+  `build_flat_rate_image_cost_estimator` builds one from a per-model price
+  table, scaling by request count (`spec.batch_size`) and, when a model's
+  entry declares one, by image size (`spec.width * spec.height`) --
+  "request count/size/model where supported" per issue #259.
+  `build_image_provider_preflight` (and `run_image_provider_request`, which
+  calls it) now accept an optional `cost_estimator` and attach its result to
+  `ImageProviderPreflightDisclosure.cost_estimate`: `None` for a local
+  provider (cost estimation is meaningless for on-machine compute, so this
+  stays optional and changes no local behavior), an explicit unknown
+  estimate for a remote provider with no `cost_estimator` supplied, and the
+  estimator's result otherwise -- so a caller always sees an estimate or an
+  explicit "unknown" before a remote request is sent (issue #259).
+- `ImageProviderResult.provider_request_id` carries the vendor's own
+  request/trace id from a *successful* call, when the vendor supplied one --
+  the success-path counterpart to `ImageProviderCallError.provider_request_id`
+  on the failure path, and still distinct from `ImageProviderIdentity
+  .request_id` (this codebase's own id). Defaults to `None`, so
+  `LocalDiffusersImageProvider` (which has no vendor request id to report)
+  needs no change.
+- `ImageProviderProvenance` / `build_image_provider_provenance` /
+  `hash_image_provider_request_inputs` build the auditable record a caller
+  attaches to job/asset metadata after a call: provider id, model id, this
+  codebase's own request id, the vendor's `provider_request_id` when
+  available, `local`/`remote` destination, the provider's declared
+  capabilities, the effective (non-secret) request params, the reference
+  assets that would be/were sent, an optional cost estimate, and a
+  deterministic SHA-256 `input_summary_hash` over the request shape --
+  auditable without reproducing raw prompt/param payloads verbatim and
+  without ever hashing a credential (issue #259: "safe summary/hash of sent
+  inputs" while keeping "Storing full remote request bodies by default" a
+  non-goal).
+
+The actual outbound transport call remains out of scope here (see the
+sibling micro-issues under #66); this module fixes the shape the local path
+and a future cloud path both implement, the opt-in/disclosure gate every
+remote call must pass through, the secret resolution/redaction contract a
+future transport implementation must use, the bounded
 timeout/retry/error-normalization contract that transport implementation's
-raised errors must be translated into -- not the transport call itself.
+raised errors must be translated into, and the cost-estimate/provenance
+shape that implementation's successful and failed calls must be summarized
+into -- not the transport call itself.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import Enum
+import hashlib
+import json
 import os
 import threading
 import time
@@ -77,6 +120,8 @@ __all__ = [
     "ImageProviderAuthError",
     "ImageProviderCallError",
     "ImageProviderCapabilities",
+    "ImageProviderCostEstimate",
+    "ImageProviderCostEstimator",
     "ImageProviderCredential",
     "ImageProviderCredentialUnavailableError",
     "ImageProviderErrorCategory",
@@ -84,6 +129,8 @@ __all__ = [
     "ImageProviderMisconfiguredError",
     "ImageProviderPermanentError",
     "ImageProviderPreflightDisclosure",
+    "ImageProviderPriceTableEntry",
+    "ImageProviderProvenance",
     "ImageProviderRateLimitError",
     "ImageProviderReferenceAsset",
     "ImageProviderResult",
@@ -93,10 +140,13 @@ __all__ = [
     "LocalDiffusersImageProvider",
     "RemoteImageProviderOptInRequiredError",
     "UnsupportedImageParameterError",
+    "build_flat_rate_image_cost_estimator",
     "build_image_provider_preflight",
+    "build_image_provider_provenance",
     "call_image_provider_with_retry",
     "cloud_image_provider_opt_in_granted",
     "ensure_image_provider_opt_in",
+    "hash_image_provider_request_inputs",
     "is_local_image_provider",
     "is_retryable_image_provider_error_category",
     "redact_provider_error",
@@ -105,6 +155,7 @@ __all__ = [
     "resolve_image_provider_credential",
     "run_image_provider_request",
     "summarize_prompt_for_preflight",
+    "unknown_image_provider_cost_estimate",
     "validate_capabilities",
 ]
 
@@ -162,11 +213,21 @@ class ImageProviderIdentity:
 
 @dataclass(frozen=True)
 class ImageProviderResult:
-    """Normalized output of one `ImageProvider.generate_image` call."""
+    """Normalized output of one `ImageProvider.generate_image` call.
+
+    `provider_request_id` is the *vendor's* own request/trace id for this
+    successful call, when the vendor supplied one -- distinct from
+    `identity.request_id` (this codebase's own id) and the success-path
+    counterpart to `ImageProviderCallError.provider_request_id` on the
+    failure path (issue #258). Defaults to `None`: a local provider has no
+    vendor request id to report, so this stays optional and local behavior
+    is unchanged (issue #259).
+    """
 
     identity: ImageProviderIdentity
     image: Any
     metadata: dict[str, Any] = field(default_factory=dict)
+    provider_request_id: str | None = None
 
 
 class RemoteImageProviderOptInRequiredError(PermissionError):
@@ -198,6 +259,148 @@ class ImageProviderReferenceAsset:
 
 
 @dataclass(frozen=True)
+class ImageProviderCostEstimate:
+    """A provider/model cost estimate, or an explicit "pricing unknown".
+
+    `is_known=False` is the deliberate representation of "this provider
+    cannot supply pricing metadata" (issue #259) -- distinct from, and never
+    collapsed into, a `0`-valued or omitted cost that a caller could misread
+    as "this request is free". When `is_known` is `True`, `low`/`high`
+    describe a range in `currency` (equal when the price is exact, a genuine
+    range when it is not, e.g. rounded per-megapixel pricing); when
+    `is_known` is `False`, `low`/`high` must both be absent -- an estimator
+    cannot claim "unknown" while also reporting numbers. `basis` is a short
+    human-readable note on how the number was derived (or why it could not
+    be), never a value that needs to stay secret.
+    """
+
+    currency: str
+    is_known: bool
+    low: float | None = None
+    high: float | None = None
+    basis: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.currency.strip():
+            raise ValueError("ImageProviderCostEstimate.currency must not be empty.")
+        if self.is_known:
+            if self.low is None or self.high is None:
+                raise ValueError(
+                    "ImageProviderCostEstimate with is_known=True must set both low and high."
+                )
+            if self.low < 0 or self.high < 0:
+                raise ValueError("ImageProviderCostEstimate.low/high must not be negative.")
+            if self.low > self.high:
+                raise ValueError(
+                    f"ImageProviderCostEstimate.low={self.low} must not exceed high={self.high}."
+                )
+        elif self.low is not None or self.high is not None:
+            raise ValueError(
+                "ImageProviderCostEstimate with is_known=False must not carry low/high values."
+            )
+
+
+_UNKNOWN_COST_ESTIMATE_BASIS = "This provider/model does not supply pricing metadata."
+
+
+def unknown_image_provider_cost_estimate(
+    *, currency: str = "USD", basis: str = _UNKNOWN_COST_ESTIMATE_BASIS
+) -> ImageProviderCostEstimate:
+    """Build the explicit "pricing unknown" estimate (issue #259).
+
+    This is the fallback `build_image_provider_preflight` uses for a remote
+    provider when no `cost_estimator` is supplied, and what a hand-written
+    estimator should return for a model it has no price-table entry for --
+    "unknown" is a first-class, always-available answer, never a crash or a
+    silent `0`.
+    """
+
+    return ImageProviderCostEstimate(currency=currency, is_known=False, basis=basis)
+
+
+# (spec, model_id) -> an estimate for that spec against that model. Bound to
+# one provider by construction (e.g. a closure built by
+# `build_flat_rate_image_cost_estimator`), so it does not also take
+# provider_id.
+ImageProviderCostEstimator = Callable[[ImageGenerationSpec, str], ImageProviderCostEstimate]
+
+
+@dataclass(frozen=True)
+class ImageProviderPriceTableEntry:
+    """One model's flat-rate pricing basis for `build_flat_rate_image_cost_estimator`.
+
+    `price_per_image` is charged once per generated image regardless of
+    size; `price_per_megapixel` (0 by default -- most flat per-image
+    pricing needs nothing else) additionally scales with
+    `spec.width * spec.height`, so a provider that bills by resolution as
+    well as (or instead of) image count can still be estimated.
+    """
+
+    price_per_image: float = 0.0
+    price_per_megapixel: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.price_per_image < 0:
+            raise ValueError(
+                f"price_per_image={self.price_per_image} must not be negative."
+            )
+        if self.price_per_megapixel < 0:
+            raise ValueError(
+                f"price_per_megapixel={self.price_per_megapixel} must not be negative."
+            )
+
+
+def build_flat_rate_image_cost_estimator(
+    price_table: Mapping[str, ImageProviderPriceTableEntry],
+    *,
+    currency: str = "USD",
+) -> ImageProviderCostEstimator:
+    """Build an `ImageProviderCostEstimator` from a per-model flat-rate price table.
+
+    The estimate scales with request count (`spec.batch_size`), image size
+    (`spec.width * spec.height`, only for a model whose entry declares a
+    non-zero `price_per_megapixel`), and model (`price_table` is keyed by
+    `model_id`) -- "request count/size/model where supported" (issue #259).
+    A model absent from `price_table` yields
+    :func:`unknown_image_provider_cost_estimate` rather than a guess or a
+    `KeyError`, so a partially-priced provider still returns a usable
+    estimator instead of one that crashes on an unlisted model.
+    """
+
+    table = dict(price_table)
+
+    def _estimate(spec: ImageGenerationSpec, model_id: str) -> ImageProviderCostEstimate:
+        entry = table.get(model_id)
+        if entry is None:
+            return unknown_image_provider_cost_estimate(
+                currency=currency,
+                basis=f"No price table entry for model {model_id!r}.",
+            )
+        request_count = max(1, spec.batch_size)
+        megapixels = (spec.width * spec.height) / 1_000_000
+        per_request = entry.price_per_image + entry.price_per_megapixel * megapixels
+        total = round(per_request * request_count, 6)
+        return ImageProviderCostEstimate(
+            currency=currency,
+            is_known=True,
+            low=total,
+            high=total,
+            basis=(
+                f"{request_count} request(s) of model {model_id!r} at "
+                f"{entry.price_per_image} {currency}/image"
+                + (
+                    f" + {entry.price_per_megapixel} {currency}/MP x {megapixels:.3f}MP"
+                    if entry.price_per_megapixel
+                    else ""
+                )
+                + "."
+            ),
+        )
+
+    return _estimate
+
+
+@dataclass(frozen=True)
 class ImageProviderPreflightDisclosure:
     """Everything that would leave the machine if a request were sent now.
 
@@ -206,7 +409,13 @@ class ImageProviderPreflightDisclosure:
     submitted -- this is what issue #256 calls "preflight disclosure".
     `destination` is `"local"` or `"remote"` rather than a raw provider id,
     so a reviewer does not have to know provider-id naming conventions to
-    tell whether anything would leave the machine at all.
+    tell whether anything would leave the machine at all. `cost_estimate`
+    (issue #259) is always `None` for a local provider (cost estimation is
+    meaningless for on-machine compute); for a remote provider it is either
+    the caller-supplied estimator's result or
+    :func:`unknown_image_provider_cost_estimate` -- never `None` -- so a
+    remote request always shows an estimate or an explicit "unknown", never
+    silence.
     """
 
     provider_id: str
@@ -215,6 +424,7 @@ class ImageProviderPreflightDisclosure:
     prompt_summary: str
     reference_assets: tuple[ImageProviderReferenceAsset, ...] = ()
     estimated_request_count: int = 1
+    cost_estimate: ImageProviderCostEstimate | None = None
 
 
 def is_local_image_provider(provider_id: str) -> bool:
@@ -313,6 +523,7 @@ def build_image_provider_preflight(
     provider_id: str,
     model_id: str,
     reference_assets: Sequence[ImageProviderReferenceAsset] = (),
+    cost_estimator: ImageProviderCostEstimator | None = None,
 ) -> ImageProviderPreflightDisclosure:
     """Build the issue #256 preflight disclosure for `spec`.
 
@@ -323,15 +534,32 @@ def build_image_provider_preflight(
     :func:`ensure_image_provider_opt_in` -- see :func:`run_image_provider_request`
     for the combination a caller should use ahead of an actual transport
     invocation.
+
+    `cost_estimator` (issue #259) is only ever consulted for a *remote*
+    provider: a local provider's `cost_estimate` is always `None`, keeping
+    the field optional and local behavior unchanged. A remote provider with
+    no `cost_estimator` supplied gets
+    :func:`unknown_image_provider_cost_estimate` rather than `None`, so
+    "pricing metadata unavailable" is always shown explicitly rather than
+    silently omitted.
     """
 
+    is_local = is_local_image_provider(provider_id)
+    cost_estimate = None
+    if not is_local:
+        cost_estimate = (
+            cost_estimator(spec, model_id)
+            if cost_estimator is not None
+            else unknown_image_provider_cost_estimate()
+        )
     return ImageProviderPreflightDisclosure(
         provider_id=provider_id,
         model_id=model_id,
-        destination="local" if is_local_image_provider(provider_id) else "remote",
+        destination="local" if is_local else "remote",
         prompt_summary=summarize_prompt_for_preflight(spec.prompt),
         reference_assets=tuple(reference_assets),
         estimated_request_count=max(1, spec.batch_size),
+        cost_estimate=cost_estimate,
     )
 
 
@@ -345,6 +573,7 @@ def run_image_provider_request(
     env: Mapping[str, str] | None = None,
     retry_policy: ImageProviderRetryPolicy | None = None,
     sleep: Callable[[float], None] = time.sleep,
+    cost_estimator: ImageProviderCostEstimator | None = None,
 ) -> tuple[ImageProviderPreflightDisclosure, _T]:
     """Disclose, then authorize, then invoke `transport` -- in that order.
 
@@ -366,6 +595,11 @@ def run_image_provider_request(
     bounded remote deadline (the same local/remote split
     :func:`ensure_image_provider_opt_in` and
     :func:`resolve_image_provider_credential` already apply).
+
+    `cost_estimator` (issue #259) is forwarded to
+    :func:`build_image_provider_preflight` unchanged -- see its docstring
+    for how it populates (or explicitly leaves unknown)
+    `disclosure.cost_estimate`.
     """
 
     disclosure = build_image_provider_preflight(
@@ -373,6 +607,7 @@ def run_image_provider_request(
         provider_id=provider_id,
         model_id=model_id,
         reference_assets=reference_assets,
+        cost_estimator=cost_estimator,
     )
     ensure_image_provider_opt_in(provider_id, env=env)
     if is_local_image_provider(provider_id):
@@ -810,6 +1045,110 @@ def redact_provider_metadata(
         return node
 
     return _walk(dict(metadata))
+
+
+def hash_image_provider_request_inputs(
+    spec: ImageGenerationSpec,
+    *,
+    effective_params: Mapping[str, Any] | None = None,
+) -> str:
+    """Deterministic, secret-free SHA-256 fingerprint of what a request would send.
+
+    Covers every field of `spec` plus the caller-supplied `effective_params`
+    -- never a credential: `ImageProviderCredential.value` belongs nowhere in
+    either (see its docstring), so a caller that follows the established
+    convention cannot hash a secret in by accident. Two calls with identical
+    inputs always produce the same digest and any change to a field changes
+    it, so this is a stable, comparable "what was sent" fingerprint a caller
+    can persist to job/asset metadata as an audit trail *without* storing the
+    raw prompt/param payload verbatim (issue #259's "safe summary/hash of
+    sent inputs", keeping "Storing full remote request bodies by default" a
+    non-goal).
+    """
+
+    payload = {
+        "prompt": spec.prompt,
+        "negative_prompt": spec.negative_prompt,
+        "width": spec.width,
+        "height": spec.height,
+        "seed": spec.seed,
+        "batch_size": spec.batch_size,
+        "lora_path": spec.lora_path,
+        "lora_scale": spec.lora_scale,
+        "reference_image_path": spec.reference_image_path,
+        "extra_params": spec.extra_params,
+        "effective_params": dict(effective_params) if effective_params is not None else {},
+    }
+    canonical = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class ImageProviderProvenance:
+    """The auditable record a caller attaches to job/asset metadata (issue #259).
+
+    Answers "output assets identify provider/model/request provenance" and
+    "sent reference assets/input summary are auditable without secrets":
+    provider/model/this-codebase's-own-request identity, the vendor's own
+    `provider_request_id` when the call supplied one, whether the request
+    went to `local` or `remote` destination, the provider's declared
+    capabilities and the effective (already-secret-free, per
+    `ImageGenerationSpec`/`ImageProviderCredential` convention) request
+    params, the reference assets that were sent and their roles,
+    `input_summary_hash` (see :func:`hash_image_provider_request_inputs`)
+    standing in for the raw request body, and an optional cost estimate.
+    Every field is JSON-serializable via `dataclasses.asdict`, so this is
+    ready to merge directly into a job/asset metadata mapping.
+    """
+
+    provider_id: str
+    model_id: str
+    request_id: str
+    destination: str
+    effective_capabilities: dict[str, Any]
+    effective_params: dict[str, Any]
+    input_summary_hash: str
+    reference_assets: tuple[ImageProviderReferenceAsset, ...] = ()
+    provider_request_id: str | None = None
+    cost_estimate: ImageProviderCostEstimate | None = None
+
+
+def build_image_provider_provenance(
+    spec: ImageGenerationSpec,
+    result: ImageProviderResult,
+    *,
+    capabilities: ImageProviderCapabilities,
+    effective_params: Mapping[str, Any] | None = None,
+    reference_assets: Sequence[ImageProviderReferenceAsset] = (),
+    cost_estimate: ImageProviderCostEstimate | None = None,
+) -> ImageProviderProvenance:
+    """Build the issue #259 provenance record for a completed provider call.
+
+    Pure and side-effect free: derives everything from `spec`/`result`/the
+    caller-supplied context, performs no I/O and no transport call. `result`
+    supplies the identity (`provider_id`/`model_id`/this codebase's own
+    `request_id`) and the vendor's `provider_request_id` when the call
+    returned one; `destination` is re-derived from `result.identity
+    .provider_id` via :func:`is_local_image_provider` rather than trusted as
+    a caller-supplied flag, so it cannot drift out of sync with the identity
+    it describes.
+    """
+
+    identity = result.identity
+    return ImageProviderProvenance(
+        provider_id=identity.provider_id,
+        model_id=identity.model_id,
+        request_id=identity.request_id,
+        destination="local" if is_local_image_provider(identity.provider_id) else "remote",
+        effective_capabilities=asdict(capabilities),
+        effective_params=dict(effective_params) if effective_params is not None else {},
+        input_summary_hash=hash_image_provider_request_inputs(
+            spec, effective_params=effective_params
+        ),
+        reference_assets=tuple(reference_assets),
+        provider_request_id=result.provider_request_id,
+        cost_estimate=cost_estimate,
+    )
 
 
 class UnsupportedImageParameterError(ValueError):

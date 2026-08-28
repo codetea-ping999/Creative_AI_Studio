@@ -32,6 +32,7 @@ from generators.image.providers import (
     ImageProviderAuthError,
     ImageProviderCallError,
     ImageProviderCapabilities,
+    ImageProviderCostEstimate,
     ImageProviderCredential,
     ImageProviderCredentialUnavailableError,
     ImageProviderErrorCategory,
@@ -39,6 +40,7 @@ from generators.image.providers import (
     ImageProviderMisconfiguredError,
     ImageProviderPermanentError,
     ImageProviderPreflightDisclosure,
+    ImageProviderPriceTableEntry,
     ImageProviderRateLimitError,
     ImageProviderReferenceAsset,
     ImageProviderResult,
@@ -48,10 +50,13 @@ from generators.image.providers import (
     LocalDiffusersImageProvider,
     RemoteImageProviderOptInRequiredError,
     UnsupportedImageParameterError,
+    build_flat_rate_image_cost_estimator,
     build_image_provider_preflight,
+    build_image_provider_provenance,
     call_image_provider_with_retry,
     cloud_image_provider_opt_in_granted,
     ensure_image_provider_opt_in,
+    hash_image_provider_request_inputs,
     is_local_image_provider,
     is_retryable_image_provider_error_category,
     redact_provider_error,
@@ -60,6 +65,7 @@ from generators.image.providers import (
     resolve_image_provider_credential,
     run_image_provider_request,
     summarize_prompt_for_preflight,
+    unknown_image_provider_cost_estimate,
     validate_capabilities,
 )
 
@@ -517,6 +523,139 @@ class BuildImageProviderPreflightTest(unittest.TestCase):
         self.assertEqual(disclosure.destination, "remote")
 
 
+class ImageProviderCostEstimateTest(unittest.TestCase):
+    """Construction rules for a known range vs. the explicit unknown case (issue #259)."""
+
+    def test_known_estimate_with_a_valid_range_is_accepted(self) -> None:
+        estimate = ImageProviderCostEstimate(
+            currency="USD", is_known=True, low=0.01, high=0.02
+        )
+        self.assertTrue(estimate.is_known)
+        self.assertEqual((estimate.low, estimate.high), (0.01, 0.02))
+
+    def test_known_estimate_requires_both_low_and_high(self) -> None:
+        with self.assertRaisesRegex(ValueError, "low and high"):
+            ImageProviderCostEstimate(currency="USD", is_known=True, low=0.01, high=None)
+        with self.assertRaisesRegex(ValueError, "low and high"):
+            ImageProviderCostEstimate(currency="USD", is_known=True, low=None, high=0.02)
+
+    def test_known_estimate_rejects_a_negative_bound(self) -> None:
+        with self.assertRaisesRegex(ValueError, "not be negative"):
+            ImageProviderCostEstimate(currency="USD", is_known=True, low=-0.01, high=0.02)
+
+    def test_known_estimate_rejects_low_above_high(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must not exceed"):
+            ImageProviderCostEstimate(currency="USD", is_known=True, low=0.05, high=0.01)
+
+    def test_unknown_estimate_must_not_carry_low_or_high(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must not carry low/high"):
+            ImageProviderCostEstimate(currency="USD", is_known=False, low=0.01, high=0.01)
+
+    def test_currency_must_not_be_empty(self) -> None:
+        with self.assertRaisesRegex(ValueError, "currency"):
+            ImageProviderCostEstimate(currency="", is_known=False)
+
+    def test_unknown_image_provider_cost_estimate_carries_no_range(self) -> None:
+        estimate = unknown_image_provider_cost_estimate()
+        self.assertFalse(estimate.is_known)
+        self.assertIsNone(estimate.low)
+        self.assertIsNone(estimate.high)
+        self.assertTrue(estimate.basis)  # explains *why* pricing is unknown
+
+    def test_unknown_image_provider_cost_estimate_honors_currency_and_basis(self) -> None:
+        estimate = unknown_image_provider_cost_estimate(
+            currency="EUR", basis="vendor endpoint does not report pricing"
+        )
+        self.assertEqual(estimate.currency, "EUR")
+        self.assertEqual(estimate.basis, "vendor endpoint does not report pricing")
+
+
+class BuildFlatRateImageCostEstimatorTest(unittest.TestCase):
+    """`build_flat_rate_image_cost_estimator`: request count/size/model (issue #259)."""
+
+    def test_flat_per_image_price_scales_with_request_count(self) -> None:
+        estimator = build_flat_rate_image_cost_estimator(
+            {"model-a": ImageProviderPriceTableEntry(price_per_image=0.04)}
+        )
+        estimate = estimator(_spec(batch_size=3), "model-a")
+        self.assertTrue(estimate.is_known)
+        self.assertAlmostEqual(estimate.low, 0.12)
+        self.assertAlmostEqual(estimate.high, 0.12)
+        self.assertEqual(estimate.currency, "USD")
+
+    def test_per_megapixel_price_scales_with_image_size(self) -> None:
+        estimator = build_flat_rate_image_cost_estimator(
+            {"model-a": ImageProviderPriceTableEntry(price_per_megapixel=0.10)}
+        )
+        one_megapixel_spec = _spec(width=1000, height=1000, batch_size=1)
+        estimate = estimator(one_megapixel_spec, "model-a")
+        self.assertAlmostEqual(estimate.low, 0.10)
+
+    def test_price_per_image_and_per_megapixel_combine(self) -> None:
+        estimator = build_flat_rate_image_cost_estimator(
+            {
+                "model-a": ImageProviderPriceTableEntry(
+                    price_per_image=0.01, price_per_megapixel=0.02
+                )
+            }
+        )
+        estimate = estimator(_spec(width=1000, height=1000, batch_size=2), "model-a")
+        # Per request: 0.01 + 0.02 * 1.0MP = 0.03; x2 requests = 0.06.
+        self.assertAlmostEqual(estimate.low, 0.06)
+
+    def test_a_model_absent_from_the_price_table_is_reported_unknown(self) -> None:
+        estimator = build_flat_rate_image_cost_estimator(
+            {"model-a": ImageProviderPriceTableEntry(price_per_image=0.04)}
+        )
+        estimate = estimator(_spec(), "model-b")
+        self.assertFalse(estimate.is_known)
+        self.assertIn("model-b", estimate.basis)
+
+    def test_price_table_entry_rejects_negative_prices(self) -> None:
+        with self.assertRaises(ValueError):
+            ImageProviderPriceTableEntry(price_per_image=-0.01)
+        with self.assertRaises(ValueError):
+            ImageProviderPriceTableEntry(price_per_megapixel=-0.01)
+
+
+class BuildImageProviderPreflightCostEstimateTest(unittest.TestCase):
+    """`cost_estimate` on the preflight disclosure (issue #259)."""
+
+    def test_local_provider_preflight_cost_estimate_is_always_none(self) -> None:
+        estimator = build_flat_rate_image_cost_estimator(
+            {"sdxl": ImageProviderPriceTableEntry(price_per_image=1.0)}
+        )
+        disclosure = build_image_provider_preflight(
+            _spec(),
+            provider_id="local-diffusers",
+            model_id="sdxl",
+            cost_estimator=estimator,
+        )
+        self.assertIsNone(disclosure.cost_estimate)
+
+    def test_remote_provider_with_no_estimator_gets_an_explicit_unknown(self) -> None:
+        disclosure = build_image_provider_preflight(
+            _spec(), provider_id="fake-cloud", model_id="fake-model"
+        )
+        self.assertIsNotNone(disclosure.cost_estimate)
+        assert disclosure.cost_estimate is not None
+        self.assertFalse(disclosure.cost_estimate.is_known)
+
+    def test_remote_provider_with_an_estimator_gets_its_known_estimate(self) -> None:
+        estimator = build_flat_rate_image_cost_estimator(
+            {"fake-model": ImageProviderPriceTableEntry(price_per_image=0.5)}
+        )
+        disclosure = build_image_provider_preflight(
+            _spec(batch_size=2),
+            provider_id="fake-cloud",
+            model_id="fake-model",
+            cost_estimator=estimator,
+        )
+        assert disclosure.cost_estimate is not None
+        self.assertTrue(disclosure.cost_estimate.is_known)
+        self.assertAlmostEqual(disclosure.cost_estimate.low, 1.0)
+
+
 class RunImageProviderRequestTest(unittest.TestCase):
     """Proves the opt-in guard executes before transport is ever reached."""
 
@@ -896,6 +1035,59 @@ class RunImageProviderRequestRetryIntegrationTest(unittest.TestCase):
         self.assertEqual(disclosure.destination, "local")
 
 
+class RunImageProviderRequestCostEstimatorIntegrationTest(unittest.TestCase):
+    """`run_image_provider_request` forwards `cost_estimator` into the
+    disclosure it returns (issue #259)."""
+
+    def test_cost_estimator_is_forwarded_into_the_returned_disclosure(self) -> None:
+        estimator = build_flat_rate_image_cost_estimator(
+            {"fake-model": ImageProviderPriceTableEntry(price_per_image=0.25)}
+        )
+
+        disclosure, _result = run_image_provider_request(
+            _spec(),
+            provider_id="fake-cloud",
+            model_id="fake-model",
+            transport=lambda: "sent",
+            env={"ALLOW_CLOUD_PROVIDERS": "true"},
+            cost_estimator=estimator,
+        )
+
+        assert disclosure.cost_estimate is not None
+        self.assertTrue(disclosure.cost_estimate.is_known)
+        self.assertAlmostEqual(disclosure.cost_estimate.low, 0.25)
+
+    def test_local_provider_ignores_a_cost_estimator_and_stays_none(self) -> None:
+        estimator = build_flat_rate_image_cost_estimator(
+            {"sdxl": ImageProviderPriceTableEntry(price_per_image=1.0)}
+        )
+
+        disclosure, _result = run_image_provider_request(
+            _spec(),
+            provider_id="local-diffusers",
+            model_id="sdxl",
+            transport=lambda: "ok",
+            env={},
+            cost_estimator=estimator,
+        )
+
+        self.assertIsNone(disclosure.cost_estimate)
+
+    def test_missing_estimator_still_discloses_an_explicit_unknown_before_transport(
+        self,
+    ) -> None:
+        disclosure, _result = run_image_provider_request(
+            _spec(),
+            provider_id="fake-cloud",
+            model_id="unpriced-model",
+            transport=lambda: "sent",
+            env={"ALLOW_CLOUD_PROVIDERS": "true"},
+        )
+
+        assert disclosure.cost_estimate is not None
+        self.assertFalse(disclosure.cost_estimate.is_known)
+
+
 class RedactProviderErrorPreservesCallErrorMetadataTest(unittest.TestCase):
     """Redaction must not discard category/provenance fields (issue #258)."""
 
@@ -1186,6 +1378,186 @@ class SentinelSecretPersistenceTest(unittest.TestCase):
             logging.getLogger("test.image.providers").error("provider call failed: %s", redacted)
 
         self.assertNotIn(_SENTINEL_SECRET, "\n".join(ctx.output))
+
+
+class HashImageProviderRequestInputsTest(unittest.TestCase):
+    """`hash_image_provider_request_inputs`: deterministic, sensitive to
+    every input, and never a substitute for storing the raw payload (issue
+    #259)."""
+
+    def test_identical_inputs_hash_identically(self) -> None:
+        spec = _spec(seed=7)
+        first = hash_image_provider_request_inputs(spec, effective_params={"guidance_scale": 7.5})
+        second = hash_image_provider_request_inputs(spec, effective_params={"guidance_scale": 7.5})
+        self.assertEqual(first, second)
+
+    def test_a_different_prompt_changes_the_hash(self) -> None:
+        first = hash_image_provider_request_inputs(_spec(prompt="a fox"))
+        second = hash_image_provider_request_inputs(_spec(prompt="a wolf"))
+        self.assertNotEqual(first, second)
+
+    def test_a_different_effective_params_value_changes_the_hash(self) -> None:
+        spec = _spec()
+        first = hash_image_provider_request_inputs(spec, effective_params={"steps": 20})
+        second = hash_image_provider_request_inputs(spec, effective_params={"steps": 30})
+        self.assertNotEqual(first, second)
+
+    def test_omitted_effective_params_defaults_to_empty_and_is_stable(self) -> None:
+        spec = _spec()
+        without_kwarg = hash_image_provider_request_inputs(spec)
+        with_empty = hash_image_provider_request_inputs(spec, effective_params={})
+        self.assertEqual(without_kwarg, with_empty)
+
+    def test_the_hash_is_a_sha256_hex_digest(self) -> None:
+        digest = hash_image_provider_request_inputs(_spec())
+        self.assertEqual(len(digest), 64)
+        int(digest, 16)  # must not raise -- every character is valid hex
+
+
+class BuildImageProviderProvenanceTest(unittest.TestCase):
+    """`build_image_provider_provenance`: the auditable record attached to
+    job/asset metadata after a call (issue #259)."""
+
+    def _result(
+        self, *, provider_id: str = "fake-cloud", provider_request_id: str | None = "vendor-req-1"
+    ) -> ImageProviderResult:
+        identity = ImageProviderIdentity(
+            provider_id=provider_id, model_id="fake-model", request_id="req-1"
+        )
+        return ImageProviderResult(
+            identity=identity, image=None, provider_request_id=provider_request_id
+        )
+
+    def test_identity_fields_come_from_the_result(self) -> None:
+        provenance = build_image_provider_provenance(
+            _spec(), self._result(), capabilities=ImageProviderCapabilities()
+        )
+        self.assertEqual(provenance.provider_id, "fake-cloud")
+        self.assertEqual(provenance.model_id, "fake-model")
+        self.assertEqual(provenance.request_id, "req-1")
+        self.assertEqual(provenance.provider_request_id, "vendor-req-1")
+
+    def test_destination_is_derived_from_the_result_provider_id_not_trusted_input(self) -> None:
+        remote_provenance = build_image_provider_provenance(
+            _spec(),
+            self._result(provider_id="fake-cloud"),
+            capabilities=ImageProviderCapabilities(),
+        )
+        local_provenance = build_image_provider_provenance(
+            _spec(),
+            self._result(provider_id="local-diffusers", provider_request_id=None),
+            capabilities=ImageProviderCapabilities(),
+        )
+        self.assertEqual(remote_provenance.destination, "remote")
+        self.assertEqual(local_provenance.destination, "local")
+
+    def test_local_result_naturally_carries_no_vendor_request_id(self) -> None:
+        provenance = build_image_provider_provenance(
+            _spec(),
+            self._result(provider_id="local-diffusers", provider_request_id=None),
+            capabilities=ImageProviderCapabilities(),
+        )
+        self.assertIsNone(provenance.provider_request_id)
+
+    def test_effective_capabilities_matches_the_declared_capabilities(self) -> None:
+        capabilities = ImageProviderCapabilities(supports_lora=True, max_batch=4)
+        provenance = build_image_provider_provenance(
+            _spec(), self._result(), capabilities=capabilities
+        )
+        self.assertEqual(provenance.effective_capabilities, asdict(capabilities))
+
+    def test_effective_params_and_reference_assets_and_cost_estimate_are_carried_through(
+        self,
+    ) -> None:
+        reference_assets = [ImageProviderReferenceAsset(asset_id="asset_1", role="style-reference")]
+        cost_estimate = ImageProviderCostEstimate(currency="USD", is_known=True, low=0.1, high=0.1)
+        provenance = build_image_provider_provenance(
+            _spec(),
+            self._result(),
+            capabilities=ImageProviderCapabilities(),
+            effective_params={"guidance_scale": 7.5},
+            reference_assets=reference_assets,
+            cost_estimate=cost_estimate,
+        )
+        self.assertEqual(provenance.effective_params, {"guidance_scale": 7.5})
+        self.assertEqual(provenance.reference_assets, tuple(reference_assets))
+        self.assertEqual(provenance.cost_estimate, cost_estimate)
+
+    def test_omitted_effective_params_and_reference_assets_default_empty(self) -> None:
+        provenance = build_image_provider_provenance(
+            _spec(), self._result(), capabilities=ImageProviderCapabilities()
+        )
+        self.assertEqual(provenance.effective_params, {})
+        self.assertEqual(provenance.reference_assets, ())
+        self.assertIsNone(provenance.cost_estimate)
+
+    def test_input_summary_hash_matches_hash_image_provider_request_inputs(self) -> None:
+        spec = _spec()
+        effective_params = {"guidance_scale": 7.5}
+        provenance = build_image_provider_provenance(
+            spec,
+            self._result(),
+            capabilities=ImageProviderCapabilities(),
+            effective_params=effective_params,
+        )
+        expected = hash_image_provider_request_inputs(spec, effective_params=effective_params)
+        self.assertEqual(provenance.input_summary_hash, expected)
+
+    def test_provenance_is_json_serializable_via_asdict(self) -> None:
+        provenance = build_image_provider_provenance(
+            _spec(),
+            self._result(),
+            capabilities=ImageProviderCapabilities(),
+            effective_params={"guidance_scale": 7.5},
+            reference_assets=[
+                ImageProviderReferenceAsset(asset_id="asset_1", role="style-reference")
+            ],
+            cost_estimate=ImageProviderCostEstimate(
+                currency="USD", is_known=True, low=0.1, high=0.1
+            ),
+        )
+        # Must not raise -- this is the shape a caller merges into job/asset
+        # metadata, which is itself JSON-persisted.
+        serialized = json.dumps(asdict(provenance))
+        self.assertIn("fake-cloud", serialized)
+
+
+class ProvenanceSentinelSecretPersistenceTest(unittest.TestCase):
+    """The provenance record must never carry a credential through, even when
+    a vendor SDK response happened to echo one back (issue #259, extending
+    the issue #257 guarantee to the new provenance shape)."""
+
+    def test_provenance_built_from_safely_resolved_inputs_never_carries_the_sentinel(
+        self,
+    ) -> None:
+        resolve_image_provider_credential(
+            {"api_key_env": "ACME_IMAGE_API_KEY"},
+            provider_id="fake-cloud",
+            manifest_label="cloud-image-test",
+            env={"ACME_IMAGE_API_KEY": _SENTINEL_SECRET},
+        )
+        identity = ImageProviderIdentity(
+            provider_id="fake-cloud", model_id="fake-model", request_id="req-1"
+        )
+        result = ImageProviderResult(
+            identity=identity, image=None, provider_request_id="vendor-req-1"
+        )
+        provenance = build_image_provider_provenance(
+            _spec(),
+            result,
+            capabilities=ImageProviderCapabilities(),
+            effective_params={"guidance_scale": 7.5},
+        )
+        self.assertNotIn(_SENTINEL_SECRET, json.dumps(asdict(provenance)))
+
+    def test_input_summary_hash_is_not_the_secret_itself(self) -> None:
+        # Not a cryptographic claim -- just proves the hash is a digest, not
+        # an accidental passthrough of a raw secret-bearing field.
+        spec = _spec()
+        digest = hash_image_provider_request_inputs(
+            spec, effective_params={"api_key": _SENTINEL_SECRET}
+        )
+        self.assertNotIn(_SENTINEL_SECRET, digest)
 
 
 if __name__ == "__main__":
