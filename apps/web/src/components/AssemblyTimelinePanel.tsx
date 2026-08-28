@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   countSceneAssetStates,
+  generateSceneMedia,
   getStory,
   listStories,
   sceneAssetStatusLookup,
@@ -12,6 +13,8 @@ import {
   type StoryScene,
   type StorySummary,
 } from "../lib/storyApi";
+import { terminalStatuses, type JobResponse, type JobStatus } from "../studio";
+import { requestJson } from "../studioClient";
 
 export type AssemblyTimelinePanelProps = {
   projectId?: string;
@@ -54,6 +57,40 @@ function formatSeconds(value: number): string {
 }
 
 /**
+ * Key one scene/role's in-flight generation.
+ *
+ * Scoped by story id, not just scene id: scene ids are per-story sequential
+ * (`scene_01`, `scene_02`, …, see `core/story/merge.py`), so two different
+ * stories can share the same scene id. Without the story id, a generation
+ * launched from one story could incorrectly disable an unrelated scene's
+ * button in another.
+ */
+function busyKey(storyId: string, sceneId: string, role: SceneRole): string {
+  return `${storyId}:${sceneId}:${role}`;
+}
+
+/**
+ * Poll a job until it reaches a terminal status and return that status.
+ *
+ * Mirrors `App.tsx`'s `awaitJobCompletion`, duplicated rather than shared: this
+ * panel is deliberately self-contained (see `AssemblyTimelinePanel`'s doc
+ * comment) so it can be mounted without a parent wiring a job-polling prop
+ * through, matching how `LatestJobPanel` reads `terminalStatuses`/`JobResponse`
+ * directly instead of taking them as props.
+ */
+async function pollJobStatus(jobId: string): Promise<JobStatus> {
+  const intervalMs = 1200;
+  const deadline = Date.now() + 10 * 60 * 1000;
+  for (;;) {
+    const payload = await requestJson<JobResponse>(`/jobs/${jobId}`);
+    if (terminalStatuses.has(payload.status) || Date.now() > deadline) {
+      return payload.status;
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, intervalMs));
+  }
+}
+
+/**
  * Resolve one scene/role's status.
  *
  * `statusEntry` (from `detail.asset_status`) is preferred when present since
@@ -89,10 +126,21 @@ function AssemblyTimelineLoading({ label }: { label: string }) {
  * Scene-order table: order, duration (with a running start/end so the
  * "timeline" framing is literal), and every role's assignment state.
  *
- * Read-only by design (issue #244): no generation actions, no export
- * controls, no reordering. Those are later, separate microtasks of #62.
+ * Read-only for layout and export (issue #244: no reordering, no export
+ * controls — later, separate microtasks of #62). Issue #246 adds one
+ * exception: a missing or failed role gets a generate/retry action right on
+ * its row, so a gap found here doesn't require switching to the Story
+ * surface and rebuilding its context by hand.
  */
-function AssemblyTimelineScenes({ detail }: { detail: StoryDetail }) {
+function AssemblyTimelineScenes({
+  detail,
+  busyRoles,
+  onGenerateRole,
+}: {
+  detail: StoryDetail;
+  busyRoles: Set<string>;
+  onGenerateRole: (scene: StoryScene, role: SceneRole) => void;
+}) {
   const scenes = [...detail.story.scenes].sort((left, right) => left.order - right.order);
   const totalDuration = scenes.reduce((total, scene) => total + scene.duration_seconds, 0);
 
@@ -194,6 +242,10 @@ function AssemblyTimelineScenes({ detail }: { detail: StoryDetail }) {
                       const statusEntry = sceneStatus?.get(role);
                       const status = roleStatusOf(scene, role, missingRoles, statusEntry);
                       const assetId = scene.asset_ids[role];
+                      const isBusy =
+                        status === "generating" ||
+                        busyRoles.has(busyKey(detail.story.id, scene.id, role));
+                      const canLaunch = status === "missing" || status === "failed";
                       return (
                         <li
                           key={role}
@@ -216,6 +268,26 @@ function AssemblyTimelineScenes({ detail }: { detail: StoryDetail }) {
                               <p>{statusEntry.error_message}</p>
                             </details>
                           ) : null}
+                          {isBusy ? (
+                            <button
+                              type="button"
+                              className="secondary-button assembly-timeline-role__action"
+                              disabled
+                              aria-busy="true"
+                            >
+                              {sceneRoleLabels[role]}を生成中…
+                            </button>
+                          ) : canLaunch ? (
+                            <button
+                              type="button"
+                              className="secondary-button assembly-timeline-role__action"
+                              onClick={() => onGenerateRole(scene, role)}
+                            >
+                              {status === "failed"
+                                ? `${sceneRoleLabels[role]}を再試行`
+                                : `${sceneRoleLabels[role]}を生成`}
+                            </button>
+                          ) : null}
                         </li>
                       );
                     })}
@@ -231,14 +303,17 @@ function AssemblyTimelineScenes({ detail }: { detail: StoryDetail }) {
 }
 
 /**
- * Read-only pre-export review: scene order, duration, and visual / narration /
- * music assignments, without opening the raw `StoryDocument` JSON.
+ * Pre-export review: scene order, duration, and visual / narration / music
+ * assignments, without opening the raw `StoryDocument` JSON.
  *
  * Self-contained on purpose, matching `StoryPanel` and `MatrixPanel`: it lists
  * and selects its own story rather than depending on selection state owned by
- * the Story surface, so it can be mounted anywhere without extra wiring.
- * Missing-asset actions, export controls, and drag/drop editing are explicitly
- * out of scope for this issue (see #62's remaining microtasks).
+ * the Story surface, so it can be mounted anywhere without extra wiring —
+ * including polling its own launched jobs (see `pollJobStatus`) rather than
+ * taking an `awaitJob` prop the way `StoryPanel` does. Export controls and
+ * drag/drop editing stay out of scope (see #62's remaining microtasks); issue
+ * #246 adds the one exception noted on `AssemblyTimelineScenes`: launching
+ * generation for a missing or failed role straight from its scene row.
  */
 export function AssemblyTimelinePanel({ projectId }: AssemblyTimelinePanelProps) {
   const [stories, setStories] = useState<StorySummary[]>([]);
@@ -247,6 +322,16 @@ export function AssemblyTimelinePanel({ projectId }: AssemblyTimelinePanelProps)
   const [detail, setDetail] = useState<StoryDetail | null>(null);
   const [detailState, setDetailState] = useState<LoadState>("ready");
   const [error, setError] = useState("");
+  const [actionError, setActionError] = useState("");
+  const [busyRoles, setBusyRoles] = useState<Set<string>>(new Set());
+
+  // Read inside async generation handlers to tell whether the user has since
+  // switched to a different story, so a job launched from story A can't clobber
+  // story B's freshly-loaded detail with a late-arriving refresh.
+  const selectedStoryIdRef = useRef(selectedStoryId);
+  useEffect(() => {
+    selectedStoryIdRef.current = selectedStoryId;
+  }, [selectedStoryId]);
 
   const refreshStories = useCallback(async () => {
     setListState("loading");
@@ -289,8 +374,59 @@ export function AssemblyTimelinePanel({ projectId }: AssemblyTimelinePanelProps)
   }, []);
 
   useEffect(() => {
+    setActionError("");
     void loadDetail(selectedStoryId);
   }, [loadDetail, selectedStoryId]);
+
+  /**
+   * Launch (or retry) one scene/role's generation from its timeline row.
+   *
+   * The request is built server-side from the scene itself — `generateSceneMedia`
+   * only ever carries `storyId`/`sceneId`/`role` — so it can't drift onto whatever
+   * the unrelated Composer surface currently holds (issue #246's "build requests
+   * from the Story/timeline scene context" criterion).
+   */
+  const handleGenerateRole = useCallback(
+    async (scene: StoryScene, role: SceneRole) => {
+      if (!detail) return;
+      const storyId = detail.story.id;
+      const key = busyKey(storyId, scene.id, role);
+      if (busyRoles.has(key)) {
+        // Already in flight for this exact scene/role — the button renders
+        // disabled once this state lands, but the guard also covers the gap
+        // between a click and that re-render.
+        return;
+      }
+      setBusyRoles((previous) => new Set(previous).add(key));
+      setActionError("");
+      try {
+        const { job_id: jobId } = await generateSceneMedia(storyId, scene.id, { role });
+        // Refresh right away so the row can show "generating" instead of
+        // sitting on "missing"/"failed" until the job finishes.
+        if (selectedStoryIdRef.current === storyId) {
+          setDetail(await getStory(storyId));
+        }
+        const finalStatus = await pollJobStatus(jobId);
+        if (selectedStoryIdRef.current === storyId) {
+          setDetail(await getStory(storyId));
+        }
+        if (finalStatus !== "succeeded") {
+          setActionError(
+            `${sceneRoleLabels[role]}の生成が ${finalStatus} で終了しました（${scene.heading || scene.id}）。`,
+          );
+        }
+      } catch (cause) {
+        setActionError(cause instanceof Error ? cause.message : String(cause));
+      } finally {
+        setBusyRoles((previous) => {
+          const next = new Set(previous);
+          next.delete(key);
+          return next;
+        });
+      }
+    },
+    [detail, busyRoles],
+  );
 
   return (
     <section
@@ -319,6 +455,12 @@ export function AssemblyTimelinePanel({ projectId }: AssemblyTimelinePanelProps)
           >
             再試行
           </button>
+        </div>
+      ) : null}
+
+      {actionError ? (
+        <div className="error-banner assembly-timeline-error" role="alert">
+          <span>{actionError}</span>
         </div>
       ) : null}
 
@@ -354,7 +496,11 @@ export function AssemblyTimelinePanel({ projectId }: AssemblyTimelinePanelProps)
       ) : detailState === "loading" ? (
         <AssemblyTimelineLoading label="タイムラインを読み込んでいます…" />
       ) : detail ? (
-        <AssemblyTimelineScenes detail={detail} />
+        <AssemblyTimelineScenes
+          detail={detail}
+          busyRoles={busyRoles}
+          onGenerateRole={(scene, role) => void handleGenerateRole(scene, role)}
+        />
       ) : null}
     </section>
   );

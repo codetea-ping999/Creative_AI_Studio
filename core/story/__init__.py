@@ -58,6 +58,12 @@ from .timeline import (
     normalize_motion,
     required_scene_roles,
 )
+from .visual_fanout import (
+    STRATEGY_MEDIA_TYPE,
+    SceneVisualFanoutResult,
+    SceneVisualJobPlan,
+    fan_out_scene_visuals,
+)
 from .visual_manifest import (
     DEFAULT_ASPECT_RATIO,
     BibleSnapshotRef,
@@ -113,11 +119,14 @@ __all__ = [
     "SCENE_ASSET_ROLES",
     "STILL",
     "STRATEGY_FALLBACK_ORDER",
+    "STRATEGY_MEDIA_TYPE",
     "SUPPORTED_MOTIONS",
     "SCENE_ID_PARAM",
     "SCENE_ROLE_PARAM",
     "STORY_ID_PARAM",
     "SceneBinder",
+    "SceneVisualFanoutResult",
+    "SceneVisualJobPlan",
     "SceneVisualManifest",
     "SceneVisualRequest",
     "STORY_FORMATS",
@@ -137,6 +146,7 @@ __all__ = [
     "build_continuity_context",
     "build_timeline",
     "build_visual_manifest",
+    "fan_out_scene_visuals",
     "scene_binding_params",
     "count_words",
     "missing_scene_assets",

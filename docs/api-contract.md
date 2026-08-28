@@ -41,6 +41,7 @@ http://127.0.0.1:8000
 | Bible | `GET` | `/bible/{entry_id}` | 作品設定詳細 |
 | Bible | `PATCH` | `/bible/{entry_id}` | 作品設定更新 |
 | Bible | `DELETE` | `/bible/{entry_id}` | 作品設定削除 |
+| Bible | `POST` | `/bible/{entry_id}/promote` | 勝者アセットを baseline として昇格（seed / model / params / attributes） |
 | Bible | `POST` | `/bible/preview` | prompt 合成のドライラン（生成しない） |
 | Bible | `GET` | `/bible/catalogs` | 軸カタログ名一覧 |
 | Bible | `GET` | `/bible/catalogs/{name}` | 軸カタログ取得（logo 30 種など） |
@@ -953,3 +954,74 @@ Response:
   "latest_feedback_at": "2026-04-19T09:00:00Z"
 }
 ```
+
+## Bible
+
+### POST /bible/{entry_id}/promote
+
+character-sheet バッチ（#194）で生成した勝者アセットを、指定した Bible entry の
+baseline として昇格します（#195, 親: #49）。勝者は人間が選ぶもの（自動選定は non-goal）
+なので、body は昇格対象の `asset_id` だけを渡します。model_id / seed / params /
+attributes は現在の UI 状態からではなく、その asset の実効メタデータ
+（`request_snapshot` と `prompt_composition.attributes`、いずれも
+`GET /gallery/{asset_id}` の `request_snapshot` / `metadata.prompt_composition` と
+同じ形）から読み直します。`bible_refs` / `axis_values` / `batch_axis_labels` などの
+バッチ側の宣言的パラメータ（「宣言的な params」参照）は、character-sheet の 1 セルを
+表すものであって baseline ではないため、`params` から除外されます。
+
+書き込まれる内容:
+
+- `attributes`: 既存の attributes に、asset 側の attributes をマージ（キー重複は
+  asset 側が勝つ）
+- `seed_policy`: `{"mode": "locked", "seed": <asset の実効 seed>}` に置き換え
+- `reference_asset_ids`: 昇格した asset_id を追加（重複なし）
+- `metadata.promotion_history`: 昇格の監査ログに1件追記（既存の履歴は保持される）
+
+Request:
+
+```json
+{
+  "asset_id": "asset_123"
+}
+```
+
+Response:
+
+```json
+{
+  "entry": {
+    "id": "bible_123",
+    "kind": "character",
+    "attributes": { "hair": "long black straight", "eyes": "purple" },
+    "seed_policy": { "mode": "locked", "seed": 4242 },
+    "reference_asset_ids": ["asset_123"]
+  },
+  "promotion": {
+    "asset_id": "asset_123",
+    "job_id": "job_456",
+    "promoted_at": "2026-08-27T00:00:00Z",
+    "applied": {
+      "model_id": "sdxl",
+      "seed": 4242,
+      "params": { "width": 832, "height": 1024 },
+      "attributes": { "hair": "long black straight", "eyes": "purple" }
+    },
+    "previous": {
+      "attributes": { "hair": "black" },
+      "seed_policy": {},
+      "reference_asset_ids": [],
+      "model_id": null,
+      "params": null
+    }
+  }
+}
+```
+
+`entry` は他のエンドポイントと同じ `BibleEntryResponse`（`metadata` は含まない）。
+昇格の監査情報を確認したいだけの場合は、この呼び出しのレスポンスの `promotion` を
+見る -- `metadata.promotion_history` 全体は API では返さない。
+
+エラー:
+
+- 404 `asset_id` が存在しない、または `entry_id` が存在しない
+- 422 asset に実効 seed または実効 model_id が記録されていない（未完了の生成など）

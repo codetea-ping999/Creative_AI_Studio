@@ -33,6 +33,35 @@ KIND_COMPOSITION_ORDER: tuple[str, ...] = (
 
 SEED_MODES: tuple[str, ...] = ("locked", "free")
 
+# Keys that describe how one specific asset was produced, not a character's
+# portable identity, so `BibleRepository.promote_winner` drops them before
+# writing to `metadata['promoted_params']`. `bible_refs`/`axis_values`/
+# `batch_axis_labels`/`extra_fragments`/`prompt_template`/`batch_stage` are
+# the declarative-params keys a batch item carries in its own
+# `request.params` (see `generators/common/prompting.py`'s
+# `_RESOLUTION_PARAM_KEYS` for the generator-side mirror of this list); a
+# character sheet exists to vary angle/expression/pose across items, so
+# copying them into the Bible entry would freeze the one winning cell's
+# variation instead of the shared baseline. `source_asset_id`/`source_job_id`/
+# `reference_asset_path`/`reuse_action` are the reverse case: bookkeeping
+# `apps/api/routes/gallery.py`'s reuse endpoint stamps onto a *derived* job,
+# and they would point a future generation at this one now-stale asset.
+PROMOTION_EXCLUDED_PARAM_KEYS: frozenset[str] = frozenset(
+    {
+        "bible_refs",
+        "axis_values",
+        "extra_fragments",
+        "prompt_template",
+        "freeze_composed_prompt",
+        "batch_axis_labels",
+        "batch_stage",
+        "source_asset_id",
+        "source_job_id",
+        "reference_asset_path",
+        "reuse_action",
+    }
+)
+
 
 @dataclass(slots=True)
 class BibleEntry:
@@ -188,6 +217,83 @@ class BibleRepository:
         self._save(entry)
         return entry
 
+    def promote_winner(
+        self,
+        entry_id: str,
+        *,
+        asset_id: str,
+        model_id: str,
+        seed: int,
+        params: dict[str, Any],
+        attributes: dict[str, str],
+        job_id: str | None = None,
+    ) -> BibleEntry | None:
+        """Copy a winning character-sheet asset's effective settings onto ``entry_id``.
+
+        Only ``entry_id`` is written -- the winning asset and every other Bible
+        entry are untouched (#195). ``model_id``/``seed``/``params``/``attributes``
+        must already be the *effective* values resolved at generation time (a
+        route builds these from the asset's ``request_snapshot``/
+        ``prompt_composition`` metadata, not from whatever a form currently
+        shows), so the same call is safe to repeat once a better winner turns up.
+
+        Each call appends to ``metadata['promotion_history']`` rather than
+        replacing it, and every history entry carries a ``previous`` snapshot of
+        what this entry looked like immediately before -- so a promotion is
+        auditable and, if it turns out to be the wrong asset, reversible by hand.
+        """
+
+        entry = self.get(entry_id)
+        if entry is None:
+            return None
+        if not asset_id.strip():
+            raise ValueError("Promotion requires a non-empty asset_id.")
+
+        portable_params = {
+            key: value
+            for key, value in params.items()
+            if key not in PROMOTION_EXCLUDED_PARAM_KEYS
+        }
+        merged_attributes = {**entry.attributes, **attributes}
+        reference_asset_ids = list(entry.reference_asset_ids)
+        if asset_id not in reference_asset_ids:
+            reference_asset_ids.append(asset_id)
+
+        promotion_record = {
+            "asset_id": asset_id,
+            "job_id": job_id,
+            "promoted_at": utc_now().isoformat(),
+            "applied": {
+                "model_id": model_id,
+                "seed": seed,
+                "params": portable_params,
+                "attributes": dict(attributes),
+            },
+            "previous": {
+                "attributes": dict(entry.attributes),
+                "seed_policy": dict(entry.seed_policy),
+                "reference_asset_ids": list(entry.reference_asset_ids),
+                "model_id": entry.metadata.get("promoted_model_id"),
+                "params": entry.metadata.get("promoted_params"),
+            },
+        }
+        history = list(entry.metadata.get("promotion_history", []))
+        history.append(promotion_record)
+
+        new_metadata = dict(entry.metadata)
+        new_metadata["promotion_history"] = history
+        new_metadata["promoted_asset_id"] = asset_id
+        new_metadata["promoted_model_id"] = model_id
+        new_metadata["promoted_params"] = portable_params
+
+        return self.update(
+            entry_id,
+            attributes=merged_attributes,
+            seed_policy={"mode": "locked", "seed": seed},
+            reference_asset_ids=reference_asset_ids,
+            metadata=new_metadata,
+        )
+
     def get(self, entry_id: str) -> BibleEntry | None:
         entry_file = self.bible_dir / f"{entry_id}.json"
         if not entry_file.exists():
@@ -287,6 +393,7 @@ class BibleRepository:
 __all__ = [
     "BIBLE_KINDS",
     "KIND_COMPOSITION_ORDER",
+    "PROMOTION_EXCLUDED_PARAM_KEYS",
     "SEED_MODES",
     "BibleEntry",
     "BibleRepository",

@@ -48,23 +48,50 @@ Credential resolution and log/error/metadata redaction (issue #236):
   diagnostics mapping before it could reach a log line or persisted
   job/asset/request data.
 
+One bounded example adapter, with a timeout/retry/error-normalization
+contract (issue #237):
+- `AudioProviderErrorCategory` gives every provider call failure one of five
+  stable, vendor-neutral categories (timeout / rate limit / transient / auth
+  / permanent); `AudioProviderCallError` and its five subclasses carry that
+  category plus an optional vendor `provider_request_id` for
+  support/provenance. Mirrors `generators.image.providers
+  .ImageProviderErrorCategory` / `ImageProviderCallError` (#258) so both
+  media types normalize provider failures the same way.
+- `AudioProviderRetryPolicy` bounds retry count, backoff, and per-attempt
+  timeout to safe ceilings, and `call_audio_provider_with_retry` retries
+  only the categories that are actually retryable (timeout, rate limit,
+  transient), with backoff -- an auth or permanent error, or any exception a
+  transport never translated into an `AudioProviderCallError`, propagates on
+  the attempt that raised it and is never retried.
+- `generators.audio.example_provider.ExampleCloudAudioProviderAdapter` is
+  the concrete adapter this issue's microtask calls for: an
+  injected-transport implementation of `CloudAudioProviderAdapter` that
+  runs its transport through `call_audio_provider_with_retry` and redacts
+  every error/result through this module's #236 redaction helpers before
+  either can leave the adapter. It is only ever reachable through
+  `run_cloud_audio_provider`, so the #235 egress guard still runs strictly
+  before its `generate()` (and therefore its transport) is invoked.
+
 Still explicitly out of scope here (see the microtask order on #57):
-- A real vendor adapter -- #237.
 - Recording egress provenance in job metadata and surfacing it in the UI --
   #238.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 import os
-from typing import Any, Protocol, runtime_checkable
+import threading
+import time
+from typing import Any, Protocol, TypeVar, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from core.models.manifest import reject_literal_credential_fields
+
+_T = TypeVar("_T")
 
 
 class AudioProviderCapability(str, Enum):
@@ -349,6 +376,263 @@ def run_cloud_audio_provider(
     return adapter.generate(request)
 
 
+class AudioProviderErrorCategory(str, Enum):
+    """Stable, vendor-neutral classification for a provider call failure.
+
+    Every vendor SDK/HTTP error shape (status code, exception type, message
+    format -- all of it vendor-specific) must be translated into exactly one
+    of these five categories by whatever raises an
+    :class:`AudioProviderCallError`, so a caller (retry logic, logging,
+    user-facing error surfacing) never has to branch on a vendor's own error
+    taxonomy. Mirrors `generators.image.providers.ImageProviderErrorCategory`
+    (#258) so image and audio providers normalize failures the same way.
+    """
+
+    TIMEOUT = "timeout"
+    RATE_LIMIT = "rate_limit"
+    TRANSIENT = "transient"
+    AUTH = "auth"
+    PERMANENT = "permanent"
+
+
+_RETRYABLE_AUDIO_PROVIDER_ERROR_CATEGORIES = frozenset(
+    {
+        AudioProviderErrorCategory.TIMEOUT,
+        AudioProviderErrorCategory.RATE_LIMIT,
+        AudioProviderErrorCategory.TRANSIENT,
+    }
+)
+
+
+def is_retryable_audio_provider_error_category(
+    category: AudioProviderErrorCategory,
+) -> bool:
+    """Whether `category` is safe to retry at all (before backoff/limits apply).
+
+    Only timeout, rate limit, and transient are retryable -- auth and
+    permanent are, by definition, not going to succeed on an identical
+    retry, so retrying them would just repeat a doomed request (issue #237:
+    "bounded retries only for documented transient failures").
+    """
+
+    return category in _RETRYABLE_AUDIO_PROVIDER_ERROR_CATEGORIES
+
+
+class AudioProviderCallError(AudioProviderError):
+    """Base for every categorized cloud-audio-provider call failure (#237).
+
+    Never raise this base class directly -- raise one of the five category
+    subclasses below (`AudioProviderTimeoutError`, `AudioProviderRateLimitError`,
+    `AudioProviderTransientError`, `AudioProviderAuthError`,
+    `AudioProviderPermanentError`) so `category` cannot drift from the type.
+    `provider_request_id` carries the *vendor's* own request/trace id for a
+    failed call when the vendor supplied one, for support/provenance.
+    `retry_after_seconds` carries a vendor-supplied wait hint (e.g. a rate
+    limit's `Retry-After`); `call_audio_provider_with_retry` honors it but
+    always clamps it to `AudioProviderRetryPolicy.max_backoff_seconds`, so a
+    vendor cannot force an effectively-unbounded wait.
+    """
+
+    category: AudioProviderErrorCategory
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider_name: str,
+        provider_request_id: str | None = None,
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.provider_name = provider_name
+        self.provider_request_id = provider_request_id
+        self.retry_after_seconds = retry_after_seconds
+
+    @property
+    def retryable(self) -> bool:
+        return is_retryable_audio_provider_error_category(self.category)
+
+
+class AudioProviderTimeoutError(AudioProviderCallError):
+    """The call did not complete within its bounded per-attempt deadline."""
+
+    category = AudioProviderErrorCategory.TIMEOUT
+
+
+class AudioProviderRateLimitError(AudioProviderCallError):
+    """The provider rejected the call for exceeding a rate limit."""
+
+    category = AudioProviderErrorCategory.RATE_LIMIT
+
+
+class AudioProviderTransientError(AudioProviderCallError):
+    """A provider-side failure that is expected to clear up on retry (e.g. a 5xx)."""
+
+    category = AudioProviderErrorCategory.TRANSIENT
+
+
+class AudioProviderAuthError(AudioProviderCallError):
+    """The provider rejected the call's credential or configuration.
+
+    Distinct from :class:`AudioProviderCredentialUnavailableError`: that one
+    fires locally, before any transport call, when a credential cannot even
+    be resolved from the environment. This one is raised from a transport
+    implementation's own translation of a vendor's 401/403-shaped response --
+    the credential *was* sent, but the vendor rejected it.
+    """
+
+    category = AudioProviderErrorCategory.AUTH
+
+
+class AudioProviderPermanentError(AudioProviderCallError):
+    """The request itself is invalid in a way retrying cannot fix (e.g. a 400)."""
+
+    category = AudioProviderErrorCategory.PERMANENT
+
+
+_MAX_ALLOWED_AUDIO_PROVIDER_RETRIES = 5
+_MAX_ALLOWED_AUDIO_PROVIDER_TIMEOUT_SECONDS = 120.0
+_MAX_ALLOWED_AUDIO_PROVIDER_BACKOFF_SECONDS = 30.0
+
+
+@dataclass(frozen=True)
+class AudioProviderRetryPolicy:
+    """Bounded, explicit retry/timeout configuration for one provider call.
+
+    Every field is validated in `__post_init__` against a hard safe-bound
+    ceiling, so a caller cannot configure effectively-unbounded retries or an
+    effectively-unbounded per-attempt timeout (issue #237 acceptance
+    criterion: "Requests have a finite timeout and bounded retry count").
+    The defaults are deliberately modest (a handful of quick retries, not an
+    aggressive retry storm against a struggling provider). Mirrors
+    `generators.image.providers.ImageProviderRetryPolicy` (#258).
+    """
+
+    max_retries: int = 2
+    timeout_seconds: float = 30.0
+    backoff_base_seconds: float = 0.5
+    backoff_multiplier: float = 2.0
+    max_backoff_seconds: float = 8.0
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.max_retries <= _MAX_ALLOWED_AUDIO_PROVIDER_RETRIES):
+            raise ValueError(
+                f"max_retries={self.max_retries} must be within "
+                f"[0, {_MAX_ALLOWED_AUDIO_PROVIDER_RETRIES}]."
+            )
+        if not (0 < self.timeout_seconds <= _MAX_ALLOWED_AUDIO_PROVIDER_TIMEOUT_SECONDS):
+            raise ValueError(
+                f"timeout_seconds={self.timeout_seconds} must be within "
+                f"(0, {_MAX_ALLOWED_AUDIO_PROVIDER_TIMEOUT_SECONDS}]."
+            )
+        if self.backoff_base_seconds < 0:
+            raise ValueError(
+                f"backoff_base_seconds={self.backoff_base_seconds} must not be negative."
+            )
+        if self.backoff_multiplier < 1:
+            raise ValueError(
+                f"backoff_multiplier={self.backoff_multiplier} must be >= 1."
+            )
+        if not (0 <= self.max_backoff_seconds <= _MAX_ALLOWED_AUDIO_PROVIDER_BACKOFF_SECONDS):
+            raise ValueError(
+                f"max_backoff_seconds={self.max_backoff_seconds} must be within "
+                f"[0, {_MAX_ALLOWED_AUDIO_PROVIDER_BACKOFF_SECONDS}]."
+            )
+
+
+def _audio_provider_backoff_seconds(
+    error: AudioProviderCallError, policy: AudioProviderRetryPolicy, attempt: int
+) -> float:
+    """Seconds to wait before the retry attempt after `attempt` (0-indexed).
+
+    Prefers a vendor-supplied `retry_after_seconds` when present (a rate
+    limit response usually names exactly how long to wait), otherwise backs
+    off exponentially from `backoff_base_seconds`. Either way the result is
+    clamped to `max_backoff_seconds` -- a vendor hint is a hint, not a
+    license to block the caller indefinitely.
+    """
+
+    if error.retry_after_seconds is not None:
+        return max(0.0, min(error.retry_after_seconds, policy.max_backoff_seconds))
+    exponential = policy.backoff_base_seconds * (policy.backoff_multiplier**attempt)
+    return min(exponential, policy.max_backoff_seconds)
+
+
+def _run_audio_provider_transport_with_timeout(
+    transport: Callable[[], _T],
+    *,
+    provider_name: str,
+    timeout_seconds: float,
+) -> _T:
+    """Run `transport` on a daemon thread, bounded by `timeout_seconds`.
+
+    Python cannot safely interrupt an arbitrary synchronous call, so a
+    timed-out `transport` may keep running in the background on its thread;
+    this bounds *how long the caller waits*, not how long the underlying
+    call itself keeps executing. That is still a real, useful guarantee: it
+    is what keeps a hung remote provider from hanging its caller forever.
+    """
+
+    outcome: list[_T] = []
+    failure: list[BaseException] = []
+
+    def _target() -> None:
+        try:
+            outcome.append(transport())
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread below
+            failure.append(exc)
+
+    worker = threading.Thread(target=_target, daemon=True)
+    worker.start()
+    worker.join(timeout_seconds)
+    if worker.is_alive():
+        raise AudioProviderTimeoutError(
+            f"Cloud audio provider {provider_name!r} request exceeded its "
+            f"{timeout_seconds}s timeout.",
+            provider_name=provider_name,
+        )
+    if failure:
+        raise failure[0]
+    return outcome[0]
+
+
+def call_audio_provider_with_retry(
+    transport: Callable[[], _T],
+    *,
+    provider_name: str,
+    retry_policy: AudioProviderRetryPolicy | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> _T:
+    """Run `transport` under a bounded per-attempt timeout and bounded retries.
+
+    Each attempt is individually bounded by `retry_policy.timeout_seconds`
+    (see :func:`_run_audio_provider_transport_with_timeout`). Only a raised
+    `AudioProviderCallError` whose category is retryable
+    (:func:`is_retryable_audio_provider_error_category`) triggers another
+    attempt, and only up to `retry_policy.max_retries` times, sleeping a
+    bounded backoff between attempts
+    (:func:`_audio_provider_backoff_seconds`). An auth- or permanent-category
+    error, or any exception `transport` raises that was never translated
+    into an `AudioProviderCallError` in the first place, propagates
+    immediately on the attempt that raised it -- an unclassified exception
+    cannot be assumed retryable (issue #237 acceptance: "Permanent errors
+    are not retried indefinitely").
+    """
+
+    policy = retry_policy if retry_policy is not None else AudioProviderRetryPolicy()
+    attempt = 0
+    while True:
+        try:
+            return _run_audio_provider_transport_with_timeout(
+                transport, provider_name=provider_name, timeout_seconds=policy.timeout_seconds
+            )
+        except AudioProviderCallError as exc:
+            if not exc.retryable or attempt >= policy.max_retries:
+                raise
+            sleep(_audio_provider_backoff_seconds(exc, policy, attempt))
+            attempt += 1
+
+
 @dataclass(frozen=True)
 class AudioProviderCredential:
     """A credential resolved from the environment for one provider call.
@@ -440,14 +724,31 @@ def redact_provider_error(
 ) -> BaseException:
     """Return an equivalent error with every `secrets` occurrence redacted.
 
-    Preserves `type(error)` where its constructor accepts a single message
-    argument (true for every stdlib exception and every error class in this
-    module); falls back to `RuntimeError` when reconstructing the original
-    type fails, so a redaction failure can never re-raise the original
-    (still secret-bearing) exception.
+    An `AudioProviderCallError` (issue #237) is reconstructed with its
+    `category`-defining type, `provider_name`, `retry_after_seconds`, and a
+    redacted `provider_request_id` preserved -- a caller further up the
+    stack (retry logic, job/asset metadata, support tooling) still needs
+    those after sanitization, and this is the one place that sanitization
+    happens. Any other exception type is preserved where its constructor
+    accepts a single message argument (true for every stdlib exception and
+    every other error class in this module); falls back to `RuntimeError`
+    when reconstructing the original type fails, so a redaction failure can
+    never re-raise the original (still secret-bearing) exception.
     """
 
     redacted_message = redact_secrets(str(error), secrets)
+    if isinstance(error, AudioProviderCallError):
+        redacted_provider_request_id = (
+            redact_secrets(error.provider_request_id, secrets)
+            if error.provider_request_id is not None
+            else None
+        )
+        return type(error)(
+            redacted_message,
+            provider_name=error.provider_name,
+            provider_request_id=redacted_provider_request_id,
+            retry_after_seconds=error.retry_after_seconds,
+        )
     try:
         return type(error)(redacted_message)
     except Exception:  # noqa: BLE001 - constructing the original type failed; never re-raise the original
@@ -529,10 +830,18 @@ def ensure_capabilities_declared(
 
 
 __all__ = [
+    "AudioProviderAuthError",
+    "AudioProviderCallError",
     "AudioProviderCapability",
     "AudioProviderCredential",
     "AudioProviderCredentialUnavailableError",
     "AudioProviderError",
+    "AudioProviderErrorCategory",
+    "AudioProviderPermanentError",
+    "AudioProviderRateLimitError",
+    "AudioProviderRetryPolicy",
+    "AudioProviderTimeoutError",
+    "AudioProviderTransientError",
     "CloudAudioProviderAdapter",
     "CloudAudioProviderOptInRequiredError",
     "CloudAudioProviderRequest",
@@ -541,10 +850,12 @@ __all__ = [
     "ProviderMisconfiguredError",
     "ProviderUnavailableError",
     "UnsupportedCapabilityError",
+    "call_audio_provider_with_retry",
     "cloud_audio_provider_opt_in_granted",
     "ensure_capabilities_declared",
     "ensure_capability_supported",
     "ensure_cloud_audio_provider_opt_in",
+    "is_retryable_audio_provider_error_category",
     "manifest_declared_capabilities",
     "redact_provider_error",
     "redact_provider_metadata",

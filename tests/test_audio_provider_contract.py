@@ -31,12 +31,33 @@ Covers the acceptance criteria on all three issues directly:
   `resolve_cloud_audio_provider_credential`.
 - A sentinel secret value never survives into a credential's `repr()`/
   `str()`, a redacted error, or redacted provider metadata.
+
+#237 (one bounded cloud-provider example with timeout/retry policy):
+- `AudioProviderErrorCategory` / `is_retryable_audio_provider_error_category`:
+  only timeout, rate limit, and transient are retryable; auth and permanent
+  are not.
+- `AudioProviderRetryPolicy` bounds every field to a finite safe ceiling.
+- `call_audio_provider_with_retry`: a successful call needs no retry; a
+  timeout raises `AudioProviderTimeoutError`; rate-limit/transient errors
+  are retried (honoring a vendor `retry_after_seconds` hint, else backing
+  off) up to `max_retries` and then either recover or raise; a permanent or
+  auth error is never retried; an unclassified exception from `transport`
+  propagates immediately, unretried.
+- `ExampleCloudAudioProviderAdapter` (`generators.audio.example_provider`):
+  a concrete, injected-transport adapter exercised only through
+  `run_cloud_audio_provider`, so it is reachable only after the #235 egress
+  guard passes; its `generate()` applies the bounded timeout/retry policy
+  to `transport` and redacts every error and successful result's
+  `provider_metadata` through the #236 helpers before either can leave the
+  adapter; all of this is exercised with a fake transport function, so no
+  live cloud access is required.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import time
 import unittest
 from unittest.mock import patch
 
@@ -45,11 +66,20 @@ from pydantic import ValidationError
 
 from core.models.manifest import ModelManifest
 from core.schemas import GenerationRequest
+from generators.audio.example_provider import ExampleCloudAudioProviderAdapter
 from generators.audio.generator import AudioGenerator
 from generators.audio.providers import (
+    AudioProviderAuthError,
+    AudioProviderCallError,
     AudioProviderCapability,
     AudioProviderCredential,
     AudioProviderCredentialUnavailableError,
+    AudioProviderErrorCategory,
+    AudioProviderPermanentError,
+    AudioProviderRateLimitError,
+    AudioProviderRetryPolicy,
+    AudioProviderTimeoutError,
+    AudioProviderTransientError,
     CloudAudioProviderOptInRequiredError,
     CloudAudioProviderRequest,
     CloudAudioProviderResult,
@@ -57,9 +87,11 @@ from generators.audio.providers import (
     ProviderMisconfiguredError,
     ProviderUnavailableError,
     UnsupportedCapabilityError,
+    call_audio_provider_with_retry,
     cloud_audio_provider_opt_in_granted,
     ensure_capabilities_declared,
     ensure_cloud_audio_provider_opt_in,
+    is_retryable_audio_provider_error_category,
     manifest_declared_capabilities,
     redact_provider_error,
     redact_provider_metadata,
@@ -71,6 +103,11 @@ from generators.audio.providers import (
 _OPT_IN_GRANTED_ENV = {
     "ALLOW_CLOUD_PROVIDERS": "true",
     "ALLOW_CLOUD_PROVIDER_FAKE_CLOUD": "true",
+}
+
+_EXAMPLE_OPT_IN_GRANTED_ENV = {
+    "ALLOW_CLOUD_PROVIDERS": "true",
+    "ALLOW_CLOUD_PROVIDER_EXAMPLE_CLOUD": "true",
 }
 
 _SENTINEL_SECRET = "sk-sentinel-1234567890abcdef"  # never a real credential
@@ -715,3 +752,460 @@ class SentinelSecretPersistenceTest(unittest.TestCase):
             )
 
         self.assertNotIn(_SENTINEL_SECRET, "\n".join(ctx.output))
+
+
+# --- Error categories and retry policy (#237) --------------------------------------
+
+
+class AudioProviderErrorCategoryTest(unittest.TestCase):
+    """The five stable categories and which ones are retryable (issue #237)."""
+
+    def test_timeout_rate_limit_and_transient_are_retryable(self) -> None:
+        for category in (
+            AudioProviderErrorCategory.TIMEOUT,
+            AudioProviderErrorCategory.RATE_LIMIT,
+            AudioProviderErrorCategory.TRANSIENT,
+        ):
+            self.assertTrue(is_retryable_audio_provider_error_category(category))
+
+    def test_auth_and_permanent_are_not_retryable(self) -> None:
+        for category in (
+            AudioProviderErrorCategory.AUTH,
+            AudioProviderErrorCategory.PERMANENT,
+        ):
+            self.assertFalse(is_retryable_audio_provider_error_category(category))
+
+    def test_error_subclasses_carry_the_matching_category_and_retryable_flag(self) -> None:
+        cases = [
+            (AudioProviderTimeoutError, AudioProviderErrorCategory.TIMEOUT, True),
+            (AudioProviderRateLimitError, AudioProviderErrorCategory.RATE_LIMIT, True),
+            (AudioProviderTransientError, AudioProviderErrorCategory.TRANSIENT, True),
+            (AudioProviderAuthError, AudioProviderErrorCategory.AUTH, False),
+            (AudioProviderPermanentError, AudioProviderErrorCategory.PERMANENT, False),
+        ]
+        for error_cls, expected_category, expected_retryable in cases:
+            error = error_cls("boom", provider_name="fake-cloud")
+            self.assertIsInstance(error, AudioProviderCallError)
+            self.assertEqual(error.category, expected_category)
+            self.assertEqual(error.retryable, expected_retryable)
+            self.assertIsNone(error.provider_request_id)
+            self.assertIsNone(error.retry_after_seconds)
+
+    def test_error_preserves_provider_request_id_and_retry_after(self) -> None:
+        error = AudioProviderRateLimitError(
+            "slow down",
+            provider_name="fake-cloud",
+            provider_request_id="vendor-req-42",
+            retry_after_seconds=2.5,
+        )
+        self.assertEqual(error.provider_request_id, "vendor-req-42")
+        self.assertEqual(error.retry_after_seconds, 2.5)
+
+
+class AudioProviderRetryPolicyTest(unittest.TestCase):
+    """Retry count and timeout must be finite/configurable within safe bounds."""
+
+    def test_default_policy_is_within_safe_bounds(self) -> None:
+        policy = AudioProviderRetryPolicy()  # must not raise
+        self.assertGreaterEqual(policy.max_retries, 0)
+        self.assertGreater(policy.timeout_seconds, 0)
+
+    def test_negative_max_retries_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "max_retries"):
+            AudioProviderRetryPolicy(max_retries=-1)
+
+    def test_max_retries_above_the_safe_ceiling_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "max_retries"):
+            AudioProviderRetryPolicy(max_retries=10_000)
+
+    def test_non_positive_timeout_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "timeout_seconds"):
+            AudioProviderRetryPolicy(timeout_seconds=0)
+
+    def test_timeout_above_the_safe_ceiling_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "timeout_seconds"):
+            AudioProviderRetryPolicy(timeout_seconds=10_000)
+
+    def test_negative_backoff_base_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "backoff_base_seconds"):
+            AudioProviderRetryPolicy(backoff_base_seconds=-1)
+
+    def test_backoff_multiplier_below_one_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "backoff_multiplier"):
+            AudioProviderRetryPolicy(backoff_multiplier=0.5)
+
+    def test_max_backoff_above_the_safe_ceiling_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "max_backoff_seconds"):
+            AudioProviderRetryPolicy(max_backoff_seconds=10_000)
+
+
+class _FlakyFakeCloudTransport:
+    """Fails `failures_before_success` times with a given categorized error,
+
+    then succeeds -- used to exercise retry-then-recover behavior without
+    any real network call (issue #237's fake-transport tests).
+    """
+
+    def __init__(
+        self,
+        *,
+        error_factory,
+        failures_before_success: int = 0,
+        sleep_seconds: float | None = None,
+    ) -> None:
+        self._error_factory = error_factory
+        self._failures_before_success = failures_before_success
+        self._sleep_seconds = sleep_seconds
+        self.call_count = 0
+
+    def __call__(self) -> str:
+        self.call_count += 1
+        if self._sleep_seconds is not None:
+            time.sleep(self._sleep_seconds)
+        if self.call_count <= self._failures_before_success:
+            raise self._error_factory()
+        return f"ok-after-{self.call_count}-calls"
+
+
+class CallAudioProviderWithRetryTest(unittest.TestCase):
+    """`call_audio_provider_with_retry`: success, timeout, rate limit,
+
+    transient recovery, and permanent failure (issue #237).
+    """
+
+    def test_a_successful_call_returns_immediately_with_no_retry(self) -> None:
+        sleeps: list[float] = []
+        transport = _FlakyFakeCloudTransport(
+            error_factory=lambda: AudioProviderTransientError(
+                "boom", provider_name="fake-cloud"
+            )
+        )
+
+        result = call_audio_provider_with_retry(
+            transport, provider_name="fake-cloud", sleep=sleeps.append
+        )
+
+        self.assertEqual(result, "ok-after-1-calls")
+        self.assertEqual(transport.call_count, 1)
+        self.assertEqual(sleeps, [])
+
+    def test_timeout_raises_when_transport_exceeds_the_per_attempt_deadline(self) -> None:
+        transport = _FlakyFakeCloudTransport(
+            error_factory=lambda: RuntimeError("unused"), sleep_seconds=0.3
+        )
+        policy = AudioProviderRetryPolicy(max_retries=0, timeout_seconds=0.05)
+
+        with self.assertRaises(AudioProviderTimeoutError) as ctx:
+            call_audio_provider_with_retry(
+                transport,
+                provider_name="fake-cloud",
+                retry_policy=policy,
+                sleep=lambda seconds: None,
+            )
+        self.assertIn("fake-cloud", str(ctx.exception))
+        self.assertEqual(ctx.exception.category, AudioProviderErrorCategory.TIMEOUT)
+
+    def test_rate_limit_is_retried_and_recovers(self) -> None:
+        sleeps: list[float] = []
+        transport = _FlakyFakeCloudTransport(
+            error_factory=lambda: AudioProviderRateLimitError(
+                "slow down", provider_name="fake-cloud", retry_after_seconds=1.0
+            ),
+            failures_before_success=2,
+        )
+        policy = AudioProviderRetryPolicy(max_retries=2)
+
+        result = call_audio_provider_with_retry(
+            transport, provider_name="fake-cloud", retry_policy=policy, sleep=sleeps.append
+        )
+
+        self.assertEqual(result, "ok-after-3-calls")
+        self.assertEqual(transport.call_count, 3)
+        self.assertEqual(sleeps, [1.0, 1.0])  # honors the vendor's retry_after_seconds hint
+
+    def test_transient_error_recovers_after_one_retry(self) -> None:
+        sleeps: list[float] = []
+        transport = _FlakyFakeCloudTransport(
+            error_factory=lambda: AudioProviderTransientError(
+                "hiccup", provider_name="fake-cloud"
+            ),
+            failures_before_success=1,
+        )
+
+        result = call_audio_provider_with_retry(
+            transport, provider_name="fake-cloud", sleep=sleeps.append
+        )
+
+        self.assertEqual(result, "ok-after-2-calls")
+        self.assertEqual(transport.call_count, 2)
+        self.assertEqual(sleeps, [0.5])  # default backoff_base_seconds
+
+    def test_permanent_error_is_never_retried(self) -> None:
+        sleeps: list[float] = []
+        transport = _FlakyFakeCloudTransport(
+            error_factory=lambda: AudioProviderPermanentError(
+                "bad request", provider_name="fake-cloud"
+            ),
+            failures_before_success=99,
+        )
+
+        with self.assertRaises(AudioProviderPermanentError):
+            call_audio_provider_with_retry(
+                transport, provider_name="fake-cloud", sleep=sleeps.append
+            )
+
+        self.assertEqual(transport.call_count, 1)
+        self.assertEqual(sleeps, [])
+
+    def test_auth_error_is_never_retried(self) -> None:
+        sleeps: list[float] = []
+        transport = _FlakyFakeCloudTransport(
+            error_factory=lambda: AudioProviderAuthError(
+                "bad credential", provider_name="fake-cloud"
+            ),
+            failures_before_success=99,
+        )
+
+        with self.assertRaises(AudioProviderAuthError):
+            call_audio_provider_with_retry(
+                transport, provider_name="fake-cloud", sleep=sleeps.append
+            )
+
+        self.assertEqual(transport.call_count, 1)
+        self.assertEqual(sleeps, [])
+
+    def test_an_unclassified_exception_propagates_immediately_unretried(self) -> None:
+        sleeps: list[float] = []
+        transport = _FlakyFakeCloudTransport(
+            error_factory=lambda: ValueError("not a categorized provider error"),
+            failures_before_success=99,
+        )
+
+        with self.assertRaises(ValueError):
+            call_audio_provider_with_retry(
+                transport, provider_name="fake-cloud", sleep=sleeps.append
+            )
+
+        self.assertEqual(transport.call_count, 1)
+        self.assertEqual(sleeps, [])
+
+    def test_retries_are_bounded_by_max_retries_then_raise(self) -> None:
+        sleeps: list[float] = []
+        transport = _FlakyFakeCloudTransport(
+            error_factory=lambda: AudioProviderTransientError(
+                "still down", provider_name="fake-cloud"
+            ),
+            failures_before_success=99,
+        )
+        policy = AudioProviderRetryPolicy(max_retries=2)
+
+        with self.assertRaises(AudioProviderTransientError):
+            call_audio_provider_with_retry(
+                transport, provider_name="fake-cloud", retry_policy=policy, sleep=sleeps.append
+            )
+
+        self.assertEqual(transport.call_count, 3)  # 1 initial attempt + 2 retries
+        self.assertEqual(len(sleeps), 2)
+
+    def test_retry_after_seconds_is_clamped_to_max_backoff(self) -> None:
+        sleeps: list[float] = []
+        transport = _FlakyFakeCloudTransport(
+            error_factory=lambda: AudioProviderRateLimitError(
+                "slow down", provider_name="fake-cloud", retry_after_seconds=999.0
+            ),
+            failures_before_success=1,
+        )
+        policy = AudioProviderRetryPolicy(max_backoff_seconds=3.0)
+
+        call_audio_provider_with_retry(
+            transport, provider_name="fake-cloud", retry_policy=policy, sleep=sleeps.append
+        )
+
+        self.assertEqual(sleeps, [3.0])
+
+
+# --- ExampleCloudAudioProviderAdapter (#237) ----------------------------------------
+
+
+class ExampleCloudAudioProviderAdapterTest(unittest.TestCase):
+    """The concrete example adapter: timeout/retry policy and #236 redaction."""
+
+    def test_satisfies_the_cloud_audio_provider_adapter_protocol(self) -> None:
+        from generators.audio.providers import CloudAudioProviderAdapter
+
+        adapter = ExampleCloudAudioProviderAdapter(
+            transport=lambda request: CloudAudioProviderResult(
+                audio_bytes=b"\x00\x00", sample_rate=32_000, channels=1, output_format="wav"
+            )
+        )
+        self.assertIsInstance(adapter, CloudAudioProviderAdapter)
+
+    def test_success_path_returns_the_transport_result(self) -> None:
+        calls: list[CloudAudioProviderRequest] = []
+
+        def transport(request: CloudAudioProviderRequest) -> CloudAudioProviderResult:
+            calls.append(request)
+            return CloudAudioProviderResult(
+                audio_bytes=b"\x01\x02",
+                sample_rate=32_000,
+                channels=1,
+                output_format="wav",
+                provider_metadata={"destination": "example-cloud"},
+            )
+
+        adapter = ExampleCloudAudioProviderAdapter(transport=transport, sleep=lambda seconds: None)
+        result = run_cloud_audio_provider(
+            adapter,
+            _request(AudioProviderCapability.TEXT_TO_MUSIC),
+            env=_EXAMPLE_OPT_IN_GRANTED_ENV,
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(result.provider_metadata["destination"], "example-cloud")
+
+    def test_unreachable_without_the_235_egress_opt_in(self) -> None:
+        """#237 acceptance: "Provider example is reachable only after the
+
+        egress guard passes."
+        """
+
+        calls: list[CloudAudioProviderRequest] = []
+
+        def transport(request: CloudAudioProviderRequest) -> CloudAudioProviderResult:
+            calls.append(request)
+            return CloudAudioProviderResult(
+                audio_bytes=b"\x00", sample_rate=32_000, channels=1, output_format="wav"
+            )
+
+        adapter = ExampleCloudAudioProviderAdapter(transport=transport, provider_name="fake-cloud")
+
+        with self.assertRaises(CloudAudioProviderOptInRequiredError):
+            run_cloud_audio_provider(
+                adapter, _request(AudioProviderCapability.TEXT_TO_MUSIC), env={}
+            )
+
+        self.assertEqual(calls, [])  # transport never invoked
+
+    def test_transient_failure_is_retried_then_succeeds(self) -> None:
+        attempts = {"count": 0}
+
+        def transport(request: CloudAudioProviderRequest) -> CloudAudioProviderResult:
+            attempts["count"] += 1
+            if attempts["count"] < 3:
+                raise AudioProviderTransientError("hiccup", provider_name="example-cloud")
+            return CloudAudioProviderResult(
+                audio_bytes=b"\x00", sample_rate=32_000, channels=1, output_format="wav"
+            )
+
+        adapter = ExampleCloudAudioProviderAdapter(
+            transport=transport,
+            provider_name="example-cloud",
+            retry_policy=AudioProviderRetryPolicy(max_retries=2),
+            sleep=lambda seconds: None,
+        )
+
+        result = run_cloud_audio_provider(
+            adapter,
+            _request(AudioProviderCapability.TEXT_TO_MUSIC),
+            env=_EXAMPLE_OPT_IN_GRANTED_ENV,
+        )
+
+        self.assertEqual(attempts["count"], 3)
+        self.assertIsInstance(result, CloudAudioProviderResult)
+
+    def test_permanent_failure_is_not_retried_indefinitely(self) -> None:
+        """#237 acceptance: "Permanent errors are not retried indefinitely"."""
+
+        attempts = {"count": 0}
+
+        def transport(request: CloudAudioProviderRequest) -> CloudAudioProviderResult:
+            attempts["count"] += 1
+            raise AudioProviderPermanentError("bad request", provider_name="example-cloud")
+
+        adapter = ExampleCloudAudioProviderAdapter(
+            transport=transport,
+            provider_name="example-cloud",
+            retry_policy=AudioProviderRetryPolicy(max_retries=2),
+            sleep=lambda seconds: None,
+        )
+
+        with self.assertRaises(AudioProviderPermanentError):
+            run_cloud_audio_provider(
+                adapter,
+                _request(AudioProviderCapability.TEXT_TO_MUSIC),
+                env=_EXAMPLE_OPT_IN_GRANTED_ENV,
+            )
+
+        self.assertEqual(attempts["count"], 1)  # never retried
+
+    def test_timeout_is_enforced_on_a_hanging_transport(self) -> None:
+        def transport(request: CloudAudioProviderRequest) -> CloudAudioProviderResult:
+            time.sleep(0.3)
+            raise AssertionError("should have timed out before returning")
+
+        adapter = ExampleCloudAudioProviderAdapter(
+            transport=transport,
+            provider_name="example-cloud",
+            retry_policy=AudioProviderRetryPolicy(max_retries=0, timeout_seconds=0.05),
+            sleep=lambda seconds: None,
+        )
+
+        with self.assertRaises(AudioProviderTimeoutError):
+            run_cloud_audio_provider(
+                adapter,
+                _request(AudioProviderCapability.TEXT_TO_MUSIC),
+                env=_EXAMPLE_OPT_IN_GRANTED_ENV,
+            )
+
+    def test_error_from_the_transport_is_redacted_before_it_leaves_the_adapter(self) -> None:
+        """#237 acceptance: "Error output is redacted according to #236"."""
+
+        def transport(request: CloudAudioProviderRequest) -> CloudAudioProviderResult:
+            raise AudioProviderPermanentError(
+                f"rejected credential {_SENTINEL_SECRET}", provider_name="example-cloud"
+            )
+
+        credential = AudioProviderCredential(env_var="ACME_AUDIO_API_KEY", value=_SENTINEL_SECRET)
+        adapter = ExampleCloudAudioProviderAdapter(
+            transport=transport,
+            provider_name="example-cloud",
+            credential=credential,
+            sleep=lambda seconds: None,
+        )
+
+        with self.assertRaises(AudioProviderPermanentError) as ctx:
+            run_cloud_audio_provider(
+                adapter,
+                _request(AudioProviderCapability.TEXT_TO_MUSIC),
+                env=_EXAMPLE_OPT_IN_GRANTED_ENV,
+            )
+
+        self.assertNotIn(_SENTINEL_SECRET, str(ctx.exception))
+
+    def test_successful_result_metadata_is_redacted_before_it_leaves_the_adapter(self) -> None:
+        def transport(request: CloudAudioProviderRequest) -> CloudAudioProviderResult:
+            return CloudAudioProviderResult(
+                audio_bytes=b"\x00",
+                sample_rate=32_000,
+                channels=1,
+                output_format="wav",
+                provider_metadata={
+                    "debug_request_headers": {"Authorization": f"Bearer {_SENTINEL_SECRET}"}
+                },
+            )
+
+        credential = AudioProviderCredential(env_var="ACME_AUDIO_API_KEY", value=_SENTINEL_SECRET)
+        adapter = ExampleCloudAudioProviderAdapter(
+            transport=transport,
+            provider_name="example-cloud",
+            credential=credential,
+            sleep=lambda seconds: None,
+        )
+
+        result = run_cloud_audio_provider(
+            adapter,
+            _request(AudioProviderCapability.TEXT_TO_MUSIC),
+            env=_EXAMPLE_OPT_IN_GRANTED_ENV,
+        )
+
+        self.assertNotIn(_SENTINEL_SECRET, json.dumps(result.provider_metadata))
