@@ -10,7 +10,7 @@ usable even when no weights are installed.
 from __future__ import annotations
 
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from itertools import chain
 import math
 from pathlib import Path
@@ -27,6 +27,13 @@ from core.audio import duck_envelope
 from core.quality import evaluate_video_output
 from core.schemas import GenerationRequest, GenerationResult
 from generators.base import BaseGenerator
+from generators.video.safe_area import (
+    PixelRegion,
+    SafeAreaPreset,
+    get_safe_area_preset,
+    resolve_preset_for_resolution,
+)
+from generators.video.subtitle_line_breaking import apply_kinsoku_rules
 
 ASSEMBLY_TASK_TYPE = "assembly"
 ASSEMBLY_OUTPUT_FORMATS = frozenset({"mp4"})
@@ -44,11 +51,13 @@ _SUPPORTED_MOTIONS = frozenset(
 
 _SUBTITLE_HEIGHT_RATIO = 0.055
 _SUBTITLE_MIN_FONT_PIXELS = 10
-_SUBTITLE_BOTTOM_MARGIN_RATIO = 0.08
-_SUBTITLE_SIDE_MARGIN_RATIO = 0.06
 _SUBTITLE_OUTLINE_PIXELS = 2
 _SUBTITLE_FILL = (255, 255, 255)
 _SUBTITLE_OUTLINE_FILL = (0, 0, 0)
+# "Ag" line-height * 1.45 leaves visible daylight between wrapped lines without
+# the block growing so tall it fights the vertical clamp in ``_burn_subtitles``.
+_SUBTITLE_LINE_SPACING = 1.45
+_SUBTITLE_ALIGNMENTS = frozenset({"left", "center", "right"})
 # Prefer fonts with Japanese glyph coverage. DejaVu is deliberately after the
 # CJK candidates: it loads successfully on most Linux hosts but renders Japanese
 # as tofu boxes, preventing later candidates from ever being tried.
@@ -133,6 +142,88 @@ class _AudioMix:
         return not (self.has_narration or self.has_music)
 
 
+@dataclass(frozen=True)
+class SubtitleStyle:
+    """Deterministic subtitle styling: font, size, outline, spacing, alignment.
+
+    Every field defaults to this module's prior hardcoded subtitle look, so a
+    timeline that never sets ``params['subtitle_style']`` renders identically
+    to before this configuration existed (issue #241 / #60).
+    """
+
+    font_path: str | None = None
+    font_size_ratio: float = _SUBTITLE_HEIGHT_RATIO
+    min_font_pixels: int = _SUBTITLE_MIN_FONT_PIXELS
+    outline_px: int = _SUBTITLE_OUTLINE_PIXELS
+    line_spacing: float = _SUBTITLE_LINE_SPACING
+    align: str = "center"
+    fill: tuple[int, int, int] = _SUBTITLE_FILL
+    outline_fill: tuple[int, int, int] = _SUBTITLE_OUTLINE_FILL
+
+    @classmethod
+    def from_params(cls, raw: Any) -> "SubtitleStyle":
+        """Validate ``params['subtitle_style']``, defaulting when it is absent.
+
+        Every rejection names the offending field and the value that was
+        actually given, per #241's "invalid/missing subtitle style data fails
+        with an actionable error" acceptance criterion.
+        """
+
+        if raw is None:
+            return cls()
+        if not isinstance(raw, dict):
+            raise ValueError(
+                "params['subtitle_style'] must be a mapping of style fields; "
+                f"got {type(raw).__name__}."
+            )
+
+        known = {field.name for field in fields(cls)}
+        unknown = sorted(set(raw) - known)
+        if unknown:
+            raise ValueError(
+                f"params['subtitle_style'] has unknown field(s) {unknown}; "
+                f"expected one of {sorted(known)}."
+            )
+
+        font_path = raw.get("font_path", cls.font_path)
+        if font_path is not None and not isinstance(font_path, str):
+            raise ValueError(
+                f"subtitle_style.font_path must be a string; got {font_path!r}."
+            )
+
+        align = raw.get("align", cls.align)
+        if not isinstance(align, str) or align not in _SUBTITLE_ALIGNMENTS:
+            raise ValueError(
+                "subtitle_style.align must be one of "
+                f"{sorted(_SUBTITLE_ALIGNMENTS)}; got {align!r}."
+            )
+
+        return cls(
+            font_path=font_path,
+            font_size_ratio=_style_positive_number(raw, "font_size_ratio", cls.font_size_ratio),
+            min_font_pixels=_style_positive_int(raw, "min_font_pixels", cls.min_font_pixels),
+            outline_px=_style_nonnegative_int(raw, "outline_px", cls.outline_px),
+            line_spacing=_style_positive_number(raw, "line_spacing", cls.line_spacing),
+            align=align,
+            fill=_style_color(raw, "fill", cls.fill),
+            outline_fill=_style_color(raw, "outline_fill", cls.outline_fill),
+        )
+
+
+@dataclass(frozen=True)
+class _SubtitleCue:
+    """One subtitle entry's pre-wrapped, kinsoku-corrected render instruction.
+
+    Lines are computed once per entry (pixel-wrapped to the resolved
+    safe-area box, then run through ``apply_kinsoku_rules`` from #240) rather
+    than re-wrapped on every one of a render's frames.
+    """
+
+    start: float
+    end: float
+    lines: tuple[str, ...]
+
+
 class AssemblyGenerator(BaseGenerator):
     """Render a timeline into a delivered mp4 with audio and subtitles."""
 
@@ -161,7 +252,7 @@ class AssemblyGenerator(BaseGenerator):
         ):
             raise ValueError("ffmpeg_timeout_seconds must be a positive number.")
         self.task_type = ASSEMBLY_TASK_TYPE
-        self._font_cache: dict[int, _Font] = {}
+        self._font_cache: dict[tuple[int, str | None], _Font] = {}
 
     def validate_request(self, request: GenerationRequest) -> None:
         if request.media_type != "video":
@@ -286,6 +377,16 @@ class AssemblyGenerator(BaseGenerator):
                 f"{_MAX_AUDIO_ENTRIES}; got {audio_entry_count}."
             )
 
+        # Validated for their own sake (actionable errors on bad style/preset
+        # data), and also so a resolution too small for the resolved subtitle
+        # safe-area box is caught here rather than mid-render.
+        subtitle_style = SubtitleStyle.from_params(request.params.get("subtitle_style"))
+        safe_area = self._resolve_safe_area(
+            request.params.get("safe_area_preset_id"), size
+        )
+        if subtitle_entries:
+            self._resolve_subtitle_box(safe_area, size, style=subtitle_style)
+
         # Keep the resolved value live so resolution validation above cannot be
         # accidentally removed as an "unused" call.
         _ = size
@@ -303,7 +404,26 @@ class AssemblyGenerator(BaseGenerator):
         fps = max(1, int(_as_float(timeline.get("fps"))))
 
         clips = self._build_clips(tracks.get("visual") or [], fps=fps)
-        subtitles = self._normalize_subtitles(tracks.get("subtitles") or [])
+
+        subtitle_style = SubtitleStyle.from_params(request.params.get("subtitle_style"))
+        safe_area = self._resolve_safe_area(
+            request.params.get("safe_area_preset_id"), size
+        )
+        subtitle_entries = self._normalize_subtitles(tracks.get("subtitles") or [])
+        # Mirror validate_request()'s `if subtitle_entries:` guard: resolving
+        # the safe-area subtitle box can itself raise (outline too wide for a
+        # tiny resolution, see _resolve_subtitle_box), so a timeline with no
+        # subtitles at all must not pay that cost or risk that failure --
+        # SubtitleStyle's own contract is that an unused configuration
+        # renders identically to before it existed.
+        subtitle_cues: list[_SubtitleCue] = []
+        subtitle_box: PixelRegion | None = None
+        if subtitle_entries:
+            subtitle_box = self._resolve_subtitle_box(safe_area, size, style=subtitle_style)
+            subtitle_cues = self._build_subtitle_cues(
+                subtitle_entries, size=size, box=subtitle_box, style=subtitle_style
+            )
+
         frame_total = sum(clip.frame_count for clip in clips)
         duration_rendered = frame_total / fps
 
@@ -320,7 +440,9 @@ class AssemblyGenerator(BaseGenerator):
                 self._render_video(
                     silent_video,
                     clips=clips,
-                    subtitles=subtitles,
+                    subtitle_cues=subtitle_cues,
+                    subtitle_box=subtitle_box,
+                    subtitle_style=subtitle_style,
                     size=size,
                     fps=fps,
                     preview_path=preview_path,
@@ -370,7 +492,8 @@ class AssemblyGenerator(BaseGenerator):
                 "audio_ducked": bool(mix and mix.ducked),
                 "audio_sample_rate": self.sample_rate if audio_path is not None else None,
                 "unresolved_audio_assets": list(mix.unresolved) if mix else [],
-                "subtitle_count": len(subtitles),
+                "subtitle_count": len(subtitle_entries),
+                "safe_area_preset_id": safe_area.preset_id,
                 "transitions": [clip.transition for clip in clips],
                 "motions": [clip.motion for clip in clips],
                 **_extract_lineage_metadata(request.params),
@@ -497,6 +620,103 @@ class AssemblyGenerator(BaseGenerator):
             normalized.append((start, end, text))
         return sorted(normalized)
 
+    def _resolve_safe_area(self, preset_id: Any, size: tuple[int, int]) -> SafeAreaPreset:
+        """Resolve the requested safe-area preset, or pick one by aspect ratio.
+
+        ``preset_id`` comes from ``params['safe_area_preset_id']``; leaving it
+        unset auto-selects the preset matching the timeline's own resolution
+        (see ``generators.video.safe_area.resolve_preset_for_resolution``), so
+        existing timelines that never opted into safe-area configuration keep
+        working without a required new field.
+        """
+
+        if preset_id is None:
+            return resolve_preset_for_resolution(*size)
+        if not isinstance(preset_id, str) or not preset_id.strip():
+            raise ValueError(
+                "params['safe_area_preset_id'] must be a non-empty string "
+                f"when provided; got {preset_id!r}."
+            )
+        return get_safe_area_preset(preset_id)
+
+    def _resolve_subtitle_box(
+        self,
+        safe_area: SafeAreaPreset,
+        size: tuple[int, int],
+        *,
+        style: SubtitleStyle,
+    ) -> PixelRegion:
+        """Resolve the preset's subtitle-safe region, inset by the outline width.
+
+        Insetting by ``outline_px`` before it is used to wrap or place text is
+        what keeps the burned-in *outline* stroke -- not just the glyph fill --
+        inside the selected safe area: an outline extends ``outline_px`` past
+        whatever box was used to wrap and align the line.
+        """
+
+        width, height = size
+        resolved = safe_area.resolve(width, height)
+        box = _inset_pixel_region(resolved.subtitle, style.outline_px)
+        if box.width <= 0 or box.height <= 0:
+            raise ValueError(
+                f"Safe-area preset {safe_area.preset_id!r} resolves to a "
+                f"subtitle region too small to render text with "
+                f"outline_px={style.outline_px} at {width}x{height}px "
+                f"(region {resolved.subtitle.width}x{resolved.subtitle.height}"
+                "px); choose a smaller outline_px, a larger resolution, or a "
+                "different safe-area preset."
+            )
+        return box
+
+    def _build_subtitle_cues(
+        self,
+        entries: list[tuple[float, float, str]],
+        *,
+        size: tuple[int, int],
+        box: PixelRegion,
+        style: SubtitleStyle,
+    ) -> list[_SubtitleCue]:
+        """Convert normalized subtitle entries into timed render instructions.
+
+        Each entry's text is split on any explicit line break the author
+        wrote, pixel-wrapped to the resolved safe-area box width, and the
+        combined line list is then run through ``apply_kinsoku_rules`` (#240)
+        so no line opens or closes on prohibited Japanese punctuation. This
+        runs once per subtitle entry rather than once per frame.
+        """
+
+        font = self._font(size[1], style)
+        # A throwaway 1x1 surface: ``ImageDraw.textlength`` only needs a font
+        # to measure, not real pixels, and cues are built once, ahead of and
+        # independent of any actual frame.
+        draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+
+        def measure(text: str) -> float:
+            return float(draw.textlength(text, font=font))
+
+        line_height = _line_height(draw, font, style.line_spacing)
+        max_lines = _max_lines_for_box(box, line_height)
+
+        cues: list[_SubtitleCue] = []
+        for start, end, text in entries:
+            segments = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+            wrapped: list[str] = []
+            for segment in segments:
+                cleaned = segment.strip()
+                if not cleaned:
+                    continue
+                wrapped.extend(_wrap_text(cleaned, max_width=box.width, measure=measure))
+            lines = apply_kinsoku_rules(wrapped)
+            # A caption longer than the safe-area box can hold is truncated
+            # rather than allowed to spill past the box: containment is the
+            # #241 acceptance criterion, and there is no preview-overlay UI
+            # (an explicit non-goal) to shrink the font or scroll instead.
+            if len(lines) > max_lines:
+                lines = lines[:max_lines]
+            if lines:
+                cues.append(_SubtitleCue(start=start, end=end, lines=tuple(lines)))
+        return cues
+
     # ------------------------------------------------------------------- video
 
     def _render_video(
@@ -504,7 +724,9 @@ class AssemblyGenerator(BaseGenerator):
         target: Path,
         *,
         clips: list[_Clip],
-        subtitles: list[tuple[float, float, str]],
+        subtitle_cues: list[_SubtitleCue],
+        subtitle_box: PixelRegion | None,
+        subtitle_style: SubtitleStyle,
         size: tuple[int, int],
         fps: int,
         preview_path: Path,
@@ -529,7 +751,12 @@ class AssemblyGenerator(BaseGenerator):
             frames = self._iter_frames(clips, size=size, fps=fps, sources=sources)
             for index, frame in enumerate(frames):
                 finished = self._burn_subtitles(
-                    frame, subtitles, seconds=index / fps, size=size
+                    frame,
+                    subtitle_cues,
+                    seconds=index / fps,
+                    box=subtitle_box,
+                    style=subtitle_style,
+                    frame_height=size[1],
                 )
                 if index == 0:
                     finished.save(preview_path)
@@ -626,60 +853,74 @@ class AssemblyGenerator(BaseGenerator):
     def _burn_subtitles(
         self,
         frame: Image.Image,
-        subtitles: list[tuple[float, float, str]],
+        cues: list[_SubtitleCue],
         *,
         seconds: float,
-        size: tuple[int, int],
+        box: PixelRegion | None,
+        style: SubtitleStyle,
+        frame_height: int,
     ) -> Image.Image:
-        active = [text for start, end, text in subtitles if start <= seconds < end]
+        active = [cue for cue in cues if cue.start <= seconds < cue.end]
         if not active:
             return frame
+        # `cues` is only ever non-empty when generate() resolved a real box
+        # (see its `if subtitle_entries:` guard), so reaching here with
+        # `box is None` would be a caller bug, not a normal empty-timeline
+        # path -- fail loudly rather than let a later `box.width` raise a
+        # confusing AttributeError.
+        if box is None:
+            raise ValueError("_burn_subtitles has active cues but no subtitle box was resolved.")
+        lines = [line for cue in active for line in cue.lines]
+        if not lines:
+            return frame
 
-        width, height = size
         draw = ImageDraw.Draw(frame)
-        font = self._font(height)
-        max_width = max(1, width - 2 * round(width * _SUBTITLE_SIDE_MARGIN_RATIO))
+        font = self._font(frame_height, style)
 
         def measure(text: str) -> float:
             return float(draw.textlength(text, font=font))
 
-        lines: list[str] = []
-        for text in active:
-            lines.extend(_wrap_text(text, max_width=max_width, measure=measure))
-        if not lines:
-            return frame
-
-        line_height = _line_height(draw, font)
-        baseline = height - round(height * _SUBTITLE_BOTTOM_MARGIN_RATIO)
-        # Clamp so an unexpectedly tall block stays on screen instead of
-        # being cropped off the top of the frame.
-        top = max(0, baseline - line_height * len(lines))
+        line_height = _line_height(draw, font, style.line_spacing)
+        # Each cue was already truncated to what fits its own box in
+        # ``_build_subtitle_cues``, but several cues can be simultaneously
+        # active (overlapping timing windows), so the *combined* line count
+        # is re-clamped here -- otherwise stacking two in-budget cues could
+        # still push the block past the box.
+        max_lines = _max_lines_for_box(box, line_height)
+        if len(lines) > max_lines:
+            lines = lines[:max_lines]
+        baseline = box.bottom
+        # Bottom-anchored: the last line always ends at the box's bottom
+        # edge. ``max(box.y, ...)`` only guards the degenerate case where a
+        # single line's own height exceeds the box -- otherwise the subtract
+        # above already keeps this at or above ``box.y``.
+        top = max(box.y, baseline - line_height * len(lines))
 
         for offset, line in enumerate(lines):
-            left = (width - measure(line)) / 2
+            left = _aligned_left(style.align, box, measure(line))
             y = top + offset * line_height
             # A contrasting outline keeps text legible over any underlying image.
             for shadow_x, shadow_y in _OUTLINE_OFFSETS:
                 draw.text(
-                    (left + shadow_x * _SUBTITLE_OUTLINE_PIXELS,
-                     y + shadow_y * _SUBTITLE_OUTLINE_PIXELS),
+                    (left + shadow_x * style.outline_px, y + shadow_y * style.outline_px),
                     line,
                     font=font,
-                    fill=_SUBTITLE_OUTLINE_FILL,
+                    fill=style.outline_fill,
                 )
-            draw.text((left, y), line, font=font, fill=_SUBTITLE_FILL)
+            draw.text((left, y), line, font=font, fill=style.fill)
         return frame
 
-    def _font(self, frame_height: int) -> _Font:
+    def _font(self, frame_height: int, style: SubtitleStyle) -> _Font:
         size = max(
-            _SUBTITLE_MIN_FONT_PIXELS, round(frame_height * _SUBTITLE_HEIGHT_RATIO)
+            style.min_font_pixels, round(frame_height * style.font_size_ratio)
         )
-        cached = self._font_cache.get(size)
+        cache_key = (size, style.font_path)
+        cached = self._font_cache.get(cache_key)
         if cached is not None:
             return cached
 
-        font = _load_font(size)
-        self._font_cache[size] = font
+        font = _load_font(size, style.font_path)
+        self._font_cache[cache_key] = font
         return font
 
     # ------------------------------------------------------------------- audio
@@ -1101,8 +1342,15 @@ def _normalize_motion(raw_motion: Any) -> str:
     return motion if motion in _SUPPORTED_MOTIONS else "none"
 
 
-def _load_font(size: int) -> _Font:
-    for name in _FONT_CANDIDATES:
+def _load_font(size: int, font_path: str | None = None) -> _Font:
+    # An explicit style override is tried first, then the built-in candidate
+    # list; either way a missing/unloadable font degrades to the next
+    # candidate rather than failing the render (host font availability is not
+    # something a subtitle style should be able to break outright).
+    candidates: tuple[str, ...] = (
+        (font_path, *_FONT_CANDIDATES) if font_path else _FONT_CANDIDATES
+    )
+    for name in candidates:
         try:
             return ImageFont.truetype(name, size)
         except OSError:
@@ -1114,11 +1362,147 @@ def _load_font(size: int) -> _Font:
         return ImageFont.load_default()
 
 
-def _line_height(draw: ImageDraw.ImageDraw, font: _Font) -> int:
+def _line_height(
+    draw: ImageDraw.ImageDraw, font: _Font, spacing: float = _SUBTITLE_LINE_SPACING
+) -> int:
     # "Ag" covers both an ascender and a descender, which bitmap fonts do not
     # report through getmetrics().
     box = draw.textbbox((0, 0), "Ag", font=font)
-    return max(1, int((box[3] - box[1]) * 1.45))
+    return max(1, int((box[3] - box[1]) * spacing))
+
+
+def _max_lines_for_box(box: PixelRegion, line_height: int) -> int:
+    """How many lines of ``line_height`` fit inside ``box`` without overflow.
+
+    Always at least 1: a box shorter than one line still gets its single
+    line drawn (best-effort, per the top clamp in ``_burn_subtitles``) rather
+    than silently dropping every subtitle for that resolution/style pairing.
+    """
+
+    return max(1, box.height // max(1, line_height))
+
+
+def _aligned_left(align: str, box: PixelRegion, text_width: float) -> float:
+    """Compute a line's left x-coordinate for the given alignment, clamped.
+
+    The clamp favours keeping the box's left edge over its right: a line that
+    is still too wide after wrapping (e.g. one character pulled past budget by
+    a kinsoku fix-up) stays anchored inside the safe area rather than
+    overflowing both edges.
+    """
+
+    if align == "left":
+        left = float(box.x)
+    elif align == "right":
+        left = box.right - text_width
+    else:
+        left = box.x + (box.width - text_width) / 2
+    left = min(left, box.right - text_width)
+    return max(left, float(box.x))
+
+
+def _inset_pixel_region(region: PixelRegion, inset: int) -> PixelRegion:
+    """Shrink a resolved safe-area region on every side by ``inset`` pixels.
+
+    Deliberately not clamped to half the region's own size: an ``inset`` that
+    consumes the whole region collapses ``width``/``height`` to 0 rather than
+    a degenerate-but-truthy sliver, so the caller's zero-size check in
+    ``_resolve_subtitle_box`` reliably catches an outline too wide for the
+    selected safe area instead of silently rendering into a 1px box.
+    """
+
+    inset = max(0, int(inset))
+    return PixelRegion(
+        x=region.x + inset,
+        y=region.y + inset,
+        width=max(0, region.width - 2 * inset),
+        height=max(0, region.height - 2 * inset),
+    )
+
+
+def _style_positive_number(raw: dict[str, Any], field: str, default: float) -> float:
+    if field not in raw:
+        return default
+    value = raw[field]
+    if isinstance(value, bool):
+        raise ValueError(
+            f"subtitle_style.{field} must be a positive number; got {value!r}."
+        )
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"subtitle_style.{field} must be a positive number; got {value!r}."
+        ) from None
+    if not math.isfinite(number) or number <= 0:
+        raise ValueError(
+            f"subtitle_style.{field} must be a positive number; got {value!r}."
+        )
+    return number
+
+
+def _style_int(value: Any) -> int | None:
+    """Coerce a style field to ``int``, accepting whole-number floats.
+
+    JSON has no int/float distinction, so a client-serialized style payload
+    may send ``2.0`` for a pixel count; ``bool`` is rejected even though it is
+    technically an ``int`` subtype, since ``True``/``False`` are never a
+    meaningful pixel count or channel value.
+    """
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        return int(value)
+    return None
+
+
+def _style_positive_int(raw: dict[str, Any], field: str, default: int) -> int:
+    if field not in raw:
+        return default
+    coerced = _style_int(raw[field])
+    if coerced is None or coerced <= 0:
+        raise ValueError(
+            f"subtitle_style.{field} must be a positive integer; got {raw[field]!r}."
+        )
+    return coerced
+
+
+def _style_nonnegative_int(raw: dict[str, Any], field: str, default: int) -> int:
+    if field not in raw:
+        return default
+    coerced = _style_int(raw[field])
+    if coerced is None or coerced < 0:
+        raise ValueError(
+            f"subtitle_style.{field} must be a non-negative integer; got "
+            f"{raw[field]!r}."
+        )
+    return coerced
+
+
+def _style_color(
+    raw: dict[str, Any], field: str, default: tuple[int, int, int]
+) -> tuple[int, int, int]:
+    if field not in raw:
+        return default
+    value = raw[field]
+    if isinstance(value, str) or not isinstance(value, (list, tuple)) or len(value) != 3:
+        raise ValueError(
+            f"subtitle_style.{field} must be an [r, g, b] triple with each "
+            f"channel 0-255; got {value!r}."
+        )
+    channels: list[int] = []
+    for channel in value:
+        coerced = _style_int(channel)
+        if coerced is None or not 0 <= coerced <= 255:
+            raise ValueError(
+                f"subtitle_style.{field} must be an [r, g, b] triple with "
+                f"each channel 0-255; got {value!r}."
+            )
+        channels.append(coerced)
+    return (channels[0], channels[1], channels[2])
 
 
 def _wrap_text(
@@ -1279,4 +1663,9 @@ def _extract_lineage_metadata(params: dict[str, Any]) -> dict[str, Any]:
     return lineage_payload
 
 
-__all__ = ["ASSEMBLY_OUTPUT_FORMATS", "ASSEMBLY_TASK_TYPE", "AssemblyGenerator"]
+__all__ = [
+    "ASSEMBLY_OUTPUT_FORMATS",
+    "ASSEMBLY_TASK_TYPE",
+    "AssemblyGenerator",
+    "SubtitleStyle",
+]

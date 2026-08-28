@@ -186,6 +186,13 @@ def _request(timeline: dict, **overrides) -> GenerationRequest:
     return GenerationRequest(**payload)
 
 
+def _request_with_params(timeline: dict, **extra_params) -> GenerationRequest:
+    """Build a request whose params carry the timeline plus top-level keys like
+    ``subtitle_style`` / ``safe_area_preset_id``."""
+
+    return _request(timeline, params={"timeline": timeline, **extra_params})
+
+
 def _probe(path: Path) -> str:
     """Return the ffmpeg stream report for a file (ffmpeg exits 1 by design)."""
 
@@ -934,6 +941,274 @@ class AssemblyGeneratorTests(unittest.TestCase):
         self.assertIs(loaded, sentinel)
         self.assertEqual(truetype.call_args_list[0].args[0], "NotoSansCJK-Regular.ttc")
 
+    def test_subtitle_pixels_stay_within_the_selected_safe_area_bounds(self) -> None:
+        # #241 acceptance criterion: "Subtitle boxes remain inside the
+        # selected safe-area bounds". Render a portrait timeline with a long
+        # Japanese subtitle that genuinely wraps across several lines (a
+        # smaller font than the module default leaves enough of the
+        # vertical_9x16 subtitle-safe band's height to hold them), then check
+        # every burned-in (non-background) pixel of the preview falls inside
+        # the preset's resolved subtitle-safe pixel box.
+        with TemporaryDirectory() as root:
+            workspace = Path(root)
+            still = workspace / "scene.png"
+            background = (18, 18, 18)
+            _write_solid(still, background, size=(720, 1280))
+
+            timeline = _timeline(
+                [_visual("sc_0", still, duration=1.0)],
+                resolution=(720, 1280),
+                subtitles=[
+                    {
+                        "text": (
+                            "安全域の中に収まるよう、長い字幕は複数行へ折り返され、"
+                            "はみ出さずに描画されなければなりません。"
+                        ),
+                        "start_seconds": 0.0,
+                        "end_seconds": 1.0,
+                    }
+                ],
+            )
+            result = AssemblyGenerator(workspace / "outputs").run(
+                _request_with_params(
+                    timeline,
+                    safe_area_preset_id="vertical_9x16",
+                    subtitle_style={
+                        "font_size_ratio": 0.025,
+                        "line_spacing": 1.2,
+                        "outline_px": 1,
+                    },
+                )
+            )
+            self.assertEqual(result.metadata["safe_area_preset_id"], "vertical_9x16")
+
+            with Image.open(result.previews[0]) as preview:
+                pixels = np.asarray(preview.convert("RGB"))
+
+            preset = assembly_module.get_safe_area_preset("vertical_9x16")
+            region = preset.resolve(720, 1280).subtitle
+            changed = np.any(pixels != np.array(background), axis=-1)
+            rows, cols = np.nonzero(changed)
+            self.assertGreater(rows.size, 0, "subtitle text did not render at all")
+            # A genuinely multi-line block, not a single truncated line, is
+            # what makes this a meaningful containment check.
+            self.assertGreater(rows.max() - rows.min(), 20)
+            self.assertGreaterEqual(rows.min(), region.y)
+            self.assertLess(rows.max(), region.bottom)
+            self.assertGreaterEqual(cols.min(), region.x)
+            self.assertLess(cols.max(), region.right)
+
+    def test_subtitle_free_render_survives_a_resolution_too_small_for_any_subtitle_box(
+        self,
+    ) -> None:
+        # #241 regression: validate_request() only resolves a subtitle box
+        # when `subtitle_entries` is non-empty, so generate() must mirror
+        # that guard rather than unconditionally calling
+        # _resolve_subtitle_box(). At 20x20 the auto-selected safe-area
+        # preset's subtitle band is too thin to survive the default
+        # outline inset -- before the fix this raised mid-generate() even
+        # though the timeline never used subtitles and validate_request()
+        # had already passed it as valid.
+        with TemporaryDirectory() as root:
+            workspace = Path(root)
+            still = workspace / "scene.png"
+            _write_solid(still, (10, 20, 30), size=(20, 20))
+
+            timeline = _timeline(
+                [_visual("sc_0", still, duration=1.0)],
+                resolution=(20, 20),
+            )
+            request = _request(timeline)
+            AssemblyGenerator(workspace / "outputs").validate_request(request)
+            result = AssemblyGenerator(workspace / "outputs").run(request)
+            self.assertEqual(result.metadata["subtitle_count"], 0)
+
+    def test_subtitle_alignment_shifts_the_burned_in_text_horizontally(self) -> None:
+        with TemporaryDirectory() as root:
+            workspace = Path(root)
+            still = workspace / "scene.png"
+            background = (40, 40, 40)
+            _write_solid(still, background)
+            timeline = _timeline(
+                [_visual("sc_0", still, duration=1.0)],
+                subtitles=[
+                    {"text": "hi", "start_seconds": 0.0, "end_seconds": 1.0}
+                ],
+            )
+
+            def leftmost_column(align: str) -> int:
+                result = AssemblyGenerator(workspace / f"out_{align}").run(
+                    _request_with_params(
+                        timeline, subtitle_style={"align": align}
+                    )
+                )
+                with Image.open(result.previews[0]) as preview:
+                    pixels = np.asarray(preview.convert("RGB"))
+                changed = np.any(pixels != np.array(background), axis=-1)
+                _, cols = np.nonzero(changed)
+                self.assertGreater(cols.size, 0)
+                return int(cols.min())
+
+            left_edge = leftmost_column("left")
+            center_edge = leftmost_column("center")
+            right_edge = leftmost_column("right")
+
+            self.assertLess(left_edge, center_edge)
+            self.assertLess(center_edge, right_edge)
+
+    def test_subtitle_rendering_is_deterministic_for_the_same_style(self) -> None:
+        with TemporaryDirectory() as root:
+            workspace = Path(root)
+            still = workspace / "scene.png"
+            _write_solid(still, (32, 32, 32))
+            timeline = _timeline(
+                [_visual("sc_0", still, duration=1.0)],
+                subtitles=[
+                    {
+                        "text": "same style, same pixels",
+                        "start_seconds": 0.0,
+                        "end_seconds": 1.0,
+                    }
+                ],
+            )
+            style = {
+                "font_size_ratio": 0.08,
+                "outline_px": 3,
+                "line_spacing": 1.3,
+                "align": "left",
+            }
+
+            first = AssemblyGenerator(workspace / "first").run(
+                _request_with_params(timeline, subtitle_style=style)
+            )
+            second = AssemblyGenerator(workspace / "second").run(
+                _request_with_params(timeline, subtitle_style=dict(style))
+            )
+
+            with Image.open(first.previews[0]) as image:
+                first_pixels = np.asarray(image.convert("RGB"))
+            with Image.open(second.previews[0]) as image:
+                second_pixels = np.asarray(image.convert("RGB"))
+            np.testing.assert_array_equal(first_pixels, second_pixels)
+
+
+class AssemblySubtitleLayoutTests(unittest.TestCase):
+    """Render-command/layout tests: exercise cue-building and placement logic
+    directly against representative subtitle fixtures, independent of ffmpeg.
+    """
+
+    def setUp(self) -> None:
+        self.generator = AssemblyGenerator("outputs/videos")
+        self.style = assembly_module.SubtitleStyle()
+
+    def test_multiline_subtitle_preserves_authored_line_order(self) -> None:
+        # A generous, hand-built box (rather than a resolved preset) isolates
+        # line-order preservation from the separate box-height truncation
+        # behaviour covered by ``test_..._is_clamped_to_the_box_height``.
+        box = assembly_module.PixelRegion(x=0, y=0, width=400, height=500)
+        cues = self.generator._build_subtitle_cues(
+            [(0.0, 1.0, "first line\nsecond line\nthird line")],
+            size=(1920, 1080),
+            box=box,
+            style=self.style,
+        )
+        self.assertEqual(len(cues), 1)
+        self.assertEqual(
+            cues[0].lines, ("first line", "second line", "third line")
+        )
+
+    def test_subtitle_lines_are_truncated_to_fit_the_box_height(self) -> None:
+        # #241 acceptance criterion: subtitle boxes remain inside the
+        # selected safe-area bounds, even when wrapped content would need
+        # more vertical space than the box has.
+        safe_area = assembly_module.get_safe_area_preset("vertical_9x16")
+        box = self.generator._resolve_subtitle_box(
+            safe_area, (144, 256), style=self.style
+        )
+        long_text = (
+            "安全域の中に収まるよう、長い字幕は複数行へ折り返され、"
+            "はみ出さずに描画されなければなりません。"
+        )
+        cues = self.generator._build_subtitle_cues(
+            [(0.0, 1.0, long_text)],
+            size=(144, 256),
+            box=box,
+            style=self.style,
+        )
+        self.assertEqual(len(cues), 1)
+        draw = assembly_module.ImageDraw.Draw(assembly_module.Image.new("RGB", (1, 1)))
+        font = self.generator._font(256, self.style)
+        line_height = assembly_module._line_height(draw, font, self.style.line_spacing)
+        max_lines = assembly_module._max_lines_for_box(box, line_height)
+        self.assertLessEqual(len(cues[0].lines), max_lines)
+        self.assertLessEqual(len(cues[0].lines) * line_height, box.height)
+
+    def test_japanese_kinsoku_line_start_prohibition_holds_after_wrapping(self) -> None:
+        from generators.video.subtitle_line_breaking import LINE_START_PROHIBITED
+
+        # A narrow box forces a hard cut right where the closing bracket
+        # would otherwise become a line's first character.
+        box = assembly_module.PixelRegion(x=0, y=0, width=40, height=200)
+        text = "本文はここまで」続きは次のシーンで日本語の字幕として描画されます。"
+        cues = self.generator._build_subtitle_cues(
+            [(0.0, 1.0, text)],
+            size=(1920, 1080),
+            box=box,
+            style=self.style,
+        )
+        self.assertEqual(len(cues), 1)
+        for line in cues[0].lines:
+            self.assertTrue(line)
+            self.assertNotIn(line[0], LINE_START_PROHIBITED)
+
+    def test_resolve_subtitle_box_rejects_outline_too_large_for_the_region(self) -> None:
+        safe_area = assembly_module.get_safe_area_preset("square_1x1")
+        oversized_style = assembly_module.SubtitleStyle(outline_px=50)
+        with self.assertRaisesRegex(ValueError, "too small to render text"):
+            self.generator._resolve_subtitle_box(
+                safe_area, (10, 10), style=oversized_style
+            )
+
+    def test_subtitle_style_from_params_returns_defaults_when_absent(self) -> None:
+        style = assembly_module.SubtitleStyle.from_params(None)
+        self.assertEqual(style, assembly_module.SubtitleStyle())
+
+    def test_subtitle_style_from_params_rejects_non_mapping(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must be a mapping"):
+            assembly_module.SubtitleStyle.from_params("center")
+
+    def test_subtitle_style_from_params_rejects_unknown_field(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unknown field"):
+            assembly_module.SubtitleStyle.from_params({"weight": "bold"})
+
+    def test_subtitle_style_from_params_rejects_invalid_align(self) -> None:
+        with self.assertRaisesRegex(ValueError, "align must be one of"):
+            assembly_module.SubtitleStyle.from_params({"align": "justify"})
+
+    def test_subtitle_style_from_params_rejects_non_positive_font_ratio(self) -> None:
+        with self.assertRaisesRegex(ValueError, "font_size_ratio"):
+            assembly_module.SubtitleStyle.from_params({"font_size_ratio": 0})
+
+    def test_subtitle_style_from_params_rejects_negative_outline(self) -> None:
+        with self.assertRaisesRegex(ValueError, "outline_px"):
+            assembly_module.SubtitleStyle.from_params({"outline_px": -1})
+
+    def test_subtitle_style_from_params_rejects_incomplete_color_triple(self) -> None:
+        with self.assertRaisesRegex(ValueError, r"\[r, g, b\] triple"):
+            assembly_module.SubtitleStyle.from_params({"fill": [255, 255]})
+
+    def test_subtitle_style_from_params_rejects_out_of_range_color_channel(self) -> None:
+        with self.assertRaisesRegex(ValueError, r"\[r, g, b\] triple"):
+            assembly_module.SubtitleStyle.from_params({"fill": [255, 255, 999]})
+
+    def test_subtitle_style_from_params_accepts_whole_number_floats(self) -> None:
+        style = assembly_module.SubtitleStyle.from_params(
+            {"outline_px": 3.0, "min_font_pixels": 12.0, "fill": [1.0, 2.0, 3.0]}
+        )
+        self.assertEqual(style.outline_px, 3)
+        self.assertEqual(style.min_font_pixels, 12)
+        self.assertEqual(style.fill, (1, 2, 3))
+
 
 class AssemblyValidationTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -1068,6 +1343,37 @@ class AssemblyValidationTests(unittest.TestCase):
 
     def test_accepts_a_well_formed_timeline(self) -> None:
         self.assertIsNone(self.generator.validate_request(_request(self.timeline)))
+
+    def test_rejects_invalid_subtitle_style_data(self) -> None:
+        request = _request_with_params(
+            self.timeline, subtitle_style={"align": "diagonal"}
+        )
+        with self.assertRaisesRegex(ValueError, "subtitle_style.align"):
+            self.generator.validate_request(request)
+
+    def test_rejects_non_mapping_subtitle_style_data(self) -> None:
+        request = _request_with_params(self.timeline, subtitle_style="bold")
+        with self.assertRaisesRegex(ValueError, "must be a mapping"):
+            self.generator.validate_request(request)
+
+    def test_rejects_unknown_safe_area_preset_id(self) -> None:
+        request = _request_with_params(
+            self.timeline, safe_area_preset_id="ultra_widescreen"
+        )
+        with self.assertRaisesRegex(ValueError, "Unknown safe-area preset id"):
+            self.generator.validate_request(request)
+
+    def test_accepts_a_known_safe_area_preset_id_with_subtitles(self) -> None:
+        timeline = _timeline(
+            [_visual("sc_0", Path("scene.png"), duration=1.0)],
+            subtitles=[
+                {"text": "hello", "start_seconds": 0.0, "end_seconds": 1.0}
+            ],
+        )
+        request = _request_with_params(
+            timeline, safe_area_preset_id="vertical_9x16"
+        )
+        self.assertIsNone(self.generator.validate_request(request))
 
 
 if __name__ == "__main__":
