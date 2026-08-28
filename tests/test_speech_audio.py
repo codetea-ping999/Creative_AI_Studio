@@ -31,7 +31,7 @@ from core.audio import (
     process_music_channels,
     trim_silence,
 )
-from core.models import ModelRegistry, create_default_loader_registry
+from core.models import ModelRegistry, ModelService, create_default_loader_registry
 from core.models.audio_runtimes import (
     build_cloud_http_speech_runtime,
     build_kokoro_runtime,
@@ -1154,8 +1154,8 @@ def _write_cloud_manifest(directory: Path, **overrides) -> Path:
     return path
 
 
-def _cloud_model_service(manifest_root: Path) -> "ModelService":
-    from core.models import ModelRuntimeCache, ModelService
+def _cloud_model_service(manifest_root: Path) -> ModelService:
+    from core.models import ModelRuntimeCache
     from core.models.resolver import ModelResolver
 
     registry = ModelRegistry(manifest_root=manifest_root)
