@@ -1,0 +1,22 @@
+{
+  "id": "cloud-tts-example",
+  "public_id": "cloud-tts-example",
+  "display_name": "Cloud TTS (example seam, disabled by default)",
+  "media_type": "audio",
+  "task_type": "text-to-speech",
+  "provider": "cloud",
+  "runtime": "cloud_http_tts",
+  "remote_ref": "https://example-cloud-tts.invalid/v1/speech",
+  "loader": "cloud_http_speech_loader",
+  "default_params": {
+    "voice": "narrator",
+    "timeout_seconds": 60,
+    "api_key_env": "CLOUD_TTS_EXAMPLE_API_KEY",
+    "max_chunk_characters": 240,
+    "chunk_gap_seconds": 0.25
+  },
+  "aliases": [],
+  "tags": ["audio", "speech", "tts", "cloud", "optional"],
+  "is_default": false,
+  "enabled": false
+}

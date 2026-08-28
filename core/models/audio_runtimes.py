@@ -527,6 +527,130 @@ def _voicevox_default_label(speaker_id: int, labels: list[str]) -> str:
 
 
 # --------------------------------------------------------------------------
+# Cloud provider seam (see core/models/cloud_guard.py)
+# --------------------------------------------------------------------------
+
+
+def resolve_cloud_endpoint(base_url: str) -> str:
+    """Validate a cloud speech endpoint URL and return it, origin-only in shape.
+
+    Cloud providers are never loopback, so this is a narrower check than
+    ``resolve_audio_endpoint``: TLS is required and no userinfo, query, or
+    fragment may ride along in the URL, since those are exactly the kind of
+    routing or tenant detail that must not end up in job metadata.
+    """
+
+    normalized = base_url.strip().rstrip("/")
+    if not normalized:
+        raise ValueError("Cloud endpoint base URL must not be empty.")
+
+    parsed = urlparse(normalized)
+    if parsed.scheme != "https":
+        raise ValueError(f"Cloud endpoint must use https: {base_url!r}")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError(
+            "Cloud endpoint must not include userinfo; the API key travels in a "
+            "header, resolved from an environment variable."
+        )
+    if "?" in normalized:
+        raise ValueError("Cloud endpoint must not include a query string.")
+    if "#" in normalized:
+        raise ValueError("Cloud endpoint must not include a fragment.")
+    if not parsed.hostname:
+        raise ValueError(f"Cloud endpoint must include a host: {base_url!r}")
+
+    return normalized
+
+
+def cloud_endpoint_origin(base_url: str) -> str:
+    """Return a credential- and path-free origin suitable for job metadata."""
+
+    parsed = urlparse(resolve_cloud_endpoint(base_url))
+    return f"{parsed.scheme}://{parsed.hostname}"
+
+
+def build_cloud_http_speech_runtime(
+    base_url: str,
+    *,
+    api_key_env: str,
+    default_voice: str | None = None,
+    voices: list[str] | None = None,
+    timeout_seconds: float = 60.0,
+) -> dict[str, Any]:
+    """Build the runtime fragment for one example cloud TTS HTTP provider.
+
+    This is the seam the issue asked for, not a vendor integration: a generic
+    JSON-in/wav-out contract (``POST {text, voice, speed, pitch}`` -> wav
+    bytes) that a real provider adapter can replace once one is picked. The
+    API key is resolved from ``api_key_env`` only -- never from the manifest
+    -- and no request is built until ``synthesize`` is actually called, so
+    loading this runtime never sends anything by itself.
+    """
+
+    try:
+        import httpx
+    except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
+        raise RuntimeError(
+            "Cloud speech generation requires httpx. Install it with: pip install httpx"
+        ) from exc
+
+    resolved_base_url = resolve_cloud_endpoint(base_url)
+    timeout = float(timeout_seconds)
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError(
+            f"Cloud speech timeout_seconds must be a positive finite number, got "
+            f"{timeout_seconds!r}."
+        )
+
+    api_key_env_name = str(api_key_env).strip()
+    if not api_key_env_name:
+        raise ValueError("Cloud speech provider manifest must set api_key_env.")
+    api_key = os.getenv(api_key_env_name, "").strip()
+    if not api_key:
+        raise ValueError(
+            f"Cloud speech provider requires the {api_key_env_name} environment "
+            "variable to hold the API key. It is never read from the manifest."
+        )
+
+    def synthesize(
+        text: str,
+        *,
+        voice: str | None = None,
+        speed: float = 1.0,
+        pitch: float = 0.0,
+    ) -> tuple[np.ndarray, int]:
+        cleaned = text.strip()
+        if not cleaned:
+            raise ValueError("Cloud speech synthesize() was called with empty text.")
+        resolved_speed, resolved_pitch = _validate_synthesis_controls(speed, pitch)
+
+        response = httpx.post(
+            resolved_base_url,
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "text": cleaned,
+                "voice": voice or default_voice,
+                "speed": resolved_speed,
+                "pitch": resolved_pitch,
+            },
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        return decode_wav_bytes(response.content)
+
+    return {
+        "synthesize": synthesize,
+        "voices": list(voices) if voices else [],
+        "default_voice": default_voice,
+        # Only the origin is safe to persist; job metadata must never carry the
+        # bearer token or a path that could encode a tenant or routing secret.
+        "endpoint_base_url": cloud_endpoint_origin(resolved_base_url),
+        "runtime_status": "ready",
+        "supports_pitch": True,
+    }
+
+
+# --------------------------------------------------------------------------
 # Shared conversion helpers
 # --------------------------------------------------------------------------
 
@@ -601,10 +725,13 @@ def to_mono_float32(audio: Any) -> np.ndarray:
 __all__ = [
     "SynthesizeCallable",
     "audio_endpoint_origin",
+    "build_cloud_http_speech_runtime",
     "build_kokoro_runtime",
     "build_voicevox_runtime",
+    "cloud_endpoint_origin",
     "decode_wav_bytes",
     "resolve_audio_endpoint",
+    "resolve_cloud_endpoint",
     "resolve_kokoro_language_code",
     "to_mono_float32",
 ]

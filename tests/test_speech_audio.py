@@ -31,14 +31,22 @@ from core.audio import (
     process_music_channels,
     trim_silence,
 )
-from core.models import ModelRegistry, create_default_loader_registry
+from core.models import ModelRegistry, ModelService, create_default_loader_registry
 from core.models.audio_runtimes import (
+    build_cloud_http_speech_runtime,
     build_kokoro_runtime,
     build_voicevox_runtime,
+    cloud_endpoint_origin,
     decode_wav_bytes,
     resolve_audio_endpoint,
+    resolve_cloud_endpoint,
     resolve_kokoro_language_code,
     to_mono_float32,
+)
+from core.models.cloud_guard import (
+    CloudProviderDisabledError,
+    cloud_provider_env_flag,
+    ensure_cloud_provider_enabled,
 )
 from core.schemas import GenerationRequest
 from generators.audio import SpeechGenerator, split_into_chunks, split_into_sentences
@@ -1097,6 +1105,7 @@ def test_speech_manifests_and_loaders_are_registered():
 
     kokoro = registry.get("kokoro-tts-local")
     voicevox = registry.get("voicevox-endpoint")
+    cloud_example = registry.get("cloud-tts-example")
     assert kokoro.task_type == "text-to-speech"
     assert kokoro.default_params["language"] == "ja"
     assert kokoro.loader == "kokoro_tts_loader"
@@ -1105,10 +1114,179 @@ def test_speech_manifests_and_loaders_are_registered():
     assert voicevox.loader == "voicevox_http_loader"
     assert voicevox.enabled is True
     assert voicevox.is_default is True
+    assert cloud_example.provider == "cloud"
+    assert cloud_example.loader == "cloud_http_speech_loader"
+    # Off by three independent switches: the manifest itself, plus the two
+    # cloud_guard env vars checked at load time.
+    assert cloud_example.enabled is False
 
     loaders = create_default_loader_registry()
     assert loaders.get("kokoro_tts_loader").__class__.__name__ == "KokoroTtsLoader"
     assert loaders.get("voicevox_http_loader").__class__.__name__ == "VoicevoxHttpLoader"
+    assert (
+        loaders.get("cloud_http_speech_loader").__class__.__name__
+        == "CloudHttpSpeechLoader"
+    )
+
+
+# --------------------------------------------------------------------------
+# Cloud provider seam (core/models/cloud_guard.py, provider: "cloud")
+# --------------------------------------------------------------------------
+
+
+def _write_cloud_manifest(directory: Path, **overrides) -> Path:
+    payload = {
+        "id": "cloud-example",
+        "display_name": "Cloud Example",
+        "media_type": "audio",
+        "task_type": "text-to-speech",
+        "provider": "cloud",
+        "runtime": "cloud_http_tts",
+        "remote_ref": "https://example-cloud-tts.invalid/v1/speech",
+        "loader": "cloud_http_speech_loader",
+        "default_params": {"api_key_env": "CLOUD_EXAMPLE_API_KEY", "voice": "narrator"},
+        "is_default": True,
+        "enabled": True,
+        **overrides,
+    }
+    path = directory / "cloud-example.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def _cloud_model_service(manifest_root: Path) -> ModelService:
+    from core.models import ModelRuntimeCache
+    from core.models.resolver import ModelResolver
+
+    registry = ModelRegistry(manifest_root=manifest_root)
+    return ModelService(
+        registry,
+        ModelResolver(registry),
+        create_default_loader_registry(),
+        ModelRuntimeCache(),
+    )
+
+
+def test_cloud_provider_flag_name_is_derived_from_the_manifest_id():
+    assert cloud_provider_env_flag("cloud-example") == "ALLOW_CLOUD_PROVIDER_CLOUD_EXAMPLE"
+    assert cloud_provider_env_flag("weird.id/42") == "ALLOW_CLOUD_PROVIDER_WEIRD_ID_42"
+
+
+def test_ensure_cloud_provider_enabled_requires_both_switches(monkeypatch):
+    monkeypatch.delenv("ALLOW_CLOUD_PROVIDERS", raising=False)
+    monkeypatch.delenv("ALLOW_CLOUD_PROVIDER_CLOUD_EXAMPLE", raising=False)
+
+    with pytest.raises(CloudProviderDisabledError, match="ALLOW_CLOUD_PROVIDERS"):
+        ensure_cloud_provider_enabled("cloud-example")
+
+    monkeypatch.setenv("ALLOW_CLOUD_PROVIDERS", "true")
+    with pytest.raises(CloudProviderDisabledError, match="ALLOW_CLOUD_PROVIDER_CLOUD_EXAMPLE"):
+        ensure_cloud_provider_enabled("cloud-example")
+
+    monkeypatch.setenv("ALLOW_CLOUD_PROVIDER_CLOUD_EXAMPLE", "true")
+    ensure_cloud_provider_enabled("cloud-example")  # does not raise
+
+
+def test_service_blocks_a_cloud_manifest_by_default(tmp_path, monkeypatch):
+    _write_cloud_manifest(tmp_path)
+    service = _cloud_model_service(tmp_path)
+
+    monkeypatch.delenv("ALLOW_CLOUD_PROVIDERS", raising=False)
+    monkeypatch.delenv("ALLOW_CLOUD_PROVIDER_CLOUD_EXAMPLE", raising=False)
+
+    with pytest.raises(CloudProviderDisabledError):
+        service.resolve_runtime(None, media_type="audio", task_type="text-to-speech")
+
+
+def test_service_loads_a_cloud_manifest_once_both_switches_are_set(
+    tmp_path, monkeypatch
+):
+    import httpx
+
+    _write_cloud_manifest(tmp_path)
+    service = _cloud_model_service(tmp_path)
+
+    monkeypatch.setenv("ALLOW_CLOUD_PROVIDERS", "true")
+    monkeypatch.setenv("ALLOW_CLOUD_PROVIDER_CLOUD_EXAMPLE", "true")
+    monkeypatch.setenv("CLOUD_EXAMPLE_API_KEY", "test-secret-key")
+
+    engine_wav = _wav_bytes(_sine(0.2, sample_rate=_FAKE_TTS_RATE), _FAKE_TTS_RATE)
+    monkeypatch.setattr(
+        httpx, "post", lambda *a, **k: _FakeHttpResponse(content=engine_wav)
+    )
+
+    manifest, runtime = service.resolve_runtime(
+        None, media_type="audio", task_type="text-to-speech"
+    )
+
+    assert manifest.provider == "cloud"
+    assert runtime["endpoint_base_url"] == "https://example-cloud-tts.invalid"
+    samples, rate = runtime["synthesize"]("こんにちは。")
+    assert rate == _FAKE_TTS_RATE
+    assert samples.size > 0
+
+
+def test_resolve_cloud_endpoint_requires_https_and_rejects_secrets():
+    assert (
+        resolve_cloud_endpoint("https://api.example.invalid/v1/speech")
+        == "https://api.example.invalid/v1/speech"
+    )
+    with pytest.raises(ValueError, match="https"):
+        resolve_cloud_endpoint("http://api.example.invalid/v1/speech")
+    with pytest.raises(ValueError, match="userinfo"):
+        resolve_cloud_endpoint("https://user:pass@api.example.invalid/v1/speech")
+    with pytest.raises(ValueError, match="query string"):
+        resolve_cloud_endpoint("https://api.example.invalid/v1/speech?key=1")
+
+
+def test_cloud_endpoint_origin_drops_path_and_credentials():
+    origin = cloud_endpoint_origin("https://api.example.invalid/v1/tenant-a/speech")
+    assert origin == "https://api.example.invalid"
+    assert "tenant-a" not in origin
+
+
+def test_build_cloud_http_speech_runtime_requires_the_api_key_env_var(monkeypatch):
+    monkeypatch.delenv("CLOUD_EXAMPLE_API_KEY", raising=False)
+    with pytest.raises(ValueError, match="CLOUD_EXAMPLE_API_KEY"):
+        build_cloud_http_speech_runtime(
+            "https://api.example.invalid/v1/speech",
+            api_key_env="CLOUD_EXAMPLE_API_KEY",
+        )
+
+
+def test_build_cloud_http_speech_runtime_sends_bearer_token_and_never_the_key_itself(
+    monkeypatch,
+):
+    import httpx
+
+    monkeypatch.setenv("CLOUD_EXAMPLE_API_KEY", "test-secret-key")
+    engine_wav = _wav_bytes(_sine(0.2, sample_rate=_FAKE_TTS_RATE), _FAKE_TTS_RATE)
+    posted: list[dict] = []
+
+    def fake_post(url, **kwargs):
+        posted.append({"url": url, **kwargs})
+        return _FakeHttpResponse(content=engine_wav)
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    runtime = build_cloud_http_speech_runtime(
+        "https://api.example.invalid/v1/speech",
+        api_key_env="CLOUD_EXAMPLE_API_KEY",
+        default_voice="narrator",
+    )
+
+    assert posted == []  # building the runtime sends nothing by itself
+    assert runtime["endpoint_base_url"] == "https://api.example.invalid"
+
+    samples, rate = runtime["synthesize"]("こんにちは。")
+
+    assert rate == _FAKE_TTS_RATE
+    assert samples.size > 0
+    assert posted[0]["headers"]["Authorization"] == "Bearer test-secret-key"
+    assert posted[0]["json"]["voice"] == "narrator"
+    # The runtime payload and the request body never carry the key itself.
+    assert "test-secret-key" not in json.dumps(runtime, default=str)
+    assert "test-secret-key" not in json.dumps(posted[0]["json"])
 
 
 def test_non_loopback_audio_endpoint_is_refused_without_the_flag(monkeypatch):

@@ -894,6 +894,45 @@ class VoicevoxHttpLoader(BaseSpeechLoader):
         }
 
 
+class CloudHttpSpeechLoader(BaseSpeechLoader):
+    """Call one example opt-in cloud text-to-speech HTTP provider.
+
+    Only reached for a ``provider: "cloud"`` manifest once ``ModelService``
+    has already cleared ``ensure_cloud_provider_enabled`` (see
+    ``core/models/cloud_guard.py``); this class does not re-check the guard.
+    """
+
+    def load(self, manifest: ModelManifest) -> dict[str, Any]:
+        from .audio_runtimes import build_cloud_http_speech_runtime
+
+        if not manifest.remote_ref:
+            raise ValueError(
+                f"Manifest {manifest.id!r} needs remote_ref set to the cloud "
+                "provider's speech endpoint URL."
+            )
+
+        default_params = manifest.default_params
+        api_key_env = default_params.get("api_key_env")
+        if not api_key_env:
+            raise ValueError(
+                f"Manifest {manifest.id!r} needs default_params.api_key_env set "
+                "to the environment variable holding the provider's API key."
+            )
+
+        runtime_fragment = build_cloud_http_speech_runtime(
+            manifest.remote_ref,
+            api_key_env=str(api_key_env),
+            default_voice=default_params.get("voice"),
+            voices=self._declared_voices(manifest),
+            timeout_seconds=float(default_params.get("timeout_seconds", 60.0)),
+        )
+        return {
+            **self._base_payload(manifest, local_path=None, device="remote"),
+            **runtime_fragment,
+            "remote_ref": runtime_fragment["endpoint_base_url"],
+        }
+
+
 class LoaderRegistry:
     """Lookup table for named loader instances."""
 
@@ -928,6 +967,7 @@ def create_default_loader_registry() -> LoaderRegistry:
     registry.register("openai_compatible_text_loader", OpenAICompatibleTextLoader())
     registry.register("kokoro_tts_loader", KokoroTtsLoader())
     registry.register("voicevox_http_loader", VoicevoxHttpLoader())
+    registry.register("cloud_http_speech_loader", CloudHttpSpeechLoader())
     return registry
 
 
@@ -936,6 +976,7 @@ __all__ = [
     "BaseModelLoader",
     "BaseSpeechLoader",
     "BaseTextLoader",
+    "CloudHttpSpeechLoader",
     "DiffusersImageLoader",
     "KokoroTtsLoader",
     "LearnedVideoLoader",

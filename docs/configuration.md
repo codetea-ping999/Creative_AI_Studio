@@ -234,6 +234,13 @@ audio output root の解決:
 - API key は manifest ではなく環境変数から解決します。manifest に書いた鍵は読みません
 - 解決後の endpoint base URL は job metadata に記録されるため、
   「どこへ送ったか」を後から必ず確認できます
+- `provider: "cloud"` の manifest は `ALLOW_CLOUD_PROVIDERS=true` に加えて、
+  manifest 単位の `ALLOW_CLOUD_PROVIDER_<MANIFEST_ID>=true`
+  （id を大文字化し英数字以外を `_` に置換したもの。例: `cloud-tts-example` →
+  `ALLOW_CLOUD_PROVIDER_CLOUD_TTS_EXAMPLE`）も設定しない限り、
+  `ModelService.resolve_runtime` の時点で `CloudProviderDisabledError` になり、
+  実際の HTTP リクエストへ到達しません。1 つの provider を有効化しても
+  他の cloud provider は既定のまま無効です（`core/models/cloud_guard.py`）
 
 ## ログ関連
 

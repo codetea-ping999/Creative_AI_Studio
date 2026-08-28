@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from .cache import ModelRuntimeCache
+from .cloud_guard import ensure_cloud_provider_enabled
 from .loader import LoaderRegistry
 from .manifest import ModelManifest
 from .registry import ModelRegistry
@@ -72,6 +73,9 @@ class ModelService:
         cached_runtime = self.runtime_cache.get(manifest.id)
         if cached_runtime is not None:
             return manifest, cached_runtime
+
+        if manifest.provider == "cloud":
+            ensure_cloud_provider_enabled(manifest.id)
 
         loader = self.loader_registry.get(manifest.loader)
         runtime_obj = loader.load(manifest)
