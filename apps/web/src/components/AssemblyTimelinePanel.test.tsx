@@ -388,4 +388,244 @@ describe("AssemblyTimelinePanel", () => {
     expect(disclosure?.hasAttribute("open")).toBe(false);
     expect(within(row).getByText("no MusicGen weights installed")).toBeTruthy();
   });
+
+  describe("generating missing/failed assets from the timeline (#246)", () => {
+    function sceneWithVisualMissing(): StoryDocument {
+      return makeStory({
+        scenes: [
+          {
+            id: "scene_01",
+            order: 0,
+            heading: "屋上の朝",
+            summary: "",
+            narration: "",
+            image_prompt: "rooftop at dawn",
+            image_negative: "",
+            bgm_mood: "",
+            duration_seconds: 5,
+            camera: "",
+            asset_ids: {},
+          },
+        ],
+      });
+    }
+
+    const missingAssetStatus = [
+      { scene_id: "scene_01", role: "visual", state: "missing", required: true },
+      { scene_id: "scene_01", role: "narration", state: "optional", required: false },
+      { scene_id: "scene_01", role: "music", state: "optional", required: false },
+    ];
+
+    async function selectStory1() {
+      const user = userEvent.setup();
+      render(<AssemblyTimelinePanel />);
+      await waitFor(() => {
+        expect(screen.getByRole("option", { name: /Rewind/ })).toBeTruthy();
+      });
+      await user.selectOptions(screen.getByLabelText("表示するストーリー"), "story_1");
+      const table = await screen.findByRole("table");
+      return { user, table };
+    }
+
+    it("launches generation for a missing role from its scene row and reflects success back on that row", async () => {
+      const story = sceneWithVisualMissing();
+      const detailBefore = {
+        story,
+        missing_assets: [{ scene_id: "scene_01", role: "visual" }],
+        asset_status: missingAssetStatus,
+      };
+      const detailAfter = {
+        story: {
+          ...story,
+          scenes: [{ ...story.scenes[0], asset_ids: { visual: "asset_visual_1" } }],
+        },
+        missing_assets: [],
+        asset_status: [
+          {
+            scene_id: "scene_01",
+            role: "visual",
+            state: "assigned",
+            required: true,
+            asset_id: "asset_visual_1",
+          },
+          missingAssetStatus[1],
+          missingAssetStatus[2],
+        ],
+      };
+
+      let detailCallCount = 0;
+      const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = (init?.method ?? "GET").toUpperCase();
+        if (url.includes("/stories/story_1") && method === "GET") {
+          detailCallCount += 1;
+          return new Response(
+            JSON.stringify(detailCallCount >= 2 ? detailAfter : detailBefore),
+            { status: 200 },
+          );
+        }
+        if (url.includes("/stories?") && method === "GET") {
+          return new Response(
+            JSON.stringify({ items: [{ id: "story_1", title: "Rewind", scene_count: 1 }] }),
+            { status: 200 },
+          );
+        }
+        if (url.includes("/scenes/scene_01/generate") && method === "POST") {
+          const body = init?.body ? JSON.parse(String(init.body)) : {};
+          expect(body.role).toBe("visual");
+          return new Response(
+            JSON.stringify({ job_id: "job_visual", status: "queued" }),
+            { status: 201 },
+          );
+        }
+        if (url.includes("/jobs/job_visual") && method === "GET") {
+          return new Response(JSON.stringify({ status: "succeeded" }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ detail: `unrouted ${method} ${url}` }), {
+          status: 404,
+        });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const { user, table } = await selectStory1();
+      const generateButton = within(table).getByRole("button", { name: "画像を生成" });
+      await user.click(generateButton);
+
+      await waitFor(() => {
+        expect(within(table).getByText(/割り当て済み.*asset_visual_1/)).toBeTruthy();
+      });
+
+      // The request carried only story/scene/role — never a separate Composer
+      // prompt — and exactly one job was queued for it.
+      const generateCalls = fetchMock.mock.calls.filter(([reqInput, reqInit]) => {
+        const initArg = reqInit as RequestInit | undefined;
+        return (
+          String(reqInput).includes("/scenes/scene_01/generate") &&
+          (initArg?.method ?? "GET").toUpperCase() === "POST"
+        );
+      });
+      expect(generateCalls).toHaveLength(1);
+    });
+
+    it("blocks a duplicate submission while the same role's generation is still in flight", async () => {
+      const story = sceneWithVisualMissing();
+      const detailBefore = {
+        story,
+        missing_assets: [{ scene_id: "scene_01", role: "visual" }],
+        asset_status: missingAssetStatus,
+      };
+
+      let resolveGenerate: ((response: Response) => void) | undefined;
+      const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = (init?.method ?? "GET").toUpperCase();
+        if (url.includes("/stories/story_1") && method === "GET") {
+          return new Response(JSON.stringify(detailBefore), { status: 200 });
+        }
+        if (url.includes("/stories?") && method === "GET") {
+          return new Response(
+            JSON.stringify({ items: [{ id: "story_1", title: "Rewind", scene_count: 1 }] }),
+            { status: 200 },
+          );
+        }
+        if (url.includes("/scenes/scene_01/generate") && method === "POST") {
+          return new Promise<Response>((resolve) => {
+            resolveGenerate = resolve;
+          });
+        }
+        if (url.includes("/jobs/job_visual") && method === "GET") {
+          return new Response(JSON.stringify({ status: "succeeded" }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ detail: `unrouted ${method} ${url}` }), {
+          status: 404,
+        });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const { user, table } = await selectStory1();
+      const generateButton = within(table).getByRole("button", { name: "画像を生成" });
+      await user.click(generateButton);
+
+      // The button goes busy/disabled immediately, before the launch request
+      // even resolves — a second click lands on a disabled element and is a
+      // browser no-op, not a second submission.
+      const busyButton = await within(table).findByRole("button", { name: /画像を生成中/ });
+      expect(busyButton.hasAttribute("disabled")).toBe(true);
+      await user.click(busyButton);
+
+      resolveGenerate?.(
+        new Response(JSON.stringify({ job_id: "job_visual", status: "queued" }), {
+          status: 201,
+        }),
+      );
+
+      await waitFor(() => {
+        expect(within(table).queryByRole("button", { name: /画像を生成中/ })).toBeNull();
+      });
+
+      const generateCalls = fetchMock.mock.calls.filter(([reqInput, reqInit]) => {
+        const initArg = reqInit as RequestInit | undefined;
+        return (
+          String(reqInput).includes("/scenes/scene_01/generate") &&
+          (initArg?.method ?? "GET").toUpperCase() === "POST"
+        );
+      });
+      expect(generateCalls).toHaveLength(1);
+    });
+
+    it("offers a retry action for a failed role and surfaces a non-succeeded outcome", async () => {
+      const story = sceneWithVisualMissing();
+      const failedAssetStatus = [
+        {
+          scene_id: "scene_01",
+          role: "visual",
+          state: "failed",
+          required: true,
+          job_id: "job_old",
+          error_message: "no SDXL weights installed",
+        },
+        missingAssetStatus[1],
+        missingAssetStatus[2],
+      ];
+      const detailBefore = {
+        story,
+        missing_assets: [{ scene_id: "scene_01", role: "visual" }],
+        asset_status: failedAssetStatus,
+      };
+
+      const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = (init?.method ?? "GET").toUpperCase();
+        if (url.includes("/stories/story_1") && method === "GET") {
+          return new Response(JSON.stringify(detailBefore), { status: 200 });
+        }
+        if (url.includes("/stories?") && method === "GET") {
+          return new Response(
+            JSON.stringify({ items: [{ id: "story_1", title: "Rewind", scene_count: 1 }] }),
+            { status: 200 },
+          );
+        }
+        if (url.includes("/scenes/scene_01/generate") && method === "POST") {
+          return new Response(
+            JSON.stringify({ job_id: "job_retry", status: "queued" }),
+            { status: 201 },
+          );
+        }
+        if (url.includes("/jobs/job_retry") && method === "GET") {
+          return new Response(JSON.stringify({ status: "failed" }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ detail: `unrouted ${method} ${url}` }), {
+          status: 404,
+        });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const { user, table } = await selectStory1();
+      const retryButton = within(table).getByRole("button", { name: "画像を再試行" });
+      await user.click(retryButton);
+
+      const alert = await screen.findByRole("alert");
+      expect(within(alert).getByText(/failed で終了しました/)).toBeTruthy();
+    });
+  });
 });

@@ -11,6 +11,7 @@ try:
 
     from apps.api.main import create_app
     from bootstrap import create_application_services
+    from core.schemas import GenerationRequest, GenerationResult
 except ModuleNotFoundError as exc:
     IMPORT_ERROR = exc
 else:
@@ -238,6 +239,181 @@ class BibleApiTests(unittest.TestCase):
             # is asserted at the contract level rather than by running it.
             job = studio.client.get(f"/jobs/{job_id}").json()
             self.assertEqual(job["request"]["params"]["bible_refs"], [entry["id"]])
+
+    def _mark_character_sheet_winner_succeeded(
+        self,
+        studio: _Studio,
+        tmp_dir: Path,
+        *,
+        entry_id: str,
+        seed: int | None,
+        model_id: str = "sdxl",
+        attributes: dict | None = None,
+        output_name: str = "winner.png",
+    ) -> str:
+        """Simulate one completed character-sheet cell without SDXL weights.
+
+        Mirrors what `generators/image/generator.py` would have written into
+        `GenerationResult.metadata` for a batch item (see #194): a
+        `prompt_composition` audit trail plus the runtime-resolved
+        `model_id`/`seed`/`params`, alongside per-cell batch bookkeeping
+        (`bible_refs`/`axis_values`/`batch_axis_labels`) in the *request*
+        params -- the exact shape `_effective_promotion_settings` and
+        `BibleRepository.promote_winner` (#195) must read from and filter.
+        """
+
+        output_path = tmp_dir / "outputs" / "images" / output_name
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"fake-png")
+
+        job = studio.services.job_service.create_job(
+            GenerationRequest(
+                media_type="image",
+                prompt="Mina, front view, neutral expression",
+                model_id="sdxl",
+                params={
+                    "bible_refs": [entry_id],
+                    "axis_values": {"angle": {"prompt_suffix": "front view"}},
+                    "batch_axis_labels": {"angle": "front-view"},
+                },
+            )
+        )
+        metadata: dict = {
+            "model_id": model_id,
+            "params": {
+                "width": 832,
+                "height": 1024,
+                "num_inference_steps": 26,
+                "guidance_scale": 7.0,
+            },
+            "prompt_composition": {
+                "prompt": "Mina, front view, neutral expression",
+                "negative_prompt": None,
+                "seed": seed,
+                "lora": None,
+                "reference_asset_ids": [],
+                "resolved_references": [],
+                "palette": [],
+                "attributes": attributes or {},
+                "applied": [],
+                "conflicts": [],
+            },
+        }
+        if seed is not None:
+            metadata["seed"] = seed
+        studio.services.job_service.mark_succeeded(
+            job.id,
+            GenerationResult(
+                job_id=job.id,
+                status="succeeded",
+                outputs=[str(output_path)],
+                previews=[str(output_path)],
+                metadata=metadata,
+            ),
+        )
+        asset = studio.services.asset_repository.get_by_job(job.id)[0]
+        return asset.id
+
+    def test_promote_winner_locks_seed_merges_attributes_and_registers_reference(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            studio = _Studio(tmp_path)
+            entry = self._create_entry(
+                studio,
+                attributes={"hair": "long black straight"},
+                seed_policy={},
+            )
+
+            asset_id = self._mark_character_sheet_winner_succeeded(
+                studio,
+                tmp_path,
+                entry_id=entry["id"],
+                seed=777,
+                attributes={"hair": "long black straight", "eyes": "purple"},
+            )
+
+            response = studio.client.post(
+                f"/bible/{entry['id']}/promote", json={"asset_id": asset_id}
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            payload = response.json()
+
+            self.assertEqual(payload["entry"]["id"], entry["id"])
+            self.assertEqual(
+                payload["entry"]["attributes"],
+                {"hair": "long black straight", "eyes": "purple"},
+            )
+            self.assertEqual(
+                payload["entry"]["seed_policy"], {"mode": "locked", "seed": 777}
+            )
+            self.assertEqual(payload["entry"]["reference_asset_ids"], [asset_id])
+            self.assertEqual(payload["promotion"]["asset_id"], asset_id)
+            self.assertEqual(payload["promotion"]["applied"]["model_id"], "sdxl")
+            self.assertEqual(payload["promotion"]["applied"]["seed"], 777)
+            # Per-cell batch bookkeeping must not leak into the promoted params.
+            applied_params = payload["promotion"]["applied"]["params"]
+            self.assertNotIn("bible_refs", applied_params)
+            self.assertNotIn("axis_values", applied_params)
+            self.assertNotIn("batch_axis_labels", applied_params)
+            self.assertEqual(applied_params["width"], 832)
+
+            # The change is persisted, not just returned once.
+            refetched = studio.client.get(f"/bible/{entry['id']}").json()
+            self.assertEqual(refetched["seed_policy"], {"mode": "locked", "seed": 777})
+
+    def test_promote_winner_rejects_unknown_asset_or_entry(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            studio = _Studio(tmp_path)
+            entry = self._create_entry(studio)
+            asset_id = self._mark_character_sheet_winner_succeeded(
+                studio, tmp_path, entry_id=entry["id"], seed=1
+            )
+
+            missing_asset = studio.client.post(
+                f"/bible/{entry['id']}/promote", json={"asset_id": "asset_missing"}
+            )
+            self.assertEqual(missing_asset.status_code, 404)
+
+            missing_entry = studio.client.post(
+                "/bible/bible_missing/promote", json={"asset_id": asset_id}
+            )
+            self.assertEqual(missing_entry.status_code, 404)
+
+    def test_promote_winner_requires_a_recorded_seed(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            studio = _Studio(tmp_path)
+            entry = self._create_entry(studio)
+            asset_id = self._mark_character_sheet_winner_succeeded(
+                studio, tmp_path, entry_id=entry["id"], seed=None
+            )
+
+            response = studio.client.post(
+                f"/bible/{entry['id']}/promote", json={"asset_id": asset_id}
+            )
+            self.assertEqual(response.status_code, 422, response.text)
+
+    def test_promote_winner_only_updates_the_targeted_entry(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            studio = _Studio(tmp_path)
+            target = self._create_entry(studio, name="Mina")
+            other = self._create_entry(studio, name="Rio")
+            asset_id = self._mark_character_sheet_winner_succeeded(
+                studio, tmp_path, entry_id=target["id"], seed=555
+            )
+
+            response = studio.client.post(
+                f"/bible/{target['id']}/promote", json={"asset_id": asset_id}
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+
+            untouched = studio.client.get(f"/bible/{other['id']}").json()
+            self.assertEqual(untouched["seed_policy"], other["seed_policy"])
+            self.assertEqual(untouched["reference_asset_ids"], [])
 
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"missing dependency: {IMPORT_ERROR}")

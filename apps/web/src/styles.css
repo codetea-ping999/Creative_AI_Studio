@@ -3081,6 +3081,17 @@ pre,
   overflow-wrap: anywhere;
 }
 
+/* Generate/retry action (issue #246): spans the row like the failure reason
+   so it reads as "the fix for this role", not a fourth data column crammed
+   into the glyph/name/status grid. */
+.assembly-timeline-role__action {
+  grid-column: 1 / -1;
+  justify-self: start;
+  margin-top: 2px;
+  padding: 3px 10px;
+  font-size: 12px;
+}
+
 @media (max-width: 768px) {
   .assembly-timeline-role {
     grid-template-columns: 18px auto;
