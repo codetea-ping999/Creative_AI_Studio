@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from .cloud_guard import cloud_provider_env_flag
 from .manifest import ModelManifest
 
 _DEFAULT_MANIFEST_ROOT = Path(__file__).resolve().parents[2] / "models" / "manifests"
@@ -37,6 +38,7 @@ class ModelRegistry:
                 manifests[manifest.id] = manifest
                 manifest_sources[manifest.id] = path
 
+        self._check_cloud_provider_flag_collisions(manifests)
         self._manifests = manifests
         self._loaded = True
 
@@ -97,6 +99,34 @@ class ModelRegistry:
     def _ensure_loaded(self) -> None:
         if not self._loaded:
             self.load_all()
+
+    def _check_cloud_provider_flag_collisions(
+        self,
+        manifests: dict[str, ModelManifest],
+    ) -> None:
+        """Fail fast if two ``provider: "cloud"`` manifests share an opt-in flag.
+
+        ``cloud_provider_env_flag`` normalizes a manifest id into
+        ``ALLOW_CLOUD_PROVIDER_<ID>`` by upper-casing and collapsing every
+        non-alphanumeric character to ``_``, so distinct ids such as
+        ``vendor-tts`` and ``vendor_tts`` collide. Left unchecked, opting into
+        one such manifest silently opts into the other too -- caught here,
+        at load time, rather than left for an operator to discover later.
+        """
+
+        seen: dict[str, str] = {}
+        for manifest in manifests.values():
+            if manifest.provider != "cloud":
+                continue
+            flag = cloud_provider_env_flag(manifest.id)
+            if flag in seen and seen[flag] != manifest.id:
+                raise ValueError(
+                    f"Cloud provider manifests {seen[flag]!r} and {manifest.id!r} "
+                    f"both normalize to the opt-in flag {flag!r}; rename one "
+                    "manifest id so each cloud provider has its own "
+                    "ALLOW_CLOUD_PROVIDER_<ID> switch."
+                )
+            seen[flag] = manifest.id
 
     def _is_duplicate_equivalent(
         self,
