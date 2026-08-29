@@ -1040,6 +1040,8 @@ def redact_provider_metadata(
             return {key: _walk(value) for key, value in node.items()}
         if isinstance(node, list):
             return [_walk(item) for item in node]
+        if isinstance(node, tuple):
+            return tuple(_walk(item) for item in node)
         if isinstance(node, str):
             return redact_secrets(node, secret_list)
         return node
