@@ -566,7 +566,10 @@ def cloud_endpoint_origin(base_url: str) -> str:
     """Return a credential- and path-free origin suitable for job metadata."""
 
     parsed = urlparse(resolve_cloud_endpoint(base_url))
-    return f"{parsed.scheme}://{parsed.hostname}"
+    host = (parsed.hostname or "").lower()
+    rendered_host = f"[{host}]" if ":" in host else host
+    port = f":{parsed.port}" if parsed.port is not None else ""
+    return f"{parsed.scheme.lower()}://{rendered_host}{port}"
 
 
 def build_cloud_http_speech_runtime(
@@ -635,7 +638,17 @@ def build_cloud_http_speech_runtime(
             },
             timeout=timeout,
         )
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            # httpx embeds the full request URL (tenant/routing path included)
+            # in its own error message; only the sanitized origin -- the same
+            # thing a successful call publishes in job metadata -- may end up
+            # in a persisted job error.
+            raise RuntimeError(
+                f"Cloud TTS request failed with HTTP {exc.response.status_code} "
+                f"(origin={cloud_endpoint_origin(resolved_base_url)})."
+            ) from None
         return decode_wav_bytes(response.content)
 
     return {

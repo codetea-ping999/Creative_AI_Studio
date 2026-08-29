@@ -64,6 +64,7 @@ _AUDIOCRAFT_T5_FILES: tuple[str, ...] = (
 class ManifestLike(Protocol):
     """Structural view of the manifest fields readiness rules depend on."""
 
+    id: str
     runtime: str
     local_path: str | None
     remote_ref: str | None
@@ -104,6 +105,7 @@ def evaluate_manifest_readiness(
         local_path=manifest.local_path,
         remote_ref=getattr(manifest, "remote_ref", None),
         default_params=manifest.default_params,
+        manifest_id=getattr(manifest, "id", None),
         repo_root=repo_root,
     )
 
@@ -118,11 +120,13 @@ def evaluate_manifest_payload(
     local_path = payload.get("local_path")
     remote_ref = payload.get("remote_ref")
     default_params = payload.get("default_params")
+    manifest_id = payload.get("id")
     return evaluate_readiness(
         runtime=str(payload.get("runtime") or ""),
         local_path=local_path if isinstance(local_path, str) else None,
         remote_ref=remote_ref if isinstance(remote_ref, str) else None,
         default_params=default_params if isinstance(default_params, Mapping) else None,
+        manifest_id=manifest_id if isinstance(manifest_id, str) else None,
         repo_root=repo_root,
     )
 
@@ -133,6 +137,7 @@ def evaluate_readiness(
     local_path: str | None,
     remote_ref: str | None = None,
     default_params: Mapping[str, Any] | None = None,
+    manifest_id: str | None = None,
     repo_root: Path | None = None,
 ) -> ModelReadiness:
     """Evaluate readiness from the manifest fields that describe local files."""
@@ -140,6 +145,8 @@ def evaluate_readiness(
     params = dict(default_params or {})
     if runtime == "voicevox_http":
         return _voicevox_readiness(remote_ref)
+    if runtime == "cloud_http_tts":
+        return _cloud_http_tts_readiness(remote_ref, params, manifest_id)
     if not local_path:
         return ModelReadiness(
             STATUS_MISSING_FILES,
@@ -190,6 +197,68 @@ def _voicevox_readiness(remote_ref: str | None) -> ModelReadiness:
         STATUS_CONFIGURED,
         f"VOICEVOX endpoint is configured at {origin}. Availability is checked "
         "when generation starts; an engine that is not running will fail that job.",
+    )
+
+
+def _cloud_http_tts_readiness(
+    remote_ref: str | None,
+    default_params: Mapping[str, Any],
+    manifest_id: str | None,
+) -> ModelReadiness:
+    """Report cloud TTS configuration status without probing the network or leaking its path.
+
+    ``ModelService.resolve_runtime()`` can only load this runtime once both
+    the global and manifest-specific cloud opt-in switches are set and its
+    API key is present (see ``core/models/cloud_guard.py``), so readiness
+    checks the same conditions -- otherwise `/models` could advertise a
+    manifest as available that ``resolve_runtime()`` immediately rejects.
+    """
+
+    import os
+
+    from core.models.audio_runtimes import cloud_endpoint_origin
+    from core.models.cloud_guard import cloud_provider_env_flag
+
+    if not remote_ref:
+        return ModelReadiness(
+            STATUS_INVALID_CONFIGURATION,
+            "Cloud TTS endpoint URL is not configured.",
+        )
+    try:
+        origin = cloud_endpoint_origin(remote_ref)
+    except ValueError:
+        return ModelReadiness(
+            STATUS_INVALID_CONFIGURATION,
+            "Cloud TTS endpoint configuration is invalid or disallowed.",
+        )
+
+    api_key_env = str(default_params.get("api_key_env") or "").strip()
+    if not api_key_env:
+        return ModelReadiness(
+            STATUS_INVALID_CONFIGURATION,
+            "Cloud TTS manifest is missing default_params.api_key_env.",
+        )
+
+    missing: list[str] = []
+    if os.getenv("ALLOW_CLOUD_PROVIDERS", "").strip().lower() != "true":
+        missing.append("ALLOW_CLOUD_PROVIDERS=true")
+    if manifest_id is not None:
+        provider_flag = cloud_provider_env_flag(manifest_id)
+        if os.getenv(provider_flag, "").strip().lower() != "true":
+            missing.append(f"{provider_flag}=true")
+    if not os.getenv(api_key_env, "").strip():
+        missing.append(f"the {api_key_env} API key")
+
+    if missing:
+        return ModelReadiness(
+            STATUS_MISSING_FILES,
+            f"Cloud TTS endpoint is configured at {origin}, but still needs: "
+            + ", ".join(missing) + ".",
+        )
+    return ModelReadiness(
+        STATUS_CONFIGURED,
+        f"Cloud TTS endpoint is configured at {origin}. Availability is checked "
+        "when generation starts; a provider outage will fail that job.",
     )
 
 

@@ -32,6 +32,8 @@ from core.audio import (
     trim_silence,
 )
 from core.models import ModelRegistry, ModelService, create_default_loader_registry
+from core.models.loader import CloudHttpSpeechLoader
+from core.models.manifest import ModelManifest
 from core.models.audio_runtimes import (
     build_cloud_http_speech_runtime,
     build_kokoro_runtime,
@@ -47,6 +49,11 @@ from core.models.cloud_guard import (
     CloudProviderDisabledError,
     cloud_provider_env_flag,
     ensure_cloud_provider_enabled,
+)
+from core.model_readiness import (
+    STATUS_CONFIGURED,
+    STATUS_MISSING_FILES,
+    evaluate_manifest_readiness,
 )
 from core.schemas import GenerationRequest
 from generators.audio import SpeechGenerator, split_into_chunks, split_into_sentences
@@ -1119,6 +1126,11 @@ def test_speech_manifests_and_loaders_are_registered():
     # Off by three independent switches: the manifest itself, plus the two
     # cloud_guard env vars checked at load time.
     assert cloud_example.enabled is False
+    # Regression: SpeechGenerator.validate_request() rejects a provider:
+    # "cloud" manifest lacking a declared capability before generate() is
+    # ever reached (see generators/audio/providers.py), so the shipped
+    # example must actually declare the one it demonstrates.
+    assert cloud_example.default_params["capabilities"] == ["text-to-speech"]
 
     loaders = create_default_loader_registry()
     assert loaders.get("kokoro_tts_loader").__class__.__name__ == "KokoroTtsLoader"
@@ -1170,6 +1182,81 @@ def _cloud_model_service(manifest_root: Path) -> ModelService:
 def test_cloud_provider_flag_name_is_derived_from_the_manifest_id():
     assert cloud_provider_env_flag("cloud-example") == "ALLOW_CLOUD_PROVIDER_CLOUD_EXAMPLE"
     assert cloud_provider_env_flag("weird.id/42") == "ALLOW_CLOUD_PROVIDER_WEIRD_ID_42"
+
+
+def test_registry_rejects_two_cloud_manifests_that_collide_on_the_same_flag(tmp_path):
+    """Regression: distinct manifest ids can normalize to the same opt-in flag.
+
+    `cloud_provider_env_flag` upper-cases and collapses every non-alphanumeric
+    character to `_`, so e.g. `vendor-tts` and `vendor_tts` collide. Left
+    unchecked, opting into one manifest would silently opt into the other;
+    the registry must fail fast at load time instead.
+    """
+
+    for manifest_id in ("vendor-tts", "vendor_tts"):
+        payload = {
+            "id": manifest_id,
+            "display_name": manifest_id,
+            "media_type": "audio",
+            "task_type": "text-to-speech",
+            "provider": "cloud",
+            "runtime": "cloud_http_tts",
+            "remote_ref": "https://example-cloud-tts.invalid/v1/speech",
+            "loader": "cloud_http_speech_loader",
+            "default_params": {
+                "api_key_env": "VENDOR_TTS_API_KEY",
+                "capabilities": ["text-to-speech"],
+            },
+            "enabled": False,
+        }
+        (tmp_path / f"{manifest_id}.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    registry = ModelRegistry(manifest_root=tmp_path)
+    with pytest.raises(ValueError, match="ALLOW_CLOUD_PROVIDER_VENDOR_TTS"):
+        registry.load_all()
+
+
+def test_cloud_http_tts_readiness_tracks_opt_in_and_key_state(tmp_path, monkeypatch):
+    """Regression: `evaluate_readiness` never handled `cloud_http_tts`.
+
+    Before this fix every `provider: "cloud"` manifest fell through to the
+    "no local_path" branch and was reported `missing_files` forever, so the
+    web client's `is_available=false` filter hid it from the UI even once
+    ModelService could actually load it.
+    """
+
+    manifest_path = _write_cloud_manifest(tmp_path)
+    manifest = ModelManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
+
+    monkeypatch.delenv("ALLOW_CLOUD_PROVIDERS", raising=False)
+    monkeypatch.delenv("ALLOW_CLOUD_PROVIDER_CLOUD_EXAMPLE", raising=False)
+    monkeypatch.delenv("CLOUD_EXAMPLE_API_KEY", raising=False)
+
+    not_ready = evaluate_manifest_readiness(manifest)
+    assert not_ready.status == STATUS_MISSING_FILES
+    assert not_ready.is_ready is False
+    assert "ALLOW_CLOUD_PROVIDERS" in not_ready.message
+
+    monkeypatch.setenv("ALLOW_CLOUD_PROVIDERS", "true")
+    monkeypatch.setenv("ALLOW_CLOUD_PROVIDER_CLOUD_EXAMPLE", "true")
+    monkeypatch.setenv("CLOUD_EXAMPLE_API_KEY", "test-secret-key")
+
+    ready = evaluate_manifest_readiness(manifest)
+    assert ready.status == STATUS_CONFIGURED
+    assert ready.is_ready is True
+    assert "example-cloud-tts.invalid" in ready.message
+    assert "tenant" not in ready.message.lower()
+
+
+def test_shipped_cloud_tts_manifest_is_readable(monkeypatch):
+    monkeypatch.delenv("ALLOW_CLOUD_PROVIDERS", raising=False)
+
+    registry = ModelRegistry()
+    registry.load_all()
+    manifest = registry.get("cloud-tts-example")
+
+    readiness = evaluate_manifest_readiness(manifest)
+    assert readiness.status in {STATUS_MISSING_FILES, STATUS_CONFIGURED}
 
 
 def test_ensure_cloud_provider_enabled_requires_both_switches(monkeypatch):
@@ -1226,6 +1313,77 @@ def test_service_loads_a_cloud_manifest_once_both_switches_are_set(
     assert samples.size > 0
 
 
+def test_revoking_either_opt_in_blocks_an_already_cached_cloud_runtime(
+    tmp_path, monkeypatch
+):
+    """Regression: the cloud guard must run before the runtime-cache lookup.
+
+    Before this fix, `resolve_runtime()` returned a cached cloud runtime
+    without re-checking either opt-in switch, so revoking one after caching
+    had no effect until the process restarted -- the cached closure kept
+    serving jobs (and holding its API key) regardless.
+    """
+
+    import httpx
+
+    _write_cloud_manifest(tmp_path)
+    service = _cloud_model_service(tmp_path)
+
+    monkeypatch.setenv("ALLOW_CLOUD_PROVIDERS", "true")
+    monkeypatch.setenv("ALLOW_CLOUD_PROVIDER_CLOUD_EXAMPLE", "true")
+    monkeypatch.setenv("CLOUD_EXAMPLE_API_KEY", "test-secret-key")
+
+    posted: list[dict] = []
+    engine_wav = _wav_bytes(_sine(0.2, sample_rate=_FAKE_TTS_RATE), _FAKE_TTS_RATE)
+
+    def fake_post(url, **kwargs):
+        posted.append({"url": url, **kwargs})
+        return _FakeHttpResponse(content=engine_wav)
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    # First resolve caches the runtime.
+    service.resolve_runtime(None, media_type="audio", task_type="text-to-speech")
+    assert len(posted) == 0  # loading a runtime never sends anything by itself
+
+    for flag in ("ALLOW_CLOUD_PROVIDERS", "ALLOW_CLOUD_PROVIDER_CLOUD_EXAMPLE"):
+        monkeypatch.delenv(flag, raising=False)
+        with pytest.raises(CloudProviderDisabledError):
+            service.resolve_runtime(None, media_type="audio", task_type="text-to-speech")
+        assert posted == []  # still zero HTTP calls: nothing snuck through the cache
+        monkeypatch.setenv(flag, "true")
+
+
+def test_cloud_loader_enforces_the_guard_even_if_the_provider_field_is_wrong(
+    monkeypatch,
+):
+    """Regression: the loader is selected by `manifest.loader`, not `manifest.provider`.
+
+    `ModelService` only runs the guard for `provider == "cloud"`, so a
+    manifest whose free-form `provider` field is misspelled would skip it
+    entirely if the loader itself trusted that check. Calling the loader
+    directly (bypassing ModelService) proves it re-checks on its own.
+    """
+
+    monkeypatch.delenv("ALLOW_CLOUD_PROVIDERS", raising=False)
+    monkeypatch.delenv("ALLOW_CLOUD_PROVIDER_CLOUD_EXAMPLE", raising=False)
+
+    manifest = ModelManifest(
+        id="cloud-example",
+        display_name="Cloud Example",
+        media_type="audio",
+        task_type="text-to-speech",
+        provider="cluod",  # typo: ModelService's `== "cloud"` check would miss this
+        runtime="cloud_http_tts",
+        remote_ref="https://example-cloud-tts.invalid/v1/speech",
+        loader="cloud_http_speech_loader",
+        default_params={"api_key_env": "CLOUD_EXAMPLE_API_KEY"},
+    )
+
+    with pytest.raises(CloudProviderDisabledError, match="ALLOW_CLOUD_PROVIDERS"):
+        CloudHttpSpeechLoader().load(manifest)
+
+
 def test_resolve_cloud_endpoint_requires_https_and_rejects_secrets():
     assert (
         resolve_cloud_endpoint("https://api.example.invalid/v1/speech")
@@ -1243,6 +1401,16 @@ def test_cloud_endpoint_origin_drops_path_and_credentials():
     origin = cloud_endpoint_origin("https://api.example.invalid/v1/tenant-a/speech")
     assert origin == "https://api.example.invalid"
     assert "tenant-a" not in origin
+
+
+def test_cloud_endpoint_origin_preserves_a_non_default_port():
+    origin = cloud_endpoint_origin("https://api.example.invalid:8443/v1/speech")
+    assert origin == "https://api.example.invalid:8443"
+
+
+def test_cloud_endpoint_origin_brackets_an_ipv6_host():
+    origin = cloud_endpoint_origin("https://[2001:db8::1]:8443/v1/speech")
+    assert origin == "https://[2001:db8::1]:8443"
 
 
 def test_build_cloud_http_speech_runtime_requires_the_api_key_env_var(monkeypatch):
@@ -1287,6 +1455,41 @@ def test_build_cloud_http_speech_runtime_sends_bearer_token_and_never_the_key_it
     # The runtime payload and the request body never carry the key itself.
     assert "test-secret-key" not in json.dumps(runtime, default=str)
     assert "test-secret-key" not in json.dumps(posted[0]["json"])
+
+
+def test_cloud_http_error_is_sanitized_before_it_can_reach_job_metadata(monkeypatch):
+    """Regression: httpx embeds the full request URL in HTTPStatusError.
+
+    `JobRunner.process_job` persists `str(exc)` as the job's error_message,
+    so an unsanitized failure would leak the tenant/routing path this
+    runtime deliberately strips from successful metadata.
+    """
+
+    import httpx
+
+    monkeypatch.setenv("CLOUD_EXAMPLE_API_KEY", "test-secret-key")
+    secret_url = "https://api.example.invalid/customer/acme-prod/secret-route/v1/tts"
+
+    def fake_post(url, **kwargs):
+        request = httpx.Request("POST", url)
+        return httpx.Response(429, request=request)
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    runtime = build_cloud_http_speech_runtime(
+        secret_url,
+        api_key_env="CLOUD_EXAMPLE_API_KEY",
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        runtime["synthesize"]("こんにちは。")
+
+    message = str(exc_info.value)
+    assert "429" in message
+    assert "api.example.invalid" in message
+    assert "acme-prod" not in message
+    assert "secret-route" not in message
+    assert secret_url not in message
 
 
 def test_non_loopback_audio_endpoint_is_refused_without_the_flag(monkeypatch):

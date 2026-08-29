@@ -70,12 +70,17 @@ class ModelService:
         task_type: str | None = None,
     ) -> tuple[ModelManifest, Any]:
         manifest = self.get_manifest(model_id, media_type, task_type)
+        # Checked before the cache lookup so revoking either cloud opt-in
+        # switch blocks a cached runtime too -- otherwise a runtime cached
+        # while both switches were on keeps serving jobs (and holding its
+        # API key) after either switch is turned back off, without a process
+        # restart.
+        if manifest.provider == "cloud":
+            ensure_cloud_provider_enabled(manifest.id)
+
         cached_runtime = self.runtime_cache.get(manifest.id)
         if cached_runtime is not None:
             return manifest, cached_runtime
-
-        if manifest.provider == "cloud":
-            ensure_cloud_provider_enabled(manifest.id)
 
         loader = self.loader_registry.get(manifest.loader)
         runtime_obj = loader.load(manifest)

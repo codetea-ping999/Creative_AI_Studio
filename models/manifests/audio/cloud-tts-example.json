@@ -13,7 +13,8 @@
     "timeout_seconds": 60,
     "api_key_env": "CLOUD_TTS_EXAMPLE_API_KEY",
     "max_chunk_characters": 240,
-    "chunk_gap_seconds": 0.25
+    "chunk_gap_seconds": 0.25,
+    "capabilities": ["text-to-speech"]
   },
   "aliases": [],
   "tags": ["audio", "speech", "tts", "cloud", "optional"],

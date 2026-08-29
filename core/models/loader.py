@@ -897,13 +897,20 @@ class VoicevoxHttpLoader(BaseSpeechLoader):
 class CloudHttpSpeechLoader(BaseSpeechLoader):
     """Call one example opt-in cloud text-to-speech HTTP provider.
 
-    Only reached for a ``provider: "cloud"`` manifest once ``ModelService``
-    has already cleared ``ensure_cloud_provider_enabled`` (see
-    ``core/models/cloud_guard.py``); this class does not re-check the guard.
+    ``ModelService`` already clears ``ensure_cloud_provider_enabled`` (see
+    ``core/models/cloud_guard.py``) before reaching a ``provider: "cloud"``
+    manifest's loader, but this loader is selected by ``manifest.loader``,
+    not by ``manifest.provider`` -- a manifest whose free-form ``provider``
+    field is misspelled or non-``"cloud"`` would otherwise skip that check
+    entirely. Re-running the same guard function here is a second call to
+    one policy, not a duplicated implementation of it.
     """
 
     def load(self, manifest: ModelManifest) -> dict[str, Any]:
         from .audio_runtimes import build_cloud_http_speech_runtime
+        from .cloud_guard import ensure_cloud_provider_enabled
+
+        ensure_cloud_provider_enabled(manifest.id)
 
         if not manifest.remote_ref:
             raise ValueError(
