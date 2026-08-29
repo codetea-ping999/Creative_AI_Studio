@@ -467,7 +467,8 @@ cp apps/web/.env.example apps/web/.env
 
 | 変数名 | デフォルト値 | 説明 |
 |--------|-------------|------|
-| `API_HOST` | `127.0.0.1` | API バインドアドレス |
+| `API_HOST` | `127.0.0.1` | API バインドアドレス。既定では loopback 以外を拒否します。 |
+| `ALLOW_UNSAFE_API_BIND` | `0` | `1` の場合のみ非 loopback bind を許可。API は無認証のため、ネットワーク公開リスクを理解した場合だけ使用します。 |
 | `API_PORT` | `8000` | API ポート番号 |
 | `WEB_PORT` | `5173` | Studio Web UI のポート。API の CORS 設定にも使われます。 |
 | `DB_PATH` | `./data/jobs.db` | SQLite データベースファイルパス |

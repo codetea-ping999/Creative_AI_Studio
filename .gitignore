@@ -36,6 +36,16 @@ data/model-download-*.log
 data/issue*/
 
 models/judges/
+# Model weights are local runtime artifacts. Keep manifests, configuration, and
+# documentation visible while preventing accidental multi-gigabyte staging.
+models/**/*.bin
+models/**/*.ckpt
+models/**/*.gguf
+models/**/*.model
+models/**/*.onnx
+models/**/*.pt
+models/**/*.pth
+models/**/*.safetensors
 models/video/cogvideox-2b/*
 !models/video/cogvideox-2b/model_index.json
 models/audio/musicgen-small/*.bin
