@@ -71,6 +71,12 @@ Creative AI Studio のドキュメント案内です。
 - [MusicGen v0.2 real-model validation](./validation/musicgen-v0.2.md)
 - [MusicGen long-form validation](./validation/musicgen-long-form-v0.2.md)
 
+### メモリと性能を測りたい
+
+- [performance/memory-lifecycle-experiment-matrix.md](./performance/memory-lifecycle-experiment-matrix.md)
+  — Hybrid Runtime (#350) の memory lifecycle 実験手順。measurement boundary、指標、
+  シナリオ、記録形式を固定しています。実測は別 issue です。
+
 ## 現在の理解ポイント
 
 このリポジトリで最初につまずきやすい点は次の 4 つです。
