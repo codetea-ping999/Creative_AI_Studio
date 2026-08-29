@@ -1319,6 +1319,12 @@ class RedactProviderMetadataTest(unittest.TestCase):
         sanitized = redact_provider_metadata({"request_count": 3, "ok": True}, [_SENTINEL_SECRET])
         self.assertEqual(sanitized, {"request_count": 3, "ok": True})
 
+    def test_redacts_secrets_inside_tuples(self) -> None:
+        metadata = {"reference_assets": (f"key={_SENTINEL_SECRET}", "clean")}
+        sanitized = redact_provider_metadata(metadata, [_SENTINEL_SECRET])
+        self.assertNotIn(_SENTINEL_SECRET, json.dumps(sanitized))
+        self.assertEqual(sanitized["reference_assets"][1], "clean")
+
 
 class SentinelSecretPersistenceTest(unittest.TestCase):
     """The sentinel must never survive into request/job/asset-shaped data
