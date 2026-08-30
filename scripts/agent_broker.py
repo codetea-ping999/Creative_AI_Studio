@@ -480,15 +480,18 @@ def _validate_task(raw: Mapping[str, Any], task_path: Path) -> tuple[dict[str, A
     if isinstance(depth, bool) or not isinstance(depth, int) or not 0 <= depth <= 1:
         raise BrokerError("invalid_task", "delegation_depth must be 0 or 1")
     mode = raw.get("mode")
-    if mode not in MODES:
+    if not isinstance(mode, str) or mode not in MODES:
         raise BrokerError("invalid_task", "mode must be read-only or workspace-write")
     providers = raw.get("providers")
     if (
         not isinstance(providers, list)
         or not 1 <= len(providers) <= 2
-        or any(provider not in PROVIDERS for provider in providers)
-        or len(set(providers)) != len(providers)
+        or any(not isinstance(provider, str) or provider not in PROVIDERS for provider in providers)
     ):
+        raise BrokerError(
+            "invalid_task", "providers must contain one or two unique known providers"
+        )
+    if len(set(providers)) != len(providers):
         raise BrokerError(
             "invalid_task", "providers must contain one or two unique known providers"
         )
@@ -788,7 +791,7 @@ def _invoke(
             text=False,
             start_new_session=os.name != "nt",
         )
-    except FileNotFoundError:
+    except OSError:
         return ProcessResult(
             exit_code=None,
             stdout="",
@@ -845,6 +848,17 @@ def _invoke(
 
     timed_out = False
     started = time.monotonic()
+    restore_sigterm = False
+    previous_sigterm: Any = None
+    if os.name != "nt" and threading.current_thread() is threading.main_thread():
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+        def terminate_on_sigterm(signum: int, frame: Any) -> None:
+            _terminate_process(process)
+            raise SystemExit(128 + signum)
+
+        signal.signal(signal.SIGTERM, terminate_on_sigterm)
+        restore_sigterm = True
     try:
         while process.poll() is None:
             if output_overflow.is_set():
@@ -859,6 +873,8 @@ def _invoke(
         _terminate_process(process)
         raise
     finally:
+        if restore_sigterm:
+            signal.signal(signal.SIGTERM, previous_sigterm)
         if process.poll() is None:
             _terminate_process(process)
         writer.join(timeout=1)

@@ -765,6 +765,123 @@ class AgentBrokerTests(unittest.TestCase):
                 except ProcessLookupError:
                     pass
 
+    @unittest.skipIf(os.name == "nt", "process-group semantics are POSIX-only")
+    def test_sigterm_terminates_worker_process_group(self) -> None:
+        worker_pid_path = self.root / "sigterm-worker.pid"
+        codex = self._fake(
+            "codex",
+            f"""
+            import os, pathlib, signal, sys, time
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            pathlib.Path({str(worker_pid_path)!r}).write_text(str(os.getpid()))
+            sys.stdin.read()
+            time.sleep(60)
+            """,
+        )
+        claude = self._fake("claude", "raise SystemExit(99)\n")
+        task = self._task(providers=["codex"])
+        env = os.environ.copy()
+        env.update(
+            {
+                "AGENT_BROKER_CODEX_BIN": str(codex),
+                "AGENT_BROKER_CLAUDE_BIN": str(claude),
+            }
+        )
+        broker = subprocess.Popen(
+            [
+                sys.executable,
+                str(BROKER),
+                "--json",
+                "--state-dir",
+                str(self.state_dir),
+                "run",
+                "--task-file",
+                str(task),
+            ],
+            cwd=REPOSITORY_ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        worker_pid: int | None = None
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not worker_pid_path.exists():
+                time.sleep(0.02)
+            self.assertTrue(worker_pid_path.exists(), "worker did not start")
+            worker_pid = int(worker_pid_path.read_text())
+            os.kill(broker.pid, signal.SIGTERM)
+            broker.communicate(timeout=12)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(worker_pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.05)
+            else:
+                self.fail("worker process survived broker SIGTERM")
+        finally:
+            if broker.poll() is None:
+                broker.kill()
+                broker.communicate()
+            if worker_pid is not None:
+                try:
+                    os.kill(worker_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def test_unexecutable_provider_falls_back_and_persists_result(self) -> None:
+        codex = self._fake("codex", "raise SystemExit(99)\n")
+        codex.chmod(0o644)
+        claude = self._fake(
+            "claude",
+            """
+            import json, sys
+            sys.stdin.read()
+            print(json.dumps({
+                "type": "result", "subtype": "success", "is_error": False,
+                "session_id": "claude-fallback", "result": "completed"
+            }))
+            """,
+        )
+
+        result = self._run_broker(self._task(), codex, claude)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["provider"], "claude")
+        self.assertEqual(
+            [item["reason"] for item in payload["attempts"]], ["unavailable", "success"]
+        )
+        self.assertTrue(Path(payload["result_path"]).is_file())
+
+    def test_non_string_task_enums_return_invalid_task(self) -> None:
+        task = self._task()
+        task.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "task_id": "fixture-task",
+                    "prompt_file": str(self.prompt),
+                    "workspace": str(self.repo),
+                    "mode": [],
+                    "providers": [{}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        codex = self._fake("codex", "raise SystemExit(99)\n")
+        claude = self._fake("claude", "raise SystemExit(99)\n")
+
+        result = self._run_broker(task, codex, claude)
+
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["error"]["code"], "invalid_task")
+
 
 if __name__ == "__main__":
     unittest.main()
