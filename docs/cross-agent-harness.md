@@ -216,17 +216,21 @@ venv/bin/python scripts/agent_broker.py --json status <run-id>
 `providers` の先頭が第一候補です。自動切替する終了理由は `quota`, `auth`, `unavailable`,
 `budget` だけです。timeout、turn limit、壊れた JSONL、通常の worker error は原因を隠さない
 ため自動切替しません。前の provider の自由記述出力や stderr は次へ渡さず、broker が生成した
-終了理由と元の task だけを渡します。
+終了理由と元の task だけを渡します。終了理由の判定も provider の任意メッセージや stderr ではなく、
+Codex/Claude CLI の既知の failure/result envelope field だけを使います。
 
 `workspace-write` は main checkout では実行できません。clean な linked Git worktree、開始時の
 HEAD、排他的 lease を検査します。第一候補が少しでも HEAD / tracked / untracked state を変えた
 後に失敗した場合は `workspace_changed` で blocked にし、第二候補を同じ worktree へ入れません。
 成功を返しても commit または index への stage があれば同じく blocked にします。
+ignored file など通常の Git status に現れない副作用も否定できないため、v1 の自動 fallback は
+`read-only` に限定し、`workspace-write` は失敗理由にかかわらず最初の provider で停止します。
 `read-only` でも開始前後の state を比較し、同じ worktree の broker worker は直列化します。
 
-Codex worker は sandbox と approval=never を明示し、project/user MCP、plugin、app、multi-agent
-を無効にします。Claude worker は safe mode + strict MCP、`dontAsk`、worktree 相対の Read/Edit
-rules を使い、Agent/MCP/Bash を公開しません。Claude の write worker は Bash を持たないため、
+Codex worker は sandbox と approval=never を明示し、project config に宣言された各 MCP server、
+user config、hook、plugin、app、multi-agent を無効にします。Claude worker は safe mode + strict MCP、
+`dontAsk`、対象 worktree に限定した Read/Glob/Grep/Edit/Write rules を使い、Agent/MCP/Bash を
+公開しません。Claude の write worker は Bash を持たないため、
 テスト実行は outer verifier（既存 `issue-fleet` など）の責務です。
 
 worker 環境は PATH/HOME/locale/auth storage path などの allowlist から組み立て、
@@ -235,7 +239,8 @@ worker 環境は PATH/HOME/locale/auth storage path などの allowlist から�
 切り替えません。API 課金 fallback を追加するときは、別の明示的な利用者ポリシーと上限が必要です。
 
 run state は既定で Git common dir の `agent-broker/runs`（通常は `.git/agent-broker/runs`）へ
-0600/0700 で保存します。task、prompt、status、JSONL、provider session/thread ID、最終 result が
+0600/0700 で保存します。入力で省略された場合も開始時 HEAD を resolved `base_commit` として task、
+status、event、result に保存します。prompt、JSONL、provider session/thread ID、最終 result も
 残るため、worktree を削除しても診断できます。モデル出力はデータとして保存するだけで、shell や
 file path として実行しません。prompt と結果そのものは機密データになり得るため、run directory を
 共有・commit しません。敵対的な repository を扱う場合は、この境界に加えて disposable OS account

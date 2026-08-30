@@ -20,9 +20,15 @@ import shutil
 import signal
 import subprocess
 import sys
-import tempfile
-from typing import Any, Iterable, Mapping, Sequence
+import threading
+import time
+from typing import Any, Mapping, Sequence
 import uuid
+
+try:
+    import tomllib
+except ImportError:  # pragma: no cover - Python 3.10 compatibility
+    tomllib = None  # type: ignore[assignment]
 
 try:
     import fcntl
@@ -38,12 +44,14 @@ MAX_PROMPT_BYTES = 1024 * 1024
 MAX_JSON_BYTES = 8 * 1024 * 1024
 MAX_CAPTURE_BYTES = 8 * 1024 * 1024
 MAX_PERSISTED_STREAM_BYTES = 4 * 1024 * 1024
+MAX_PROJECT_CONFIG_BYTES = 1024 * 1024
 FALLBACK_REASONS = frozenset({"quota", "auth", "unavailable", "budget"})
 PROVIDERS = frozenset({"codex", "claude"})
 MODES = frozenset({"read-only", "workspace-write"})
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
+MCP_SERVER_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 SAFE_ENV_KEYS = frozenset(
     {
@@ -282,11 +290,12 @@ def _truncate_stream(text: str) -> str:
     encoded = text.encode("utf-8", errors="replace")
     if len(encoded) <= MAX_PERSISTED_STREAM_BYTES:
         return text
-    first_size = MAX_PERSISTED_STREAM_BYTES // 4
-    last_size = MAX_PERSISTED_STREAM_BYTES - first_size
-    first = encoded[:first_size].decode("utf-8", errors="replace")
-    last = encoded[-last_size:].decode("utf-8", errors="replace")
-    return f"{first}\n<agent-broker: stream truncated>\n{last}"
+    marker = b"\n<agent-broker: stream truncated>\n"
+    available = MAX_PERSISTED_STREAM_BYTES - len(marker)
+    first_size = available // 4
+    last_size = available - first_size
+    retained = encoded[:first_size] + marker + encoded[-last_size:]
+    return retained.decode("utf-8", errors="ignore")
 
 
 def _redact_text(text: str, inherited_env: Mapping[str, str] | None = None) -> str:
@@ -579,9 +588,89 @@ def _provider_binary(provider: str) -> str:
     return os.environ.get(env_name, provider)
 
 
+def _fallback_mcp_server_names(config_text: str) -> list[str]:
+    """Read simple MCP table names without making Python 3.10 depend on tomli."""
+
+    names: set[str] = set()
+    table_re = re.compile(
+        r'^\s*\[\s*mcp_servers\.(?:("(?:[^"\\]|\\.)*")|([A-Za-z0-9_-]+))'
+    )
+    for line in config_text.splitlines():
+        match = table_re.match(line)
+        if match:
+            if match.group(1):
+                try:
+                    name = json.loads(match.group(1))
+                except json.JSONDecodeError as exc:
+                    raise BrokerError(
+                        "unsupported_project_config",
+                        "cannot safely parse a quoted project MCP server name",
+                    ) from exc
+            else:
+                name = match.group(2)
+            if isinstance(name, str) and name:
+                names.add(name)
+            continue
+        code = line.split("#", 1)[0]
+        if "mcp_servers" in code:
+            raise BrokerError(
+                "unsupported_project_config",
+                "Python 3.10 can only disable project MCP servers declared as tables",
+            )
+    return sorted(names)
+
+
+def _project_mcp_server_names(workspace: Path) -> list[str]:
+    config_path = workspace / ".codex" / "config.toml"
+    if config_path.is_symlink():
+        raise BrokerError(
+            "unsafe_project_config", ".codex/config.toml must be a regular file"
+        )
+    if not config_path.exists():
+        return []
+    try:
+        if not config_path.is_file():
+            raise BrokerError(
+                "unsafe_project_config", ".codex/config.toml must be a regular file"
+            )
+        if config_path.stat().st_size > MAX_PROJECT_CONFIG_BYTES:
+            raise BrokerError(
+                "unsafe_project_config", ".codex/config.toml exceeds the safe size limit"
+            )
+        config_bytes = config_path.read_bytes()
+        config_text = config_bytes.decode("utf-8")
+    except BrokerError:
+        raise
+    except (OSError, UnicodeError) as exc:
+        raise BrokerError(
+            "unsafe_project_config", "cannot safely inspect .codex/config.toml"
+        ) from exc
+    if tomllib is None:
+        names = _fallback_mcp_server_names(config_text)
+    else:
+        try:
+            parsed = tomllib.loads(config_text)
+        except tomllib.TOMLDecodeError as exc:
+            raise BrokerError(
+                "unsafe_project_config", ".codex/config.toml is not valid TOML"
+            ) from exc
+        servers = parsed.get("mcp_servers", {})
+        if not isinstance(servers, dict):
+            raise BrokerError(
+                "unsafe_project_config", "project mcp_servers must be a TOML table"
+            )
+        names = sorted(str(name) for name in servers)
+    if any(not MCP_SERVER_NAME_RE.fullmatch(name) for name in names):
+        raise BrokerError(
+            "unsupported_project_config",
+            "Codex cannot safely override a project MCP server name containing punctuation",
+        )
+    return names
+
+
 def _codex_command(task: Mapping[str, Any], attempt_dir: Path) -> list[str]:
     mode = str(task["mode"])
-    return [
+    command = [
         _provider_binary("codex"),
         "--ask-for-approval",
         "never",
@@ -591,8 +680,13 @@ def _codex_command(task: Mapping[str, Any], attempt_dir: Path) -> list[str]:
         "plugins",
         "--disable",
         "apps",
-        "-c",
-        "mcp_servers={}",
+        "--disable",
+        "hooks",
+    ]
+    for server_name in _project_mcp_server_names(Path(str(task["workspace"]))):
+        command.extend(["-c", f"mcp_servers.{server_name}.enabled=false"])
+    command.extend(
+        [
         "exec",
         "--ignore-user-config",
         "--ignore-rules",
@@ -605,12 +699,24 @@ def _codex_command(task: Mapping[str, Any], attempt_dir: Path) -> list[str]:
         "--output-last-message",
         str(attempt_dir / "last-message.txt"),
         "-",
-    ]
+        ]
+    )
+    return command
 
 
 def _claude_command(task: Mapping[str, Any]) -> list[str]:
-    tools = "Read,Glob,Grep" if task["mode"] == "read-only" else "Read,Glob,Grep,Edit,Write"
-    allowed = "Read(/**)" if task["mode"] == "read-only" else "Read(/**),Edit(/**)"
+    workspace = str(Path(str(task["workspace"])).resolve())
+    if any(character in workspace for character in ("\x00", "\n", "\r", ",", "(", ")")):
+        raise BrokerError(
+            "unsafe_workspace_path",
+            "Claude permission rules cannot safely represent this workspace path",
+        )
+    tool_names = ["Read", "Glob", "Grep"]
+    if task["mode"] == "workspace-write":
+        tool_names.extend(["Edit", "Write"])
+    tools = ",".join(tool_names)
+    workspace_glob = f"{workspace}/**"
+    allowed = ",".join(f"{tool}({workspace_glob})" for tool in tool_names)
     denied = (
         "Agent,Task,TaskOutput,TaskStop,SendMessage,TeamCreate,TeamDelete,Bash,NotebookEdit,mcp__*"
     )
@@ -639,7 +745,7 @@ def _claude_command(task: Mapping[str, Any]) -> list[str]:
     ]
 
 
-def _terminate_process(process: subprocess.Popen[str]) -> None:
+def _terminate_process(process: subprocess.Popen[Any]) -> None:
     def send(sig: int) -> None:
         try:
             if os.name != "nt":
@@ -668,69 +774,110 @@ def _terminate_process(process: subprocess.Popen[str]) -> None:
         pass
 
 
-def _read_capture(handle: Any) -> tuple[str, bool]:
-    handle.flush()
-    handle.seek(0, os.SEEK_END)
-    size = handle.tell()
-    overflow = size > MAX_CAPTURE_BYTES
-    if not overflow:
-        handle.seek(0)
-        data = handle.read()
-    else:
-        first_size = MAX_CAPTURE_BYTES // 4
-        last_size = MAX_CAPTURE_BYTES - first_size
-        handle.seek(0)
-        first = handle.read(first_size)
-        handle.seek(-last_size, os.SEEK_END)
-        last = handle.read(last_size)
-        data = first + b"\n<agent-broker: capture overflow>\n" + last
-    return data.decode("utf-8", errors="replace"), overflow
-
-
 def _invoke(
     argv: Sequence[str], *, cwd: Path, prompt: str, timeout: int, provider: str
 ) -> ProcessResult:
-    with (
-        tempfile.TemporaryFile(mode="w+b") as stdout_file,
-        tempfile.TemporaryFile(mode="w+b") as stderr_file,
-    ):
-        try:
-            process = subprocess.Popen(
-                list(argv),
-                cwd=cwd,
-                env=_safe_environment(provider),
-                stdin=subprocess.PIPE,
-                stdout=stdout_file,
-                stderr=stderr_file,
-                text=True,
-                start_new_session=os.name != "nt",
-            )
-        except FileNotFoundError:
-            return ProcessResult(
-                exit_code=None,
-                stdout="",
-                stderr=f"{provider} executable is unavailable",
-                timed_out=False,
-                unavailable=True,
-                output_overflow=False,
-            )
-        timed_out = False
-        try:
-            process.communicate(input=prompt, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            _terminate_process(process)
-            process.communicate()
-        stdout, stdout_overflow = _read_capture(stdout_file)
-        stderr, stderr_overflow = _read_capture(stderr_file)
-        return ProcessResult(
-            exit_code=process.returncode,
-            stdout=stdout,
-            stderr=stderr,
-            timed_out=timed_out,
-            unavailable=False,
-            output_overflow=stdout_overflow or stderr_overflow,
+    try:
+        process = subprocess.Popen(
+            list(argv),
+            cwd=cwd,
+            env=_safe_environment(provider),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=False,
+            start_new_session=os.name != "nt",
         )
+    except FileNotFoundError:
+        return ProcessResult(
+            exit_code=None,
+            stdout="",
+            stderr=f"{provider} executable is unavailable",
+            timed_out=False,
+            unavailable=True,
+            output_overflow=False,
+        )
+
+    captured = {"stdout": bytearray(), "stderr": bytearray()}
+    capture_lock = threading.Lock()
+    output_overflow = threading.Event()
+    total_bytes = 0
+
+    def read_stream(name: str, stream: Any) -> None:
+        nonlocal total_bytes
+        try:
+            while True:
+                chunk = stream.read(64 * 1024)
+                if not chunk:
+                    break
+                with capture_lock:
+                    remaining = max(0, MAX_CAPTURE_BYTES - total_bytes)
+                    captured[name].extend(chunk[:remaining])
+                    total_bytes += min(len(chunk), remaining)
+                    if len(chunk) > remaining:
+                        output_overflow.set()
+        except (OSError, ValueError):
+            pass
+
+    def write_prompt() -> None:
+        assert process.stdin is not None
+        try:
+            process.stdin.write(prompt.encode("utf-8"))
+            process.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+        finally:
+            try:
+                process.stdin.close()
+            except (OSError, ValueError):
+                pass
+
+    assert process.stdout is not None
+    assert process.stderr is not None
+    readers = [
+        threading.Thread(target=read_stream, args=("stdout", process.stdout), daemon=True),
+        threading.Thread(target=read_stream, args=("stderr", process.stderr), daemon=True),
+    ]
+    writer = threading.Thread(target=write_prompt, daemon=True)
+    for thread in readers:
+        thread.start()
+    writer.start()
+
+    timed_out = False
+    started = time.monotonic()
+    try:
+        while process.poll() is None:
+            if output_overflow.is_set():
+                _terminate_process(process)
+                break
+            if time.monotonic() - started >= timeout:
+                timed_out = True
+                _terminate_process(process)
+                break
+            time.sleep(0.01)
+    except BaseException:
+        _terminate_process(process)
+        raise
+    finally:
+        if process.poll() is None:
+            _terminate_process(process)
+        writer.join(timeout=1)
+        for thread in readers:
+            thread.join(timeout=1)
+        for stream in (process.stdout, process.stderr):
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                pass
+
+    return ProcessResult(
+        exit_code=process.returncode,
+        stdout=bytes(captured["stdout"]).decode("utf-8", errors="replace"),
+        stderr=bytes(captured["stderr"]).decode("utf-8", errors="replace"),
+        timed_out=timed_out,
+        unavailable=False,
+        output_overflow=output_overflow.is_set(),
+    )
 
 
 def _json_lines(text: str) -> tuple[list[dict[str, Any]], bool]:
@@ -749,18 +896,6 @@ def _json_lines(text: str) -> tuple[list[dict[str, Any]], bool]:
             continue
         events.append(value)
     return events, malformed
-
-
-def _all_strings(value: Any) -> Iterable[str]:
-    if isinstance(value, str):
-        yield value
-    elif isinstance(value, Mapping):
-        for key, nested in value.items():
-            yield str(key)
-            yield from _all_strings(nested)
-    elif isinstance(value, list):
-        for nested in value:
-            yield from _all_strings(nested)
 
 
 def _reason_from_text(text: str, *, exit_code: int | None = None) -> str:
@@ -829,6 +964,54 @@ def _reason_from_text(text: str, *, exit_code: int | None = None) -> str:
     return "worker_error"
 
 
+def _codex_failure_reason(
+    events: Sequence[Mapping[str, Any]], *, exit_code: int | None
+) -> str:
+    """Classify only stable fields from Codex failure envelopes."""
+
+    values: list[str] = []
+    for event in events:
+        if event.get("type") not in {"turn.failed", "error"}:
+            continue
+        sources = [event]
+        error = event.get("error")
+        if isinstance(error, Mapping):
+            sources.append(error)
+        for source in sources:
+            for field in ("codexErrorInfo", "codex_error_info", "code", "type"):
+                value = source.get(field)
+                if isinstance(value, str):
+                    values.append(re.sub(r"[^a-z0-9]", "", value.casefold()))
+    quota_codes = {
+        "usagelimitexceeded",
+        "ratelimitexceeded",
+        "insufficientquota",
+        "creditsexhausted",
+    }
+    auth_codes = {
+        "authenticationfailed",
+        "notauthenticated",
+        "unauthorized",
+        "invalidapikey",
+    }
+    budget_codes = {"budgetexceeded", "maxbudget", "spendinglimitexceeded"}
+    unavailable_codes = {
+        "serviceunavailable",
+        "temporarilyunavailable",
+        "overloaded",
+        "connectionfailed",
+    }
+    if any(value in quota_codes for value in values):
+        return "quota"
+    if any(value in auth_codes for value in values):
+        return "auth"
+    if any(value in budget_codes for value in values):
+        return "budget"
+    if any(value in unavailable_codes for value in values) or exit_code in {126, 127}:
+        return "unavailable"
+    return "worker_error"
+
+
 def _classify_codex(process: ProcessResult, attempt_dir: Path) -> ClassifiedResult:
     if process.timed_out:
         return ClassifiedResult(False, "timeout", None, None)
@@ -848,11 +1031,10 @@ def _classify_codex(process: ProcessResult, attempt_dir: Path) -> ClassifiedResu
             completed = True
         elif event_type in {"turn.failed", "error"}:
             failed = True
-    combined = "\n".join([*list(_all_strings(events)), process.stderr])
     if process.exit_code != 0 or failed:
         return ClassifiedResult(
             False,
-            _reason_from_text(combined, exit_code=process.exit_code),
+            _codex_failure_reason(events, exit_code=process.exit_code),
             session_id,
             None,
         )
@@ -885,11 +1067,23 @@ def _classify_claude(process: ProcessResult) -> ClassifiedResult:
     session_id = None
     if result_event is not None and isinstance(result_event.get("session_id"), str):
         session_id = result_event["session_id"]
-    combined = "\n".join([*list(_all_strings(events)), process.stderr])
     if process.exit_code != 0 or result_event is None or result_event.get("is_error") is True:
+        subtype = str(result_event.get("subtype", "")) if result_event else ""
+        if subtype.startswith("error_max_turns"):
+            reason = "turn_limit"
+        elif subtype.startswith("error_max_budget"):
+            reason = "budget"
+        elif result_event is not None and isinstance(result_event.get("result"), str):
+            reason = _reason_from_text(
+                result_event["result"], exit_code=process.exit_code
+            )
+        elif process.exit_code in {126, 127}:
+            reason = "unavailable"
+        else:
+            reason = "worker_error"
         return ClassifiedResult(
             False,
-            _reason_from_text(combined, exit_code=process.exit_code),
+            reason,
             session_id,
             None,
         )
@@ -965,11 +1159,17 @@ def _run_task(task_path: Path, *, explicit_state_dir: str | None) -> dict[str, A
     task, prompt = _validate_task(raw, task_path)
     workspace = Path(task["workspace"])
     info = _workspace_info(workspace)
-    if task["base_commit"] is not None and info.snapshot.head != task["base_commit"]:
+    if (
+        task["base_commit"] is not None
+        and info.snapshot.head.casefold() != task["base_commit"].casefold()
+    ):
         raise BrokerError(
             "base_commit_mismatch",
             f"workspace HEAD {info.snapshot.head} does not match task base_commit",
         )
+    task["base_commit"] = info.snapshot.head
+    if "codex" in task["providers"]:
+        _project_mcp_server_names(workspace)
     if task["mode"] == "workspace-write":
         if not info.linked_worktree:
             raise BrokerError(
@@ -1024,12 +1224,21 @@ def _run_task(task_path: Path, *, explicit_state_dir: str | None) -> dict[str, A
             "provider": None,
             "workspace": str(workspace),
             "mode": task["mode"],
+            "base_commit": baseline.head,
             "attempts": [],
             "result_path": str(result_path),
             "updated_at": _now(),
         }
         _atomic_write_json(status_path, initial_status)
-        _append_event(events_path, {"type": "run.started", "at": _now(), "run_id": run_id})
+        _append_event(
+            events_path,
+            {
+                "type": "run.started",
+                "at": _now(),
+                "run_id": run_id,
+                "base_commit": baseline.head,
+            },
+        )
 
         providers = list(task["providers"])
         if not task["allow_fallback"]:
@@ -1112,6 +1321,8 @@ def _run_task(task_path: Path, *, explicit_state_dir: str | None) -> dict[str, A
             )
             if classified.ok:
                 break
+            if task["mode"] == "workspace-write":
+                break
             if classified.reason not in FALLBACK_REASONS:
                 break
             if changed:
@@ -1139,6 +1350,7 @@ def _run_task(task_path: Path, *, explicit_state_dir: str | None) -> dict[str, A
         "session_id": final_classified.session_id,
         "workspace": str(workspace),
         "mode": task["mode"],
+        "base_commit": baseline.head,
         "output": final_classified.output,
         "attempts": attempts,
         "result_path": str(result_path),
@@ -1151,6 +1363,7 @@ def _run_task(task_path: Path, *, explicit_state_dir: str | None) -> dict[str, A
             "type": "run.finished",
             "at": _now(),
             "run_id": run_id,
+            "base_commit": baseline.head,
             "status": status,
             "reason": final_classified.reason,
         },
@@ -1297,7 +1510,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "doctor":
             result = _doctor(Path(args.workspace), explicit_state_dir=args.state_dir)
             _emit(result, json_output=args.json)
-            return 0
+            return 0 if result["ok"] else 1
         if args.command == "run":
             result = _run_task(
                 Path(args.task_file).expanduser().resolve(), explicit_state_dir=args.state_dir
