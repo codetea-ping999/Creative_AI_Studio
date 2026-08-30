@@ -1,0 +1,60 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://creative-ai-studio.local/agents/protocol/v1/task.schema.json",
+  "title": "Cross-agent broker task",
+  "description": "Input contract for `scripts/agent_broker.py run --task-file <this>`. See .agents/protocol/v1/worker-policy.md for the invariants this contract exists to enforce.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["task_id", "repo_path", "prompt", "primary_agent"],
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,64}$",
+      "description": "Unique identifier. Used as the dedicated worktree's directory name and as the git branch suffix (agent-broker/<task_id>), so it must be filesystem- and branch-name-safe."
+    },
+    "repo_path": {
+      "type": "string",
+      "description": "Absolute path to any existing checkout (main or a worktree) of the repository the task should branch from. The broker creates a brand new dedicated linked worktree from this repo -- it never runs the task directly in `repo_path` itself."
+    },
+    "base_ref": {
+      "type": "string",
+      "default": "HEAD",
+      "description": "Git ref the new dedicated worktree's branch is created from."
+    },
+    "prompt": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Task instructions handed to the agent verbatim (after the harness prepends its anti-recursion guard)."
+    },
+    "primary_agent": {
+      "type": "string",
+      "enum": ["claude", "codex"],
+      "description": "Agent to attempt first."
+    },
+    "fallback_agent": {
+      "type": "string",
+      "enum": ["claude", "codex", "none"],
+      "description": "Agent to fall back to if `primary_agent` fails with a recognized quota/auth/service-unavailable signal AND leaves the worktree clean. Defaults to the agent other than `primary_agent`. 'none' disables fallback entirely for this task."
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["read_only", "write"],
+      "default": "write",
+      "description": "'read_only' runs the agent in a no-edits/plan-equivalent mode (Claude: --permission-mode plan; Codex: --sandbox read-only). 'write' allows file edits within the dedicated worktree only."
+    },
+    "primary_model": {
+      "type": "string",
+      "description": "Optional model override passed to the primary agent's CLI."
+    },
+    "fallback_model": {
+      "type": "string",
+      "description": "Optional model override passed to the fallback agent's CLI, if a fallback occurs."
+    },
+    "timeout_seconds": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "default": 3600,
+      "description": "Wall-clock timeout applied independently to each attempt (primary, and fallback if triggered)."
+    }
+  }
+}

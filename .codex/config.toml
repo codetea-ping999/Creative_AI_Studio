@@ -1,0 +1,15 @@
+# Project-scoped Codex CLI defaults for Creative AI Studio.
+#
+# ~/.codex/config.toml (global, all projects) currently sets
+# approval_policy = "never" and sandbox_mode = "danger-full-access" — Codex
+# runs with no approval gate and unrestricted filesystem/network access
+# everywhere else on this machine. That default is intentionally left alone
+# so it doesn't change behavior in the user's other projects.
+#
+# This file scopes safer defaults to just this repo, matching the harness's
+# "auto-fallback only on quota/auth/service failure, writes confined to a
+# dedicated worktree" design: Codex here can read/edit files in its sandbox
+# without asking every time, but must ask before anything wider (running
+# outside the workspace, reaching the network, etc).
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"

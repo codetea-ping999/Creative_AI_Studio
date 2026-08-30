@@ -1,0 +1,95 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://creative-ai-studio.local/agents/protocol/v1/result.schema.json",
+  "title": "Cross-agent broker result",
+  "description": "Output contract produced by `scripts/agent_broker.py run --task-file ...` (the JSON body of TaskResult / agent_broker.TaskResult, as printed by --json). See .agents/protocol/v1/worker-policy.md for what each status means and why fallback is single-hop.",
+  "type": "object",
+  "required": [
+    "task_id",
+    "status",
+    "agent_used",
+    "fallback_triggered",
+    "fallback_reason",
+    "worktree_path",
+    "branch",
+    "dirty",
+    "output_text",
+    "error_message",
+    "started_at",
+    "ended_at",
+    "duration_seconds",
+    "attempts"
+  ],
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "description": "Echoes the task's task_id."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["success", "blocked", "failed"],
+      "description": "'success': the agent that ran (primary or fallback) exited cleanly. 'blocked': the primary agent failed and left uncommitted changes -- fallback was deliberately NOT attempted; a human must inspect worktree_path. 'failed': the run (primary, or primary+fallback) ended without success and without a dirty worktree to block on -- either the failure wasn't a recognized quota/auth/service signal, or the fallback attempt also failed, or fallback_agent was 'none'/unavailable."
+    },
+    "agent_used": {
+      "type": "string",
+      "enum": ["claude", "codex"],
+      "description": "Whichever agent produced the final outcome (the fallback agent, if fallback_triggered is true)."
+    },
+    "fallback_triggered": {
+      "type": "boolean",
+      "description": "True only if the primary agent failed with a recognized transient signal on a clean worktree and the fallback agent was actually invoked."
+    },
+    "fallback_reason": {
+      "type": ["string", "null"],
+      "enum": ["quota_exceeded", "auth_failed", "service_unavailable", null],
+      "description": "Set only when fallback_triggered is true; null otherwise, even if the primary failure text loosely matched a keyword but fallback was declined (e.g. fallback_agent: 'none')."
+    },
+    "worktree_path": {
+      "type": ["string", "null"],
+      "description": "Absolute path to the dedicated linked worktree the task ran in. Null if worktree creation itself failed, or if the run succeeded with zero changes and the broker pruned the (empty) worktree. Non-null whenever `dirty` is true -- the broker never deletes a worktree with any changes in it, staged or not."
+    },
+    "branch": {
+      "type": ["string", "null"],
+      "description": "Git branch created for the dedicated worktree (agent-broker/<task_id>). Null iff worktree_path is null for the same reason."
+    },
+    "dirty": {
+      "type": "boolean",
+      "description": "Whether the worktree had any uncommitted changes (tracked or untracked, per `git status --porcelain`) when the run ended. The broker never stages or commits on the agent's behalf -- this always reflects whatever the agent itself left behind."
+    },
+    "output_text": {
+      "type": "string",
+      "description": "Final text output from whichever agent produced the reported status (Claude: the --output-format json 'result' field; Codex: the --output-last-message file contents)."
+    },
+    "error_message": {
+      "type": ["string", "null"],
+      "description": "Human-readable failure detail. Null only when status is 'success'."
+    },
+    "started_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "ended_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "duration_seconds": {
+      "type": "number",
+      "minimum": 0
+    },
+    "attempts": {
+      "type": "array",
+      "description": "One entry per agent actually invoked (length 1, or 2 if fallback_triggered), in order.",
+      "items": {
+        "type": "object",
+        "required": ["agent", "exit_code", "timed_out", "launch_error", "dirty_after"],
+        "properties": {
+          "agent": { "type": "string", "enum": ["claude", "codex"] },
+          "exit_code": { "type": "integer" },
+          "timed_out": { "type": "boolean" },
+          "launch_error": { "type": ["string", "null"] },
+          "dirty_after": { "type": "boolean" }
+        }
+      }
+    }
+  }
+}

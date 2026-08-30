@@ -160,6 +160,17 @@ project state). `apps/web/src/components/PromptForm.tsx` + `styles.css` own form
 `App.tsx` owns API-response handling. Other panels under `apps/web/src/components/` are split by
 surface (gallery, matrix/batch, story, asset detail, models summary).
 
+## Cross-agent harness (Claude Code ⇄ Codex)
+
+This repo supports delegating work between Claude Code and OpenAI's Codex CLI in both
+directions, plus a headless fallback broker for when one is out of quota, logged out, or
+down. See `docs/cross-agent-harness.md` first, then `.agents/protocol/v1/worker-policy.md`
+for the exact rules (fallback triggers on quota/auth/service-down only, never on an
+ordinary task failure; every task runs in a fresh dedicated worktree; a dirty worktree
+after a failure blocks rather than falling back). The Claude Code → Codex plugin
+(`codex@openai-codex`) is enabled per project *path* — check `claude plugin list` before
+assuming `/codex:*` commands are available in whichever worktree you're in.
+
 ## Conventions
 
 - Follow `AGENTS.md` for any Web UI change: source-of-truth docs are `docs/design-system.md`,

@@ -59,6 +59,10 @@ Creative AI Studio のドキュメント案内です。
 
 - [agent-harness.md](./agent-harness.md) — 検証ゲート、ファイル所有権、禁止事項
 
+### Claude CodeとCodexを連携させたい
+
+- [cross-agent-harness.md](./cross-agent-harness.md) — 双方向委任、quota/認証/停止時のみの自動フォールバック、worker-policy
+
 ### API を叩きたい
 
 - [api-contract.md](./api-contract.md)

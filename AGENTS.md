@@ -7,6 +7,15 @@ read `docs/agent-harness.md` first. It defines the verification gate, which file
 are reserved for the integrator, and what you must not do (commit, install heavy
 dependencies, download weights).
 
+## Delegating to Codex, or being delegated to by Codex
+
+If you are asked to hand a task to Codex, or you are running as a task Codex handed to
+you (via the `claude_code` MCP tool or `scripts/agent_broker.py`), read
+`docs/cross-agent-harness.md` first. In particular: do not re-delegate further (no
+`/codex:*` commands, no `claude_code` MCP calls, no `agent_broker.py`) from inside a
+delegated run -- see rule 7 in `.agents/protocol/v1/worker-policy.md`. If you were invoked
+with `mode="read_only"`, do not attempt file writes even if you believe they'd help.
+
 ## Frontend design source of truth
 
 When changing the web UI, follow:
