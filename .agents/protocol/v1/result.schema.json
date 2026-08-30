@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://creative-ai-studio.local/agent-broker/result.v1.schema.json",
+  "title": "Agent broker result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "ok",
+    "run_id",
+    "task_id",
+    "status",
+    "reason",
+    "workspace",
+    "mode",
+    "attempts",
+    "result_path"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "ok": {"type": "boolean"},
+    "run_id": {"type": "string"},
+    "task_id": {"type": "string"},
+    "status": {
+      "enum": ["completed", "failed", "blocked"]
+    },
+    "reason": {
+      "enum": [
+        "success",
+        "quota",
+        "auth",
+        "unavailable",
+        "budget",
+        "timeout",
+        "turn_limit",
+        "workspace_changed",
+        "protocol_error",
+        "worker_error",
+        "invalid_task"
+      ]
+    },
+    "provider": {
+      "type": ["string", "null"],
+      "enum": ["codex", "claude", null]
+    },
+    "session_id": {"type": ["string", "null"]},
+    "workspace": {"type": "string"},
+    "mode": {"enum": ["read-only", "workspace-write"]},
+    "output": {"type": ["string", "null"]},
+    "attempts": {
+      "type": "array",
+      "maxItems": 2,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "attempt",
+          "provider",
+          "status",
+          "reason",
+          "exit_code",
+          "session_id",
+          "started_at",
+          "finished_at",
+          "stdout_path",
+          "stderr_path"
+        ],
+        "properties": {
+          "attempt": {"type": "integer", "minimum": 1, "maximum": 2},
+          "provider": {"enum": ["codex", "claude"]},
+          "status": {"enum": ["completed", "failed"]},
+          "reason": {"type": "string"},
+          "exit_code": {"type": ["integer", "null"]},
+          "session_id": {"type": ["string", "null"]},
+          "started_at": {"type": "string"},
+          "finished_at": {"type": "string"},
+          "stdout_path": {"type": "string"},
+          "stderr_path": {"type": "string"}
+        }
+      }
+    },
+    "result_path": {"type": "string"}
+  }
+}
