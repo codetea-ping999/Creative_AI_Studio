@@ -179,6 +179,29 @@ class ExpansionTests(unittest.TestCase):
             sorted(item.request.seed for item in per_item), [100, 101, 102, 103]
         )
 
+    def test_seed_tracks_index_after_model_id_sort_reorders_items(self) -> None:
+        # "b" is declared first but patches model_id to a name that sorts
+        # after "a"'s; expand_items groups by model_id, so the two items
+        # swap positions relative to their declaration order.
+        spec = _spec(
+            seed=100,
+            seed_policy="per_item",
+            axes=[
+                Axis(
+                    name="model",
+                    values=[
+                        AxisValue(label="b", patch={"model_id": "zeta-model"}),
+                        AxisValue(label="a", patch={"model_id": "alpha-model"}),
+                    ],
+                )
+            ],
+        )
+        items = expand_items(spec, stage=Stage(name="single"), stage_index=0)
+        model_order = [item.request.model_id for item in items]
+        self.assertEqual(model_order, sorted(model_order))
+        for item in items:
+            self.assertEqual(item.request.seed, 100 + item.index)
+
     def test_next_stage_inherits_the_winning_seed(self) -> None:
         spec = _spec(
             seed=1000,

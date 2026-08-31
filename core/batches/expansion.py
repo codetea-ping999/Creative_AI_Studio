@@ -71,8 +71,16 @@ def expand_items(
         )
 
     items.sort(key=lambda item: (item.request.model_id, item.index))
+    # Sorting can move an item to a different index. per_item/sweep seeds are
+    # base + index, so they must be re-derived from the final index here or a
+    # child's seed stops matching the base + item.index contract once items
+    # are grouped by model. Inherited seeds (seed_items) and the "shared"
+    # policy's constant seed do not depend on index and are left alone.
+    reseed = seed_items is None and spec.seed_policy in ("per_item", "sweep")
     for order, item in enumerate(items):
         item.index = order
+        if reseed:
+            item.request.seed = _resolve_seed(spec, order, item.axis_values)
     return items
 
 
