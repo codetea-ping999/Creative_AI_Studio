@@ -202,6 +202,38 @@ class ExpansionTests(unittest.TestCase):
         for item in items:
             self.assertEqual(item.request.seed, 100 + item.index)
 
+    def test_explicit_axis_seed_patch_survives_the_model_id_sort(self) -> None:
+        # "a" pins its own seed via an axis patch (a legitimate, unlocked
+        # override); "b" and "c" get the ordinary base + index seed. All three
+        # model_ids sort in the opposite order from declaration, so the
+        # reseed-after-sort pass must tell the pinned item apart from the two
+        # that should be re-derived from their post-sort index.
+        spec = _spec(
+            seed=100,
+            seed_policy="per_item",
+            axes=[
+                Axis(
+                    name="model",
+                    values=[
+                        AxisValue(label="b", patch={"model_id": "zeta-model"}),
+                        AxisValue(
+                            label="a",
+                            patch={"model_id": "alpha-model", "seed": 777},
+                        ),
+                        AxisValue(label="c", patch={"model_id": "mu-model"}),
+                    ],
+                )
+            ],
+        )
+        items = expand_items(spec, stage=Stage(name="single"), stage_index=0)
+        model_order = [item.request.model_id for item in items]
+        self.assertEqual(model_order, sorted(model_order))
+
+        by_label = {item.label: item for item in items}
+        self.assertEqual(by_label["a"].request.seed, 777)
+        self.assertEqual(by_label["b"].request.seed, 100 + by_label["b"].index)
+        self.assertEqual(by_label["c"].request.seed, 100 + by_label["c"].index)
+
     def test_next_stage_inherits_the_winning_seed(self) -> None:
         spec = _spec(
             seed=1000,
