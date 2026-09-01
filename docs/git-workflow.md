@@ -41,7 +41,7 @@ git switch -c feature/short-description upstream/main
   `git switch -c` の代替であり、同じブランチを先に作成してから実行しません。
 
 ```bash
-git worktree add ../Creative_AI_Studio-fix -b codex/fix/short-description origin/main
+git worktree add ../Creative_AI_Studio-fix -b codex/fix/short-description upstream/main
 ```
 
 ## 変更を commit する前
@@ -93,9 +93,9 @@ Docs: clarify local model setup
   修正・更新してからレビュー依頼します。
 - マージ後はブランチと不要になった worktree を削除します。ただし `git status --short` が
   clean でも ignored 資産は表示されず、`git worktree remove <path>` で一緒に削除されます。
-  削除前に `git status --short --ignored` で ignored file を確認し、モデル、DB、outputs、cache
-  などの固有データがあれば別の安全な場所へ複製して checksum を確認します。残すデータが
-  ないことを確認できた worktree だけを削除します。
+  削除前に `git -C <path> status --short --ignored` で削除対象自身の ignored file を確認し、
+  モデル、DB、outputs、cache などの固有データがあれば別の安全な場所へ複製して checksum を
+  確認します。残すデータがないことを確認できた worktree だけを削除します。
 
 ## Git に入れてはいけないもの
 
