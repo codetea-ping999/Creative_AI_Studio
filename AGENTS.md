@@ -29,3 +29,22 @@ Before calling a frontend change complete:
 - run frontend tests and the production build.
 
 Do not judge visual completion from source code alone.
+
+## Experimental Codex model routing
+
+For non-trivial Codex tasks, follow the `Codex モデル・ルーティングの試行`
+section in `docs/cross-agent-harness.md`. Use it only when the runtime exposes
+explicit subagent model selection, and never report an effective model that the
+runtime did not attest.
+
+## Cross-agent delegation
+
+Follow `docs/cross-agent-harness.md` when delegating between Codex and Claude Code.
+Claude Code is available through the project-scoped `claude_code` MCP server, but
+starting its `Agent` consumes Claude usage and requires operator approval.
+
+- Keep delegation depth at one; a delegated agent must not delegate back.
+- Use `isolation: "worktree"` for every delegated write task.
+- Never allow two providers to write to the same worktree concurrently.
+- Prefer the other provider for independent verification of high-risk changes.
+- Preserve the patch and verification contract in `docs/agent-harness.md`.

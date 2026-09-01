@@ -183,3 +183,17 @@ surface (gallery, matrix/batch, story, asset detail, models summary).
   optional semantic judge is a separate, explicitly-gated scorer.
 - Commit message style (`CONTRIBUTING.md`): start with a verb (Add/Fix/Update/Remove/Refactor), be
   specific, reference issue numbers where relevant.
+
+## Cross-agent delegation
+
+Follow `docs/cross-agent-harness.md` for Claude Code <-> Codex handoffs. The project-scoped
+`codex@openai-codex` plugin is the supported Claude-to-Codex path; do not add the deprecated
+`codex mcp-server` integration.
+
+- Use `/codex:review` for an independent read-only review. Use `/codex:rescue` for writes only
+  when this Claude session already runs in a dedicated worktree; a background rescue owns that
+  worktree until it finishes.
+- Keep delegated write work isolated in its own worktree and preserve the patch handoff contract.
+- Do not delegate recursively: Codex invoked by Claude must not invoke Claude again.
+- Keep the optional stop-time review gate disabled unless the user explicitly asks to monitor it;
+  an automatic review loop can exhaust both providers' usage limits.

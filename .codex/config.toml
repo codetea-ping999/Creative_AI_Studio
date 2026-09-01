@@ -1,0 +1,18 @@
+# Expose Claude Code's agent controls to Codex without also exposing its raw
+# filesystem and shell tools. The Claude agent remains responsible for its own
+# permission checks; callers must use an isolated worktree for write tasks.
+[mcp_servers.claude_code]
+command = "claude"
+args = ["--safe-mode", "mcp", "serve"]
+env = { CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH = "1", CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS = "1" }
+enabled = true
+required = false
+enabled_tools = ["Agent", "TaskOutput", "TaskStop", "SendMessage", "ListAgents"]
+startup_timeout_sec = 20
+tool_timeout_sec = 900
+default_tools_approval_mode = "approve"
+
+# Starting a Claude agent consumes Claude usage, so keep the costly operation
+# visible to the operator. Follow-up/status calls are approved automatically.
+[mcp_servers.claude_code.tools.Agent]
+approval_mode = "prompt"
