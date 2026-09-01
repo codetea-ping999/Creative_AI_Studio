@@ -42,6 +42,9 @@ Creative AI Studio のドキュメント案内です。
 11. [model-download-guide.md](./model-download-guide.md)
     実モデルの配置や manifest 運用を確認します。
 
+12. [git-workflow.md](./git-workflow.md)
+    ブランチ、commit、PR、worktree、秘密情報・モデル成果物の Git 運用ルールです。
+
 ## 目的別の読み方
 
 ### とにかく動かしたい
@@ -58,6 +61,7 @@ Creative AI Studio のドキュメント案内です。
 ### 複数エージェントで並列に実装したい
 
 - [agent-harness.md](./agent-harness.md) — 検証ゲート、ファイル所有権、禁止事項
+- [git-workflow.md](./git-workflow.md) — 通常開発を含む Git の共通ルール
 
 ### API を叩きたい
 

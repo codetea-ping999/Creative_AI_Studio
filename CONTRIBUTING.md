@@ -24,11 +24,13 @@ Please be respectful and constructive in all interactions. We are committed to p
    cd Creative_AI_Studio
    ```
 
-3. Create a new branch for your feature:
+3. Add the canonical repository and create a branch from its latest `main`:
    ```bash
-   git checkout -b feature/your-feature-name
-   # or for bug fixes:
-   git checkout -b fix/bug-description
+   git remote add upstream https://github.com/codetea-ping999/Creative_AI_Studio.git
+   git fetch upstream
+   # Choose one branch type:
+   git checkout -b feature/your-feature-name upstream/main
+   # git checkout -b fix/bug-description upstream/main
    ```
 
 4. Set up the development environment:
@@ -53,27 +55,20 @@ Please be respectful and constructive in all interactions. We are committed to p
 
 ### Before Submitting a Pull Request
 
-1. **Run tests locally:**
+1. **Run the canonical local verifier:**
    ```bash
-   pytest -q
+   venv/bin/python scripts/verify_local_stack.py --start-api
    ```
 
-2. **Check code style and types:**
+   This runs setup validation, Python and Web tests with coverage gates, ESLint,
+   Ruff, mypy, npm audit, the production Web build, and API smoke checks. If a
+   gate cannot run locally, list it explicitly in the pull request.
+
+2. **For faster iteration before the full verifier, run focused checks:**
    ```bash
    make lint       # eslint (apps/web) + ruff (core/, generators/)
    make typecheck  # mypy (core/, generators/)
-   ```
-
-3. **Verify setup:**
-   ```bash
-   python scripts/check_local_setup.py
-   ```
-
-4. **Build Web UI (if changed):**
-   ```bash
-   cd apps/web
-   npm run build
-   cd ../..
+   pytest -q
    ```
 
 ### Commit Messages
