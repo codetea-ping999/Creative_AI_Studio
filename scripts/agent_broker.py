@@ -52,6 +52,7 @@ TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
 MCP_SERVER_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+CLAUDE_RULE_METACHARACTERS = frozenset("\x00\n\r,()[]{}*?!\\")
 
 SAFE_ENV_KEYS = frozenset(
     {
@@ -397,13 +398,26 @@ def _state_root(workspace_info: WorkspaceInfo | None, explicit: str | None = Non
     configured = explicit or os.environ.get("AGENT_BROKER_STATE_DIR")
     if configured:
         root = Path(configured).expanduser().resolve()
-    elif workspace_info is not None:
-        root = workspace_info.common_dir / "agent-broker"
     else:
         xdg = os.environ.get("XDG_STATE_HOME")
         base = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "state"
-        root = (base / "agent-broker").resolve()
+        root = base / "agent-broker"
+        if workspace_info is not None:
+            repository_id = hashlib.sha256(
+                str(workspace_info.common_dir).encode("utf-8")
+            ).hexdigest()
+            root = root / "repositories" / repository_id
+        root = root.resolve()
     return root
+
+
+def _validate_state_root(state_root: Path, info: WorkspaceInfo) -> None:
+    protected_roots = (info.root, info.git_dir, info.common_dir)
+    if any(state_root.is_relative_to(root) for root in protected_roots):
+        raise BrokerError(
+            "unsafe_state_path",
+            "state root must be outside the worker-readable worktree and Git directories",
+        )
 
 
 def _read_json_file(path: Path, *, label: str, max_bytes: int = MAX_JSON_BYTES) -> dict[str, Any]:
@@ -707,18 +721,22 @@ def _codex_command(task: Mapping[str, Any], attempt_dir: Path) -> list[str]:
     return command
 
 
-def _claude_command(task: Mapping[str, Any]) -> list[str]:
-    workspace = str(Path(str(task["workspace"])).resolve())
-    if any(character in workspace for character in ("\x00", "\n", "\r", ",", "(", ")")):
+def _claude_workspace_glob(workspace_path: Path) -> str:
+    workspace = str(workspace_path.resolve())
+    if any(character in workspace for character in CLAUDE_RULE_METACHARACTERS):
         raise BrokerError(
             "unsafe_workspace_path",
             "Claude permission rules cannot safely represent this workspace path",
         )
+    return f"{workspace}/**"
+
+
+def _claude_command(task: Mapping[str, Any]) -> list[str]:
+    workspace_glob = _claude_workspace_glob(Path(str(task["workspace"])))
     tool_names = ["Read", "Glob", "Grep"]
     if task["mode"] == "workspace-write":
         tool_names.extend(["Edit", "Write"])
     tools = ",".join(tool_names)
-    workspace_glob = f"{workspace}/**"
     allowed = ",".join(f"{tool}({workspace_glob})" for tool in tool_names)
     denied = (
         "Agent,Task,TaskOutput,TaskStop,SendMessage,TeamCreate,TeamDelete,Bash,NotebookEdit,mcp__*"
@@ -749,32 +767,50 @@ def _claude_command(task: Mapping[str, Any]) -> list[str]:
 
 
 def _terminate_process(process: subprocess.Popen[Any]) -> None:
-    def send(sig: int) -> None:
+    if os.name == "nt":  # pragma: no cover
+        process.send_signal(signal.SIGINT)
         try:
-            if os.name != "nt":
-                os.killpg(process.pid, sig)
-            else:  # pragma: no cover
-                process.send_signal(sig)
-        except ProcessLookupError:
-            pass
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
+        return
 
-    send(signal.SIGINT)
-    try:
-        process.wait(timeout=3)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    send(signal.SIGTERM)
-    try:
-        process.wait(timeout=3)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    send(signal.SIGKILL)
-    try:
-        process.wait(timeout=3)
-    except subprocess.TimeoutExpired:
-        pass
+    def group_exists() -> bool:
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            break
+        deadline = time.monotonic() + 3
+        while group_exists() and time.monotonic() < deadline:
+            if process.poll() is None:
+                try:
+                    process.wait(timeout=0.05)
+                except subprocess.TimeoutExpired:
+                    pass
+            else:
+                time.sleep(0.05)
+        if not group_exists():
+            break
+    if process.poll() is None:
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=1)
 
 
 def _invoke(
@@ -875,8 +911,7 @@ def _invoke(
     finally:
         if restore_sigterm:
             signal.signal(signal.SIGTERM, previous_sigterm)
-        if process.poll() is None:
-            _terminate_process(process)
+        _terminate_process(process)
         writer.join(timeout=1)
         for thread in readers:
             thread.join(timeout=1)
@@ -1170,7 +1205,49 @@ def _attempt(
     return attempt, classified
 
 
-def _run_task(task_path: Path, *, explicit_state_dir: str | None) -> dict[str, Any]:
+def _persist_interrupted_run(
+    *,
+    task: Mapping[str, Any],
+    run_id: str,
+    baseline: WorkspaceSnapshot,
+    result_path: Path,
+    status_path: Path,
+    events_path: Path,
+    provider: str | None,
+    attempts: Sequence[Mapping[str, Any]],
+) -> None:
+    interrupted_result = {
+        "schema_version": SCHEMA_VERSION,
+        "ok": False,
+        "run_id": run_id,
+        "task_id": task["task_id"],
+        "status": "failed",
+        "reason": "interrupted",
+        "provider": provider,
+        "session_id": None,
+        "workspace": str(task["workspace"]),
+        "mode": task["mode"],
+        "base_commit": baseline.head,
+        "output": None,
+        "attempts": list(attempts),
+        "result_path": str(result_path),
+    }
+    _atomic_write_json(result_path, interrupted_result)
+    _atomic_write_json(status_path, interrupted_result)
+    _append_event(
+        events_path,
+        {
+            "type": "run.finished",
+            "at": _now(),
+            "run_id": run_id,
+            "base_commit": baseline.head,
+            "status": "failed",
+            "reason": "interrupted",
+        },
+    )
+
+
+def _run_task_impl(task_path: Path, *, explicit_state_dir: str | None) -> dict[str, Any]:
     raw = _read_json_file(task_path, label="task file", max_bytes=MAX_PROMPT_BYTES)
     task, prompt = _validate_task(raw, task_path)
     workspace = Path(task["workspace"])
@@ -1186,6 +1263,8 @@ def _run_task(task_path: Path, *, explicit_state_dir: str | None) -> dict[str, A
     task["base_commit"] = info.snapshot.head
     if "codex" in task["providers"]:
         _project_mcp_server_names(workspace)
+    if "claude" in task["providers"]:
+        _claude_workspace_glob(workspace)
     if task["mode"] == "workspace-write":
         if not info.linked_worktree:
             raise BrokerError(
@@ -1201,30 +1280,26 @@ def _run_task(task_path: Path, *, explicit_state_dir: str | None) -> dict[str, A
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_id = f"{stamp}-{task['task_id']}-{uuid.uuid4().hex[:8]}"
     state_root = _state_root(info, explicit_state_dir)
-    if state_root.is_relative_to(workspace) and not state_root.is_relative_to(info.git_dir):
-        raise BrokerError(
-            "unsafe_state_path",
-            "state root must be outside the worktree (the Git directory is allowed)",
-        )
+    _validate_state_root(state_root, info)
     _mkdir_private(state_root)
     baseline = info.snapshot
     lease = WorkspaceLease(info.common_dir, workspace, run_id)
     lease.__enter__()
-    if _snapshot(workspace) != baseline:
-        lease.__exit__(None, None, None)
-        raise BrokerError(
-            "workspace_changed_before_start",
-            "workspace changed while the broker was acquiring its lease",
-        )
-    setup_complete = False
+    runs_root = state_root / "runs"
+    run_dir = runs_root / run_id
+    result_path = run_dir / "result.json"
+    status_path = run_dir / "status.json"
+    events_path = run_dir / "events.jsonl"
+    attempts: list[dict[str, Any]] = []
+    active_provider: str | None = None
     try:
-        runs_root = state_root / "runs"
+        if _snapshot(workspace) != baseline:
+            raise BrokerError(
+                "workspace_changed_before_start",
+                "workspace changed while the broker was acquiring its lease",
+            )
         _mkdir_private(runs_root)
-        run_dir = runs_root / run_id
         run_dir.mkdir(mode=0o700)
-        result_path = run_dir / "result.json"
-        status_path = run_dir / "status.json"
-        events_path = run_dir / "events.jsonl"
         stored_prompt_path = run_dir / "prompt.txt"
         _atomic_write_text(stored_prompt_path, prompt)
         stored_task = dict(task)
@@ -1259,17 +1334,11 @@ def _run_task(task_path: Path, *, explicit_state_dir: str | None) -> dict[str, A
         providers = list(task["providers"])
         if not task["allow_fallback"]:
             providers = providers[:1]
-        attempts: list[dict[str, Any]] = []
         final_classified: ClassifiedResult | None = None
         final_provider: str | None = None
         previous_reason: str | None = None
-        setup_complete = True
-    finally:
-        if not setup_complete:
-            lease.__exit__(None, None, None)
-
-    try:
         for attempt_number, provider in enumerate(providers, start=1):
+            active_provider = provider
             _append_event(
                 events_path,
                 {
@@ -1344,47 +1413,77 @@ def _run_task(task_path: Path, *, explicit_state_dir: str | None) -> dict[str, A
             if changed:
                 break
             previous_reason = classified.reason
+
+        if final_classified is None:
+            raise BrokerError("worker_error", "no provider attempt was executed", exit_code=1)
+        if final_classified.ok:
+            status = "completed"
+        elif final_classified.reason == "workspace_changed":
+            status = "blocked"
+        else:
+            status = "failed"
+        result = {
+            "schema_version": SCHEMA_VERSION,
+            "ok": final_classified.ok,
+            "run_id": run_id,
+            "task_id": task["task_id"],
+            "status": status,
+            "reason": final_classified.reason,
+            "provider": final_provider,
+            "session_id": final_classified.session_id,
+            "workspace": str(workspace),
+            "mode": task["mode"],
+            "base_commit": baseline.head,
+            "output": final_classified.output,
+            "attempts": attempts,
+            "result_path": str(result_path),
+        }
+        _atomic_write_json(result_path, result)
+        _atomic_write_json(status_path, result)
+        _append_event(
+            events_path,
+            {
+                "type": "run.finished",
+                "at": _now(),
+                "run_id": run_id,
+                "base_commit": baseline.head,
+                "status": status,
+                "reason": final_classified.reason,
+            },
+        )
+        return result
+    except (KeyboardInterrupt, SystemExit):
+        _persist_interrupted_run(
+            task=task,
+            run_id=run_id,
+            baseline=baseline,
+            result_path=result_path,
+            status_path=status_path,
+            events_path=events_path,
+            provider=active_provider,
+            attempts=attempts,
+        )
+        raise
     finally:
         lease.__exit__(None, None, None)
 
-    if final_classified is None:
-        raise BrokerError("worker_error", "no provider attempt was executed", exit_code=1)
-    if final_classified.ok:
-        status = "completed"
-    elif final_classified.reason == "workspace_changed":
-        status = "blocked"
-    else:
-        status = "failed"
-    result = {
-        "schema_version": SCHEMA_VERSION,
-        "ok": final_classified.ok,
-        "run_id": run_id,
-        "task_id": task["task_id"],
-        "status": status,
-        "reason": final_classified.reason,
-        "provider": final_provider,
-        "session_id": final_classified.session_id,
-        "workspace": str(workspace),
-        "mode": task["mode"],
-        "base_commit": baseline.head,
-        "output": final_classified.output,
-        "attempts": attempts,
-        "result_path": str(result_path),
-    }
-    _atomic_write_json(result_path, result)
-    _atomic_write_json(status_path, result)
-    _append_event(
-        events_path,
-        {
-            "type": "run.finished",
-            "at": _now(),
-            "run_id": run_id,
-            "base_commit": baseline.head,
-            "status": status,
-            "reason": final_classified.reason,
-        },
-    )
-    return result
+
+def _run_task(task_path: Path, *, explicit_state_dir: str | None) -> dict[str, Any]:
+    restore_sigterm = False
+    previous_sigterm: Any = None
+    if os.name != "nt" and threading.current_thread() is threading.main_thread():
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+        def interrupt_on_sigterm(signum: int, frame: Any) -> None:
+            raise SystemExit(128 + signum)
+
+        signal.signal(signal.SIGTERM, interrupt_on_sigterm)
+        restore_sigterm = True
+    try:
+        return _run_task_impl(task_path, explicit_state_dir=explicit_state_dir)
+    finally:
+        if restore_sigterm:
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 def _probe(name: str, argv: Sequence[str], cwd: Path) -> dict[str, Any]:
@@ -1450,13 +1549,15 @@ def _doctor(workspace: Path, *, explicit_state_dir: str | None) -> dict[str, Any
         checks["git_workspace"] = {"ok": False, "detail": str(exc), "path": str(workspace)}
     try:
         state_root = _state_root(info, explicit_state_dir)
+        if info is not None:
+            _validate_state_root(state_root, info)
         _mkdir_private(state_root)
         checks["state_root"] = {
             "ok": True,
             "detail": "private durable state",
             "path": str(state_root),
         }
-    except OSError as exc:
+    except (OSError, BrokerError) as exc:
         checks["state_root"] = {"ok": False, "detail": str(exc), "path": None}
     checks["worker_policy"] = {
         "ok": WORKER_POLICY_PATH.is_file(),

@@ -34,6 +34,7 @@
         "budget",
         "timeout",
         "turn_limit",
+        "interrupted",
         "workspace_changed",
         "protocol_error",
         "worker_error",

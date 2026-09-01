@@ -238,8 +238,9 @@ worker 環境は PATH/HOME/locale/auth storage path などの allowlist から�
 つまり v1 は既存の ChatGPT / Claude.ai subscription login だけを使い、従量課金へ暗黙に
 切り替えません。API 課金 fallback を追加するときは、別の明示的な利用者ポリシーと上限が必要です。
 
-run state は既定で Git common dir の `agent-broker/runs`（通常は `.git/agent-broker/runs`）へ
-0600/0700 で保存します。入力で省略された場合も開始時 HEAD を resolved `base_commit` として task、
+run state は既定で XDG state（通常は `~/.local/state/agent-broker/repositories/<hash>/runs`）へ
+0600/0700 で保存し、worker が読める worktree や Git directory の外へ隔離します。入力で省略された
+場合も開始時 HEAD を resolved `base_commit` として task、
 status、event、result に保存します。prompt、JSONL、provider session/thread ID、最終 result も
 残るため、worktree を削除しても診断できます。モデル出力はデータとして保存するだけで、shell や
 file path として実行しません。prompt と結果そのものは機密データになり得るため、run directory を

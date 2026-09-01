@@ -17,6 +17,9 @@ import tempfile
 import textwrap
 import time
 import unittest
+from unittest import mock
+
+from scripts import agent_broker
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -519,6 +522,27 @@ class AgentBrokerTests(unittest.TestCase):
         self.assertEqual(payload["error"]["code"], "unsupported_project_config")
         self.assertFalse(marker.exists())
 
+    def test_claude_workspace_glob_metacharacters_fail_closed(self) -> None:
+        marker = self.root / "claude-called"
+        claude = self._fake(
+            "claude",
+            f"import pathlib\npathlib.Path({str(marker)!r}).write_text('called')\n",
+        )
+        codex = self._fake("codex", "raise SystemExit(99)\n")
+        for character in ("*", "?", "[", "]"):
+            with self.subTest(character=character):
+                worktree = self.root / f"unsafe{character}worktree"
+                branch = f"unsafe-{ord(character)}"
+                self._git("worktree", "add", "-qb", branch, str(worktree))
+                result = self._run_broker(
+                    self._task(workspace=worktree, providers=["claude"]), codex, claude
+                )
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertEqual(
+                    json.loads(result.stdout)["error"]["code"], "unsafe_workspace_path"
+                )
+        self.assertFalse(marker.exists())
+
     def test_untrusted_codex_message_cannot_trigger_fallback(self) -> None:
         codex = self._fake(
             "codex",
@@ -814,6 +838,11 @@ class AgentBrokerTests(unittest.TestCase):
             worker_pid = int(worker_pid_path.read_text())
             os.kill(broker.pid, signal.SIGTERM)
             broker.communicate(timeout=12)
+            statuses = list(self.state_dir.glob("runs/*/status.json"))
+            self.assertEqual(len(statuses), 1)
+            status_payload = json.loads(statuses[0].read_text())
+            self.assertEqual(status_payload["status"], "failed")
+            self.assertEqual(status_payload["reason"], "interrupted")
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
                 try:
@@ -832,6 +861,238 @@ class AgentBrokerTests(unittest.TestCase):
                     os.kill(worker_pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+
+    @unittest.skipIf(os.name == "nt", "process-group semantics are POSIX-only")
+    def test_successful_provider_cannot_leave_a_background_child(self) -> None:
+        child_pid_path = self.root / "background-child.pid"
+        codex = self._fake(
+            "codex",
+            f"""
+            import json, pathlib, subprocess, sys
+            args = sys.argv[1:]
+            sys.stdin.read()
+            child_code = (
+                "import signal,time;"
+                "signal.signal(signal.SIGINT, signal.SIG_IGN);"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+                "time.sleep(60)"
+            )
+            child = subprocess.Popen(
+                [sys.executable, "-c", child_code],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            pathlib.Path({str(child_pid_path)!r}).write_text(str(child.pid))
+            output = pathlib.Path(args[args.index("--output-last-message") + 1])
+            output.write_text("done", encoding="utf-8")
+            print(json.dumps({{"type": "thread.started", "thread_id": "codex-child"}}))
+            print(json.dumps({{"type": "turn.completed"}}))
+            """,
+        )
+        claude = self._fake("claude", "raise SystemExit(99)\n")
+
+        result = self._run_broker(self._task(providers=["codex"]), codex, claude)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        child_pid = int(child_pid_path.read_text())
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            self.fail("background child survived a successful provider exit")
+
+    def test_default_state_is_outside_worker_readable_workspace(self) -> None:
+        claude_record = self.root / "default-state-claude.json"
+        claude = self._fake(
+            "claude",
+            f"""
+            import json, pathlib, sys
+            args = sys.argv[1:]
+            sys.stdin.read()
+            pathlib.Path({str(claude_record)!r}).write_text(json.dumps(args))
+            print(json.dumps({{
+                "type": "result", "subtype": "success", "is_error": False,
+                "session_id": "claude-state", "result": "done"
+            }}))
+            """,
+        )
+        codex = self._fake("codex", "raise SystemExit(99)\n")
+        state_home = self.root / "xdg-state"
+        env = os.environ.copy()
+        env.pop("AGENT_BROKER_STATE_DIR", None)
+        env.update(
+            {
+                "AGENT_BROKER_CODEX_BIN": str(codex),
+                "AGENT_BROKER_CLAUDE_BIN": str(claude),
+                "XDG_STATE_HOME": str(state_home),
+            }
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(BROKER),
+                "--json",
+                "run",
+                "--task-file",
+                str(self._task(providers=["claude"])),
+            ],
+            cwd=REPOSITORY_ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=45,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        payload = json.loads(result.stdout)
+        result_path = Path(payload["result_path"])
+        self.assertTrue(result_path.is_relative_to(state_home.resolve()))
+        self.assertFalse(result_path.is_relative_to(self.repo.resolve()))
+        self.assertFalse((self.repo / ".git" / "agent-broker" / "runs").exists())
+        allowed = json.loads(claude_record.read_text())
+        allowed_tools = allowed[allowed.index("--allowedTools") + 1]
+        self.assertNotIn(str(state_home), allowed_tools)
+
+    def test_state_root_rejects_linked_worktree_git_directories(self) -> None:
+        linked = self.root / "linked"
+        self._git("worktree", "add", "--detach", str(linked), "HEAD")
+        git_dir = Path(self._git("-C", str(linked), "rev-parse", "--git-dir")).resolve()
+        common_dir = Path(
+            self._git("-C", str(linked), "rev-parse", "--git-common-dir")
+        ).resolve()
+        provider_record = self.root / "provider-started"
+        codex = self._fake(
+            "codex",
+            f"import pathlib; pathlib.Path({str(provider_record)!r}).touch()\n",
+        )
+        claude = self._fake("claude", "raise SystemExit(99)\n")
+        task = self._task(workspace=linked, providers=["codex"])
+        env = os.environ.copy()
+        env.update(
+            {
+                "AGENT_BROKER_CODEX_BIN": str(codex),
+                "AGENT_BROKER_CLAUDE_BIN": str(claude),
+            }
+        )
+
+        for unsafe_root in (git_dir / "broker-state", common_dir / "broker-state"):
+            with self.subTest(state_root=unsafe_root):
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(BROKER),
+                        "--json",
+                        "--state-dir",
+                        str(unsafe_root),
+                        "run",
+                        "--task-file",
+                        str(task),
+                    ],
+                    cwd=REPOSITORY_ROOT,
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    timeout=45,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertEqual(
+                    json.loads(result.stdout)["error"]["code"], "unsafe_state_path"
+                )
+        self.assertFalse(provider_record.exists())
+
+    @unittest.skipIf(os.name == "nt", "POSIX signal semantics are required")
+    def test_interruptions_persist_terminal_status_across_run_phases(self) -> None:
+        codex = self._fake(
+            "codex",
+            """
+            import json, pathlib, sys
+            args = sys.argv[1:]
+            sys.stdin.read()
+            output = pathlib.Path(args[args.index("--output-last-message") + 1])
+            output.write_text("done", encoding="utf-8")
+            print(json.dumps({"type": "thread.started", "thread_id": "codex-interrupt"}))
+            print(json.dumps({"type": "turn.completed"}))
+            """,
+        )
+        claude = self._fake("claude", "raise SystemExit(99)\n")
+        original_write = agent_broker._atomic_write_text
+        original_snapshot = agent_broker._snapshot
+
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            for phase in ("setup", "snapshot", "finalize"):
+                with self.subTest(signal=signum, phase=phase):
+                    state_dir = self.root / f"interrupt-{signum}-{phase}"
+                    triggered = False
+                    snapshot_calls = 0
+
+                    def interrupt() -> None:
+                        nonlocal triggered
+                        triggered = True
+                        os.kill(os.getpid(), signum)
+
+                    def write_with_interrupt(path: Path, content: str) -> None:
+                        if phase == "setup" and not triggered and path.name == "prompt.txt":
+                            original_write(path, content)
+                            interrupt()
+                            return
+                        if (
+                            phase == "finalize"
+                            and not triggered
+                            and path.name == "result.json"
+                            and '"status": "completed"' in content
+                        ):
+                            interrupt()
+                        original_write(path, content)
+
+                    def snapshot_with_interrupt(workspace: Path) -> object:
+                        nonlocal snapshot_calls
+                        snapshot_calls += 1
+                        value = original_snapshot(workspace)
+                        if phase == "snapshot" and not triggered and snapshot_calls == 2:
+                            interrupt()
+                        return value
+
+                    env = {
+                        "AGENT_BROKER_CODEX_BIN": str(codex),
+                        "AGENT_BROKER_CLAUDE_BIN": str(claude),
+                    }
+                    with (
+                        mock.patch.dict(os.environ, env),
+                        mock.patch.object(
+                            agent_broker, "_atomic_write_text", write_with_interrupt
+                        ),
+                        mock.patch.object(
+                            agent_broker, "_snapshot", snapshot_with_interrupt
+                        ),
+                        self.assertRaises((KeyboardInterrupt, SystemExit)),
+                    ):
+                        agent_broker._run_task(
+                            self._task(providers=["codex"]),
+                            explicit_state_dir=str(state_dir),
+                        )
+
+                    self.assertTrue(triggered)
+                    status_paths = list(state_dir.glob("runs/*/status.json"))
+                    result_paths = list(state_dir.glob("runs/*/result.json"))
+                    self.assertEqual(len(status_paths), 1)
+                    self.assertEqual(len(result_paths), 1)
+                    status_payload = json.loads(status_paths[0].read_text())
+                    result_payload = json.loads(result_paths[0].read_text())
+                    self.assertEqual(status_payload["status"], "failed")
+                    self.assertEqual(status_payload["reason"], "interrupted")
+                    self.assertEqual(result_payload["status"], "failed")
+                    self.assertEqual(result_payload["reason"], "interrupted")
 
     def test_unexecutable_provider_falls_back_and_persists_result(self) -> None:
         codex = self._fake("codex", "raise SystemExit(99)\n")
