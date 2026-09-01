@@ -17,27 +17,31 @@ Creative AI Studio の変更履歴を安全に保ち、複数人・複数エー�
 
 ## 通常の作業フロー
 
-作業は最新の `origin/main` から短命なブランチを切って始めます。ブランチは原則として
-1〜3 日で PR または統合に回します。未完了の機能を長期ブランチに置く代わりに、可能なら
-feature flag を使います。
+作業は canonical repository の最新 `main` から短命なブランチを切って始めます。ブランチは
+原則として 1〜3 日で PR または統合に回します。未完了の機能を長期ブランチに置く代わりに、
+可能なら feature flag を使います。直接 clone した共同開発者は `origin`、fork を clone した
+開発者は canonical repository を `upstream` として参照します。
 
 ```bash
-git fetch origin
-git switch main
-git pull --ff-only origin main
-git switch -c codex/feature/short-description
+# fork を clone した場合は最初に一度だけ追加
+git remote add upstream https://github.com/codetea-ping999/Creative_AI_Studio.git
+git fetch upstream
+git switch -c feature/short-description upstream/main
 ```
 
-- ブランチ名は `codex/feature/...`、`codex/fix/...`、`codex/chore/...`、
-  `codex/refactor/...` を使います。人が作成するブランチでも、作業種別と内容が
-  分かる小文字の kebab-case を使います。
-- 取り込み前の更新は、作業ツリーが clean であることを確認してから `git fetch origin`
-  を行います。履歴を書き換える rebase や force push は、共有済みブランチでは行いません。
+- 人のブランチは `feature/...`、`fix/...`、`chore/...`、`refactor/...` を使います。Codex が
+  作成するブランチだけは `codex/feature/...`、`codex/fix/...`、`codex/chore/...`、
+  `codex/refactor/...` とします。どちらも内容が分かる小文字の kebab-case を使います。
+- 直接 clone していて `origin` が canonical repository の場合は、上の `upstream/main` を
+  `origin/main` に読み替えます。
+- 取り込み前の更新は、作業ツリーが clean であることを確認してから canonical remote を
+  fetch します。履歴を書き換える rebase や force push は、共有済みブランチでは行いません。
 - 他の作業と並行する、または実験を隔離したい場合は worktree を使います。同一 worktree
-  には同時に 1 人（または 1 エージェント）だけが書き込みます。
+  には同時に 1 人（または 1 エージェント）だけが書き込みます。次のコマンドは
+  `git switch -c` の代替であり、同じブランチを先に作成してから実行しません。
 
 ```bash
-git worktree add ../Creative_AI_Studio-feature -b codex/feature/short-description origin/main
+git worktree add ../Creative_AI_Studio-fix -b codex/fix/short-description origin/main
 ```
 
 ## 変更を commit する前
@@ -52,9 +56,17 @@ git diff --cached --check
 git diff --cached
 ```
 
-次に、変更範囲に応じた検証を実行します。最低限の目安は次のとおりです。
+コード変更を PR へ出す前の canonical verifier は次のコマンドです。setup、pytest、Python
+coverage、Ruff、mypy、Web test/coverage/build、ESLint、npm audit、API smoke を一括で実行します。
 
-| 変更範囲 | 必須の確認 |
+```bash
+venv/bin/python scripts/verify_local_stack.py --start-api
+```
+
+開発中の早いフィードバックには、変更範囲に応じて次の部分検証を使えます。部分検証だけを
+実行した場合は「全ローカル検証済み」とせず、未実行項目を PR へ記載します。
+
+| 変更範囲 | 開発中の部分検証 |
 | --- | --- |
 | Python / API / core | `venv/bin/python -m pytest -q` |
 | `apps/web/` | `npm --prefix apps/web test` と `npm --prefix apps/web run build` |
@@ -79,8 +91,11 @@ Docs: clarify local model setup
   「未検証事項」「関連 issue」を書きます。
 - CI が失敗している、競合が未解決、または base branch が大きく古い PR は、まず
   修正・更新してからレビュー依頼します。
-- マージ後はブランチと不要になった worktree を削除します。worktree は clean な状態で
-  `git worktree remove <path>` を使います。
+- マージ後はブランチと不要になった worktree を削除します。ただし `git status --short` が
+  clean でも ignored 資産は表示されず、`git worktree remove <path>` で一緒に削除されます。
+  削除前に `git status --short --ignored` で ignored file を確認し、モデル、DB、outputs、cache
+  などの固有データがあれば別の安全な場所へ複製して checksum を確認します。残すデータが
+  ないことを確認できた worktree だけを削除します。
 
 ## Git に入れてはいけないもの
 
@@ -91,11 +106,13 @@ Docs: clarify local model setup
 - `data/` 配下のローカル DB・生成履歴・キャッシュ、`outputs/` の生成物
 - checkpoint、weight、`*.safetensors`、`*.gguf` などの大容量モデル本体
 
-モデルは manifest・設定・取得手順・README・ライセンス・tokenizer などの軽量補助ファイルだけを
-管理し、本体は外部ストレージまたは各ローカル環境に配置します。誤って secrets や大容量ファイルを
-stage した場合は、commit / push の前なら `git restore --staged <path>` で外し、必要に応じて対象ファイルを
-削除せず安全な場所へ退避します。すでに push 済みの secret は無効化・ローテーションを最優先にし、
-履歴修正は管理者と相談して実施します。
+モデルは manifest・設定・取得手順・README・ライセンスなど、`.gitignore` が追跡を許可する
+軽量補助ファイルだけを管理します。tokenizer を含む現在 ignore 対象の component を追跡したい
+場合は、必要な軽量ファイルだけに限定した ignore 例外を別レビューで追加します。本体は外部
+ストレージまたは各ローカル環境に配置します。誤って secrets や大容量ファイルを stage した
+場合は、commit / push 前なら `git restore --staged <path>` で外し、対象ファイルを削除せず
+安全な場所へ退避します。push 済みの secret は無効化・ローテーションを最優先にし、履歴修正は
+管理者と相談して実施します。
 
 ## 並列・エージェント作業の追加ルール
 
@@ -109,8 +126,8 @@ stage した場合は、commit / push の前なら `git restore --staged <path>`
 - サブエージェントは commit / push せず、検証済みの patch file を統合役へ渡す。
 - 同じファイルを複数の writer が並行編集しない。共有ファイルは統合役だけが編集する。
 - patch の検証目的の適用・revert は Verify 用の隔離 worktree だけで行い、base commit、SHA-256、
-  変更ファイル、`git apply --check` を独立に確認する。統合役は受理した patch を統合作業用の
-  worktree へ適用する。
+  byte 数（`wc -c`）、変更ファイル、`git apply --check` を独立に確認する。統合役は受理した
+  patch を統合作業用の worktree へ適用する。
 
 ## 禁止・要相談の操作
 
