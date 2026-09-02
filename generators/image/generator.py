@@ -9,6 +9,8 @@ import secrets
 from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
+from PIL import Image
+
 from core.models import ModelService
 from core.prompting import PromptComposer
 from core.quality import (
@@ -16,10 +18,15 @@ from core.quality import (
     evaluate_image_output,
     evaluate_image_semantics,
 )
+from core.reference_capabilities import ReferenceImageInput
 from core.schemas import GenerationRequest, GenerationResult
 from generators.base import BaseGenerator
 from generators.common import resolve_generation_prompt
-from generators.image.providers import ImageGenerationSpec, LocalDiffusersImageProvider
+from generators.image.providers import (
+    ImageGenerationSpec,
+    LocalDiffusersImageProvider,
+    local_diffusers_capabilities,
+)
 
 if TYPE_CHECKING:
     from core.jobs.context import GenerationContext
@@ -105,6 +112,22 @@ class ImageGenerator(BaseGenerator):
             if resolved_prompt.seed is not None
             else secrets.randbits(63)
         )
+        reference_image_path, reference_strength = self._resolve_reference_image(
+            resolved_prompt.resolved_references
+        )
+        # A reference the composer resolved is only actually honored when the
+        # loaded pipeline's own call signature can take it (#201: one
+        # supported conditioning path, not every image model family). When a
+        # reference was requested but this pipeline can't honor it,
+        # `reference_capable` stays False and `capabilities.supports_reference_image`
+        # below stays at its default False -- `validate_capabilities` then
+        # rejects the request before any pipeline call, rather than silently
+        # dropping the reference or passing it into a call that doesn't
+        # accept it.
+        reference_capable = (
+            reference_image_path is not None
+            and self._pipeline_accepts_reference_image(pipeline)
+        )
         # Route the pipeline call through the provider-neutral contract
         # (generators/image/providers.py) so this local diffusers path and a
         # future cloud provider are invoked and validated the same way; the
@@ -113,6 +136,11 @@ class ImageGenerator(BaseGenerator):
         provider = LocalDiffusersImageProvider(
             model_id=manifest.public_model_id,
             pipeline=pipeline,
+            capabilities=(
+                local_diffusers_capabilities(supports_reference_image=True)
+                if reference_capable
+                else None
+            ),
         )
         spec_lora_path = lora_metadata["path"]
         spec_lora_scale = lora_metadata["scale"]
@@ -132,8 +160,17 @@ class ImageGenerator(BaseGenerator):
             lora_scale=(
                 float(cast(float, spec_lora_scale)) if spec_lora_scale is not None else 1.0
             ),
-            reference_image_path=None,
+            # Set whenever a reference resolved, regardless of pipeline
+            # support -- this is what makes validate_capabilities() actually
+            # reject an unsupported request instead of validating nothing.
+            reference_image_path=reference_image_path,
         )
+        reference_conditioning_kwargs: dict[str, Any] = {}
+        if reference_capable:
+            reference_conditioning_kwargs = {
+                "image": Image.open(cast(str, reference_image_path)).convert("RGB"),
+                "strength": reference_strength,
+            }
         common_generation_kwargs = {
             "prompt": resolved_prompt.prompt,
             "negative_prompt": resolved_prompt.negative_prompt,
@@ -142,6 +179,7 @@ class ImageGenerator(BaseGenerator):
             "guidance_scale": guidance_scale,
             "num_inference_steps": num_inference_steps,
             **effective_params,
+            **reference_conditioning_kwargs,
         }
         batch_id = f"img_{uuid4().hex}"
         output_paths: list[str] = []
@@ -257,13 +295,18 @@ class ImageGenerator(BaseGenerator):
                 "prompt_composition": resolved_prompt.composition,
                 "reference_asset_ids": resolved_prompt.reference_asset_ids,
                 # #199: which asset, role (character/location), and strength a
-                # Bible reference resolved to -- recorded even though nothing
-                # downstream conditions on it yet (#201), so a job's metadata
-                # is a complete audit trail of what was asked for.
+                # Bible reference resolved to. #201:
+                # reference_conditioning_applied says whether the first one
+                # actually reached the pipeline as image/strength conditioning
+                # -- False can mean no reference was requested, or one was
+                # requested but this pipeline doesn't support it (in which
+                # case generation already failed before reaching here; see
+                # request_spec's reference_image_path / validate_capabilities).
                 "resolved_references": [
                     reference.model_dump(mode="json")
                     for reference in resolved_prompt.resolved_references
                 ],
+                "reference_conditioning_applied": reference_capable,
                 "requested_model_id": requested_model_id,
                 "model_id": manifest.public_model_id,
                 "manifest_id": manifest.id,
@@ -329,6 +372,46 @@ class ImageGenerator(BaseGenerator):
         except (TypeError, ValueError):
             return False
         return "callback_on_step_end" in signature.parameters
+
+    def _resolve_reference_image(
+        self, resolved_references: list[ReferenceImageInput]
+    ) -> tuple[str | None, float | None]:
+        """Resolve the first reference to an asset path (#201: one supported path).
+
+        A model honors at most `max_references_per_role=1` reference per role
+        (see `core/reference_capabilities.py`), so this picks exactly the
+        first entry `PromptComposer` resolved -- the same order it built the
+        list in. Reuses the composer's own `AssetRepository`: it already
+        validated that asset exists and is an image (raising
+        `MissingReferenceAssetError` otherwise) while building
+        `resolved_references`, so this only needs to look the path up, not
+        re-validate it.
+        """
+
+        if not resolved_references:
+            return None, None
+        asset_repository = (
+            self.prompt_composer.asset_repository
+            if self.prompt_composer is not None
+            else None
+        )
+        if asset_repository is None:
+            return None, None
+        primary = resolved_references[0]
+        asset = asset_repository.get(primary.asset_id)
+        if asset is None:
+            return None, None
+        return asset.path, primary.strength
+
+    def _pipeline_accepts_reference_image(self, pipeline: object) -> bool:
+        call = getattr(pipeline, "__call__", None)
+        if call is None:
+            return False
+        try:
+            signature = inspect.signature(call)
+        except (TypeError, ValueError):
+            return False
+        return "image" in signature.parameters and "strength" in signature.parameters
 
     def _resolve_variation_count(self, params: dict[str, Any]) -> int:
         value = params.get("variation_count", 1)

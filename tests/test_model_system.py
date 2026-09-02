@@ -23,6 +23,8 @@ try:
         create_default_image_generator,
         create_default_model_service,
     )
+    from core.assets import Asset, AssetRepository
+    from core.bible import BibleRepository
     from core.jobs.context import GenerationCancelled, GenerationContext
     from core.models import (
         ModelRegistry,
@@ -32,9 +34,12 @@ try:
         release_runtime,
     )
     from core.models.cache import resolve_media_cache_limits
+    from core.prompting import PromptComposer
+    from core.reference_capabilities import DEFAULT_REFERENCE_STRENGTH
     from core.schemas import GenerationRequest
     from generators.audio import AudioGenerator
     from generators.image import ImageGenerator
+    from generators.image.providers import UnsupportedImageParameterError
     from generators.video import VideoGenerator
 except ModuleNotFoundError as exc:
     IMPORT_ERROR = exc
@@ -137,6 +142,59 @@ class _FakeStepAwarePipeline:
 
     def to(self, device: str) -> "_FakeStepAwarePipeline":
         return self
+
+
+class _FakeReferenceCapablePipeline:
+    """Fake pipeline that mimics an img2img-style diffusers call signature.
+
+    Declares `image`/`strength` as literal named parameters (not swallowed
+    into `**kwargs`) because `ImageGenerator._pipeline_accepts_reference_image`
+    (#201) probes for those exact names via `inspect.signature`.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def __call__(
+        self,
+        *,
+        prompt,
+        negative_prompt=None,
+        width=64,
+        height=64,
+        guidance_scale=7.5,
+        num_inference_steps=30,
+        image=None,
+        strength=None,
+        **kwargs,
+    ):
+        self.calls.append({"image": image, "strength": strength})
+        return _FakePipelineResult(Image.new("RGB", (width, height), color=(7, 8, 9)))
+
+    def to(self, device: str) -> "_FakeReferenceCapablePipeline":
+        return self
+
+
+def _fake_diffusers_load_reference_capable(self, manifest):
+    return {
+        "stub": False,
+        "loader": self.__class__.__name__,
+        "manifest_id": manifest.id,
+        "display_name": manifest.display_name,
+        "runtime": manifest.runtime,
+        "provider": manifest.provider,
+        "local_path": manifest.local_path,
+        "remote_ref": manifest.remote_ref,
+        "dtype": manifest.dtype,
+        "load_dtype": "float32",
+        "torch_dtype": "float32",
+        "weight_dtype": "float16",
+        "variant": "fp16",
+        "device": "cpu",
+        "default_params": dict(manifest.default_params),
+        "path_exists": True,
+        "pipeline": _FakeReferenceCapablePipeline(),
+    }
 
 
 def _fake_diffusers_load_step_aware(self, manifest):
@@ -1100,6 +1158,142 @@ class ModelSystemTests(unittest.TestCase):
             self.assertEqual(result.metadata["requested_model_id"], "sdxl-local")
             self.assertEqual(result.metadata["model_id"], "sdxl")
             self.assertEqual(result.metadata["manifest_id"], "sdxl-local")
+
+    def _prepare_character_reference(
+        self, root: Path
+    ) -> tuple[PromptComposer, str]:
+        """Real Bible/Asset repositories with one character reference (#199/#201).
+
+        Returns the composer and the Bible entry id -- request params then
+        set `bible_refs: [entry_id]` to pull the reference into
+        `resolved_prompt.resolved_references`, exactly as production does.
+        """
+
+        bible_repository = BibleRepository(root / "bible")
+        asset_repository = AssetRepository(root / "assets")
+        reference_image_path = root / "reference.png"
+        Image.new("RGB", (32, 32), color=(200, 50, 50)).save(reference_image_path)
+        asset_repository.create_or_update(
+            Asset(
+                id="asset_char_1",
+                job_id="job_fixture",
+                project_id=None,
+                media_type="image",
+                kind="output",
+                title="reference fixture",
+                prompt="a reference image",
+                model_id="sdxl",
+                path=str(reference_image_path),
+            )
+        )
+        character = bible_repository.create(
+            kind="character", name="Mina", reference_asset_ids=["asset_char_1"]
+        )
+        composer = PromptComposer(bible_repository, asset_repository)
+        return composer, character.id
+
+    def test_image_generator_applies_resolved_reference_when_pipeline_supports_it(
+        self,
+    ) -> None:
+        # Regression (#201): a Bible reference the composer resolved must
+        # actually reach the pipeline as image/strength conditioning when the
+        # loaded pipeline supports it, not just sit in metadata.
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            composer, character_id = self._prepare_character_reference(root)
+            output_dir = root / "outputs"
+
+            with patch(
+                "core.models.loader.DiffusersImageLoader.load",
+                new=_fake_diffusers_load_reference_capable,
+            ):
+                service = create_default_model_service()
+                generator = ImageGenerator(
+                    service, output_dir=output_dir, prompt_composer=composer
+                )
+                result = generator.run(
+                    GenerationRequest(
+                        media_type="image",
+                        prompt="Mina on the rooftop",
+                        model_id="sdxl",
+                        params={
+                            "steps": 1,
+                            "width": 64,
+                            "height": 64,
+                            "bible_refs": [character_id],
+                        },
+                    )
+                )
+                pipeline = service.get_runtime("sdxl", "image", "text-to-image")["pipeline"]
+
+            self.assertEqual(result.status, "succeeded")
+            self.assertEqual(len(pipeline.calls), 1)
+            self.assertEqual(pipeline.calls[0]["strength"], DEFAULT_REFERENCE_STRENGTH)
+            applied_image = pipeline.calls[0]["image"]
+            self.assertIsInstance(applied_image, Image.Image)
+            self.assertEqual(applied_image.size, (32, 32))
+            self.assertTrue(result.metadata["reference_conditioning_applied"])
+
+    def test_image_generator_skips_conditioning_kwargs_without_a_reference(self) -> None:
+        # Same reference-capable pipeline, but no reference requested: the
+        # existing generation path must stay unchanged (no image/strength).
+        with TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir) / "outputs"
+            with patch(
+                "core.models.loader.DiffusersImageLoader.load",
+                new=_fake_diffusers_load_reference_capable,
+            ):
+                service = create_default_model_service()
+                generator = ImageGenerator(service, output_dir=output_dir)
+                result = generator.run(
+                    GenerationRequest(
+                        media_type="image",
+                        prompt="No reference here",
+                        model_id="sdxl",
+                        params={"steps": 1, "width": 64, "height": 64},
+                    )
+                )
+                pipeline = service.get_runtime("sdxl", "image", "text-to-image")["pipeline"]
+
+            self.assertEqual(result.status, "succeeded")
+            self.assertIsNone(pipeline.calls[0]["image"])
+            self.assertIsNone(pipeline.calls[0]["strength"])
+            self.assertFalse(result.metadata["reference_conditioning_applied"])
+
+    def test_image_generator_rejects_a_reference_the_pipeline_cannot_honor(self) -> None:
+        # Regression (#201 acceptance criterion): "Unsupported runtime
+        # capabilities fail before an invalid model call" -- a reference
+        # requested against a pipeline without image/strength support must
+        # raise, not silently drop the reference or call the pipeline wrong.
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            composer, character_id = self._prepare_character_reference(root)
+            output_dir = root / "outputs"
+
+            with patch(
+                "core.models.loader.DiffusersImageLoader.load",
+                new=_fake_diffusers_load,
+            ):
+                service = create_default_model_service()
+                generator = ImageGenerator(
+                    service, output_dir=output_dir, prompt_composer=composer
+                )
+                with self.assertRaises(UnsupportedImageParameterError):
+                    generator.run(
+                        GenerationRequest(
+                            media_type="image",
+                            prompt="Mina on the rooftop",
+                            model_id="sdxl",
+                            params={
+                                "steps": 1,
+                                "width": 64,
+                                "height": 64,
+                                "bible_refs": [character_id],
+                            },
+                        )
+                    )
+
+            self.assertEqual(list(output_dir.glob("**/*")), [])
 
     def test_bootstrap_factory_composes_default_image_generator(self) -> None:
         with TemporaryDirectory() as tmp_dir:
