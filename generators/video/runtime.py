@@ -269,10 +269,15 @@ class LearnedVideoRuntime(BaseVideoRuntime):
             **effective_params,
         }
         if context is not None:
-            # The loaded model's own callable is opaque third-party code (see
-            # LearnedVideoLoader) and cannot be interrupted mid-inference, so this
-            # is a boundary check, not step-level cancellation.
             context.raise_if_cancelled()
+            # The loaded model's own callable is opaque third-party code (see
+            # LearnedVideoLoader), so step-level cancellation only happens if
+            # the adapter itself opts in: it can pop this kwarg and call it
+            # from a diffusers-style callback_on_step_end (see the CogVideoX
+            # adapter under models/video/learned-runtime/runtime.py). An
+            # adapter that ignores it still gets this boundary check, exactly
+            # as before.
+            generation_kwargs["raise_if_cancelled"] = context.raise_if_cancelled
         generated = callable_runtime(**generation_kwargs)
         return self._normalize_generated_output(
             generated=generated,

@@ -1743,6 +1743,139 @@ class ModelSystemTests(unittest.TestCase):
 
             self.assertFalse((runtime_root / "learned-output.mp4").exists())
 
+    def _write_step_aware_learned_video_manifest(
+        self, manifest_root: Path, runtime_root: Path
+    ) -> tuple[Path, Path]:
+        """A fake CogVideoX-shaped adapter that simulates 5 denoising steps.
+
+        Mirrors the real adapter's contract (models/video/learned-runtime/
+        runtime.py): it pops `raise_if_cancelled` from kwargs and calls it
+        once per step, exactly like the real adapter's callback_on_step_end
+        does -- so this proves the generator -> adapter wiring (#209) without
+        needing torch/diffusers/real weights.
+        """
+
+        runtime_root.mkdir(parents=True)
+        output_path = runtime_root / "learned-output.mp4"
+        progress_path = runtime_root / "steps-completed.txt"
+        (runtime_root / "runtime.py").write_text(
+            "\n".join(
+                [
+                    "from pathlib import Path",
+                    "",
+                    "def load_runtime(manifest):",
+                    "    output_path = Path(__file__).with_name('learned-output.mp4')",
+                    "    progress_path = Path(__file__).with_name('steps-completed.txt')",
+                    "    def renderer(**kwargs):",
+                    "        raise_if_cancelled = kwargs.pop('raise_if_cancelled', None)",
+                    "        for step_index in range(5):",
+                    "            if raise_if_cancelled is not None:",
+                    "                raise_if_cancelled()",
+                    "            progress_path.write_text(str(step_index + 1))",
+                    "        output_path.write_bytes(b'0' * 131072)",
+                    "        return {",
+                    "            'output_path': str(output_path),",
+                    "            'output_format': 'mp4',",
+                    "            'metadata': {'adapter_contract': 'test'},",
+                    "        }",
+                    "    return {'runtime_adapter': 'learned_text_to_video', 'renderer': renderer}",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        _write_manifest(
+            manifest_root / "video" / "learned.json",
+            {
+                "id": "learned-video-local",
+                "public_id": "learned-video",
+                "display_name": "Learned Video",
+                "media_type": "video",
+                "task_type": "text-to-video",
+                "provider": "local",
+                "runtime": "learned",
+                "local_path": str(runtime_root),
+                "loader": "learned_video_loader",
+                "default_params": {"entrypoint": "runtime.py"},
+                "aliases": ["learned-video-local"],
+                "enabled": True,
+            },
+        )
+        return output_path, progress_path
+
+    def test_learned_video_generator_stops_mid_inference_when_cancelled_via_step_callback(
+        self,
+    ) -> None:
+        # Regression (#209): cancellation must reach the adapter's own
+        # per-step callback, not just the boundary check before/after the
+        # whole render call -- a cancel request mid-run should stop a
+        # multi-step CogVideoX-shaped generation before its final step.
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_root = root / "manifests"
+            runtime_root = root / "runtime" / "learned-video"
+            output_path, progress_path = self._write_step_aware_learned_video_manifest(
+                manifest_root, runtime_root
+            )
+            service = create_default_model_service(manifest_root=manifest_root)
+            generator = VideoGenerator(service, output_dir=root / "outputs" / "videos")
+
+            call_count = {"n": 0}
+
+            def is_cancelled() -> bool:
+                call_count["n"] += 1
+                # Two boundary checks (VideoGenerator.generate() and
+                # LearnedVideoRuntime.render()) run before the adapter's own
+                # step loop starts, so this must clear those first before
+                # letting a couple of in-loop step checks pass too.
+                return call_count["n"] > 4
+
+            context = GenerationContext(is_cancelled=is_cancelled)
+
+            with self.assertRaises(GenerationCancelled):
+                generator.run(
+                    GenerationRequest(
+                        media_type="video",
+                        prompt="learned runtime smoke",
+                        model_id="learned-video",
+                        output_format="mp4",
+                        params={"duration_seconds": 1},
+                    ),
+                    context,
+                )
+
+            self.assertTrue(progress_path.exists())
+            self.assertLess(int(progress_path.read_text()), 5)
+            self.assertFalse(output_path.exists())  # never reached the final write
+
+    def test_learned_video_generator_completes_all_steps_when_not_cancelled(self) -> None:
+        # Same step-aware adapter, but with cancellation never requested:
+        # normal generation must run every step and succeed unchanged.
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_root = root / "manifests"
+            runtime_root = root / "runtime" / "learned-video"
+            output_path, progress_path = self._write_step_aware_learned_video_manifest(
+                manifest_root, runtime_root
+            )
+            service = create_default_model_service(manifest_root=manifest_root)
+            generator = VideoGenerator(service, output_dir=root / "outputs" / "videos")
+            context = GenerationContext(is_cancelled=lambda: False)
+
+            result = generator.run(
+                GenerationRequest(
+                    media_type="video",
+                    prompt="learned runtime smoke",
+                    model_id="learned-video",
+                    output_format="mp4",
+                    params={"duration_seconds": 1},
+                ),
+                context,
+            )
+
+            self.assertEqual(result.status, "succeeded")
+            self.assertEqual(progress_path.read_text(), "5")
+            self.assertTrue(output_path.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

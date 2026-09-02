@@ -63,12 +63,25 @@ def load_runtime(manifest: dict[str, Any]) -> dict[str, Any]:
         if output_format != "mp4":
             raise ValueError("CogVideoX pilot supports mp4 output only.")
         seed = kwargs.pop("seed", None)
+        raise_if_cancelled = kwargs.pop("raise_if_cancelled", None)
         generation_kwargs = _normalize_generation_kwargs(kwargs)
         generator_device = "cpu" if device == "mps" else device
         if seed is not None:
             generation_kwargs["generator"] = torch.Generator(device=generator_device).manual_seed(
                 int(seed)
             )
+        if raise_if_cancelled is not None and _pipeline_accepts_step_callback(pipeline):
+            # Stops inference between denoising steps rather than waiting for
+            # all of them: GenerationCancelled raised here propagates straight
+            # out of pipeline(...) (it is a plain Exception, not one of the
+            # RuntimeError/NotImplementedError types the MPS fallback below
+            # retries on), through renderer(), and up to JobRunner, which
+            # treats it as a successful cancellation rather than a failure.
+            def _on_step_end(pipe, step_index, timestep, callback_kwargs):
+                raise_if_cancelled()
+                return callback_kwargs
+
+            generation_kwargs["callback_on_step_end"] = _on_step_end
 
         try:
             result = pipeline(**generation_kwargs)
@@ -164,6 +177,19 @@ def _normalize_generation_kwargs(values: dict[str, Any]) -> dict[str, Any]:
         "num_videos_per_prompt",
     }
     return {key: value for key, value in values.items() if key in allowed and value is not None}
+
+
+def _pipeline_accepts_step_callback(pipeline: Any) -> bool:
+    import inspect
+
+    call = getattr(pipeline, "__call__", None)
+    if call is None:
+        return False
+    try:
+        signature = inspect.signature(call)
+    except (TypeError, ValueError):
+        return False
+    return "callback_on_step_end" in signature.parameters
 
 
 __all__ = ["load_runtime"]
