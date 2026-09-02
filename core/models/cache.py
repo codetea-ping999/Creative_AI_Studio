@@ -88,7 +88,12 @@ class ModelRuntimeCache:
         """
 
         if model_id in self._cache:
-            self._cache.pop(model_id)
+            # A replaced entry must run the same cleanup as unload()/
+            # unload_all() -- on_evict is what actually returns GPU/MPS
+            # memory (torch.mps.empty_cache() etc. in bootstrap/factories.py's
+            # wiring), which plain Python GC does not reliably do on its own.
+            previous_obj = self._cache.pop(model_id)
+            self._evict(model_id, previous_obj)
         self._cache[model_id] = runtime_obj
 
         bucket = media_type if media_type in self.media_limits else _DEFAULT_BUCKET

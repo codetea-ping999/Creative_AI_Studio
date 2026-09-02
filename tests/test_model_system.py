@@ -490,6 +490,27 @@ class ModelSystemTests(unittest.TestCase):
 
         self.assertEqual(evicted, ["model-a", "model-b", "model-c"])
 
+    def test_runtime_cache_put_evicts_the_runtime_it_replaces(self) -> None:
+        # Regression (#373): replacing an existing model_id via put() must run
+        # the same on_evict cleanup as unload()/unload_all(), not just drop
+        # the old runtime object -- that cleanup is what actually returns
+        # GPU/MPS memory, which plain Python GC does not reliably do.
+        evicted: list[tuple[str, dict]] = []
+        cache = ModelRuntimeCache(
+            max_entries=2,  # large enough that this never triggers overflow eviction
+            on_evict=lambda model_id, runtime_obj: evicted.append((model_id, runtime_obj)),
+        )
+        first = {"id": "model-a", "generation": 1}
+        second = {"id": "model-a", "generation": 2}
+
+        cache.put("model-a", first)
+        self.assertEqual(evicted, [])  # nothing to evict on first insert
+
+        cache.put("model-a", second)  # replaces the same model_id
+
+        self.assertEqual(evicted, [("model-a", first)])
+        self.assertIs(cache.get("model-a"), second)
+
     def test_runtime_cache_unload_all_calls_on_evict_for_every_entry(self) -> None:
         evicted: list[str] = []
         cache = ModelRuntimeCache(
