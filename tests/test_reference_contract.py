@@ -342,6 +342,83 @@ class UnsupportedReferenceRequestApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 201, response.text)
         self.assertEqual(len(self.services.job_repository.list()), 1)
 
+    def test_post_generate_image_rejects_a_reference_from_a_different_project(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, fifth Codex round on PR #376, P1): a
+        # reference asset from a different project must not silently
+        # condition a job in this one. apps/api/routes/generate.py already
+        # enforces the identical project-membership boundary for
+        # assembly-request timeline assets (asset.project_id != project_id);
+        # reference-image conditioning had no such check at all, so a job in
+        # project B could resolve and condition on project A's image.
+        from core.assets import Asset
+
+        client = self._client()
+        project_a = self.services.project_repository.create("Project A")
+        project_b = self.services.project_repository.create("Project B")
+        self.services.asset_repository.create_or_update(
+            Asset(
+                id="cross_project_ref",
+                job_id="job_fixture",
+                project_id=project_a.id,
+                media_type="image",
+                kind="output",
+                title="reference fixture",
+                prompt="a reference image",
+                model_id="sdxl",
+                path="/tmp/does-not-need-to-exist.png",
+            )
+        )
+        response = client.post(
+            "/generate/image",
+            json={
+                "prompt": "a knight",
+                "model_id": "sdxl",
+                "project_id": project_b.id,
+                "references": [
+                    {"asset_id": "cross_project_ref", "role": "character", "strength": 0.8}
+                ],
+            },
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertIn("cross_project_ref", response.text)
+        self.assertEqual(self.services.job_repository.list(), [])
+
+    def test_post_generate_image_accepts_a_reference_from_the_same_project(
+        self,
+    ) -> None:
+        from core.assets import Asset
+
+        client = self._client()
+        project_a = self.services.project_repository.create("Project A")
+        self.services.asset_repository.create_or_update(
+            Asset(
+                id="same_project_ref",
+                job_id="job_fixture",
+                project_id=project_a.id,
+                media_type="image",
+                kind="output",
+                title="reference fixture",
+                prompt="a reference image",
+                model_id="sdxl",
+                path="/tmp/does-not-need-to-exist.png",
+            )
+        )
+        response = client.post(
+            "/generate/image",
+            json={
+                "prompt": "a knight",
+                "model_id": "sdxl",
+                "project_id": project_a.id,
+                "references": [
+                    {"asset_id": "same_project_ref", "role": "character", "strength": 0.8}
+                ],
+            },
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(len(self.services.job_repository.list()), 1)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

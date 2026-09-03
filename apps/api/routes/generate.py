@@ -14,7 +14,11 @@ from bootstrap import ApplicationServices
 from core.assets import Asset
 from core.jobs import JobRecord
 from core.projects import ProjectRepository
-from core.reference_capabilities import ReferenceImageInput, UnsupportedReferenceError
+from core.reference_capabilities import (
+    MissingReferenceAssetError,
+    ReferenceImageInput,
+    UnsupportedReferenceError,
+)
 from core.schemas import GenerationRequest, MediaType
 
 router = APIRouter(prefix="/generate", tags=["generate"])
@@ -115,7 +119,7 @@ def _create_project_bound_job(
     resolved_project_id = _resolve_project_id(services, project_id)
     try:
         job = services.job_service.create_job(generation_request, project_id=resolved_project_id)
-    except UnsupportedReferenceError as exc:
+    except (UnsupportedReferenceError, MissingReferenceAssetError) as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
         ) from exc

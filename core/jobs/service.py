@@ -8,7 +8,7 @@ from uuid import uuid4
 from typing import TYPE_CHECKING
 
 from core.models import ModelService
-from core.reference_capabilities import validate_reference_inputs
+from core.reference_capabilities import MissingReferenceAssetError, validate_reference_inputs
 from core.schemas import GenerationRequest, GenerationResult, GenerationStatus
 
 from .events import EventBus
@@ -103,6 +103,25 @@ class JobService:
                 capability=manifest.reference_capability,
                 model_id=request.model_id or manifest.public_model_id,
             )
+        if request.references and self.asset_repository is not None:
+            # #201 follow-up (Codex P1 on PR #376): a reference asset from a
+            # different project must not silently condition a job in this
+            # one -- the same exact-project-membership boundary
+            # apps/api/routes/generate.py's assembly-request path already
+            # enforces for timeline assets (asset.project_id != project_id).
+            # An asset that does not exist at all is left to the generator's
+            # own MissingReferenceAssetError at execution time (unchanged);
+            # this only rejects a reference that resolves to an asset
+            # belonging to a *different* project than this job targets.
+            for reference in request.references:
+                asset = self.asset_repository.get(reference.asset_id)
+                if asset is not None and asset.project_id != project_id:
+                    raise MissingReferenceAssetError(
+                        f"Reference asset {reference.asset_id!r} belongs to "
+                        f"project {asset.project_id or 'no project'!r}, not "
+                        f"{project_id or 'no project'!r}; a reference must "
+                        "belong to the same project as the job it conditions."
+                    )
         now = datetime.now(timezone.utc)
         job = JobRecord(
             id=f"job_{uuid4().hex}",
