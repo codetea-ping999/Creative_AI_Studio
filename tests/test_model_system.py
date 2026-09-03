@@ -514,6 +514,34 @@ class ModelSystemTests(unittest.TestCase):
         self.assertEqual(evicted, [("model-a", first)])
         self.assertIs(cache.get("model-a"), second)
 
+    def test_runtime_cache_put_skips_eviction_when_reinserting_the_same_object(
+        self,
+    ) -> None:
+        # Regression (Codex review on PR #374, P2): reinserting the *same*
+        # runtime instance under its own model_id -- e.g. to refresh its LRU
+        # position or change its media bucket -- is not a replacement. The
+        # #373 fix above must not run on_evict cleanup (which strips
+        # pipeline/model/processor, see core/models/cleanup.py) on an object
+        # that is being kept, not discarded.
+        evicted: list[str] = []
+
+        def _on_evict(model_id: str, runtime_obj: dict) -> None:
+            # Mirrors core/models/cleanup.py's release_runtime(): a real
+            # on_evict hook destructively strips the runtime, which is
+            # exactly what must not happen to an object being reinserted.
+            evicted.append(model_id)
+            runtime_obj.pop("pipeline", None)
+
+        cache = ModelRuntimeCache(max_entries=2, on_evict=_on_evict)
+        runtime = {"id": "model-a", "pipeline": object()}
+
+        cache.put("model-a", runtime)
+        cache.put("model-a", runtime, media_type="image")  # reinsert same object
+
+        self.assertEqual(evicted, [])
+        self.assertIs(cache.get("model-a"), runtime)
+        self.assertIn("pipeline", runtime)  # not stripped by a spurious evict
+
     def test_resolve_runtime_serializes_concurrent_loads_of_the_same_model(self) -> None:
         # Regression (#373 follow-up, Codex review on PR #374): two callers
         # racing to resolve the same uncached model_id must not both load

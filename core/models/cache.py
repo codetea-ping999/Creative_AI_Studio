@@ -117,8 +117,13 @@ class ModelRuntimeCache:
             # unload_all() -- on_evict is what actually returns GPU/MPS
             # memory (torch.mps.empty_cache() etc. in bootstrap/factories.py's
             # wiring), which plain Python GC does not reliably do on its own.
+            # But a caller reinserting the *same* runtime instance under its
+            # own model_id (e.g. to refresh LRU position or change its media
+            # bucket) is not a replacement -- evicting it here would strip
+            # pipeline/model/processor from the very object being kept.
             previous_obj = self._cache.pop(model_id)
-            self._evict(model_id, previous_obj)
+            if previous_obj is not runtime_obj:
+                self._evict(model_id, previous_obj)
         self._cache[model_id] = runtime_obj
 
         bucket = media_type if media_type in self.media_limits else _DEFAULT_BUCKET
