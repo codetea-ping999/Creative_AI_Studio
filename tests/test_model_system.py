@@ -6,6 +6,8 @@ import json
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Event, Thread
+import time
 import unittest
 from unittest.mock import patch
 import wave
@@ -28,6 +30,7 @@ try:
         ModelRegistry,
         ModelResolver,
         ModelRuntimeCache,
+        ModelService,
         create_default_loader_registry,
         release_runtime,
     )
@@ -489,6 +492,130 @@ class ModelSystemTests(unittest.TestCase):
         cache.unload("missing-model")  # no-op, must not call on_evict
 
         self.assertEqual(evicted, ["model-a", "model-b", "model-c"])
+
+    def test_runtime_cache_put_evicts_the_runtime_it_replaces(self) -> None:
+        # Regression (#373): replacing an existing model_id via put() must run
+        # the same on_evict cleanup as unload()/unload_all(), not just drop
+        # the old runtime object -- that cleanup is what actually returns
+        # GPU/MPS memory, which plain Python GC does not reliably do.
+        evicted: list[tuple[str, dict]] = []
+        cache = ModelRuntimeCache(
+            max_entries=2,  # large enough that this never triggers overflow eviction
+            on_evict=lambda model_id, runtime_obj: evicted.append((model_id, runtime_obj)),
+        )
+        first = {"id": "model-a", "generation": 1}
+        second = {"id": "model-a", "generation": 2}
+
+        cache.put("model-a", first)
+        self.assertEqual(evicted, [])  # nothing to evict on first insert
+
+        cache.put("model-a", second)  # replaces the same model_id
+
+        self.assertEqual(evicted, [("model-a", first)])
+        self.assertIs(cache.get("model-a"), second)
+
+    def test_runtime_cache_put_skips_eviction_when_reinserting_the_same_object(
+        self,
+    ) -> None:
+        # Regression (Codex review on PR #374, P2): reinserting the *same*
+        # runtime instance under its own model_id -- e.g. to refresh its LRU
+        # position or change its media bucket -- is not a replacement. The
+        # #373 fix above must not run on_evict cleanup (which strips
+        # pipeline/model/processor, see core/models/cleanup.py) on an object
+        # that is being kept, not discarded.
+        evicted: list[str] = []
+
+        def _on_evict(model_id: str, runtime_obj: dict) -> None:
+            # Mirrors core/models/cleanup.py's release_runtime(): a real
+            # on_evict hook destructively strips the runtime, which is
+            # exactly what must not happen to an object being reinserted.
+            evicted.append(model_id)
+            runtime_obj.pop("pipeline", None)
+
+        cache = ModelRuntimeCache(max_entries=2, on_evict=_on_evict)
+        runtime = {"id": "model-a", "pipeline": object()}
+
+        cache.put("model-a", runtime)
+        cache.put("model-a", runtime, media_type="image")  # reinsert same object
+
+        self.assertEqual(evicted, [])
+        self.assertIs(cache.get("model-a"), runtime)
+        self.assertIn("pipeline", runtime)  # not stripped by a spurious evict
+
+    def test_resolve_runtime_serializes_concurrent_loads_of_the_same_model(self) -> None:
+        # Regression (#373 follow-up, Codex review on PR #374): two callers
+        # racing to resolve the same uncached model_id must not both load
+        # and put() their own runtime -- the second put() would evict (and
+        # run on_evict cleanup on) the runtime the first caller already
+        # received and may still be using mid-generation. ModelService now
+        # serializes load+put per model_id via ModelRuntimeCache.lock_for().
+        load_started = Event()
+        release_load = Event()
+
+        class _FakeManifest:
+            id = "model-a"
+            loader = "fake"
+            provider = "local"
+            public_model_id = "model-a"
+
+        class _FakeResolver:
+            def resolve(self, model_id, media_type, task_type):
+                return _FakeManifest()
+
+        class _SlowLoader:
+            def __init__(self) -> None:
+                self.load_calls = 0
+
+            def load(self, manifest):
+                self.load_calls += 1
+                load_started.set()
+                # Blocks here to hold the "in progress" window open long
+                # enough for a second concurrent resolve_runtime() call to
+                # reach (and be forced to wait on) the same model's lock.
+                release_load.wait(timeout=5)
+                return {"id": manifest.id, "token": object()}
+
+        class _FakeLoaderRegistry:
+            def __init__(self, loader) -> None:
+                self._loader = loader
+
+            def get(self, name):
+                return self._loader
+
+        loader = _SlowLoader()
+        service = ModelService(
+            registry=None,
+            resolver=_FakeResolver(),
+            loader_registry=_FakeLoaderRegistry(loader),
+            runtime_cache=ModelRuntimeCache(max_entries=2),
+        )
+
+        results: list[tuple[object, object]] = []
+
+        def _resolve() -> None:
+            results.append(service.resolve_runtime(None, "image", "text-to-image"))
+
+        first_caller = Thread(target=_resolve)
+        first_caller.start()
+        self.assertTrue(load_started.wait(timeout=5))  # first caller is inside load(), blocked
+
+        second_caller = Thread(target=_resolve)
+        second_caller.start()
+        time.sleep(0.05)  # give the second caller a chance to reach the lock
+
+        # The second caller must be blocked waiting for the first caller's
+        # lock, not independently calling load() a second time.
+        self.assertEqual(loader.load_calls, 1)
+
+        release_load.set()
+        first_caller.join(timeout=5)
+        second_caller.join(timeout=5)
+
+        self.assertEqual(loader.load_calls, 1)
+        self.assertEqual(len(results), 2)
+        # Both callers received the exact same runtime object -- the second
+        # one reused the cache instead of loading (and evicting) its own.
+        self.assertIs(results[0][1], results[1][1])
 
     def test_runtime_cache_unload_all_calls_on_evict_for_every_entry(self) -> None:
         evicted: list[str] = []

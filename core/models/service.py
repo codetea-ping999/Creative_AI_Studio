@@ -82,14 +82,27 @@ class ModelService:
         if cached_runtime is not None:
             return manifest, cached_runtime
 
-        loader = self.loader_registry.get(manifest.loader)
-        runtime_obj = loader.load(manifest)
-        # `media_type` selects this runtime's eviction bucket (issue #182):
-        # a per-media budget in `runtime_cache.media_limits` lets this media
-        # family stay resident independently of others; absent one, it falls
-        # back to the cache's single shared budget unchanged.
-        self.runtime_cache.put(manifest.id, runtime_obj, media_type=media_type)
-        return manifest, runtime_obj
+        # Single-flight: only one caller loads a given uncached model_id at a
+        # time (see ModelRuntimeCache.lock_for's docstring for why -- a
+        # second concurrent loader's put() would otherwise evict, and run
+        # cleanup on, the runtime the first caller already returned and may
+        # still be using). A second caller blocks here rather than also
+        # loading; re-checking the cache after acquiring the lock picks up
+        # whatever the first caller already loaded instead of loading again.
+        with self.runtime_cache.lock_for(manifest.id):
+            cached_runtime = self.runtime_cache.get(manifest.id)
+            if cached_runtime is not None:
+                return manifest, cached_runtime
+
+            loader = self.loader_registry.get(manifest.loader)
+            runtime_obj = loader.load(manifest)
+            # `media_type` selects this runtime's eviction bucket (issue
+            # #182): a per-media budget in `runtime_cache.media_limits` lets
+            # this media family stay resident independently of others;
+            # absent one, it falls back to the cache's single shared budget
+            # unchanged.
+            self.runtime_cache.put(manifest.id, runtime_obj, media_type=media_type)
+            return manifest, runtime_obj
 
     def unload_model(self, model_id: str) -> None:
         self.runtime_cache.unload(model_id)
