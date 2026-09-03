@@ -521,6 +521,51 @@ class UnsupportedReferenceRequestApiTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 201, response.text)
 
+    def test_post_generate_audio_accepts_a_bible_ref_with_a_cross_project_image(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, seventh Codex round on PR #376, P2):
+        # the Bible-derived project-boundary check must be gated on image
+        # jobs specifically -- no other media type performs reference-image
+        # conditioning at all, so an audio (or text/video) job carrying
+        # bible_refs that happens to name a character/location entry with a
+        # cross-project image reference must not be rejected for a risk
+        # that generator can never act on.
+        from core.assets import Asset
+
+        client = self._client()
+        project_a = self.services.project_repository.create("Project A")
+        project_b = self.services.project_repository.create("Project B")
+        self.services.asset_repository.create_or_update(
+            Asset(
+                id="audio_job_bible_ref",
+                job_id="job_fixture",
+                project_id=project_a.id,
+                media_type="image",
+                kind="output",
+                title="reference fixture",
+                prompt="a reference image",
+                model_id="sdxl",
+                path="/tmp/does-not-need-to-exist.png",
+            )
+        )
+        entry = self.services.bible_repository.create(
+            kind="character",
+            name="Mina",
+            reference_asset_ids=["audio_job_bible_ref"],
+        )
+        response = client.post(
+            "/generate/audio",
+            json={
+                "prompt": "bright synth loop",
+                "model_id": "musicgen-small",
+                "project_id": project_b.id,
+                "output_format": "wav",
+                "params": {"bible_refs": [entry.id], "duration_seconds": 4},
+            },
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

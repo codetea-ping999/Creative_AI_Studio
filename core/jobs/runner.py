@@ -113,7 +113,7 @@ class JobRunner:
             )
             return job
 
-        context = self._begin_context(job_id)
+        context = self._begin_context(job_id, project_id=job.project_id)
         try:
             try:
                 if self._update_status(job_id, JOB_STATUS_PREPARING, progress=0.0) is None:
@@ -188,7 +188,9 @@ class JobRunner:
 
         return self.job_service.finalize_cancellation(job_id)
 
-    def _begin_context(self, job_id: str) -> GenerationContext | None:
+    def _begin_context(
+        self, job_id: str, project_id: str | None = None
+    ) -> GenerationContext | None:
         cancellation_registry = self.cancellation_registry
         if cancellation_registry is None:
             return None
@@ -196,6 +198,7 @@ class JobRunner:
         return GenerationContext(
             is_cancelled=lambda: cancellation_registry.is_cancelled(job_id),
             on_progress=lambda fraction: self._report_generation_progress(job_id, fraction),
+            project_id=project_id,
         )
 
     def _report_generation_progress(self, job_id: str, fraction: float) -> None:

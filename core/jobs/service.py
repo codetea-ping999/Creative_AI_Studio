@@ -128,7 +128,11 @@ class JobService:
                 self._reject_cross_project_reference_asset(
                     self.asset_repository, reference.asset_id, project_id
                 )
-        if self.asset_repository is not None and self.bible_repository is not None:
+        if (
+            request.media_type == "image"
+            and self.asset_repository is not None
+            and self.bible_repository is not None
+        ):
             # #201 follow-up (Codex P1, second round): the check above only
             # covers the documented request.references field. A
             # Bible-derived character/location reference (params.bible_refs)
@@ -143,6 +147,11 @@ class JobService:
             # (PromptComposer degrades it to a warning, see
             # _resolve_entries): this early check must not reject a request
             # for a problem the real resolution already handles gracefully.
+            # Gated to image jobs (Codex P2, third round): no other media
+            # type performs reference-image conditioning at all, so a
+            # text/audio/video job carrying bible_refs that happens to name
+            # a character/location entry with a cross-project image must not
+            # be rejected for a risk that generator can never act on.
             bible_refs = request.params.get("bible_refs")
             if isinstance(bible_refs, list):
                 for entry_id in bible_refs:

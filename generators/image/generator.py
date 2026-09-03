@@ -121,7 +121,12 @@ class ImageGenerator(BaseGenerator):
             reference_image_path,
             reference_strength,
             considered_references,
-        ) = self._resolve_references_for_conditioning(request, resolved_prompt, manifest)
+        ) = self._resolve_references_for_conditioning(
+            request,
+            resolved_prompt,
+            manifest,
+            project_id=context.project_id if context is not None else None,
+        )
         # A reference is only actually honored when a dedicated img2img-shaped
         # runtime exists and its own call signature takes image/strength
         # (#201: one supported conditioning path, not every image model
@@ -144,23 +149,32 @@ class ImageGenerator(BaseGenerator):
             # `strength` (from the public 0=no-effect/1=follow-closely
             # contract, see below) whenever `denoising_start` is also set --
             # and `denoising_end` applies its own cutoff *after* strength has
-            # already selected the timestep range, which can leave zero
-            # denoising steps or run fewer steps than the progress callback's
-            # denominator expects. Either parameter silently breaks the
-            # reference's lock strength or progress reporting, so both are
+            # already selected the timestep range. `timesteps`/`sigmas`
+            # (custom schedules) go further still: diffusers replaces
+            # num_inference_steps with the custom schedule's own length
+            # before applying strength at all, so the floor/progress
+            # denominator computed below (from the *requested*
+            # num_inference_steps) would no longer match what diffusers
+            # actually runs. Every one of these silently breaks the
+            # reference's lock strength or progress reporting, so all are
             # rejected outright for a reference job rather than forwarded
             # alongside strength.
-            for incompatible_param in ("denoising_start", "denoising_end"):
+            for incompatible_param in (
+                "denoising_start",
+                "denoising_end",
+                "timesteps",
+                "sigmas",
+            ):
                 if incompatible_param in effective_params:
                     raise UnsupportedImageParameterError(
                         f"Model {manifest.public_model_id!r}: "
                         f"{incompatible_param!r} cannot be combined with "
                         "reference-image conditioning -- diffusers img2img's "
-                        "timestep selection from denoising_start/denoising_end "
-                        "does not compose with the computed 'strength', so "
-                        "the reference's lock strength would not be honored. "
-                        f"Remove {incompatible_param!r} from params or drop "
-                        "the reference."
+                        "timestep selection from denoising_start/denoising_end/"
+                        "timesteps/sigmas does not compose with the computed "
+                        "'strength', so the reference's lock strength would "
+                        f"not be honored. Remove {incompatible_param!r} from "
+                        "params or drop the reference."
                     )
         # LoRA is configured on `pipeline` above, but `img2img_pipeline` (see
         # core/models/loader.py) wraps the *same* unet/text-encoder objects
@@ -234,27 +248,28 @@ class ImageGenerator(BaseGenerator):
             # here keeps the public contract's meaning intact for callers
             # regardless of which pipeline convention ends up serving it.
             # Diffusers computes init_timestep = int(num_inference_steps
-            # * strength) and needs at least one surviving step, so the
-            # floor is derived from num_inference_steps rather than a
-            # fixed constant: with the default 30 steps, a fixed 0.01
-            # floor rounds down to zero steps and diffusers has nothing
-            # left to denoise.
-            img2img_strength = min(
-                1.0,
-                max(
-                    # `+ 1e-6` covers float rounding in the division
-                    # itself (e.g. 30 * (1.0 / 30) landing a hair under
-                    # 1.0), which would otherwise still truncate to zero
-                    # steps. Capped at 1.0 by the outer min(): with very
-                    # few num_inference_steps (e.g. 1), the floor alone
-                    # can exceed 1.0 -- diffusers has no way to honor a
-                    # gentle lock with that few steps regardless of the
-                    # requested strength, so it is forced to the
-                    # strongest (least reference-preserving) setting.
-                    (1.0 / max(1, num_inference_steps)) + 1e-6,
-                    1.0 - cast(float, reference_strength),
-                ),
-            )
+            # * strength) and needs at least one surviving step. An earlier
+            # version of this code floored `img2img_strength` up to whatever
+            # value guaranteed one step, but that silently *replaced* a
+            # strong requested lock with a much weaker one whenever the
+            # step count was too low to represent it (e.g. num_inference_steps
+            # =1 forced every request, regardless of lock strength, to
+            # diffusers strength 1.0 -- the least reference-preserving
+            # setting) while still reporting the lock as applied. Rejecting
+            # the combination outright is more honest: the caller finds out
+            # their steps/strength combination cannot be honored, rather
+            # than silently getting a materially different result than
+            # what they asked for.
+            img2img_strength = 1.0 - cast(float, reference_strength)
+            if int(num_inference_steps * img2img_strength) < 1:
+                raise UnsupportedImageParameterError(
+                    f"Model {manifest.public_model_id!r}: the requested "
+                    f"reference lock strength {reference_strength} combined "
+                    f"with {num_inference_steps} inference step(s) would "
+                    "leave diffusers with zero denoising steps to actually "
+                    "run. Increase num_inference_steps or reduce the "
+                    "reference strength."
+                )
             reference_conditioning_kwargs = {
                 "image": (
                     Image.open(cast(str, reference_image_path))
@@ -263,14 +278,10 @@ class ImageGenerator(BaseGenerator):
                 ),
                 "strength": img2img_strength,
             }
-            # Mirrors diffusers' own init_timestep computation so the step
-            # callback's denominator matches how many steps will actually
-            # fire; floored at 1 for the same reason the strength floor
-            # above exists -- there is always at least one real step to
-            # report progress against.
-            effective_inference_steps = max(
-                1, int(num_inference_steps * img2img_strength)
-            )
+            # Mirrors diffusers' own init_timestep computation, using the
+            # exact same expression checked above so this can never disagree
+            # with it -- the check above already guarantees this is >= 1.
+            effective_inference_steps = int(num_inference_steps * img2img_strength)
         common_generation_kwargs = {
             "prompt": resolved_prompt.prompt,
             "negative_prompt": resolved_prompt.negative_prompt,
@@ -488,6 +499,8 @@ class ImageGenerator(BaseGenerator):
         request: GenerationRequest,
         resolved_prompt: "ResolvedPrompt",
         manifest: "ModelManifest",
+        *,
+        project_id: str | None = None,
     ) -> tuple[str | None, float | None, list["ReferenceImageInput"]]:
         """Pick the references to condition on and validate them against the manifest.
 
@@ -510,6 +523,17 @@ class ImageGenerator(BaseGenerator):
         source, or one from each source combined -- raises rather than
         silently applying only the first and reporting every one of them as
         honored.
+
+        `project_id` re-checks the same project-membership invariant
+        `JobService.create_job()` already enforced at job-creation time
+        (#201 follow-up, seventh Codex round on PR #376): that check
+        resolves a *mutable* Bible entry once at creation, but this method
+        resolves it again here when the job actually executes -- if
+        `PATCH /bible/{entry_id}` changed `reference_asset_ids` to a
+        different project's asset in between, the creation-time check saw
+        only the old asset. Re-checking against the resolved asset itself,
+        right where it is actually used, closes that gap regardless of
+        which upstream check (if any) already ran.
         """
 
         references = list(request.references or []) + list(
@@ -582,6 +606,18 @@ class ImageGenerator(BaseGenerator):
             raise MissingReferenceAssetError(
                 f"Reference asset {primary.asset_id!r} is {asset.media_type!r}, "
                 "not image; reference-image conditioning requires an image asset."
+            )
+        if asset.project_id != project_id:
+            # Re-check at the point of actual use, not just at job creation
+            # (see the docstring above) -- covers both request.references
+            # (already checked once by JobService) and Bible-derived
+            # references (only ever checked at job-creation time for
+            # character/location entries; this is authoritative for both).
+            raise MissingReferenceAssetError(
+                f"Reference asset {primary.asset_id!r} belongs to project "
+                f"{asset.project_id or 'no project'!r}, not "
+                f"{project_id or 'no project'!r}; a reference must belong "
+                "to the same project as the job it conditions."
             )
         if primary.strength <= 0.0:
             # ReferenceImageInput.strength=0 means "no effect" -- but img2img

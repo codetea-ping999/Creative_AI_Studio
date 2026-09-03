@@ -1526,6 +1526,76 @@ class ModelSystemTests(unittest.TestCase):
 
             self.assertEqual(list(output_dir.glob("**/*")), [])
 
+    def test_image_generator_rejects_a_reference_asset_outside_the_context_project(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, seventh Codex round on PR #376, P1):
+        # JobService.create_job()'s project-boundary check resolves a Bible
+        # entry's reference_asset_ids only once, at job creation. If
+        # PATCH /bible/{entry_id} changes those ids to point at a different
+        # project's asset before the queued job executes, the generator
+        # would load that new asset without ever re-checking the boundary --
+        # JobRunner threads the job's project_id through GenerationContext
+        # precisely so the generator can re-check here, at the point the
+        # asset is actually resolved and used, regardless of what changed
+        # between creation and execution.
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_root = root / "manifests"
+            model_id = self._write_reference_capable_manifest(manifest_root)
+            bible_repository = BibleRepository(root / "bible")
+            asset_repository = AssetRepository(root / "assets")
+            reference_image_path = root / "reference.png"
+            Image.new("RGB", (16, 16), color=(9, 9, 9)).save(reference_image_path)
+            asset_repository.create_or_update(
+                Asset(
+                    id="asset_char_1",
+                    job_id="job_fixture",
+                    project_id="project-a",
+                    media_type="image",
+                    kind="output",
+                    title="reference fixture",
+                    prompt="a reference image",
+                    model_id="sdxl",
+                    path=str(reference_image_path),
+                )
+            )
+            character = bible_repository.create(
+                kind="character", name="Mina", reference_asset_ids=["asset_char_1"]
+            )
+            composer = PromptComposer(bible_repository, asset_repository)
+            output_dir = root / "outputs"
+            # Simulates JobRunner's context for a job that was created
+            # (and had its Bible reference validated) against project-b --
+            # the asset above now belongs to project-a instead.
+            context = GenerationContext(is_cancelled=lambda: False, project_id="project-b")
+
+            with patch(
+                "core.models.loader.DiffusersImageLoader.load",
+                new=_fake_diffusers_load_reference_capable,
+            ):
+                service = create_default_model_service(manifest_root=manifest_root)
+                generator = ImageGenerator(
+                    service, output_dir=output_dir, prompt_composer=composer
+                )
+                with self.assertRaises(MissingReferenceAssetError):
+                    generator.run(
+                        GenerationRequest(
+                            media_type="image",
+                            prompt="Mina on the rooftop",
+                            model_id=model_id,
+                            params={
+                                "steps": 10,
+                                "width": 64,
+                                "height": 64,
+                                "bible_refs": [character.id],
+                            },
+                        ),
+                        context,
+                    )
+
+            self.assertEqual(list(output_dir.glob("**/*")), [])
+
     def test_image_generator_reports_progress_using_the_effective_img2img_step_count(
         self,
     ) -> None:
@@ -1584,16 +1654,21 @@ class ModelSystemTests(unittest.TestCase):
             self.assertTrue(reported_progress)
             self.assertAlmostEqual(reported_progress[-1], 1.0)
 
-    def test_image_generator_preserves_a_denoising_step_at_maximum_lock_strength(
+    def test_image_generator_rejects_a_lock_strength_too_strong_for_the_step_count(
         self,
     ) -> None:
-        # Regression (#201 follow-up, second Codex round on PR #376): with
-        # the public contract's strength=1.0 (strongest identity/location
-        # lock) and the default-shaped 30 num_inference_steps, a fixed 0.01
-        # diffusers-strength floor computes int(30 * 0.01) == 0 -- zero
-        # denoising steps, which diffusers img2img cannot run at all. The
-        # floor must be derived from num_inference_steps so at least one
-        # step survives regardless of how strong a lock was requested.
+        # Regression (#201 follow-up, second AND seventh Codex rounds on PR
+        # #376): the second round fixed a fixed 0.01 diffusers-strength
+        # floor computing int(30 * 0.01) == 0 -- zero denoising steps -- by
+        # deriving a floor from num_inference_steps instead. The seventh
+        # round found that floor itself was wrong: silently substituting a
+        # much weaker diffusers strength (up to a fully-noised 1.0) than
+        # what a strong public lock actually requested, while still
+        # reporting the lock as applied. The public contract's strength=1.0
+        # ("follows the reference image most closely") inverts to diffusers
+        # strength 0.0, which can never leave a surviving denoising step at
+        # any step count (int(steps * 0) == 0 always) -- so this combination
+        # must now be rejected outright rather than silently weakened.
         with TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
             manifest_root = root / "manifests"
@@ -1626,6 +1701,74 @@ class ModelSystemTests(unittest.TestCase):
                     service, output_dir=output_dir, prompt_composer=composer
                 )
                 num_inference_steps = 30
+                with self.assertRaises(UnsupportedImageParameterError):
+                    generator.run(
+                        GenerationRequest(
+                            media_type="image",
+                            prompt="Mina on the rooftop",
+                            model_id=model_id,
+                            references=[
+                                ReferenceImageInput(
+                                    asset_id="asset_char_1", role="character", strength=1.0
+                                )
+                            ],
+                            params={
+                                "steps": num_inference_steps,
+                                "width": 64,
+                                "height": 64,
+                            },
+                        )
+                    )
+                img2img_pipeline = service.get_runtime(model_id, "image", "text-to-image")[
+                    "img2img_pipeline"
+                ]
+
+            # Rejected before the pipeline is ever called -- not silently
+            # weakened to some other diffusers strength.
+            self.assertEqual(img2img_pipeline.calls, [])
+
+    def test_image_generator_honors_a_strong_lock_the_step_count_can_represent(
+        self,
+    ) -> None:
+        # Companion to the rejection test above: a strong (but not literally
+        # maximal) lock that a given step count *can* represent must still
+        # succeed and actually reach the requested strength, proving the new
+        # reject-when-infeasible check isn't rejecting strong locks broadly
+        # -- only combinations that are genuinely impossible to honor.
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_root = root / "manifests"
+            model_id = self._write_reference_capable_manifest(manifest_root)
+            asset_repository = AssetRepository(root / "assets")
+            reference_image_path = root / "reference.png"
+            Image.new("RGB", (16, 16), color=(9, 9, 9)).save(reference_image_path)
+            asset_repository.create_or_update(
+                Asset(
+                    id="asset_char_1",
+                    job_id="job_fixture",
+                    project_id=None,
+                    media_type="image",
+                    kind="output",
+                    title="reference fixture",
+                    prompt="a reference image",
+                    model_id="sdxl",
+                    path=str(reference_image_path),
+                )
+            )
+            composer = PromptComposer(BibleRepository(root / "bible"), asset_repository)
+            output_dir = root / "outputs"
+
+            with patch(
+                "core.models.loader.DiffusersImageLoader.load",
+                new=_fake_diffusers_load_reference_capable,
+            ):
+                service = create_default_model_service(manifest_root=manifest_root)
+                generator = ImageGenerator(
+                    service, output_dir=output_dir, prompt_composer=composer
+                )
+                num_inference_steps = 30
+                # natural_strength = 1.0 - 0.95 = 0.05; int(30 * 0.05) == 1,
+                # so this is right at the edge of what 30 steps can honor.
                 result = generator.run(
                     GenerationRequest(
                         media_type="image",
@@ -1633,7 +1776,7 @@ class ModelSystemTests(unittest.TestCase):
                         model_id=model_id,
                         references=[
                             ReferenceImageInput(
-                                asset_id="asset_char_1", role="character", strength=1.0
+                                asset_id="asset_char_1", role="character", strength=0.95
                             )
                         ],
                         params={
@@ -1648,11 +1791,7 @@ class ModelSystemTests(unittest.TestCase):
                 ]
 
             self.assertEqual(result.status, "succeeded")
-            diffusers_strength = img2img_pipeline.calls[0]["strength"]
-            # Must survive int(num_inference_steps * strength) >= 1, i.e.
-            # strictly more than 1/num_inference_steps -- the old fixed 0.01
-            # floor (0.01 * 30 == 0.3, truncating to 0) would fail this.
-            self.assertGreater(diffusers_strength * num_inference_steps, 1.0)
+            self.assertAlmostEqual(img2img_pipeline.calls[0]["strength"], 0.05)
 
     def test_image_generator_skips_conditioning_kwargs_without_a_reference(self) -> None:
         # Same reference-capable manifest/runtime, but no reference
@@ -1817,7 +1956,12 @@ class ModelSystemTests(unittest.TestCase):
                                 asset_id="asset_direct_1", role="character", strength=0.5
                             )
                         ],
-                        params={"steps": 1, "width": 64, "height": 64},
+                        # >1 so natural_strength=0.5 stays representable
+                        # (int(steps * 0.5) >= 1, see the reject-when-
+                        # infeasible check in generate()) -- 1 step would
+                        # make this combination itself get rejected, which
+                        # is not what this test is checking.
+                        params={"steps": 10, "width": 64, "height": 64},
                     )
                 )
                 img2img_pipeline = service.get_runtime(model_id, "image", "text-to-image")[
@@ -2129,6 +2273,47 @@ class ModelSystemTests(unittest.TestCase):
                                 "height": 64,
                                 "bible_refs": [character_id],
                                 "denoising_end": 0.7,
+                            },
+                        )
+                    )
+
+            self.assertEqual(list(output_dir.glob("**/*")), [])
+
+    def test_image_generator_rejects_custom_timesteps_for_a_reference_job(self) -> None:
+        # Regression (#201 follow-up, seventh Codex round on PR #376, P2):
+        # a custom `timesteps` (or `sigmas`) schedule makes diffusers replace
+        # num_inference_steps with the schedule's own length before applying
+        # strength at all -- so the floor/progress denominator computed from
+        # the *requested* num_inference_steps would no longer match what
+        # diffusers actually runs, exactly like denoising_start/denoising_end
+        # above but one step further removed from the requested step count.
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_root = root / "manifests"
+            model_id = self._write_reference_capable_manifest(manifest_root)
+            composer, character_id = self._prepare_character_reference(root)
+            output_dir = root / "outputs"
+
+            with patch(
+                "core.models.loader.DiffusersImageLoader.load",
+                new=_fake_diffusers_load_reference_capable,
+            ):
+                service = create_default_model_service(manifest_root=manifest_root)
+                generator = ImageGenerator(
+                    service, output_dir=output_dir, prompt_composer=composer
+                )
+                with self.assertRaises(UnsupportedImageParameterError):
+                    generator.run(
+                        GenerationRequest(
+                            media_type="image",
+                            prompt="Mina on the rooftop",
+                            model_id=model_id,
+                            params={
+                                "steps": 10,
+                                "width": 64,
+                                "height": 64,
+                                "bible_refs": [character_id],
+                                "timesteps": [999, 500, 1],
                             },
                         )
                     )
