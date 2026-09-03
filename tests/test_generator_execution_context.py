@@ -96,17 +96,27 @@ class _RigContext:
 # ---------------------------------------------------------------------------
 
 
-def test_runner_builds_context_only_when_a_cancellation_registry_is_configured() -> None:
+def test_runner_builds_context_regardless_of_cancellation_registry() -> None:
     """A generator never builds its own ``GenerationContext``; only the
-    runner does, and only once a ``CancellationRegistry`` backs it -- the
-    same runner falls back to ``None`` otherwise (legacy behavior)."""
+    runner does. It always builds one now (#201 follow-up, eighth Codex
+    round on PR #376) -- carrying project_id and progress reporting even
+    without a ``CancellationRegistry`` backing it, since neither of those
+    ever depended on cancellation support. Only ``is_cancelled`` itself
+    is affected: with no registry to ever record a cancellation request
+    in, it always reports "never cancelled" rather than the context being
+    entirely absent (the prior legacy behavior)."""
     with TemporaryDirectory() as tmp_dir:
         repository = JobRepository(Path(tmp_dir) / "jobs.db")
         queue = JobQueue()
         registry = GeneratorRegistry({})
 
         without_registry = JobRunner(repository, queue, registry, cancellation_registry=None)
-        assert without_registry._begin_context("job-a") is None
+        context_without_registry = without_registry._begin_context(
+            "job-a", project_id="project-a"
+        )
+        assert isinstance(context_without_registry, GenerationContext)
+        assert context_without_registry.project_id == "project-a"
+        assert context_without_registry.is_cancelled() is False
 
         with_registry = JobRunner(
             repository, queue, registry, cancellation_registry=CancellationRegistry()
