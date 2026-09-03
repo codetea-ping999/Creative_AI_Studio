@@ -1876,6 +1876,82 @@ class ModelSystemTests(unittest.TestCase):
             self.assertEqual(progress_path.read_text(), "5")
             self.assertTrue(output_path.exists())
 
+    def test_learned_video_generator_tolerates_a_fixed_signature_renderer(self) -> None:
+        # Regression (#209 follow-up, Codex review on PR #375): a renderer
+        # with a fixed keyword-only signature (no **kwargs, no
+        # raise_if_cancelled parameter) must not be handed that opt-in
+        # kwarg -- doing so raises TypeError: unexpected keyword argument
+        # for any adapter that was never updated to accept it. The
+        # cancellation boundary check must still run either way.
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_root = root / "manifests"
+            runtime_root = root / "runtime" / "learned-video"
+            runtime_root.mkdir(parents=True)
+            (runtime_root / "runtime.py").write_text(
+                "\n".join(
+                    [
+                        "from pathlib import Path",
+                        "",
+                        "def load_runtime(manifest):",
+                        "    def renderer(",
+                        "        *, prompt, negative_prompt, seed, output_dir,",
+                        "        output_format, entrypoint=None,",
+                        "    ):",
+                        "        out_dir = Path(output_dir)",
+                        "        out_dir.mkdir(parents=True, exist_ok=True)",
+                        "        output_path = out_dir / 'learned-output.mp4'",
+                        "        output_path.write_bytes(b'0' * 131072)",
+                        "        return {",
+                        "            'output_path': str(output_path),",
+                        "            'output_format': 'mp4',",
+                        "            'metadata': {'adapter_contract': 'fixed-signature'},",
+                        "        }",
+                        "    return {",
+                        "        'runtime_adapter': 'learned_text_to_video',",
+                        "        'renderer': renderer,",
+                        "    }",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            _write_manifest(
+                manifest_root / "video" / "learned.json",
+                {
+                    "id": "learned-video-local",
+                    "public_id": "learned-video",
+                    "display_name": "Learned Video",
+                    "media_type": "video",
+                    "task_type": "text-to-video",
+                    "provider": "local",
+                    "runtime": "learned",
+                    "local_path": str(runtime_root),
+                    "loader": "learned_video_loader",
+                    "default_params": {"entrypoint": "runtime.py"},
+                    "aliases": ["learned-video-local"],
+                    "enabled": True,
+                },
+            )
+            service = create_default_model_service(manifest_root=manifest_root)
+            generator = VideoGenerator(service, output_dir=root / "outputs" / "videos")
+            # A non-null context with is_cancelled always False: this proves
+            # the fixed-signature renderer is tolerated when cancellation is
+            # in play at all, not just when context is None entirely.
+            context = GenerationContext(is_cancelled=lambda: False)
+
+            result = generator.run(
+                GenerationRequest(
+                    media_type="video",
+                    prompt="fixed-signature adapter smoke",
+                    model_id="learned-video",
+                    output_format="mp4",
+                ),
+                context,
+            )
+
+            self.assertEqual(result.status, "succeeded")
+            self.assertEqual(result.metadata["adapter_contract"], "fixed-signature")
+
 
 if __name__ == "__main__":
     unittest.main()
