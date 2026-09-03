@@ -560,6 +560,17 @@ class ImageGenerator(BaseGenerator):
                 f"Reference asset {primary.asset_id!r} is {asset.media_type!r}, "
                 "not image; reference-image conditioning requires an image asset."
             )
+        if primary.strength <= 0.0:
+            # ReferenceImageInput.strength=0 means "no effect" -- but img2img
+            # still VAE-encodes the reference and consumes the seeded
+            # generator's random draws to do it, so even diffusers
+            # strength=1.0 (the value this would otherwise invert to) is not
+            # guaranteed to reproduce what a plain text2img call would have
+            # produced. An explicit zero-strength reference is treated as
+            # unconditioned generation -- reported in `considered_references`
+            # for audit purposes, but never routed through img2img -- rather
+            # than as "closest to the reference" at diffusers strength 1.0.
+            return None, None, references
         return asset.path, primary.strength, references
 
     def _pipeline_accepts_reference_image(self, pipeline: object) -> bool:

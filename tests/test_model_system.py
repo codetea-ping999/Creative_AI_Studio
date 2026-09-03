@@ -1398,6 +1398,63 @@ class ModelSystemTests(unittest.TestCase):
             self.assertEqual(result.metadata["reference_applied_asset_id"], "asset_char_1")
             self.assertEqual(result.metadata["pipeline_class"], "_FakeReferenceCapablePipeline")
 
+    def test_image_generator_treats_zero_strength_reference_as_unconditioned(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, fourth Codex round on PR #376):
+        # strength=0 in the public contract means "no effect", but the
+        # img2img path routed every resolved reference through img2img
+        # regardless of strength, computing diffusers strength=1.0 for a
+        # strength=0 request. img2img still VAE-encodes the reference and
+        # consumes the seeded generator's random draws to do it, so even
+        # diffusers strength=1.0 is not guaranteed to reproduce what a plain
+        # text2img call would have produced -- a zero-strength reference
+        # must bypass img2img entirely, not just get the "weakest" img2img
+        # setting.
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_root = root / "manifests"
+            model_id = self._write_reference_capable_manifest(manifest_root)
+            composer, _character_id = self._prepare_character_reference(root)
+            output_dir = root / "outputs"
+
+            with patch(
+                "core.models.loader.DiffusersImageLoader.load",
+                new=_fake_diffusers_load_reference_capable,
+            ):
+                service = create_default_model_service(manifest_root=manifest_root)
+                generator = ImageGenerator(
+                    service, output_dir=output_dir, prompt_composer=composer
+                )
+                result = generator.run(
+                    GenerationRequest(
+                        media_type="image",
+                        prompt="Mina on the rooftop",
+                        model_id=model_id,
+                        references=[
+                            ReferenceImageInput(
+                                asset_id="asset_char_1", role="character", strength=0.0
+                            )
+                        ],
+                        params={"steps": 10, "width": 64, "height": 64},
+                    )
+                )
+                runtime = service.get_runtime(model_id, "image", "text-to-image")
+                text2img_pipeline = runtime["pipeline"]
+                img2img_pipeline = runtime["img2img_pipeline"]
+
+            self.assertEqual(result.status, "succeeded")
+            self.assertEqual(len(img2img_pipeline.calls), 0)  # img2img never called
+            self.assertEqual(text2img_pipeline.steps_invoked, 10)
+            self.assertFalse(result.metadata["reference_conditioning_applied"])
+            self.assertIsNone(result.metadata["reference_applied_asset_id"])
+            # Still reported as considered, for audit purposes, even though
+            # it was correctly never applied.
+            self.assertEqual(len(result.metadata["considered_references"]), 1)
+            self.assertEqual(
+                result.metadata["considered_references"][0]["asset_id"], "asset_char_1"
+            )
+
     def test_image_generator_rejects_combined_top_level_and_bible_references(
         self,
     ) -> None:
