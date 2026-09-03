@@ -8,7 +8,11 @@ from uuid import uuid4
 from typing import TYPE_CHECKING
 
 from core.models import ModelService
-from core.reference_capabilities import MissingReferenceAssetError, validate_reference_inputs
+from core.reference_capabilities import (
+    REFERENCE_ROLES,
+    MissingReferenceAssetError,
+    validate_reference_inputs,
+)
 from core.schemas import GenerationRequest, GenerationResult, GenerationStatus
 
 from .events import EventBus
@@ -16,6 +20,7 @@ from .lanes import LaneConfig, assign_lane
 
 if TYPE_CHECKING:
     from core.assets import AssetRepository
+    from core.bible import BibleRepository
     from core.storage.repositories.job_repository import JobRepository
     from .cancellation import CancellationRegistry
     from .queue import JobQueue
@@ -68,6 +73,7 @@ class JobService:
         cancellation_registry: "CancellationRegistry | None" = None,
         model_service: ModelService | None = None,
         lane_config: LaneConfig | None = None,
+        bible_repository: "BibleRepository | None" = None,
     ) -> None:
         self.job_repository = job_repository
         self.job_queue = job_queue
@@ -75,6 +81,11 @@ class JobService:
         self.asset_repository = asset_repository
         self.cancellation_registry = cancellation_registry
         self.model_service = model_service
+        # Only used by create_job()'s project-boundary check on Bible-derived
+        # (bible_refs) references (#201 follow-up) -- optional like the
+        # other repositories above, so existing callers that construct
+        # JobService without it keep working, just without that check.
+        self.bible_repository = bible_repository
         # #180: when set to a genuinely multi-lane configuration, enqueue_job
         # routes each job to `assign_lane(media_type, task_type, lane_config)`
         # instead of the queue's implicit single lane. Left as None (the
@@ -114,14 +125,36 @@ class JobService:
             # this only rejects a reference that resolves to an asset
             # belonging to a *different* project than this job targets.
             for reference in request.references:
-                asset = self.asset_repository.get(reference.asset_id)
-                if asset is not None and asset.project_id != project_id:
-                    raise MissingReferenceAssetError(
-                        f"Reference asset {reference.asset_id!r} belongs to "
-                        f"project {asset.project_id or 'no project'!r}, not "
-                        f"{project_id or 'no project'!r}; a reference must "
-                        "belong to the same project as the job it conditions."
-                    )
+                self._reject_cross_project_reference_asset(
+                    self.asset_repository, reference.asset_id, project_id
+                )
+        if self.asset_repository is not None and self.bible_repository is not None:
+            # #201 follow-up (Codex P1, second round): the check above only
+            # covers the documented request.references field. A
+            # Bible-derived character/location reference (params.bible_refs)
+            # resolves its asset the same way once PromptComposer runs
+            # inside the generator (resolved_prompt.resolved_references),
+            # with the identical cross-project exposure risk if left
+            # unchecked here. Only character/location entries ever feed
+            # pixel conditioning (see PromptComposer.compose()) -- a
+            # style/brand/prop entry's reference_asset_ids never reach
+            # img2img, so those are left alone. An unknown bible entry id is
+            # tolerated here exactly as it is everywhere else
+            # (PromptComposer degrades it to a warning, see
+            # _resolve_entries): this early check must not reject a request
+            # for a problem the real resolution already handles gracefully.
+            bible_refs = request.params.get("bible_refs")
+            if isinstance(bible_refs, list):
+                for entry_id in bible_refs:
+                    if not isinstance(entry_id, str):
+                        continue
+                    entry = self.bible_repository.get(entry_id)
+                    if entry is None or entry.kind not in REFERENCE_ROLES:
+                        continue
+                    for asset_id in entry.reference_asset_ids:
+                        self._reject_cross_project_reference_asset(
+                            self.asset_repository, asset_id, project_id
+                        )
         now = datetime.now(timezone.utc)
         job = JobRecord(
             id=f"job_{uuid4().hex}",
@@ -144,6 +177,27 @@ class JobService:
         )
         self.enqueue_job(created_job.id)
         return created_job
+
+    def _reject_cross_project_reference_asset(
+        self,
+        asset_repository: AssetRepository,
+        asset_id: str,
+        project_id: str | None,
+    ) -> None:
+        """Raise if `asset_id` resolves to an asset outside `project_id`.
+
+        A no-op when the asset does not exist at all -- that case is left to
+        the generator's own MissingReferenceAssetError at execution time.
+        """
+
+        asset = asset_repository.get(asset_id)
+        if asset is not None and asset.project_id != project_id:
+            raise MissingReferenceAssetError(
+                f"Reference asset {asset_id!r} belongs to project "
+                f"{asset.project_id or 'no project'!r}, not "
+                f"{project_id or 'no project'!r}; a reference must belong "
+                "to the same project as the job it conditions."
+            )
 
     def enqueue_job(self, job_id: str) -> JobRecord | None:
         job = self.get_job(job_id)

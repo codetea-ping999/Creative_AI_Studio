@@ -139,21 +139,29 @@ class ImageGenerator(BaseGenerator):
             and reference_pipeline is not None
             and self._pipeline_accepts_reference_image(reference_pipeline)
         )
-        if reference_capable and "denoising_start" in effective_params:
-            # Diffusers img2img's get_timesteps() ignores `strength` entirely
-            # whenever `denoising_start` is also set -- so the lock strength
-            # computed just below (from the public 0=no-effect/1=follow-
-            # closely contract) would be silently discarded, and the
-            # requested reference conditioning would not actually be
-            # honored the way the caller asked for it.
-            raise UnsupportedImageParameterError(
-                f"Model {manifest.public_model_id!r}: 'denoising_start' "
-                "cannot be combined with reference-image conditioning -- "
-                "diffusers img2img ignores the computed 'strength' whenever "
-                "denoising_start is set, so the reference's lock strength "
-                "would not be honored. Remove denoising_start from params "
-                "or drop the reference."
-            )
+        if reference_capable:
+            # Diffusers img2img's get_timesteps() ignores the computed
+            # `strength` (from the public 0=no-effect/1=follow-closely
+            # contract, see below) whenever `denoising_start` is also set --
+            # and `denoising_end` applies its own cutoff *after* strength has
+            # already selected the timestep range, which can leave zero
+            # denoising steps or run fewer steps than the progress callback's
+            # denominator expects. Either parameter silently breaks the
+            # reference's lock strength or progress reporting, so both are
+            # rejected outright for a reference job rather than forwarded
+            # alongside strength.
+            for incompatible_param in ("denoising_start", "denoising_end"):
+                if incompatible_param in effective_params:
+                    raise UnsupportedImageParameterError(
+                        f"Model {manifest.public_model_id!r}: "
+                        f"{incompatible_param!r} cannot be combined with "
+                        "reference-image conditioning -- diffusers img2img's "
+                        "timestep selection from denoising_start/denoising_end "
+                        "does not compose with the computed 'strength', so "
+                        "the reference's lock strength would not be honored. "
+                        f"Remove {incompatible_param!r} from params or drop "
+                        "the reference."
+                    )
         # LoRA is configured on `pipeline` above, but `img2img_pipeline` (see
         # core/models/loader.py) wraps the *same* unet/text-encoder objects
         # rather than copies, so a loaded adapter is visible to both --

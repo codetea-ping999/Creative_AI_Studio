@@ -287,6 +287,64 @@ class ApiExtensionTests(unittest.TestCase):
             self.assertEqual(source_project["job_count"], 1)
             self.assertEqual(target_project["job_count"], 1)
 
+    def test_rerun_job_reports_422_not_500_for_a_cross_project_reference(self) -> None:
+        # Regression (#201 follow-up, sixth Codex round on PR #376, P2):
+        # /jobs/{id}/rerun calls JobService.create_job() outside the
+        # try/except that POST /jobs and /generate/* already use to convert
+        # a project-boundary rejection (MissingReferenceAssetError) into a
+        # 422 -- so moving a job with a reference into a project the
+        # reference doesn't belong to surfaced as an unhandled 500 instead.
+        from core.assets import Asset
+
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            services = create_application_services(
+                db_path=root / "jobs.db",
+                output_dir=root / "outputs" / "images",
+            )
+            client = TestClient(create_app(services, start_job_runner=False))
+
+            source_project_id = client.post("/projects", json={"name": "Source"}).json()["id"]
+            target_project_id = client.post("/projects", json={"name": "Target"}).json()["id"]
+            services.asset_repository.create_or_update(
+                Asset(
+                    id="rerun_cross_project_ref",
+                    job_id="job_fixture",
+                    project_id=source_project_id,
+                    media_type="image",
+                    kind="output",
+                    title="reference fixture",
+                    prompt="a reference image",
+                    model_id="sdxl",
+                    path="/tmp/does-not-need-to-exist.png",
+                )
+            )
+
+            create_response = client.post(
+                "/generate/image",
+                json={
+                    "prompt": "a knight",
+                    "model_id": "sdxl",
+                    "project_id": source_project_id,
+                    "references": [
+                        {
+                            "asset_id": "rerun_cross_project_ref",
+                            "role": "character",
+                            "strength": 0.8,
+                        }
+                    ],
+                },
+            )
+            self.assertEqual(create_response.status_code, 201, create_response.text)
+            source_job_id = create_response.json()["job_id"]
+
+            rerun_response = client.post(
+                f"/jobs/{source_job_id}/rerun",
+                json={"project_id": target_project_id},
+            )
+            self.assertEqual(rerun_response.status_code, 422, rerun_response.text)
+            self.assertIn("rerun_cross_project_ref", rerun_response.text)
+
     def test_remove_job_rejects_foreign_project_and_preserves_bindings(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)

@@ -419,6 +419,108 @@ class UnsupportedReferenceRequestApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 201, response.text)
         self.assertEqual(len(self.services.job_repository.list()), 1)
 
+    def test_post_generate_image_rejects_a_bible_derived_reference_from_a_different_project(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, sixth Codex round on PR #376, P1): the
+        # request.references check above only covers the documented
+        # top-level field. A Bible-derived character/location reference
+        # (params.bible_refs) resolves its asset the same way once
+        # PromptComposer runs inside the generator, with the identical
+        # cross-project exposure risk if left unchecked -- a job in project B
+        # could still resolve a Bible entry whose reference_asset_ids point
+        # at a project-A image and condition on it.
+        from core.assets import Asset
+
+        client = self._client()
+        project_a = self.services.project_repository.create("Project A")
+        project_b = self.services.project_repository.create("Project B")
+        self.services.asset_repository.create_or_update(
+            Asset(
+                id="bible_cross_project_ref",
+                job_id="job_fixture",
+                project_id=project_a.id,
+                media_type="image",
+                kind="output",
+                title="reference fixture",
+                prompt="a reference image",
+                model_id="sdxl",
+                path="/tmp/does-not-need-to-exist.png",
+            )
+        )
+        entry = self.services.bible_repository.create(
+            kind="character",
+            name="Mina",
+            reference_asset_ids=["bible_cross_project_ref"],
+        )
+        response = client.post(
+            "/generate/image",
+            json={
+                "prompt": "a knight",
+                "model_id": "sdxl",
+                "project_id": project_b.id,
+                "params": {"bible_refs": [entry.id]},
+            },
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertIn("bible_cross_project_ref", response.text)
+        self.assertEqual(self.services.job_repository.list(), [])
+
+    def test_post_generate_image_accepts_a_bible_derived_reference_from_the_same_project(
+        self,
+    ) -> None:
+        from core.assets import Asset
+
+        client = self._client()
+        project_a = self.services.project_repository.create("Project A")
+        self.services.asset_repository.create_or_update(
+            Asset(
+                id="bible_same_project_ref",
+                job_id="job_fixture",
+                project_id=project_a.id,
+                media_type="image",
+                kind="output",
+                title="reference fixture",
+                prompt="a reference image",
+                model_id="sdxl",
+                path="/tmp/does-not-need-to-exist.png",
+            )
+        )
+        entry = self.services.bible_repository.create(
+            kind="character",
+            name="Mina",
+            reference_asset_ids=["bible_same_project_ref"],
+        )
+        response = client.post(
+            "/generate/image",
+            json={
+                "prompt": "a knight",
+                "model_id": "sdxl",
+                "project_id": project_a.id,
+                "params": {"bible_refs": [entry.id]},
+            },
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(len(self.services.job_repository.list()), 1)
+
+    def test_post_generate_image_ignores_an_unknown_bible_ref_in_the_project_check(
+        self,
+    ) -> None:
+        # An unknown bible entry id must not be rejected by this early
+        # project-boundary check -- PromptComposer already degrades that to
+        # a warning later (see _resolve_entries), and this check must not
+        # be stricter than the real resolution it is only a fast-fail for.
+        client = self._client()
+        response = client.post(
+            "/generate/image",
+            json={
+                "prompt": "a knight",
+                "model_id": "sdxl",
+                "params": {"bible_refs": ["does-not-exist"]},
+            },
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

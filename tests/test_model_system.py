@@ -2094,6 +2094,47 @@ class ModelSystemTests(unittest.TestCase):
 
             self.assertEqual(list(output_dir.glob("**/*")), [])
 
+    def test_image_generator_rejects_denoising_end_for_a_reference_job(self) -> None:
+        # Regression (#201 follow-up, sixth Codex round on PR #376, P2):
+        # denoising_end applies its own cutoff *after* diffusers has already
+        # selected the timestep range from the computed `strength`, which can
+        # leave zero denoising steps or run fewer steps than the progress
+        # callback's denominator expects -- a noisy/incorrect result and
+        # incomplete progress reporting, exactly like denoising_start's
+        # conflict with strength above.
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_root = root / "manifests"
+            model_id = self._write_reference_capable_manifest(manifest_root)
+            composer, character_id = self._prepare_character_reference(root)
+            output_dir = root / "outputs"
+
+            with patch(
+                "core.models.loader.DiffusersImageLoader.load",
+                new=_fake_diffusers_load_reference_capable,
+            ):
+                service = create_default_model_service(manifest_root=manifest_root)
+                generator = ImageGenerator(
+                    service, output_dir=output_dir, prompt_composer=composer
+                )
+                with self.assertRaises(UnsupportedImageParameterError):
+                    generator.run(
+                        GenerationRequest(
+                            media_type="image",
+                            prompt="Mina on the rooftop",
+                            model_id=model_id,
+                            params={
+                                "steps": 10,
+                                "width": 64,
+                                "height": 64,
+                                "bible_refs": [character_id],
+                                "denoising_end": 0.7,
+                            },
+                        )
+                    )
+
+            self.assertEqual(list(output_dir.glob("**/*")), [])
+
     def test_image_generator_rejects_a_non_image_direct_reference_asset(self) -> None:
         # Regression (#201 follow-up, second Codex round on PR #376):
         # PromptComposer._resolve_reference_asset() rejects a non-image

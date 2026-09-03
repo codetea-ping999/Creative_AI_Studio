@@ -126,7 +126,12 @@ def rerun_job(
             "params": dict(request.params) if request.params is not None else dict(source_job.request.params),
         }
     )
-    job = services.job_service.create_job(generation_request, project_id=resolved_project_id)
+    try:
+        job = services.job_service.create_job(generation_request, project_id=resolved_project_id)
+    except (UnsupportedReferenceError, MissingReferenceAssetError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
     if resolved_project_id is not None:
         _get_project_repo(services).add_job(resolved_project_id, job.id)
     return CreateJobResponse(job_id=job.id, status=job.status)
