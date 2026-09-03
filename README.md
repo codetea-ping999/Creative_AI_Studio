@@ -16,6 +16,7 @@
 - 新規作業は `git clone https://github.com/codetea-ping999/Creative_AI_Studio.git` で取得したリポジトリ直下で行ってください
 - `.env`、`venv/`、`data/*.db`、`outputs/`、`apps/web/node_modules/` はローカル専用で Git には含めません
 - 実モデル本体は Git 管理対象外です。`models/manifests/` と軽量な補助ファイルだけをリポジトリに含め、重い checkpoint や weight は各開発環境で配置します
+- ブランチ、commit、PR、worktree、並列エージェント作業のルールは [docs/git-workflow.md](docs/git-workflow.md) を参照してください
 
 ## すぐに起動
 
