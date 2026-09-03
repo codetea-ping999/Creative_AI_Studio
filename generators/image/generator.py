@@ -18,18 +18,22 @@ from core.quality import (
     evaluate_image_output,
     evaluate_image_semantics,
 )
-from core.reference_capabilities import ReferenceImageInput
+from core.reference_capabilities import MissingReferenceAssetError, validate_reference_inputs
 from core.schemas import GenerationRequest, GenerationResult
 from generators.base import BaseGenerator
 from generators.common import resolve_generation_prompt
 from generators.image.providers import (
     ImageGenerationSpec,
     LocalDiffusersImageProvider,
+    UnsupportedImageParameterError,
     local_diffusers_capabilities,
 )
 
 if TYPE_CHECKING:
     from core.jobs.context import GenerationContext
+    from core.models import ModelManifest
+    from core.reference_capabilities import ReferenceImageInput
+    from generators.common.prompting import ResolvedPrompt
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _MAX_VARIATION_COUNT = 4
@@ -112,22 +116,33 @@ class ImageGenerator(BaseGenerator):
             if resolved_prompt.seed is not None
             else secrets.randbits(63)
         )
-        reference_image_path, reference_strength = self._resolve_reference_image(
-            resolved_prompt.resolved_references
-        )
-        # A reference the composer resolved is only actually honored when the
-        # loaded pipeline's own call signature can take it (#201: one
-        # supported conditioning path, not every image model family). When a
-        # reference was requested but this pipeline can't honor it,
+        (
+            reference_image_path,
+            reference_strength,
+            considered_references,
+        ) = self._resolve_references_for_conditioning(request, resolved_prompt, manifest)
+        # A reference is only actually honored when a dedicated img2img-shaped
+        # runtime exists and its own call signature takes image/strength
+        # (#201: one supported conditioning path, not every image model
+        # family -- StableDiffusionXLPipeline itself never accepts these, see
+        # core/models/loader.py's separate img2img_pipeline). When a
+        # reference was requested but this can't be honored,
         # `reference_capable` stays False and `capabilities.supports_reference_image`
         # below stays at its default False -- `validate_capabilities` then
         # rejects the request before any pipeline call, rather than silently
         # dropping the reference or passing it into a call that doesn't
         # accept it.
+        reference_pipeline = runtime_obj.get("img2img_pipeline")
         reference_capable = (
             reference_image_path is not None
-            and self._pipeline_accepts_reference_image(pipeline)
+            and reference_pipeline is not None
+            and self._pipeline_accepts_reference_image(reference_pipeline)
         )
+        # LoRA is configured on `pipeline` above, but `img2img_pipeline` (see
+        # core/models/loader.py) wraps the *same* unet/text-encoder objects
+        # rather than copies, so a loaded adapter is visible to both --
+        # nothing extra is needed here for "LoRA + reference" to compose.
+        active_pipeline = reference_pipeline if reference_capable else pipeline
         # Route the pipeline call through the provider-neutral contract
         # (generators/image/providers.py) so this local diffusers path and a
         # future cloud provider are invoked and validated the same way; the
@@ -135,7 +150,7 @@ class ImageGenerator(BaseGenerator):
         # contract existed, so behavior is identical to a direct call.
         provider = LocalDiffusersImageProvider(
             model_id=manifest.public_model_id,
-            pipeline=pipeline,
+            pipeline=active_pipeline,
             capabilities=(
                 local_diffusers_capabilities(supports_reference_image=True)
                 if reference_capable
@@ -167,17 +182,33 @@ class ImageGenerator(BaseGenerator):
         )
         reference_conditioning_kwargs: dict[str, Any] = {}
         if reference_capable:
+            # A real img2img call derives its output size from `image`
+            # itself rather than accepting width/height (unlike the text2img
+            # call below), so the reference is resized to the requested
+            # output dimensions instead of forwarding width/height.
             reference_conditioning_kwargs = {
-                "image": Image.open(cast(str, reference_image_path)).convert("RGB"),
-                "strength": reference_strength,
+                "image": (
+                    Image.open(cast(str, reference_image_path))
+                    .convert("RGB")
+                    .resize((width, height))
+                ),
+                # ReferenceImageInput.strength is 0=no effect, 1=follow the
+                # reference most closely (core/reference_capabilities.py).
+                # diffusers img2img `strength` is the opposite: the fraction
+                # of denoising applied to the *source* image, so 0=closest to
+                # the reference and 1=ignores it almost entirely. Inverting
+                # here keeps the public contract's meaning intact for callers
+                # regardless of which pipeline convention ends up serving it.
+                # Diffusers requires strength in (0, 1], so a lock strength of
+                # exactly 1.0 is clamped just above zero rather than rejected.
+                "strength": max(0.01, min(1.0, 1.0 - cast(float, reference_strength))),
             }
         common_generation_kwargs = {
             "prompt": resolved_prompt.prompt,
             "negative_prompt": resolved_prompt.negative_prompt,
-            "width": width,
-            "height": height,
             "guidance_scale": guidance_scale,
             "num_inference_steps": num_inference_steps,
+            **({} if reference_capable else {"width": width, "height": height}),
             **effective_params,
             **reference_conditioning_kwargs,
         }
@@ -201,7 +232,7 @@ class ImageGenerator(BaseGenerator):
                     torch,
                 )
                 step_callback = self._build_step_callback(
-                    pipeline,
+                    active_pipeline,
                     num_inference_steps,
                     context,
                     variation_index=variation_index,
@@ -294,19 +325,30 @@ class ImageGenerator(BaseGenerator):
                 "requested_prompt": request.prompt,
                 "prompt_composition": resolved_prompt.composition,
                 "reference_asset_ids": resolved_prompt.reference_asset_ids,
-                # #199: which asset, role (character/location), and strength a
-                # Bible reference resolved to. #201:
-                # reference_conditioning_applied says whether the first one
-                # actually reached the pipeline as image/strength conditioning
-                # -- False can mean no reference was requested, or one was
-                # requested but this pipeline doesn't support it (in which
-                # case generation already failed before reaching here; see
-                # request_spec's reference_image_path / validate_capabilities).
+                # `considered_references` is whichever source
+                # (request.references or Bible-derived resolved_references,
+                # see _resolve_references_for_conditioning) actually fed
+                # conditioning -- distinct from `resolved_prompt
+                # .resolved_references` above, which is Bible-only audit
+                # trail regardless of which source won. #201:
+                # reference_conditioning_applied is true only when exactly
+                # one reference was considered and reached the pipeline as
+                # image/strength conditioning; more than one considered
+                # reference, or one this pipeline can't honor, already
+                # failed generation before reaching here (see
+                # request_spec.reference_image_path / validate_capabilities
+                # and _resolve_references_for_conditioning's own checks).
                 "resolved_references": [
                     reference.model_dump(mode="json")
                     for reference in resolved_prompt.resolved_references
                 ],
+                "considered_references": [
+                    reference.model_dump(mode="json") for reference in considered_references
+                ],
                 "reference_conditioning_applied": reference_capable,
+                "reference_applied_asset_id": (
+                    considered_references[0].asset_id if reference_capable else None
+                ),
                 "requested_model_id": requested_model_id,
                 "model_id": manifest.public_model_id,
                 "manifest_id": manifest.id,
@@ -316,7 +358,7 @@ class ImageGenerator(BaseGenerator):
                 "model_provider": manifest.provider,
                 "loader": manifest.loader,
                 "runtime_type": type(runtime_obj).__name__,
-                "pipeline_class": type(pipeline).__name__,
+                "pipeline_class": type(active_pipeline).__name__,
                 "device": runtime_obj["device"],
                 "load_dtype": runtime_obj.get("load_dtype"),
                 "torch_dtype": runtime_obj["torch_dtype"],
@@ -373,35 +415,69 @@ class ImageGenerator(BaseGenerator):
             return False
         return "callback_on_step_end" in signature.parameters
 
-    def _resolve_reference_image(
-        self, resolved_references: list[ReferenceImageInput]
-    ) -> tuple[str | None, float | None]:
-        """Resolve the first reference to an asset path (#201: one supported path).
+    def _resolve_references_for_conditioning(
+        self,
+        request: GenerationRequest,
+        resolved_prompt: "ResolvedPrompt",
+        manifest: "ModelManifest",
+    ) -> tuple[str | None, float | None, list["ReferenceImageInput"]]:
+        """Pick the references to condition on and validate them against the manifest.
 
-        A model honors at most `max_references_per_role=1` reference per role
-        (see `core/reference_capabilities.py`), so this picks exactly the
-        first entry `PromptComposer` resolved -- the same order it built the
-        list in. Reuses the composer's own `AssetRepository`: it already
-        validated that asset exists and is an image (raising
-        `MissingReferenceAssetError` otherwise) while building
-        `resolved_references`, so this only needs to look the path up, not
-        re-validate it.
+        `request.references` -- the documented top-level field `JobService`
+        already validates against `manifest.reference_capability` before a
+        job is even created -- takes priority over Bible-derived
+        `resolved_prompt.resolved_references` when both are non-empty; a
+        caller using the documented field should not have it silently
+        ignored in favor of an unrelated Bible axis (#201 follow-up). Bible
+        references never go through `JobService`'s check (there is no
+        `request.references` for it to see), so they are validated here
+        against the same `manifest.reference_capability` contract instead of
+        bypassing it entirely.
+
+        This conditioning path honors exactly one reference image at a time:
+        a request considering more than one (whether >1 role or the manifest
+        somehow allows >1 per role) raises rather than silently applying
+        only the first and reporting every one of them as honored.
         """
 
-        if not resolved_references:
-            return None, None
+        references = list(request.references) if request.references else list(
+            resolved_prompt.resolved_references
+        )
+        if not references:
+            return None, None, []
+
+        validate_reference_inputs(
+            references,
+            capability=manifest.reference_capability,
+            model_id=manifest.public_model_id,
+        )
+        if len(references) > 1:
+            raise UnsupportedImageParameterError(
+                f"Model {manifest.public_model_id!r} was asked to honor "
+                f"{len(references)} reference images at once, but this "
+                "conditioning path applies exactly one; remove all but one "
+                "reference from the request or Bible entries in play."
+            )
+        primary = references[0]
+
         asset_repository = (
             self.prompt_composer.asset_repository
             if self.prompt_composer is not None
             else None
         )
         if asset_repository is None:
-            return None, None
-        primary = resolved_references[0]
+            raise MissingReferenceAssetError(
+                f"Reference asset {primary.asset_id!r} was requested but no "
+                "asset repository is configured to resolve it."
+            )
         asset = asset_repository.get(primary.asset_id)
         if asset is None:
-            return None, None
-        return asset.path, primary.strength
+            raise MissingReferenceAssetError(
+                f"Reference asset {primary.asset_id!r} could not be resolved "
+                "(missing or deleted); it may have existed when the prompt "
+                "was composed but is no longer available."
+            )
+        return asset.path, primary.strength, references
 
     def _pipeline_accepts_reference_image(self, pipeline: object) -> bool:
         call = getattr(pipeline, "__call__", None)

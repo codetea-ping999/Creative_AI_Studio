@@ -36,7 +36,7 @@ class DiffusersImageLoader(BaseModelLoader):
     def load(self, manifest: ModelManifest) -> dict[str, Any]:
         try:
             import torch
-            from diffusers import StableDiffusionXLPipeline
+            from diffusers import StableDiffusionXLImg2ImgPipeline, StableDiffusionXLPipeline
         except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
             raise RuntimeError(
                 "Diffusers runtime dependencies are missing. "
@@ -64,6 +64,19 @@ class DiffusersImageLoader(BaseModelLoader):
         elif hasattr(pipeline, "enable_vae_slicing"):
             pipeline.enable_vae_slicing()
 
+        # Reference-image conditioning (#201) needs an img2img-shaped call
+        # (`image`/`strength` kwargs), which `StableDiffusionXLPipeline`
+        # itself does not accept. `StableDiffusionXLImg2ImgPipeline(**pipeline
+        # .components)` wraps the *same* already-loaded unet/vae/text
+        # encoders/tokenizers/scheduler in the img2img calling convention
+        # rather than loading the model a second time, so this shares GPU/CPU
+        # memory with `pipeline` instead of duplicating it.
+        img2img_pipeline = StableDiffusionXLImg2ImgPipeline(**pipeline.components)
+        # diffusers' stub for this constructor loses the method mypy can see
+        # directly on `StableDiffusionXLPipeline`'s `.from_pretrained(...)`
+        # result above; both classes inherit it from the same base pipeline.
+        img2img_pipeline.set_progress_bar_config(disable=True)  # type: ignore[attr-defined]
+
         return {
             "stub": False,
             "loader": self.__class__.__name__,
@@ -82,6 +95,7 @@ class DiffusersImageLoader(BaseModelLoader):
             "default_params": dict(manifest.default_params),
             "path_exists": True,
             "pipeline": pipeline,
+            "img2img_pipeline": img2img_pipeline,
         }
 
     def _resolve_local_path(self, manifest: ModelManifest) -> str:
