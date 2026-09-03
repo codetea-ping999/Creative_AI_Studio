@@ -6,6 +6,7 @@ from collections import OrderedDict
 from collections.abc import Iterable, Mapping
 import logging
 import os
+from threading import Lock
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
@@ -61,9 +62,33 @@ class ModelRuntimeCache:
         self._on_evict = on_evict
         self._cache: OrderedDict[str, Any] = OrderedDict()
         self._bucket_of: dict[str, str] = {}
+        self._load_locks: dict[str, Lock] = {}
+        self._load_locks_guard = Lock()
 
     def has(self, model_id: str) -> bool:
         return model_id in self._cache
+
+    def lock_for(self, model_id: str) -> Lock:
+        """A lock serializing "load and put" for one `model_id`.
+
+        Without this, two callers racing to resolve the same uncached
+        `model_id` (e.g. two `JOB_LANES` workers picking up jobs for the same
+        model at once) can both miss the cache, both load their own runtime,
+        and both call `put()` -- the second `put()` then evicts (and runs
+        `on_evict` cleanup on) the runtime the first caller already received
+        and may still be using mid-generation. Callers should re-check
+        `get(model_id)` after acquiring this lock: another caller may have
+        already loaded and cached the model while this one was waiting.
+        Locks are per-`model_id`, so unrelated models still load
+        concurrently -- only a genuine same-model race is serialized.
+        """
+
+        with self._load_locks_guard:
+            lock = self._load_locks.get(model_id)
+            if lock is None:
+                lock = Lock()
+                self._load_locks[model_id] = lock
+            return lock
 
     def get(self, model_id: str) -> Any | None:
         if model_id not in self._cache:

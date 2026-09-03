@@ -6,6 +6,8 @@ import json
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Event, Thread
+import time
 import unittest
 from unittest.mock import patch
 import wave
@@ -28,6 +30,7 @@ try:
         ModelRegistry,
         ModelResolver,
         ModelRuntimeCache,
+        ModelService,
         create_default_loader_registry,
         release_runtime,
     )
@@ -510,6 +513,81 @@ class ModelSystemTests(unittest.TestCase):
 
         self.assertEqual(evicted, [("model-a", first)])
         self.assertIs(cache.get("model-a"), second)
+
+    def test_resolve_runtime_serializes_concurrent_loads_of_the_same_model(self) -> None:
+        # Regression (#373 follow-up, Codex review on PR #374): two callers
+        # racing to resolve the same uncached model_id must not both load
+        # and put() their own runtime -- the second put() would evict (and
+        # run on_evict cleanup on) the runtime the first caller already
+        # received and may still be using mid-generation. ModelService now
+        # serializes load+put per model_id via ModelRuntimeCache.lock_for().
+        load_started = Event()
+        release_load = Event()
+
+        class _FakeManifest:
+            id = "model-a"
+            loader = "fake"
+            provider = "local"
+            public_model_id = "model-a"
+
+        class _FakeResolver:
+            def resolve(self, model_id, media_type, task_type):
+                return _FakeManifest()
+
+        class _SlowLoader:
+            def __init__(self) -> None:
+                self.load_calls = 0
+
+            def load(self, manifest):
+                self.load_calls += 1
+                load_started.set()
+                # Blocks here to hold the "in progress" window open long
+                # enough for a second concurrent resolve_runtime() call to
+                # reach (and be forced to wait on) the same model's lock.
+                release_load.wait(timeout=5)
+                return {"id": manifest.id, "token": object()}
+
+        class _FakeLoaderRegistry:
+            def __init__(self, loader) -> None:
+                self._loader = loader
+
+            def get(self, name):
+                return self._loader
+
+        loader = _SlowLoader()
+        service = ModelService(
+            registry=None,
+            resolver=_FakeResolver(),
+            loader_registry=_FakeLoaderRegistry(loader),
+            runtime_cache=ModelRuntimeCache(max_entries=2),
+        )
+
+        results: list[tuple[object, object]] = []
+
+        def _resolve() -> None:
+            results.append(service.resolve_runtime(None, "image", "text-to-image"))
+
+        first_caller = Thread(target=_resolve)
+        first_caller.start()
+        self.assertTrue(load_started.wait(timeout=5))  # first caller is inside load(), blocked
+
+        second_caller = Thread(target=_resolve)
+        second_caller.start()
+        time.sleep(0.05)  # give the second caller a chance to reach the lock
+
+        # The second caller must be blocked waiting for the first caller's
+        # lock, not independently calling load() a second time.
+        self.assertEqual(loader.load_calls, 1)
+
+        release_load.set()
+        first_caller.join(timeout=5)
+        second_caller.join(timeout=5)
+
+        self.assertEqual(loader.load_calls, 1)
+        self.assertEqual(len(results), 2)
+        # Both callers received the exact same runtime object -- the second
+        # one reused the cache instead of loading (and evicting) its own.
+        self.assertIs(results[0][1], results[1][1])
 
     def test_runtime_cache_unload_all_calls_on_evict_for_every_entry(self) -> None:
         evicted: list[str] = []
