@@ -44,6 +44,7 @@ import {
   type ReuseAssetResponse,
 } from "./studio";
 import { requestJson } from "./studioClient";
+import { useJobPolling } from "./hooks/useJobPolling";
 
 type ThemeMode = "light" | "dark";
 type ModelLoadState = "idle" | "loading" | "loaded" | "error";
@@ -109,8 +110,6 @@ function App() {
     useState<GalleryAssetDetailResponse | null>(null);
   const [selectedAssetProjectId, setSelectedAssetProjectId] = useState("");
   const [metrics, setMetrics] = useState<MetricsSummaryResponse | null>(null);
-  const [latestJob, setLatestJob] = useState<JobResponse | null>(null);
-  const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isAssetBusy, setIsAssetBusy] = useState(false);
   const [isProjectBusy, setIsProjectBusy] = useState(false);
@@ -120,6 +119,28 @@ function App() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [readinessError, setReadinessError] = useState<string | null>(null);
   const [apiReachable, setApiReachable] = useState<boolean | null>(null);
+  const { latestJob, setLatestJob, setActiveJobId, loadJob } = useJobPolling({
+    onJobUpdate: async (payload, refreshAfterFinish) => {
+      if (terminalStatuses.has(payload.status)) {
+        setIsSubmitting(false);
+        setStatusMessage(
+          payload.status === "succeeded"
+            ? "Generation finished."
+            : payload.error_message || `Job ${payload.status}.`,
+        );
+        if (refreshAfterFinish) {
+          await refreshStudio(payload.media_type, { preferredJobId: payload.id });
+          await loadProjects();
+        }
+      } else {
+        setStatusMessage(`Job ${payload.status}...`);
+      }
+    },
+    onJobError: (error) => {
+      setIsSubmitting(false);
+      setErrorMessage(error instanceof Error ? error.message : "Failed to load job state.");
+    },
+  });
 
   const activeModels = modelOptionsByMedia[mediaType];
   const activeModelLoadState = modelLoadState[mediaType];
@@ -262,17 +283,6 @@ function App() {
     }
     void refreshStudio(mediaType);
   }, [apiReachable, selectedProjectId, gallerySearch, galleryBatchFilter]);
-
-  useEffect(() => {
-    if (!activeJobId) {
-      return undefined;
-    }
-
-    const timer = window.setInterval(() => {
-      void loadJob(activeJobId, true);
-    }, 2000);
-    return () => window.clearInterval(timer);
-  }, [activeJobId]);
 
   useEffect(() => {
     setProjectStatusDraft(selectedProject?.status ?? "active");
@@ -450,35 +460,6 @@ function App() {
       });
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : "Failed to refresh studio data.");
-    }
-  }
-
-  async function loadJob(jobId: string, refreshAfterFinish = false): Promise<void> {
-    try {
-      const payload = await requestJson<JobResponse>(`/jobs/${jobId}`);
-      startTransition(() => {
-        setLatestJob(payload);
-      });
-
-      if (terminalStatuses.has(payload.status)) {
-        setActiveJobId(null);
-        setIsSubmitting(false);
-        setStatusMessage(
-          payload.status === "succeeded"
-            ? "Generation finished."
-            : payload.error_message || `Job ${payload.status}.`,
-        );
-        if (refreshAfterFinish) {
-          await refreshStudio(payload.media_type, { preferredJobId: payload.id });
-          await loadProjects();
-        }
-      } else {
-        setStatusMessage(`Job ${payload.status}...`);
-      }
-    } catch (error) {
-      setActiveJobId(null);
-      setIsSubmitting(false);
-      setErrorMessage(error instanceof Error ? error.message : "Failed to load job state.");
     }
   }
 
