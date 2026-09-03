@@ -87,3 +87,24 @@
 4. assembly timeline panel（#62）と batch-aware gallery（#40）でUIの手動編集・閲覧性を上げる
 5. ローカル実機（GPU + weight）が用意でき次第、GGUF Golden Path 実測（#45）、30パターン probe 実測（#54）、CogVideoX-2B smoke を行い既定パラメータを決める
 6. 制作時のhuman feedbackを蓄積し（#19）、`make calibration-report` で相関を確認する（#20）
+
+## v0.4 候補 — Creative 3D / Game Pipeline
+
+Tracking Epic: [#380](https://github.com/codetea-ping999/Creative_AI_Studio/issues/380)  
+Detailed roadmap: [creative-3d-roadmap.md](./creative-3d-roadmap.md)
+
+Creative AI StudioをImage / Video / Audioから **3D Asset / Interactive production** へ拡張する将来トラック。
+製品UXはStudioへ統合するが、Blender / Unity本体はoptional executor / destinationとして分離する。
+
+| 順 | 状態 | タスク | 目的 |
+| --- | --- | --- | --- |
+| 1 | Future | 3D core contract | `3d` media type、Job/result schema、GLB output、3D asset metadataを既存Coreへ追加 |
+| 2 | Future | Blender executor MVP | headless Blenderでvalidation / cleanup / normalization / preview / GLB exportをJob化 |
+| 3 | Future | Creative Package | prompt・reference・raw/optimized mesh・texture・preview・provenanceをmanifestで束ねる |
+| 4 | Future | AI 3D generator adapter | Hunyuan3D等のlocal runtimeを接続し、生成→Blender後処理まで一気通貫化 |
+| 5 | Future | Unity destination | Unity batchmode + Editor C#でGLB import、Material、Collider、Prefab、Scene/Buildを自動化 |
+| 6 | Future | Agent-driven asset QA | mesh/texture budget、破損検証、preview QA、Issue→Generate→Validate→Export→Testループ |
+
+**着手順の原則:** Unityから始めない。まず3D contractとBlender executorで再現可能なCreative Packageを安定生成し、その成果物をUnityや将来のUnreal / Godot / Three.jsへ渡す。
+
+このトラックは現行v0.3 / reliability作業を置き換えない。既存のJob lane、reference conditioning、quality/release gateが安定した後にPhase 1へ入る。
