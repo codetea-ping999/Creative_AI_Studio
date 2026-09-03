@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import inspect
 from pathlib import Path
 import random
 import textwrap
@@ -269,10 +270,18 @@ class LearnedVideoRuntime(BaseVideoRuntime):
             **effective_params,
         }
         if context is not None:
-            # The loaded model's own callable is opaque third-party code (see
-            # LearnedVideoLoader) and cannot be interrupted mid-inference, so this
-            # is a boundary check, not step-level cancellation.
             context.raise_if_cancelled()
+            # The loaded model's own callable is opaque third-party code (see
+            # LearnedVideoLoader), so step-level cancellation only happens if
+            # the adapter itself opts in: it can pop this kwarg and call it
+            # from a diffusers-style callback_on_step_end (see the CogVideoX
+            # adapter under models/video/learned-runtime/runtime.py).
+            # `_callable_accepts_kwarg` guards against a fixed-signature
+            # renderer (no **kwargs) raising TypeError on this extra
+            # argument -- an adapter that can't take it still gets the
+            # boundary check above, exactly as before this feature existed.
+            if _callable_accepts_kwarg(callable_runtime, "raise_if_cancelled"):
+                generation_kwargs["raise_if_cancelled"] = context.raise_if_cancelled
         generated = callable_runtime(**generation_kwargs)
         return self._normalize_generated_output(
             generated=generated,
@@ -362,6 +371,28 @@ class LearnedVideoRuntime(BaseVideoRuntime):
             "Learned video runtime returned an unsupported payload. "
             "Use output_path, frames, or a saved file path."
         )
+
+
+def _callable_accepts_kwarg(callable_obj: Any, name: str) -> bool:
+    """Whether calling `callable_obj(**{name: ...})` would not raise TypeError.
+
+    True when the callable declares `name` explicitly, or accepts arbitrary
+    keyword arguments via `**kwargs`. Used to avoid handing an opt-in
+    parameter (e.g. `raise_if_cancelled`) to a fixed-signature renderer that
+    was never updated to accept it.
+    """
+
+    try:
+        signature = inspect.signature(callable_obj)
+    except (TypeError, ValueError):
+        return False
+    parameters = signature.parameters
+    if name in parameters:
+        return True
+    return any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
 
 
 class VideoRuntimeRouter:

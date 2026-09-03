@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from bootstrap import ApplicationServices, create_application_services
+from apps.api.routes.agent import router as agent_router
 from apps.api.routes.batches import router as batches_router
 from apps.api.routes.bible import router as bible_router
 from apps.api.routes.catalog import router as catalog_router
@@ -19,6 +20,7 @@ from apps.api.routes.metrics import router as metrics_router
 from apps.api.routes.models import router as models_router
 from apps.api.routes.projects import router as projects_router
 from apps.api.routes.stories import router as stories_router
+from core.remote import AgentProtocol
 
 
 def _local_web_origins() -> list[str]:
@@ -81,6 +83,7 @@ def create_app(
 
     app = FastAPI(title="Creative AI Studio API", lifespan=lifespan)
     app.state.services = resolved_services
+    app.state.agent_protocol = AgentProtocol()
 
     app.add_middleware(
         CORSMiddleware,
@@ -95,6 +98,7 @@ def create_app(
     app.mount("/outputs", StaticFiles(directory=output_root), name="outputs")
 
     app.include_router(health_router)
+    app.include_router(agent_router)
     app.include_router(jobs_router)
     app.include_router(projects_router)
     app.include_router(models_router)

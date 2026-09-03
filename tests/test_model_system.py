@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Event, Thread
 import time
 import unittest
 from unittest.mock import patch
@@ -31,6 +32,7 @@ try:
         ModelRegistry,
         ModelResolver,
         ModelRuntimeCache,
+        ModelService,
         create_default_loader_registry,
         release_runtime,
     )
@@ -648,6 +650,130 @@ class ModelSystemTests(unittest.TestCase):
         cache.unload("missing-model")  # no-op, must not call on_evict
 
         self.assertEqual(evicted, ["model-a", "model-b", "model-c"])
+
+    def test_runtime_cache_put_evicts_the_runtime_it_replaces(self) -> None:
+        # Regression (#373): replacing an existing model_id via put() must run
+        # the same on_evict cleanup as unload()/unload_all(), not just drop
+        # the old runtime object -- that cleanup is what actually returns
+        # GPU/MPS memory, which plain Python GC does not reliably do.
+        evicted: list[tuple[str, dict]] = []
+        cache = ModelRuntimeCache(
+            max_entries=2,  # large enough that this never triggers overflow eviction
+            on_evict=lambda model_id, runtime_obj: evicted.append((model_id, runtime_obj)),
+        )
+        first = {"id": "model-a", "generation": 1}
+        second = {"id": "model-a", "generation": 2}
+
+        cache.put("model-a", first)
+        self.assertEqual(evicted, [])  # nothing to evict on first insert
+
+        cache.put("model-a", second)  # replaces the same model_id
+
+        self.assertEqual(evicted, [("model-a", first)])
+        self.assertIs(cache.get("model-a"), second)
+
+    def test_runtime_cache_put_skips_eviction_when_reinserting_the_same_object(
+        self,
+    ) -> None:
+        # Regression (Codex review on PR #374, P2): reinserting the *same*
+        # runtime instance under its own model_id -- e.g. to refresh its LRU
+        # position or change its media bucket -- is not a replacement. The
+        # #373 fix above must not run on_evict cleanup (which strips
+        # pipeline/model/processor, see core/models/cleanup.py) on an object
+        # that is being kept, not discarded.
+        evicted: list[str] = []
+
+        def _on_evict(model_id: str, runtime_obj: dict) -> None:
+            # Mirrors core/models/cleanup.py's release_runtime(): a real
+            # on_evict hook destructively strips the runtime, which is
+            # exactly what must not happen to an object being reinserted.
+            evicted.append(model_id)
+            runtime_obj.pop("pipeline", None)
+
+        cache = ModelRuntimeCache(max_entries=2, on_evict=_on_evict)
+        runtime = {"id": "model-a", "pipeline": object()}
+
+        cache.put("model-a", runtime)
+        cache.put("model-a", runtime, media_type="image")  # reinsert same object
+
+        self.assertEqual(evicted, [])
+        self.assertIs(cache.get("model-a"), runtime)
+        self.assertIn("pipeline", runtime)  # not stripped by a spurious evict
+
+    def test_resolve_runtime_serializes_concurrent_loads_of_the_same_model(self) -> None:
+        # Regression (#373 follow-up, Codex review on PR #374): two callers
+        # racing to resolve the same uncached model_id must not both load
+        # and put() their own runtime -- the second put() would evict (and
+        # run on_evict cleanup on) the runtime the first caller already
+        # received and may still be using mid-generation. ModelService now
+        # serializes load+put per model_id via ModelRuntimeCache.lock_for().
+        load_started = Event()
+        release_load = Event()
+
+        class _FakeManifest:
+            id = "model-a"
+            loader = "fake"
+            provider = "local"
+            public_model_id = "model-a"
+
+        class _FakeResolver:
+            def resolve(self, model_id, media_type, task_type):
+                return _FakeManifest()
+
+        class _SlowLoader:
+            def __init__(self) -> None:
+                self.load_calls = 0
+
+            def load(self, manifest):
+                self.load_calls += 1
+                load_started.set()
+                # Blocks here to hold the "in progress" window open long
+                # enough for a second concurrent resolve_runtime() call to
+                # reach (and be forced to wait on) the same model's lock.
+                release_load.wait(timeout=5)
+                return {"id": manifest.id, "token": object()}
+
+        class _FakeLoaderRegistry:
+            def __init__(self, loader) -> None:
+                self._loader = loader
+
+            def get(self, name):
+                return self._loader
+
+        loader = _SlowLoader()
+        service = ModelService(
+            registry=None,
+            resolver=_FakeResolver(),
+            loader_registry=_FakeLoaderRegistry(loader),
+            runtime_cache=ModelRuntimeCache(max_entries=2),
+        )
+
+        results: list[tuple[object, object]] = []
+
+        def _resolve() -> None:
+            results.append(service.resolve_runtime(None, "image", "text-to-image"))
+
+        first_caller = Thread(target=_resolve)
+        first_caller.start()
+        self.assertTrue(load_started.wait(timeout=5))  # first caller is inside load(), blocked
+
+        second_caller = Thread(target=_resolve)
+        second_caller.start()
+        time.sleep(0.05)  # give the second caller a chance to reach the lock
+
+        # The second caller must be blocked waiting for the first caller's
+        # lock, not independently calling load() a second time.
+        self.assertEqual(loader.load_calls, 1)
+
+        release_load.set()
+        first_caller.join(timeout=5)
+        second_caller.join(timeout=5)
+
+        self.assertEqual(loader.load_calls, 1)
+        self.assertEqual(len(results), 2)
+        # Both callers received the exact same runtime object -- the second
+        # one reused the cache instead of loading (and evicting) its own.
+        self.assertIs(results[0][1], results[1][1])
 
     def test_runtime_cache_unload_all_calls_on_evict_for_every_entry(self) -> None:
         evicted: list[str] = []
@@ -3061,6 +3187,215 @@ class ModelSystemTests(unittest.TestCase):
                 )
 
             self.assertFalse((runtime_root / "learned-output.mp4").exists())
+
+    def _write_step_aware_learned_video_manifest(
+        self, manifest_root: Path, runtime_root: Path
+    ) -> tuple[Path, Path]:
+        """A fake CogVideoX-shaped adapter that simulates 5 denoising steps.
+
+        Mirrors the real adapter's contract (models/video/learned-runtime/
+        runtime.py): it pops `raise_if_cancelled` from kwargs and calls it
+        once per step, exactly like the real adapter's callback_on_step_end
+        does -- so this proves the generator -> adapter wiring (#209) without
+        needing torch/diffusers/real weights.
+        """
+
+        runtime_root.mkdir(parents=True)
+        output_path = runtime_root / "learned-output.mp4"
+        progress_path = runtime_root / "steps-completed.txt"
+        (runtime_root / "runtime.py").write_text(
+            "\n".join(
+                [
+                    "from pathlib import Path",
+                    "",
+                    "def load_runtime(manifest):",
+                    "    output_path = Path(__file__).with_name('learned-output.mp4')",
+                    "    progress_path = Path(__file__).with_name('steps-completed.txt')",
+                    "    def renderer(**kwargs):",
+                    "        raise_if_cancelled = kwargs.pop('raise_if_cancelled', None)",
+                    "        for step_index in range(5):",
+                    "            if raise_if_cancelled is not None:",
+                    "                raise_if_cancelled()",
+                    "            progress_path.write_text(str(step_index + 1))",
+                    "        output_path.write_bytes(b'0' * 131072)",
+                    "        return {",
+                    "            'output_path': str(output_path),",
+                    "            'output_format': 'mp4',",
+                    "            'metadata': {'adapter_contract': 'test'},",
+                    "        }",
+                    "    return {'runtime_adapter': 'learned_text_to_video', 'renderer': renderer}",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        _write_manifest(
+            manifest_root / "video" / "learned.json",
+            {
+                "id": "learned-video-local",
+                "public_id": "learned-video",
+                "display_name": "Learned Video",
+                "media_type": "video",
+                "task_type": "text-to-video",
+                "provider": "local",
+                "runtime": "learned",
+                "local_path": str(runtime_root),
+                "loader": "learned_video_loader",
+                "default_params": {"entrypoint": "runtime.py"},
+                "aliases": ["learned-video-local"],
+                "enabled": True,
+            },
+        )
+        return output_path, progress_path
+
+    def test_learned_video_generator_stops_mid_inference_when_cancelled_via_step_callback(
+        self,
+    ) -> None:
+        # Regression (#209): cancellation must reach the adapter's own
+        # per-step callback, not just the boundary check before/after the
+        # whole render call -- a cancel request mid-run should stop a
+        # multi-step CogVideoX-shaped generation before its final step.
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_root = root / "manifests"
+            runtime_root = root / "runtime" / "learned-video"
+            output_path, progress_path = self._write_step_aware_learned_video_manifest(
+                manifest_root, runtime_root
+            )
+            service = create_default_model_service(manifest_root=manifest_root)
+            generator = VideoGenerator(service, output_dir=root / "outputs" / "videos")
+
+            call_count = {"n": 0}
+
+            def is_cancelled() -> bool:
+                call_count["n"] += 1
+                # Two boundary checks (VideoGenerator.generate() and
+                # LearnedVideoRuntime.render()) run before the adapter's own
+                # step loop starts, so this must clear those first before
+                # letting a couple of in-loop step checks pass too.
+                return call_count["n"] > 4
+
+            context = GenerationContext(is_cancelled=is_cancelled)
+
+            with self.assertRaises(GenerationCancelled):
+                generator.run(
+                    GenerationRequest(
+                        media_type="video",
+                        prompt="learned runtime smoke",
+                        model_id="learned-video",
+                        output_format="mp4",
+                        params={"duration_seconds": 1},
+                    ),
+                    context,
+                )
+
+            self.assertTrue(progress_path.exists())
+            self.assertLess(int(progress_path.read_text()), 5)
+            self.assertFalse(output_path.exists())  # never reached the final write
+
+    def test_learned_video_generator_completes_all_steps_when_not_cancelled(self) -> None:
+        # Same step-aware adapter, but with cancellation never requested:
+        # normal generation must run every step and succeed unchanged.
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_root = root / "manifests"
+            runtime_root = root / "runtime" / "learned-video"
+            output_path, progress_path = self._write_step_aware_learned_video_manifest(
+                manifest_root, runtime_root
+            )
+            service = create_default_model_service(manifest_root=manifest_root)
+            generator = VideoGenerator(service, output_dir=root / "outputs" / "videos")
+            context = GenerationContext(is_cancelled=lambda: False)
+
+            result = generator.run(
+                GenerationRequest(
+                    media_type="video",
+                    prompt="learned runtime smoke",
+                    model_id="learned-video",
+                    output_format="mp4",
+                    params={"duration_seconds": 1},
+                ),
+                context,
+            )
+
+            self.assertEqual(result.status, "succeeded")
+            self.assertEqual(progress_path.read_text(), "5")
+            self.assertTrue(output_path.exists())
+
+    def test_learned_video_generator_tolerates_a_fixed_signature_renderer(self) -> None:
+        # Regression (#209 follow-up, Codex review on PR #375): a renderer
+        # with a fixed keyword-only signature (no **kwargs, no
+        # raise_if_cancelled parameter) must not be handed that opt-in
+        # kwarg -- doing so raises TypeError: unexpected keyword argument
+        # for any adapter that was never updated to accept it. The
+        # cancellation boundary check must still run either way.
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_root = root / "manifests"
+            runtime_root = root / "runtime" / "learned-video"
+            runtime_root.mkdir(parents=True)
+            (runtime_root / "runtime.py").write_text(
+                "\n".join(
+                    [
+                        "from pathlib import Path",
+                        "",
+                        "def load_runtime(manifest):",
+                        "    def renderer(",
+                        "        *, prompt, negative_prompt, seed, output_dir,",
+                        "        output_format, entrypoint=None,",
+                        "    ):",
+                        "        out_dir = Path(output_dir)",
+                        "        out_dir.mkdir(parents=True, exist_ok=True)",
+                        "        output_path = out_dir / 'learned-output.mp4'",
+                        "        output_path.write_bytes(b'0' * 131072)",
+                        "        return {",
+                        "            'output_path': str(output_path),",
+                        "            'output_format': 'mp4',",
+                        "            'metadata': {'adapter_contract': 'fixed-signature'},",
+                        "        }",
+                        "    return {",
+                        "        'runtime_adapter': 'learned_text_to_video',",
+                        "        'renderer': renderer,",
+                        "    }",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            _write_manifest(
+                manifest_root / "video" / "learned.json",
+                {
+                    "id": "learned-video-local",
+                    "public_id": "learned-video",
+                    "display_name": "Learned Video",
+                    "media_type": "video",
+                    "task_type": "text-to-video",
+                    "provider": "local",
+                    "runtime": "learned",
+                    "local_path": str(runtime_root),
+                    "loader": "learned_video_loader",
+                    "default_params": {"entrypoint": "runtime.py"},
+                    "aliases": ["learned-video-local"],
+                    "enabled": True,
+                },
+            )
+            service = create_default_model_service(manifest_root=manifest_root)
+            generator = VideoGenerator(service, output_dir=root / "outputs" / "videos")
+            # A non-null context with is_cancelled always False: this proves
+            # the fixed-signature renderer is tolerated when cancellation is
+            # in play at all, not just when context is None entirely.
+            context = GenerationContext(is_cancelled=lambda: False)
+
+            result = generator.run(
+                GenerationRequest(
+                    media_type="video",
+                    prompt="fixed-signature adapter smoke",
+                    model_id="learned-video",
+                    output_format="mp4",
+                ),
+                context,
+            )
+
+            self.assertEqual(result.status, "succeeded")
+            self.assertEqual(result.metadata["adapter_contract"], "fixed-signature")
 
 
 if __name__ == "__main__":
