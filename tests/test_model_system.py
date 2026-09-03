@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import time
 import unittest
 from unittest.mock import patch
 import wave
@@ -1229,14 +1230,19 @@ class ModelSystemTests(unittest.TestCase):
         composer = PromptComposer(bible_repository, asset_repository)
         return composer, character.id
 
-    def _write_reference_capable_manifest(self, manifest_root: Path) -> str:
+    def _write_reference_capable_manifest(
+        self, manifest_root: Path, *, reference_capability: dict[str, object] | None = None
+    ) -> str:
         """A custom SDXL-shaped manifest that advertises reference_capability.
 
         The real "sdxl" default manifest deliberately does not (#201 follow-up:
         Bible-derived references must be checked against
         `manifest.reference_capability` just like `request.references` already
         is), so tests that need a model advertising support use this instead.
-        Returns the manifest's public_id.
+        `reference_capability` overrides the default img2img-capable one, for
+        tests that need a manifest advertising something narrower (e.g. only
+        ip_adapter, or no face_crop preprocessing). Returns the manifest's
+        public_id.
         """
 
         _write_manifest(
@@ -1251,7 +1257,8 @@ class ModelSystemTests(unittest.TestCase):
                 "runtime": "diffusers",
                 "local_path": "./models/image/sdxl",
                 "loader": "diffusers_image_loader",
-                "reference_capability": {
+                "reference_capability": reference_capability
+                or {
                     "supported_modes": ["img2img"],
                     "supported_roles": ["character", "location"],
                     "min_strength": 0.0,
@@ -1293,7 +1300,13 @@ class ModelSystemTests(unittest.TestCase):
                         prompt="Mina on the rooftop",
                         model_id=model_id,
                         params={
-                            "steps": 1,
+                            # >1 so the strength floor (derived from
+                            # num_inference_steps, see generate()) stays well
+                            # below DEFAULT_REFERENCE_STRENGTH's expected
+                            # inverted value and does not affect this
+                            # assertion; 1 step would force strength to 1.0
+                            # regardless of the requested lock strength.
+                            "steps": 10,
                             "width": 64,
                             "height": 64,
                             "bible_refs": [character_id],
@@ -1321,6 +1334,76 @@ class ModelSystemTests(unittest.TestCase):
             self.assertTrue(result.metadata["reference_conditioning_applied"])
             self.assertEqual(result.metadata["reference_applied_asset_id"], "asset_char_1")
             self.assertEqual(result.metadata["pipeline_class"], "_FakeReferenceCapablePipeline")
+
+    def test_image_generator_preserves_a_denoising_step_at_maximum_lock_strength(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, second Codex round on PR #376): with
+        # the public contract's strength=1.0 (strongest identity/location
+        # lock) and the default-shaped 30 num_inference_steps, a fixed 0.01
+        # diffusers-strength floor computes int(30 * 0.01) == 0 -- zero
+        # denoising steps, which diffusers img2img cannot run at all. The
+        # floor must be derived from num_inference_steps so at least one
+        # step survives regardless of how strong a lock was requested.
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_root = root / "manifests"
+            model_id = self._write_reference_capable_manifest(manifest_root)
+            asset_repository = AssetRepository(root / "assets")
+            reference_image_path = root / "reference.png"
+            Image.new("RGB", (16, 16), color=(9, 9, 9)).save(reference_image_path)
+            asset_repository.create_or_update(
+                Asset(
+                    id="asset_char_1",
+                    job_id="job_fixture",
+                    project_id=None,
+                    media_type="image",
+                    kind="output",
+                    title="reference fixture",
+                    prompt="a reference image",
+                    model_id="sdxl",
+                    path=str(reference_image_path),
+                )
+            )
+            composer = PromptComposer(BibleRepository(root / "bible"), asset_repository)
+            output_dir = root / "outputs"
+
+            with patch(
+                "core.models.loader.DiffusersImageLoader.load",
+                new=_fake_diffusers_load_reference_capable,
+            ):
+                service = create_default_model_service(manifest_root=manifest_root)
+                generator = ImageGenerator(
+                    service, output_dir=output_dir, prompt_composer=composer
+                )
+                num_inference_steps = 30
+                result = generator.run(
+                    GenerationRequest(
+                        media_type="image",
+                        prompt="Mina on the rooftop",
+                        model_id=model_id,
+                        references=[
+                            ReferenceImageInput(
+                                asset_id="asset_char_1", role="character", strength=1.0
+                            )
+                        ],
+                        params={
+                            "steps": num_inference_steps,
+                            "width": 64,
+                            "height": 64,
+                        },
+                    )
+                )
+                img2img_pipeline = service.get_runtime(model_id, "image", "text-to-image")[
+                    "img2img_pipeline"
+                ]
+
+            self.assertEqual(result.status, "succeeded")
+            diffusers_strength = img2img_pipeline.calls[0]["strength"]
+            # Must survive int(num_inference_steps * strength) >= 1, i.e.
+            # strictly more than 1/num_inference_steps -- the old fixed 0.01
+            # floor (0.01 * 30 == 0.3, truncating to 0) would fail this.
+            self.assertGreater(diffusers_strength * num_inference_steps, 1.0)
 
     def test_image_generator_skips_conditioning_kwargs_without_a_reference(self) -> None:
         # Same reference-capable manifest/runtime, but no reference
@@ -1600,6 +1683,227 @@ class ModelSystemTests(unittest.TestCase):
                     )
 
             self.assertEqual(list(output_dir.glob("**/*")), [])
+
+    def test_image_generator_rejects_a_reference_when_manifest_lacks_img2img_mode(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, second Codex round on PR #376):
+        # validate_reference_inputs() only checks that *some* mode is
+        # declared (capability.enabled), not that it is specifically
+        # img2img -- the only mode this conditioning path implements. A
+        # manifest advertising e.g. only ip_adapter must not be routed
+        # through the img2img pipeline anyway.
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_root = root / "manifests"
+            model_id = self._write_reference_capable_manifest(
+                manifest_root,
+                reference_capability={
+                    "supported_modes": ["ip_adapter"],
+                    "supported_roles": ["character", "location"],
+                    "min_strength": 0.0,
+                    "max_strength": 1.0,
+                    "max_references_per_role": 1,
+                },
+            )
+            composer, character_id = self._prepare_character_reference(root)
+            output_dir = root / "outputs"
+
+            with patch(
+                "core.models.loader.DiffusersImageLoader.load",
+                new=_fake_diffusers_load_reference_capable,
+            ):
+                service = create_default_model_service(manifest_root=manifest_root)
+                generator = ImageGenerator(
+                    service, output_dir=output_dir, prompt_composer=composer
+                )
+                with self.assertRaises(UnsupportedImageParameterError):
+                    generator.run(
+                        GenerationRequest(
+                            media_type="image",
+                            prompt="Mina on the rooftop",
+                            model_id=model_id,
+                            params={
+                                "steps": 1,
+                                "width": 64,
+                                "height": 64,
+                                "bible_refs": [character_id],
+                            },
+                        )
+                    )
+
+            self.assertEqual(list(output_dir.glob("**/*")), [])
+
+    def test_image_generator_rejects_unimplemented_reference_preprocessing(self) -> None:
+        # Regression (#201 follow-up, second Codex round on PR #376): a
+        # manifest can advertise support for face_crop/canny/depth
+        # preprocessing, and validate_reference_inputs() accepts a request
+        # for it, but this path only ever performs a plain resize --
+        # silently ignoring the requested transform would report
+        # conditioning as applied while quietly skipping part of what was
+        # asked for.
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_root = root / "manifests"
+            model_id = self._write_reference_capable_manifest(
+                manifest_root,
+                reference_capability={
+                    "supported_modes": ["img2img"],
+                    "supported_roles": ["character", "location"],
+                    "supported_preprocessing": ["none", "auto", "face_crop"],
+                    "min_strength": 0.0,
+                    "max_strength": 1.0,
+                    "max_references_per_role": 1,
+                },
+            )
+            bible_repository = BibleRepository(root / "bible")
+            asset_repository = AssetRepository(root / "assets")
+            reference_image_path = root / "reference.png"
+            Image.new("RGB", (16, 16), color=(1, 2, 3)).save(reference_image_path)
+            asset_repository.create_or_update(
+                Asset(
+                    id="asset_char_1",
+                    job_id="job_fixture",
+                    project_id=None,
+                    media_type="image",
+                    kind="output",
+                    title="reference fixture",
+                    prompt="a reference image",
+                    model_id="sdxl",
+                    path=str(reference_image_path),
+                )
+            )
+            character = bible_repository.create(
+                kind="character",
+                name="Mina",
+                reference_asset_ids=["asset_char_1"],
+            )
+            composer = PromptComposer(bible_repository, asset_repository)
+            output_dir = root / "outputs"
+
+            with patch(
+                "core.models.loader.DiffusersImageLoader.load",
+                new=_fake_diffusers_load_reference_capable,
+            ):
+                service = create_default_model_service(manifest_root=manifest_root)
+                generator = ImageGenerator(
+                    service, output_dir=output_dir, prompt_composer=composer
+                )
+                request = GenerationRequest(
+                    media_type="image",
+                    prompt="Mina on the rooftop",
+                    model_id=model_id,
+                    references=[
+                        ReferenceImageInput(
+                            asset_id="asset_char_1", role="character", preprocessing="face_crop"
+                        )
+                    ],
+                    params={"steps": 1, "width": 64, "height": 64},
+                )
+                with self.assertRaises(UnsupportedImageParameterError):
+                    generator.run(request)
+
+            self.assertEqual(list(output_dir.glob("**/*")), [])
+
+    def test_image_generator_rejects_a_non_image_direct_reference_asset(self) -> None:
+        # Regression (#201 follow-up, second Codex round on PR #376):
+        # PromptComposer._resolve_reference_asset() rejects a non-image
+        # asset for Bible-derived references, but request.references skips
+        # the composer entirely -- without the same check here, a
+        # mislabeled audio/video asset id could be conditioned on directly.
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_root = root / "manifests"
+            model_id = self._write_reference_capable_manifest(manifest_root)
+            asset_repository = AssetRepository(root / "assets")
+            asset_repository.create_or_update(
+                Asset(
+                    id="asset_audio_1",
+                    job_id="job_fixture",
+                    project_id=None,
+                    media_type="audio",
+                    kind="output",
+                    title="not an image",
+                    prompt="a narration clip",
+                    model_id="kokoro",
+                    path=str(root / "narration.wav"),
+                )
+            )
+            composer = PromptComposer(BibleRepository(root / "bible"), asset_repository)
+            output_dir = root / "outputs"
+
+            with patch(
+                "core.models.loader.DiffusersImageLoader.load",
+                new=_fake_diffusers_load_reference_capable,
+            ):
+                service = create_default_model_service(manifest_root=manifest_root)
+                generator = ImageGenerator(
+                    service, output_dir=output_dir, prompt_composer=composer
+                )
+                request = GenerationRequest(
+                    media_type="image",
+                    prompt="Mina on the rooftop",
+                    model_id=model_id,
+                    references=[
+                        ReferenceImageInput(asset_id="asset_audio_1", role="character")
+                    ],
+                    params={"steps": 1, "width": 64, "height": 64},
+                )
+                with self.assertRaises(MissingReferenceAssetError):
+                    generator.run(request)
+
+            self.assertEqual(list(output_dir.glob("**/*")), [])
+
+    def test_image_generator_rejects_oversized_dimensions_before_resizing_reference(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, second Codex round on PR #376): the
+        # reference image used to be opened and resized before
+        # validate_capabilities() ever ran (that only happened later,
+        # inside generate_image() in the per-variation loop) -- an absurd
+        # width/height could make Pillow attempt a huge allocation before
+        # the provider's own size bounds got a chance to reject it. The
+        # error alone isn't proof of *when* it happened (generate_image()
+        # would eventually raise the same error after paying for the
+        # resize), so this also asserts on wall-clock time: resizing to
+        # 100000x100000 first measurably takes tens of seconds.
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_root = root / "manifests"
+            model_id = self._write_reference_capable_manifest(manifest_root)
+            composer, character_id = self._prepare_character_reference(root)
+            output_dir = root / "outputs"
+
+            with patch(
+                "core.models.loader.DiffusersImageLoader.load",
+                new=_fake_diffusers_load_reference_capable,
+            ):
+                service = create_default_model_service(manifest_root=manifest_root)
+                generator = ImageGenerator(
+                    service, output_dir=output_dir, prompt_composer=composer
+                )
+                started_at = time.monotonic()
+                with self.assertRaises(UnsupportedImageParameterError):
+                    generator.run(
+                        GenerationRequest(
+                            media_type="image",
+                            prompt="Mina on the rooftop",
+                            model_id=model_id,
+                            params={
+                                "steps": 1,
+                                # Local diffusers capabilities cap at 2048px
+                                # (generators/image/providers.py); this must
+                                # be rejected, not attempted.
+                                "width": 100000,
+                                "height": 100000,
+                                "bible_refs": [character_id],
+                            },
+                        )
+                    )
+                elapsed = time.monotonic() - started_at
+
+            self.assertEqual(list(output_dir.glob("**/*")), [])
+            self.assertLess(elapsed, 5.0)
 
     def test_bootstrap_factory_composes_default_image_generator(self) -> None:
         with TemporaryDirectory() as tmp_dir:

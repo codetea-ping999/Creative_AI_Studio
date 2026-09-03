@@ -27,6 +27,7 @@ from generators.image.providers import (
     LocalDiffusersImageProvider,
     UnsupportedImageParameterError,
     local_diffusers_capabilities,
+    validate_capabilities,
 )
 
 if TYPE_CHECKING:
@@ -180,6 +181,13 @@ class ImageGenerator(BaseGenerator):
             # reject an unsupported request instead of validating nothing.
             reference_image_path=reference_image_path,
         )
+        # Checked here -- before the reference image is even opened, let
+        # alone resized -- rather than only inside generate_image() inside
+        # the variation loop below: an absurd width/height (e.g. 100000)
+        # must be rejected before Pillow attempts a matching allocation, not
+        # after.
+        if provider.capabilities is not None:
+            validate_capabilities(provider.capabilities, request_spec)
         reference_conditioning_kwargs: dict[str, Any] = {}
         if reference_capable:
             # A real img2img call derives its output size from `image`
@@ -199,9 +207,28 @@ class ImageGenerator(BaseGenerator):
                 # the reference and 1=ignores it almost entirely. Inverting
                 # here keeps the public contract's meaning intact for callers
                 # regardless of which pipeline convention ends up serving it.
-                # Diffusers requires strength in (0, 1], so a lock strength of
-                # exactly 1.0 is clamped just above zero rather than rejected.
-                "strength": max(0.01, min(1.0, 1.0 - cast(float, reference_strength))),
+                # Diffusers computes init_timestep = int(num_inference_steps
+                # * strength) and needs at least one surviving step, so the
+                # floor is derived from num_inference_steps rather than a
+                # fixed constant: with the default 30 steps, a fixed 0.01
+                # floor rounds down to zero steps and diffusers has nothing
+                # left to denoise.
+                "strength": min(
+                    1.0,
+                    max(
+                        # `+ 1e-6` covers float rounding in the division
+                        # itself (e.g. 30 * (1.0 / 30) landing a hair under
+                        # 1.0), which would otherwise still truncate to zero
+                        # steps. Capped at 1.0 by the outer min(): with very
+                        # few num_inference_steps (e.g. 1), the floor alone
+                        # can exceed 1.0 -- diffusers has no way to honor a
+                        # gentle lock with that few steps regardless of the
+                        # requested strength, so it is forced to the
+                        # strongest (least reference-preserving) setting.
+                        (1.0 / max(1, num_inference_steps)) + 1e-6,
+                        1.0 - cast(float, reference_strength),
+                    ),
+                ),
             }
         common_generation_kwargs = {
             "prompt": resolved_prompt.prompt,
@@ -451,6 +478,19 @@ class ImageGenerator(BaseGenerator):
             capability=manifest.reference_capability,
             model_id=manifest.public_model_id,
         )
+        # validate_reference_inputs only checks that *some* mode is declared
+        # (via capability.enabled) plus role/strength/preprocessing/count --
+        # it does not require "img2img" specifically. This conditioning path
+        # only ever performs an img2img-style call (see the img2img_pipeline
+        # probe in generate()), so a manifest that advertises e.g. only
+        # ip_adapter must not be routed through it.
+        capability = manifest.reference_capability
+        if capability is None or "img2img" not in capability.supported_modes:
+            raise UnsupportedImageParameterError(
+                f"Model {manifest.public_model_id!r} does not advertise "
+                "img2img in reference_capability.supported_modes, which is "
+                "the only conditioning mode this path implements."
+            )
         if len(references) > 1:
             raise UnsupportedImageParameterError(
                 f"Model {manifest.public_model_id!r} was asked to honor "
@@ -459,6 +499,18 @@ class ImageGenerator(BaseGenerator):
                 "reference from the request or Bible entries in play."
             )
         primary = references[0]
+        # Likewise, validate_reference_inputs only checks the requested
+        # preprocessing is one the manifest declares support for -- it does
+        # not know this path never actually applies face_crop/canny/depth
+        # transforms, only a plain resize. Silently ignoring a declared
+        # preprocessing request would report conditioning as applied while
+        # quietly skipping part of what was asked for.
+        if primary.preprocessing not in ("none", "auto"):
+            raise UnsupportedImageParameterError(
+                f"Model {manifest.public_model_id!r}: reference preprocessing "
+                f"{primary.preprocessing!r} is not implemented by this "
+                "conditioning path (only 'none'/'auto', a plain resize, are)."
+            )
 
         asset_repository = (
             self.prompt_composer.asset_repository
@@ -476,6 +528,15 @@ class ImageGenerator(BaseGenerator):
                 f"Reference asset {primary.asset_id!r} could not be resolved "
                 "(missing or deleted); it may have existed when the prompt "
                 "was composed but is no longer available."
+            )
+        if asset.media_type != "image":
+            # PromptComposer._resolve_reference_asset already enforces this
+            # for Bible-derived references; request.references skips the
+            # composer entirely; enforced here too so it is not the only
+            # source that can point conditioning at a non-image asset.
+            raise MissingReferenceAssetError(
+                f"Reference asset {primary.asset_id!r} is {asset.media_type!r}, "
+                "not image; reference-image conditioning requires an image asset."
             )
         return asset.path, primary.strength, references
 
