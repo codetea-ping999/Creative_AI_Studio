@@ -10,9 +10,11 @@ IMPORT_ERROR: Exception | None = None
 
 try:
     from fastapi.testclient import TestClient
+    from pydantic import ValidationError
 
     from apps.api.main import create_app
     from bootstrap import create_application_services
+    from core.remote import AgentInfo
 except ModuleNotFoundError as exc:
     IMPORT_ERROR = exc
 
@@ -45,6 +47,18 @@ class AgentApiTests(unittest.TestCase):
         self.assertTrue(payload["instance_id"])
         self.assertEqual(payload["capabilities"], sorted(payload["capabilities"]))
         self.assertEqual(second.json(), payload)
+
+    def test_agent_info_schema_forbids_unknown_fields(self) -> None:
+        with self.assertRaises(ValidationError):
+            AgentInfo.model_validate(
+                {
+                    "protocol_version": "1",
+                    "agent_version": "0.1.0",
+                    "instance_id": "studio-test",
+                    "capabilities": ["jobs"],
+                    "unexpected": True,
+                }
+            )
 
 
 if __name__ == "__main__":
