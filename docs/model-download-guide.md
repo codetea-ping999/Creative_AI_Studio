@@ -179,8 +179,10 @@ make cogvideox-smoke
 
 標準条件は720x480、49 frames、8 fps、20 steps、MP4です。MPSを優先し、
 未対応operationが発生した場合だけ同じpipelineをCPUへ移して1回再試行します。
-CogVideoX の推論中 step callback はまだ接続されていないため、running job の cancel は
-生成処理の前後の境界で反映されます。Diffusers image job は step 単位の協調 cancel に
+CogVideoX の推論中 step callback は接続済みです（#209）。ロードされた pipeline が
+`callback_on_step_end` を受け付ける場合、running job の cancel は次の denoising step
+境界で反映されます。受け付けないカスタム entrypoint（`renderer`/`pipeline`）を使う場合は、
+生成処理の前後の境界での反映に留まります。Diffusers image job も step 単位の協調 cancel に
 対応しています。
 
 ### Semantic judge model
