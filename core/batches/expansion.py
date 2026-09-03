@@ -71,8 +71,18 @@ def expand_items(
         )
 
     items.sort(key=lambda item: (item.request.model_id, item.index))
+    # Sorting can move an item to a different index. per_item/sweep seeds are
+    # base + index, so they must be re-derived from the final index here or a
+    # child's seed stops matching the base + item.index contract once items
+    # are grouped by model. Inherited seeds (seed_items), the "shared"
+    # policy's constant seed, and an item whose axis values patch "seed"
+    # directly (an unlocked axis is allowed to pin its own seed, see
+    # _TOP_LEVEL_KEYS) do not depend on index and are left alone.
+    reseed = seed_items is None and spec.seed_policy in ("per_item", "sweep")
     for order, item in enumerate(items):
         item.index = order
+        if reseed and not _axis_values_patch_seed(spec, item.axis_values):
+            item.request.seed = _resolve_seed(spec, order, item.axis_values)
     return items
 
 
@@ -109,6 +119,25 @@ def _combinations(spec: BatchSpec) -> list[list[tuple[str, str]]]:
 
 def _axis_by_name(spec: BatchSpec, name: str) -> Axis | None:
     return next((axis for axis in spec.axes if axis.name == name), None)
+
+
+def _axis_values_patch_seed(spec: BatchSpec, axis_values: dict[str, str]) -> bool:
+    """True if one of this item's axis values sets "seed" directly.
+
+    Mirrors the axis/value lookup _build_request uses to apply patches, so it
+    recognizes exactly the same explicit seed override _apply_patch would.
+    """
+
+    for axis_name, value_label in axis_values.items():
+        axis = _axis_by_name(spec, axis_name)
+        if axis is None:
+            continue
+        value = next(
+            (entry for entry in axis.values if entry.label == value_label), None
+        )
+        if value is not None and "seed" in value.patch:
+            return True
+    return False
 
 
 def _build_request(
