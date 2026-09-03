@@ -181,6 +181,69 @@ class _FakeReferenceCapablePipeline:
         return self
 
 
+class _FakeReferenceCapableStepAwarePipeline:
+    """Img2img-shaped pipeline that also invokes callback_on_step_end.
+
+    Mirrors real diffusers img2img: it only actually runs
+    ``int(num_inference_steps * strength)`` denoising steps (see
+    generators/image/generator.py's ``effective_inference_steps``), not the
+    full requested count -- used to prove the step callback's denominator is
+    derived from that reduced count, not the raw request.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+        self.steps_invoked = 0
+
+    def __call__(
+        self,
+        *,
+        prompt,
+        negative_prompt=None,
+        width=64,
+        height=64,
+        guidance_scale=7.5,
+        num_inference_steps=30,
+        image=None,
+        strength=None,
+        callback_on_step_end=None,
+        **kwargs,
+    ):
+        self.calls.append({"image": image, "strength": strength})
+        actual_steps = max(1, int(num_inference_steps * (strength or 0.0)))
+        for step_index in range(actual_steps):
+            self.steps_invoked = step_index + 1
+            if callback_on_step_end is not None:
+                callback_on_step_end(self, step_index, 0, {})
+        return _FakePipelineResult(Image.new("RGB", (width, height), color=(7, 8, 9)))
+
+    def to(self, device: str) -> "_FakeReferenceCapableStepAwarePipeline":
+        return self
+
+
+def _fake_diffusers_load_reference_capable_step_aware(self, manifest):
+    return {
+        "stub": False,
+        "loader": self.__class__.__name__,
+        "manifest_id": manifest.id,
+        "display_name": manifest.display_name,
+        "runtime": manifest.runtime,
+        "provider": manifest.provider,
+        "local_path": manifest.local_path,
+        "remote_ref": manifest.remote_ref,
+        "dtype": manifest.dtype,
+        "load_dtype": "float32",
+        "torch_dtype": "float32",
+        "weight_dtype": "float16",
+        "variant": "fp16",
+        "device": "cpu",
+        "default_params": dict(manifest.default_params),
+        "path_exists": True,
+        "pipeline": _FakeStepAwarePipeline(),
+        "img2img_pipeline": _FakeReferenceCapableStepAwarePipeline(),
+    }
+
+
 def _fake_diffusers_load_reference_capable(self, manifest):
     return {
         "stub": False,
@@ -1335,6 +1398,135 @@ class ModelSystemTests(unittest.TestCase):
             self.assertEqual(result.metadata["reference_applied_asset_id"], "asset_char_1")
             self.assertEqual(result.metadata["pipeline_class"], "_FakeReferenceCapablePipeline")
 
+    def test_image_generator_rejects_combined_top_level_and_bible_references(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, third Codex round on PR #376): a
+        # non-empty `request.references` used to replace
+        # `resolved_prompt.resolved_references` outright, so a request
+        # carrying both a top-level reference and a Bible axis that resolves
+        # its own reference silently dropped the Bible one from pixel
+        # conditioning -- while it still showed up in prompt composition and
+        # `resolved_references` metadata as if it had been honored, and
+        # bypassed the "exactly one reference" limit below entirely. Both
+        # sources are now merged before that limit is enforced.
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_root = root / "manifests"
+            model_id = self._write_reference_capable_manifest(manifest_root)
+            composer, character_id = self._prepare_character_reference(root)
+            second_reference_path = root / "second_reference.png"
+            Image.new("RGB", (16, 16), color=(10, 20, 30)).save(second_reference_path)
+            composer.asset_repository.create_or_update(
+                Asset(
+                    id="asset_location_1",
+                    job_id="job_fixture",
+                    project_id=None,
+                    media_type="image",
+                    kind="output",
+                    title="second reference fixture",
+                    prompt="a second reference image",
+                    model_id="sdxl",
+                    path=str(second_reference_path),
+                )
+            )
+            output_dir = root / "outputs"
+
+            with patch(
+                "core.models.loader.DiffusersImageLoader.load",
+                new=_fake_diffusers_load_reference_capable,
+            ):
+                service = create_default_model_service(manifest_root=manifest_root)
+                generator = ImageGenerator(
+                    service, output_dir=output_dir, prompt_composer=composer
+                )
+                with self.assertRaises(UnsupportedImageParameterError):
+                    generator.run(
+                        GenerationRequest(
+                            media_type="image",
+                            prompt="Mina on the rooftop",
+                            model_id=model_id,
+                            # Distinct role from the Bible entry's "character"
+                            # so validate_reference_inputs' per-role count
+                            # limit does not itself reject this first --
+                            # this test isolates the "exactly one reference
+                            # total" check in _resolve_references_for_conditioning.
+                            references=[
+                                ReferenceImageInput(
+                                    asset_id="asset_location_1",
+                                    role="location",
+                                    strength=0.5,
+                                )
+                            ],
+                            params={
+                                "steps": 10,
+                                "width": 64,
+                                "height": 64,
+                                "bible_refs": [character_id],
+                            },
+                        )
+                    )
+
+            self.assertEqual(list(output_dir.glob("**/*")), [])
+
+    def test_image_generator_reports_progress_using_the_effective_img2img_step_count(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, third Codex round on PR #376): real
+        # diffusers img2img only ever runs int(num_inference_steps *
+        # strength) denoising steps, not the full requested count. The step
+        # callback's progress fraction used the raw requested count as its
+        # denominator, so it topped out around `strength` (here 0.4, well
+        # under 1.0) instead of reaching 1.0 by the last step diffusers
+        # actually runs.
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_root = root / "manifests"
+            model_id = self._write_reference_capable_manifest(manifest_root)
+            composer, character_id = self._prepare_character_reference(root)
+            output_dir = root / "outputs"
+            reported_progress: list[float] = []
+            context = GenerationContext(
+                is_cancelled=lambda: False,
+                on_progress=reported_progress.append,
+                min_interval_seconds=0.0,
+                min_progress_delta=0.0,
+            )
+
+            with patch(
+                "core.models.loader.DiffusersImageLoader.load",
+                new=_fake_diffusers_load_reference_capable_step_aware,
+            ):
+                service = create_default_model_service(manifest_root=manifest_root)
+                generator = ImageGenerator(
+                    service, output_dir=output_dir, prompt_composer=composer
+                )
+                generator.run(
+                    GenerationRequest(
+                        media_type="image",
+                        prompt="Mina on the rooftop",
+                        model_id=model_id,
+                        params={
+                            "steps": 10,
+                            "width": 64,
+                            "height": 64,
+                            "bible_refs": [character_id],
+                        },
+                    ),
+                    context,
+                )
+                img2img_pipeline = service.get_runtime(
+                    model_id, "image", "text-to-image"
+                )["img2img_pipeline"]
+
+            # DEFAULT_REFERENCE_STRENGTH=0.6 inverts to diffusers strength
+            # 0.4; with 10 requested steps that is int(10 * 0.4) == 4 actual
+            # steps -- the fake pipeline (mirroring real diffusers) only
+            # invokes the callback that many times.
+            self.assertEqual(img2img_pipeline.steps_invoked, 4)
+            self.assertTrue(reported_progress)
+            self.assertAlmostEqual(reported_progress[-1], 1.0)
+
     def test_image_generator_preserves_a_denoising_step_at_maximum_lock_strength(
         self,
     ) -> None:
@@ -1439,12 +1631,13 @@ class ModelSystemTests(unittest.TestCase):
     def test_image_generator_rejects_a_reference_when_the_manifest_lacks_capability(
         self,
     ) -> None:
-        # Regression (#201 follow-up, P2): the real "sdxl" default manifest
-        # declares no reference_capability at all. Before this fix, a
-        # Bible-derived reference against it was checked only by physically
-        # probing the pipeline signature -- JobService's
-        # validate_reference_inputs() never ran for the Bible path. Now the
-        # same manifest-level contract applies to both paths.
+        # Regression (#201 follow-up, P2): the real "ssd-1b" manifest
+        # declares no reference_capability at all ("sdxl" now does -- #201
+        # second follow-up -- so this uses the shipped manifest that still
+        # doesn't). Before this fix, a Bible-derived reference against it was
+        # checked only by physically probing the pipeline signature --
+        # JobService's validate_reference_inputs() never ran for the Bible
+        # path. Now the same manifest-level contract applies to both paths.
         with TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
             composer, character_id = self._prepare_character_reference(root)
@@ -1454,7 +1647,7 @@ class ModelSystemTests(unittest.TestCase):
                 "core.models.loader.DiffusersImageLoader.load",
                 new=_fake_diffusers_load_reference_capable,
             ):
-                service = create_default_model_service()  # real "sdxl": no reference_capability
+                service = create_default_model_service()  # real "ssd-1b": no reference_capability
                 generator = ImageGenerator(
                     service, output_dir=output_dir, prompt_composer=composer
                 )
@@ -1463,7 +1656,7 @@ class ModelSystemTests(unittest.TestCase):
                         GenerationRequest(
                             media_type="image",
                             prompt="Mina on the rooftop",
-                            model_id="sdxl",
+                            model_id="ssd-1b",
                             params={
                                 "steps": 1,
                                 "width": 64,
@@ -1773,11 +1966,8 @@ class ModelSystemTests(unittest.TestCase):
                     path=str(reference_image_path),
                 )
             )
-            character = bible_repository.create(
-                kind="character",
-                name="Mina",
-                reference_asset_ids=["asset_char_1"],
-            )
+            # No Bible entry needed -- this test conditions via
+            # request.references directly, not a bible_refs axis.
             composer = PromptComposer(bible_repository, asset_repository)
             output_dir = root / "outputs"
 

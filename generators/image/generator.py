@@ -189,47 +189,65 @@ class ImageGenerator(BaseGenerator):
         if provider.capabilities is not None:
             validate_capabilities(provider.capabilities, request_spec)
         reference_conditioning_kwargs: dict[str, Any] = {}
+        # Diffusers img2img only ever runs int(num_inference_steps *
+        # strength) denoising steps internally (see the strength comment
+        # below), not the full requested count -- a step callback driven by
+        # the requested count would then top out well under 100% and jump
+        # straight to whatever the *next* variation (or job completion)
+        # reports, never itself reaching a completed fraction. Defaults to
+        # the plain requested count for the non-reference (text2img) path,
+        # where every requested step actually runs.
+        effective_inference_steps = num_inference_steps
         if reference_capable:
             # A real img2img call derives its output size from `image`
             # itself rather than accepting width/height (unlike the text2img
             # call below), so the reference is resized to the requested
             # output dimensions instead of forwarding width/height.
+            # ReferenceImageInput.strength is 0=no effect, 1=follow the
+            # reference most closely (core/reference_capabilities.py).
+            # diffusers img2img `strength` is the opposite: the fraction
+            # of denoising applied to the *source* image, so 0=closest to
+            # the reference and 1=ignores it almost entirely. Inverting
+            # here keeps the public contract's meaning intact for callers
+            # regardless of which pipeline convention ends up serving it.
+            # Diffusers computes init_timestep = int(num_inference_steps
+            # * strength) and needs at least one surviving step, so the
+            # floor is derived from num_inference_steps rather than a
+            # fixed constant: with the default 30 steps, a fixed 0.01
+            # floor rounds down to zero steps and diffusers has nothing
+            # left to denoise.
+            img2img_strength = min(
+                1.0,
+                max(
+                    # `+ 1e-6` covers float rounding in the division
+                    # itself (e.g. 30 * (1.0 / 30) landing a hair under
+                    # 1.0), which would otherwise still truncate to zero
+                    # steps. Capped at 1.0 by the outer min(): with very
+                    # few num_inference_steps (e.g. 1), the floor alone
+                    # can exceed 1.0 -- diffusers has no way to honor a
+                    # gentle lock with that few steps regardless of the
+                    # requested strength, so it is forced to the
+                    # strongest (least reference-preserving) setting.
+                    (1.0 / max(1, num_inference_steps)) + 1e-6,
+                    1.0 - cast(float, reference_strength),
+                ),
+            )
             reference_conditioning_kwargs = {
                 "image": (
                     Image.open(cast(str, reference_image_path))
                     .convert("RGB")
                     .resize((width, height))
                 ),
-                # ReferenceImageInput.strength is 0=no effect, 1=follow the
-                # reference most closely (core/reference_capabilities.py).
-                # diffusers img2img `strength` is the opposite: the fraction
-                # of denoising applied to the *source* image, so 0=closest to
-                # the reference and 1=ignores it almost entirely. Inverting
-                # here keeps the public contract's meaning intact for callers
-                # regardless of which pipeline convention ends up serving it.
-                # Diffusers computes init_timestep = int(num_inference_steps
-                # * strength) and needs at least one surviving step, so the
-                # floor is derived from num_inference_steps rather than a
-                # fixed constant: with the default 30 steps, a fixed 0.01
-                # floor rounds down to zero steps and diffusers has nothing
-                # left to denoise.
-                "strength": min(
-                    1.0,
-                    max(
-                        # `+ 1e-6` covers float rounding in the division
-                        # itself (e.g. 30 * (1.0 / 30) landing a hair under
-                        # 1.0), which would otherwise still truncate to zero
-                        # steps. Capped at 1.0 by the outer min(): with very
-                        # few num_inference_steps (e.g. 1), the floor alone
-                        # can exceed 1.0 -- diffusers has no way to honor a
-                        # gentle lock with that few steps regardless of the
-                        # requested strength, so it is forced to the
-                        # strongest (least reference-preserving) setting.
-                        (1.0 / max(1, num_inference_steps)) + 1e-6,
-                        1.0 - cast(float, reference_strength),
-                    ),
-                ),
+                "strength": img2img_strength,
             }
+            # Mirrors diffusers' own init_timestep computation so the step
+            # callback's denominator matches how many steps will actually
+            # fire; floored at 1 for the same reason the strength floor
+            # above exists -- there is always at least one real step to
+            # report progress against.
+            effective_inference_steps = max(
+                1, int(num_inference_steps * img2img_strength)
+            )
         common_generation_kwargs = {
             "prompt": resolved_prompt.prompt,
             "negative_prompt": resolved_prompt.negative_prompt,
@@ -260,7 +278,7 @@ class ImageGenerator(BaseGenerator):
                 )
                 step_callback = self._build_step_callback(
                     active_pipeline,
-                    num_inference_steps,
+                    effective_inference_steps,
                     context,
                     variation_index=variation_index,
                     variation_count=variation_count,
@@ -452,22 +470,26 @@ class ImageGenerator(BaseGenerator):
 
         `request.references` -- the documented top-level field `JobService`
         already validates against `manifest.reference_capability` before a
-        job is even created -- takes priority over Bible-derived
-        `resolved_prompt.resolved_references` when both are non-empty; a
-        caller using the documented field should not have it silently
-        ignored in favor of an unrelated Bible axis (#201 follow-up). Bible
-        references never go through `JobService`'s check (there is no
+        job is even created -- is combined with Bible-derived
+        `resolved_prompt.resolved_references` rather than one silently
+        replacing the other (#201 follow-up). Both sources already applied
+        to prompt composition and both appear under `resolved_references`
+        in job metadata, so a Bible reference dropped here would receive no
+        pixel conditioning while still looking "considered" everywhere else,
+        and would bypass the one-reference-at-a-time check below entirely.
+        Bible references never go through `JobService`'s check (there is no
         `request.references` for it to see), so they are validated here
         against the same `manifest.reference_capability` contract instead of
         bypassing it entirely.
 
         This conditioning path honors exactly one reference image at a time:
-        a request considering more than one (whether >1 role or the manifest
-        somehow allows >1 per role) raises rather than silently applying
-        only the first and reporting every one of them as honored.
+        a request considering more than one -- whether >1 from a single
+        source, or one from each source combined -- raises rather than
+        silently applying only the first and reporting every one of them as
+        honored.
         """
 
-        references = list(request.references) if request.references else list(
+        references = list(request.references or []) + list(
             resolved_prompt.resolved_references
         )
         if not references:

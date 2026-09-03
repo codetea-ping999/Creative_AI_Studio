@@ -15,6 +15,13 @@
     "steps": 30,
     "guidance_scale": 7.5
   },
+  "reference_capability": {
+    "supported_modes": ["img2img"],
+    "supported_roles": ["character", "location"],
+    "min_strength": 0.0,
+    "max_strength": 1.0,
+    "max_references_per_role": 1
+  },
   "aliases": ["sdxl-local"],
   "tags": ["image", "base"],
   "is_default": true,

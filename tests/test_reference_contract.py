@@ -281,7 +281,10 @@ class UnsupportedReferenceRequestApiTests(unittest.TestCase):
             json={
                 "media_type": "image",
                 "prompt": "a knight",
-                "model_id": "sdxl",
+                # "sdxl" now advertises img2img reference_capability (#201
+                # follow-up); "ssd-1b" is the shipped manifest that still
+                # doesn't, so this exercises the actual no-capability path.
+                "model_id": "ssd-1b",
                 "references": [
                     {"asset_id": "char-1", "role": "character", "strength": 0.8}
                 ],
@@ -299,7 +302,7 @@ class UnsupportedReferenceRequestApiTests(unittest.TestCase):
             "/generate/image",
             json={
                 "prompt": "a knight",
-                "model_id": "sdxl",
+                "model_id": "ssd-1b",
                 "references": [
                     {"asset_id": "char-1", "role": "character", "strength": 0.8}
                 ],
@@ -314,6 +317,27 @@ class UnsupportedReferenceRequestApiTests(unittest.TestCase):
         response = client.post(
             "/jobs",
             json={"media_type": "image", "prompt": "a knight", "model_id": "sdxl"},
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(len(self.services.job_repository.list()), 1)
+
+    def test_post_jobs_accepts_a_reference_for_sdxl_which_advertises_img2img(self) -> None:
+        # Regression (#201 follow-up, third Codex round on PR #376): every
+        # shipped image manifest omitted reference_capability, so the img2img
+        # conditioning path built for #201 was unreachable by any real model
+        # -- only a test-only manifest could exercise it. "sdxl" (the
+        # is_default manifest) now advertises img2img support.
+        client = self._client()
+        response = client.post(
+            "/jobs",
+            json={
+                "media_type": "image",
+                "prompt": "a knight",
+                "model_id": "sdxl",
+                "references": [
+                    {"asset_id": "char-1", "role": "character", "strength": 0.8}
+                ],
+            },
         )
         self.assertEqual(response.status_code, 201, response.text)
         self.assertEqual(len(self.services.job_repository.list()), 1)
