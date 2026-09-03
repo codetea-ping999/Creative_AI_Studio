@@ -99,7 +99,11 @@ If a future `BackendSupervisor` owns a packaged Python sidecar, tray-only reside
 Stopped -> Starting -> Ready -> Busy -> Stopping -> Stopped
 ```
 
-A transition to tray-only requests backend shutdown. If a generation job is active, shutdown is deferred until that job reaches a terminal state; the supervisor records the pending stop rather than killing an in-flight generation. Once idle, it performs graceful shutdown with a bounded timeout and escalates to process termination if needed. Hiding or destroying a WebView never counts as backend cleanup by itself.
+A transition to tray-only, or the companion becoming idle while resident (no active Studio window and no user interaction), requests backend shutdown. If a generation job is active, shutdown is deferred; the supervisor records the pending stop rather than killing an in-flight generation.
+
+The deferred stop does not fire on job-terminal status alone. `JobService.mark_succeeded` persists the terminal status before it synchronizes assets and publishes the terminal event, and `BatchService.handle_job_event` can react to that event by enqueuing further stage jobs; stopping as soon as the job record turns terminal can therefore kill the process before assets are synced or before batch-triggered work is even queued. The supervisor instead waits for a worker-drained signal — the terminal job's post-terminal handlers (asset synchronization, terminal-event publication, and any batch-stage advancement that event triggers) have completed and no further job is queued — before shutdown proceeds.
+
+If the Studio or companion leaves the idle/tray-only state before the deferred stop fires — for example, the user reopens the Studio while a job is still finishing — the pending stop is cleared and no shutdown occurs. Once the worker-drained condition holds, the supervisor performs graceful shutdown with a bounded timeout and escalates to process termination if needed. Hiding or destroying a WebView never counts as backend cleanup by itself.
 
 ### 6. Use an explicit desktop lifecycle
 
