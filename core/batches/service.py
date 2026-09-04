@@ -319,6 +319,15 @@ class BatchService:
                     # will ever retrigger this path. Persist it as failed
                     # instead so the batch reaches an observable terminal
                     # state.
+                    #
+                    # #201 follow-up (Codex P2, twelfth round): setting only
+                    # `status` here was not durable -- the next read calls
+                    # _recompute_and_save(), whose _derive_status() has no
+                    # concept of "the stage transition itself failed" and
+                    # recomputes "running" from a successful current stage
+                    # plus a pending next one, silently reverting this.
+                    # advance_error is what _derive_status() actually checks.
+                    refreshed.advance_error = str(exc)
                     refreshed.status = BATCH_STATUS_FAILED
                     self.batch_repository.save(refreshed)
                     logger.warning(
@@ -364,6 +373,12 @@ def _build_aggregate(items: list[BatchItem]) -> BatchAggregate:
 
 
 def _derive_status(record: BatchRecord) -> str:
+    if record.advance_error is not None:
+        # A stage transition itself failed (see BatchRecord.advance_error) --
+        # authoritative and terminal, regardless of what the items/aggregate
+        # below would otherwise derive (a successful current stage with
+        # another stage still pending would normally compute "running").
+        return BATCH_STATUS_FAILED
     items = record.items
     if not items:
         return BATCH_STATUS_QUEUED

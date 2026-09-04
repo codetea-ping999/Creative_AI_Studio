@@ -201,6 +201,19 @@ class BatchRecord(BaseModel):
     stage_index: int = 0
     items: list[BatchItem] = Field(default_factory=list)
     aggregate: BatchAggregate = Field(default_factory=BatchAggregate)
+    # Set when a stage transition itself fails (e.g. a later stage's
+    # reference preflight rejects it), as opposed to an individual item
+    # failing -- item failures are already reflected in `aggregate` and
+    # `_derive_status()` folds them into "partial"/"failed" normally.
+    # `_derive_status()` treats a non-None value here as authoritative and
+    # always terminal, overriding what it would otherwise derive from
+    # `items`/`aggregate`/`stage_index` alone (#201 follow-up, twelfth Codex
+    # round on PR #376): without this, `_recompute_and_save()` -- called on
+    # essentially every read -- recomputes `running` from a stage that
+    # finished successfully with another stage still pending, silently
+    # reverting a batch that was explicitly marked failed back to
+    # `running` on the very next `GET`.
+    advance_error: str | None = None
     created_at: datetime
     updated_at: datetime
 

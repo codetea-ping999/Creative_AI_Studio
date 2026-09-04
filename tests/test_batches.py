@@ -351,6 +351,28 @@ class BatchServiceTests(unittest.TestCase):
         self.assertEqual(reconciled.aggregate.succeeded, 1)
         self.assertEqual(reconciled.aggregate.best_item_id, first.id)
 
+    def test_advance_error_survives_reconciliation(self) -> None:
+        # Regression (#201 follow-up, twelfth Codex round on PR #376, P2):
+        # handle_job_event() sets advance_error when a stage transition's
+        # reference preflight rejects it, but every subsequent read calls
+        # _recompute_and_save() -> _derive_status(), which previously had
+        # no concept of a failed stage transition and recomputed a status
+        # from items/aggregate alone -- silently reverting the failure on
+        # the very next read (here, from "failed" back to "queued", since
+        # this batch's items haven't run). advance_error must survive that
+        # recomputation.
+        record = self.service.create_batch(_spec())
+        record.advance_error = "stage 2 reference preflight failed: boom"
+        record.status = "failed"
+        self.batch_repository.save(record)
+
+        reconciled = self.service.get_batch(record.id)
+
+        self.assertEqual(reconciled.status, "failed")
+        self.assertEqual(
+            reconciled.advance_error, "stage 2 reference preflight failed: boom"
+        )
+
     def test_partial_status_when_some_children_fail(self) -> None:
         record = self.service.create_batch(_spec())
         self._succeed(record.items[0].job_id, 70.0)

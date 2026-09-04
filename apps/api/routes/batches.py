@@ -50,6 +50,7 @@ class BatchResponse(BaseModel):
     stage_names: list[str]
     aggregate: dict[str, Any]
     items: list[BatchItemResponse]
+    error_message: str | None
     created_at: str
     updated_at: str
 
@@ -68,6 +69,7 @@ class BatchResponse(BaseModel):
                 BatchItemResponse(**item.model_dump(mode="json", exclude={"request"}))
                 for item in record.items
             ],
+            error_message=record.advance_error,
             created_at=record.created_at.isoformat(),
             updated_at=record.updated_at.isoformat(),
         )

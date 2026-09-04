@@ -149,16 +149,15 @@ class JobService:
         # reaches the front of the queue. model_service is optional (some
         # tests construct JobService without one); without it we cannot
         # resolve a manifest, so there is nothing to validate against.
-        if request.references and self.model_service is not None:
-            manifest = self.model_service.get_manifest(
-                request.model_id, request.media_type, request.task_type
-            )
-            validate_reference_inputs(
-                request.references,
-                capability=manifest.reference_capability,
-                model_id=request.model_id or manifest.public_model_id,
-            )
-            self._require_img2img_mode(manifest, request.model_id)
+        if request.references:
+            manifest = self._resolve_manifest_for_references(request)
+            if manifest is not None:
+                validate_reference_inputs(
+                    request.references,
+                    capability=manifest.reference_capability,
+                    model_id=request.model_id or manifest.public_model_id,
+                )
+                self._require_img2img_mode(manifest, request.model_id)
         if request.references and self.asset_repository is not None:
             # #201 follow-up (Codex P1 on PR #376): a reference asset from a
             # different project must not silently condition a job in this
@@ -231,7 +230,7 @@ class JobService:
                                 strength=DEFAULT_REFERENCE_STRENGTH,
                             )
                         )
-                if bible_reference_inputs and self.model_service is not None:
+                if bible_reference_inputs:
                     # #201 follow-up (Codex P2, ninth round): request.references
                     # is validated against manifest.reference_capability above
                     # (line ~108), but a Bible-derived reference reached job
@@ -240,15 +239,14 @@ class JobService:
                     # the wrong role/strength/count) was queued successfully
                     # and only failed later, asynchronously, once the
                     # generator's own validate_reference_inputs() ran.
-                    manifest = self.model_service.get_manifest(
-                        request.model_id, request.media_type, request.task_type
-                    )
-                    validate_reference_inputs(
-                        bible_reference_inputs,
-                        capability=manifest.reference_capability,
-                        model_id=request.model_id or manifest.public_model_id,
-                    )
-                    self._require_img2img_mode(manifest, request.model_id)
+                    manifest = self._resolve_manifest_for_references(request)
+                    if manifest is not None:
+                        validate_reference_inputs(
+                            bible_reference_inputs,
+                            capability=manifest.reference_capability,
+                            model_id=request.model_id or manifest.public_model_id,
+                        )
+                        self._require_img2img_mode(manifest, request.model_id)
         # #201 follow-up (Codex P2, tenth round): per-role capability
         # validation (above, for both request.references and Bible-derived
         # references) allows e.g. one character *and* one location reference
@@ -273,7 +271,7 @@ class JobService:
         # here must match or a request the generator can honor would be
         # rejected before it ever reaches the generator.
         seen_combined_references: set[tuple[str, str, float, str]] = set()
-        combined_reference_count = 0
+        combined_references: list[ReferenceImageInput] = []
         for reference in list(request.references or []) + bible_reference_inputs:
             dedupe_key = (
                 reference.asset_id,
@@ -284,14 +282,74 @@ class JobService:
             if dedupe_key in seen_combined_references:
                 continue
             seen_combined_references.add(dedupe_key)
-            combined_reference_count += 1
-        if combined_reference_count > 1:
+            combined_references.append(reference)
+        if len(combined_references) > 1:
             raise UnsupportedReferenceError(
                 f"Model {request.model_id!r}: reference-image conditioning "
                 "honors exactly one reference image per request (across "
                 "`references` and Bible-derived character/location entries "
-                f"combined); got {combined_reference_count}."
+                f"combined); got {len(combined_references)}."
             )
+        if len(combined_references) == 1:
+            # #201 follow-up (Codex P2, twelfth round): diffusers img2img
+            # runs int(num_inference_steps * (1 - strength)) denoising steps
+            # -- ImageGenerator.generate() rejects a combination that leaves
+            # zero (see its own identical computation), but the shipped
+            # "sdxl" manifest advertises max_strength=1.0, which zeroes out
+            # regardless of step count. Preflighting the same computation
+            # here, using the same effective_params merge (manifest defaults
+            # then request.params) the generator uses, catches a
+            # deterministically doomed job before it's queued.
+            manifest = self._resolve_manifest_for_references(request)
+            if manifest is not None:
+                effective_params = {**manifest.default_params, **request.params}
+                num_inference_steps = int(
+                    effective_params.get(
+                        "num_inference_steps", effective_params.get("steps", 30)
+                    )
+                )
+                primary = combined_references[0]
+                img2img_strength = 1.0 - primary.strength
+                if int(num_inference_steps * img2img_strength) < 1:
+                    raise UnsupportedReferenceError(
+                        f"Model {request.model_id!r}: the requested reference "
+                        f"lock strength {primary.strength} combined with "
+                        f"{num_inference_steps} inference step(s) would leave "
+                        "diffusers with zero denoising steps to actually run. "
+                        "Increase num_inference_steps or reduce the reference "
+                        "strength."
+                    )
+
+    def _resolve_manifest_for_references(
+        self,
+        request: GenerationRequest,
+    ) -> "ModelManifest | None":
+        """Resolve `request`'s manifest for reference validation, or None.
+
+        `model_service` is optional (some tests construct `JobService`
+        without one) -- returns `None` rather than raising in that case,
+        since there is nothing to validate reference support against.
+
+        An unknown, disabled, or wrong-task `model_id` makes
+        `ModelService.get_manifest()` raise `LookupError`; translated to
+        `UnsupportedReferenceError` here (#201 follow-up, twelfth Codex
+        round on PR #376) so every calling route's existing
+        `(UnsupportedReferenceError, MissingReferenceAssetError)` handler
+        covers it too, instead of a bad client-supplied `model_id` on an
+        otherwise-valid reference surfacing as an unhandled 500.
+        """
+
+        if self.model_service is None:
+            return None
+        try:
+            return self.model_service.get_manifest(
+                request.model_id, request.media_type, request.task_type
+            )
+        except LookupError as exc:
+            raise UnsupportedReferenceError(
+                f"Cannot validate reference-image conditioning for model "
+                f"{request.model_id!r}: {exc}"
+            ) from exc
 
     def _require_img2img_mode(
         self,

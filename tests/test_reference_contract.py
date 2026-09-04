@@ -546,6 +546,71 @@ class UnsupportedReferenceRequestApiTests(unittest.TestCase):
             self.assertIn("img2img", response.text)
             self.assertEqual(services.job_repository.list(), [])
 
+    def test_post_generate_image_rejects_a_reference_strength_that_leaves_zero_steps(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, twelfth Codex round on PR #376, P2):
+        # "sdxl" advertises max_strength=1.0, but diffusers img2img runs
+        # int(num_inference_steps * (1 - strength)) denoising steps --
+        # strength=1.0 always computes to zero, for any step count.
+        # ImageGenerator.generate() already rejects this at execution time;
+        # this creation-time preflight must reject it too, rather than
+        # queue a job deterministically doomed to fail.
+        client = self._client()
+        response = client.post(
+            "/generate/image",
+            json={
+                "prompt": "a knight",
+                "model_id": "sdxl",
+                "references": [
+                    {"asset_id": "char-1", "role": "character", "strength": 1.0}
+                ],
+            },
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertIn("denoising steps", response.text)
+        self.assertEqual(self.services.job_repository.list(), [])
+
+    def test_post_generate_image_reports_422_not_500_for_an_unknown_model_with_a_bible_ref(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, twelfth Codex round on PR #376, P2):
+        # ModelService.get_manifest() raises LookupError for an unknown
+        # model id. The Bible-derived-reference preflight added two rounds
+        # ago calls it too, but every route only catches
+        # (UnsupportedReferenceError, MissingReferenceAssetError) -- an
+        # unknown model_id on an otherwise-valid Bible reference surfaced
+        # as an unhandled 500 instead of a 4xx.
+        from core.assets import Asset
+
+        client = self._client()
+        self.services.asset_repository.create_or_update(
+            Asset(
+                id="unknown_model_ref",
+                job_id="job_fixture",
+                project_id=None,
+                media_type="image",
+                kind="output",
+                title="reference fixture",
+                prompt="a reference image",
+                model_id="sdxl",
+                path="/tmp/does-not-need-to-exist.png",
+            )
+        )
+        entry = self.services.bible_repository.create(
+            kind="character", name="Mina", reference_asset_ids=["unknown_model_ref"]
+        )
+        response = client.post(
+            "/generate/image",
+            json={
+                "prompt": "a knight",
+                "model_id": "does-not-exist",
+                "params": {"bible_refs": [entry.id]},
+            },
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertEqual(self.services.job_repository.list(), [])
+
     def test_post_jobs_accepts_a_request_with_no_references(self) -> None:
         client = self._client()
         response = client.post(
