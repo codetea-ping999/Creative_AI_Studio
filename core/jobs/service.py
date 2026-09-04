@@ -273,15 +273,21 @@ class JobService:
         seen_combined_references: set[tuple[str, str, float, str]] = set()
         combined_references: list[ReferenceImageInput] = []
         for reference in list(request.references or []) + bible_reference_inputs:
-            dedupe_key = (
+            # Named distinctly from the bible-only loop's `dedupe_key` above
+            # (a narrower (str, str) pair) -- mypy infers a variable's type
+            # from its first assignment in the function, so reusing the same
+            # name for this wider (str, str, float, str) tuple was a type
+            # error CI caught (round twelve): "Incompatible types in
+            # assignment" / "Argument 1 to add() ... incompatible type".
+            combined_dedupe_key = (
                 reference.asset_id,
                 reference.role,
                 reference.strength,
                 reference.preprocessing,
             )
-            if dedupe_key in seen_combined_references:
+            if combined_dedupe_key in seen_combined_references:
                 continue
-            seen_combined_references.add(dedupe_key)
+            seen_combined_references.add(combined_dedupe_key)
             combined_references.append(reference)
         if len(combined_references) > 1:
             raise UnsupportedReferenceError(
