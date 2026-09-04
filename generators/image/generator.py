@@ -488,17 +488,40 @@ class ImageGenerator(BaseGenerator):
             # `t_start * scheduler.order`, and the exact expansion factor
             # varies by scheduler implementation, so a fixed formula tied to
             # `order` alone would not generalize across schedulers.
-            # `pipe.scheduler.timesteps` is the actual, already-expanded
-            # schedule diffusers is stepping through for this call, so its
-            # length is the true denominator regardless of scheduler order.
+            #
+            # `pipe.scheduler.timesteps` (tried first, and reverted here) is
+            # the WRONG source: for an img2img call with strength < 1,
+            # `get_timesteps()` slices that table into a *local* variable
+            # the denoising loop actually iterates over -- it never mutates
+            # `scheduler.timesteps` itself, which stays at the full,
+            # un-sliced (and, for a higher-order scheduler, still fully
+            # expanded) length regardless of strength. Reading it here
+            # produced a denominator larger than the true number of
+            # callback invocations (Codex P2 on PR #393: Heun, 10 requested
+            # steps, strength 0.4 -> 7 sliced iterations but 19 in
+            # `scheduler.timesteps`), so progress would never reach 1.0.
+            # It is also unsafe outright: a real scheduler's `.timesteps` is
+            # a multi-element `torch.Tensor`, and `if timesteps` tries to
+            # coerce that to a single bool, raising `RuntimeError: Boolean
+            # value of Tensor with more than one value is ambiguous` on
+            # every real reference job (Codex P1 on PR #393).
+            #
+            # `pipe.num_timesteps` is diffusers' own count of the current
+            # call's actual denoising-loop length -- set from the same
+            # already-sliced, already-order-expanded local `timesteps`
+            # variable the loop iterates over, so it agrees with the true
+            # invocation count regardless of scheduler order or strength.
             # Read fresh on every invocation (not cached) since it reflects
-            # whatever `set_timesteps()` produced for this specific pipeline
-            # call; fall back to the requested count for a pipeline (real or
-            # fake) that exposes no scheduler, preserving prior behavior for
+            # whatever this specific pipeline call computed; fall back to
+            # the requested count for a pipeline (real or fake) that
+            # exposes no such attribute, preserving prior behavior for
             # every already-passing first-order-scheduler test.
-            scheduler = getattr(pipe, "scheduler", None)
-            timesteps = getattr(scheduler, "timesteps", None)
-            total_steps = len(timesteps) if timesteps else num_inference_steps
+            num_timesteps = getattr(pipe, "num_timesteps", None)
+            total_steps = (
+                num_timesteps
+                if isinstance(num_timesteps, int) and num_timesteps > 0
+                else num_inference_steps
+            )
             step_fraction = min((step_index + 1) / total_steps, 1.0)
             context.report_progress(
                 (variation_index + step_fraction) / variation_count

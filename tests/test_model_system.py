@@ -251,21 +251,27 @@ class _FakeReferenceCapableSecondOrderPipeline:
     """Img2img-shaped pipeline simulating a second-order scheduler (#389).
 
     Real diffusers 0.37 expands a second-order scheduler's (e.g.
-    HeunDiscreteScheduler) internal timestep table and slices it at
-    `t_start * scheduler.order`, so callback_on_step_end fires roughly
+    HeunDiscreteScheduler) internal timestep table for the *full* requested
+    `num_inference_steps` when `set_timesteps()` runs, so
+    `scheduler.timesteps` stays at that full expanded length (19, for 10
+    requested steps) regardless of strength. For an img2img call,
+    `get_timesteps()` then slices a *local* variable down to the steps
+    strength actually selects -- `scheduler.timesteps` itself is never
+    replaced -- so callback_on_step_end fires only
     `2 * base_steps - 1` times for `base_steps =
-    int(num_inference_steps * strength)`, not `base_steps` times. This fake
-    reproduces exactly that invocation count and exposes
-    `scheduler.timesteps` at the same expanded length -- a fix that reads
-    `pipe.scheduler.timesteps` sees the same signal a real pipeline call
-    would; a fix (or bug) that instead derives the denominator from
-    `int(num_inference_steps * strength)` alone would under-count it here.
+    int(num_inference_steps * strength)` (7, here), not 19 times (#393
+    Codex P2). This fake reproduces both numbers distinctly: `scheduler
+    .timesteps` deliberately stays at the full, un-sliced 19-length table a
+    correct fix must NOT read, while `num_timesteps` -- diffusers' own
+    count of the current call's actual loop length, mirrored here exactly
+    as diffusers sets it -- carries the true 7.
     """
 
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
         self.steps_invoked = 0
         self.scheduler = SimpleNamespace(timesteps=[])
+        self.num_timesteps = 0
 
     def __call__(
         self,
@@ -284,7 +290,18 @@ class _FakeReferenceCapableSecondOrderPipeline:
         self.calls.append({"image": image, "strength": strength})
         base_steps = max(1, int(num_inference_steps * (strength or 0.0)))
         expanded_steps = 2 * base_steps - 1
-        self.scheduler = SimpleNamespace(timesteps=list(range(expanded_steps)))
+        full_schedule_steps = 2 * num_inference_steps - 1
+        # Deliberately the *wrong*, larger number a correct fix must ignore
+        # -- mirrors a real scheduler's un-sliced, multi-element
+        # torch.Tensor closely enough to also catch a regression back to
+        # `if timesteps:` truthiness-testing it (#393 Codex P1): a
+        # non-empty list is truthy exactly like a non-empty tensor would be,
+        # so this alone wouldn't raise, but reading its *length* here as the
+        # denominator reproduces the P2 under-reporting bug precisely.
+        self.scheduler = SimpleNamespace(
+            timesteps=list(range(full_schedule_steps))
+        )
+        self.num_timesteps = expanded_steps
         for step_index in range(expanded_steps):
             self.steps_invoked = step_index + 1
             if callback_on_step_end is not None:
