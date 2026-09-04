@@ -481,7 +481,25 @@ class ImageGenerator(BaseGenerator):
             return None
 
         def _on_step_end(pipe: object, step_index: int, timestep: object, callback_kwargs: dict):
-            step_fraction = (step_index + 1) / num_inference_steps
+            # #389: a higher-order scheduler (e.g. HeunDiscreteScheduler)
+            # expands its internal timestep table, so callback_on_step_end
+            # fires more times than the requested `num_inference_steps` --
+            # diffusers 0.37 slices that expanded table at
+            # `t_start * scheduler.order`, and the exact expansion factor
+            # varies by scheduler implementation, so a fixed formula tied to
+            # `order` alone would not generalize across schedulers.
+            # `pipe.scheduler.timesteps` is the actual, already-expanded
+            # schedule diffusers is stepping through for this call, so its
+            # length is the true denominator regardless of scheduler order.
+            # Read fresh on every invocation (not cached) since it reflects
+            # whatever `set_timesteps()` produced for this specific pipeline
+            # call; fall back to the requested count for a pipeline (real or
+            # fake) that exposes no scheduler, preserving prior behavior for
+            # every already-passing first-order-scheduler test.
+            scheduler = getattr(pipe, "scheduler", None)
+            timesteps = getattr(scheduler, "timesteps", None)
+            total_steps = len(timesteps) if timesteps else num_inference_steps
+            step_fraction = min((step_index + 1) / total_steps, 1.0)
             context.report_progress(
                 (variation_index + step_fraction) / variation_count
             )
