@@ -120,6 +120,7 @@ class ImageGenerator(BaseGenerator):
         (
             reference_image_path,
             reference_strength,
+            reference_applied_asset_id,
             considered_references,
         ) = self._resolve_references_for_conditioning(
             request,
@@ -426,7 +427,7 @@ class ImageGenerator(BaseGenerator):
                 ],
                 "reference_conditioning_applied": reference_capable,
                 "reference_applied_asset_id": (
-                    considered_references[0].asset_id if reference_capable else None
+                    reference_applied_asset_id if reference_capable else None
                 ),
                 "requested_model_id": requested_model_id,
                 "model_id": manifest.public_model_id,
@@ -501,8 +502,17 @@ class ImageGenerator(BaseGenerator):
         manifest: "ModelManifest",
         *,
         project_id: str | None = None,
-    ) -> tuple[str | None, float | None, list["ReferenceImageInput"]]:
+    ) -> tuple[str | None, float | None, str | None, list["ReferenceImageInput"]]:
         """Pick the references to condition on and validate them against the manifest.
+
+        Returns ``(reference_image_path, reference_strength,
+        applied_asset_id, considered_references)``. ``considered_references``
+        is every reference actually requested (zero-strength ones included,
+        for audit); ``applied_asset_id`` is the one reference among those
+        that was actually selected for conditioning, distinct from
+        ``considered_references[0]`` -- a zero-strength reference can
+        legitimately be requested first and a later, non-zero-strength one
+        still be the one applied.
 
         `request.references` -- the documented top-level field `JobService`
         already validates against `manifest.reference_capability` before a
@@ -518,11 +528,13 @@ class ImageGenerator(BaseGenerator):
         against the same `manifest.reference_capability` contract instead of
         bypassing it entirely.
 
-        This conditioning path honors exactly one reference image at a time:
-        a request considering more than one -- whether >1 from a single
-        source, or one from each source combined -- raises rather than
-        silently applying only the first and reporting every one of them as
-        honored.
+        This conditioning path honors exactly one *effective* (strength > 0)
+        reference image at a time: a request whose effective references
+        number more than one -- whether >1 from a single source, or one from
+        each source combined -- raises rather than silently applying only
+        the first and reporting every one of them as honored. A zero-strength
+        reference requests no conditioning at all (see the effective-vs-
+        requested split below), so it never occupies that one-image slot.
 
         `project_id` re-checks the same project-membership invariant
         `JobService.create_job()` already enforced at job-creation time
@@ -560,7 +572,7 @@ class ImageGenerator(BaseGenerator):
             seen_references.add(dedupe_key)
             references.append(reference)
         if not references:
-            return None, None, []
+            return None, None, None, []
 
         validate_reference_inputs(
             references,
@@ -580,14 +592,34 @@ class ImageGenerator(BaseGenerator):
                 "img2img in reference_capability.supported_modes, which is "
                 "the only conditioning mode this path implements."
             )
-        if len(references) > 1:
+        # #201 follow-up (Option A): a zero-strength reference requests no
+        # conditioning (ReferenceImageInput's own contract) and must not
+        # occupy this path's one-image slot. The limit and primary selection
+        # below apply to the *effective* (strength > 0) subset; `references`
+        # -- every reference actually requested, zero-strength ones included
+        # -- is still returned unchanged so job metadata/audit reports every
+        # reference that was considered, not just the one applied.
+        effective_references = [
+            reference for reference in references if reference.strength > 0.0
+        ]
+        if not effective_references:
+            # ReferenceImageInput.strength=0 means "no effect" -- but img2img
+            # still VAE-encodes the reference and consumes the seeded
+            # generator's random draws to do it, so even diffusers
+            # strength=1.0 (the value zero would otherwise invert to) is not
+            # guaranteed to reproduce what a plain text2img call would have
+            # produced. Every requested reference here is zero-strength (or
+            # there were none), so generation stays unconditioned.
+            return None, None, None, references
+        if len(effective_references) > 1:
             raise UnsupportedImageParameterError(
                 f"Model {manifest.public_model_id!r} was asked to honor "
-                f"{len(references)} reference images at once, but this "
-                "conditioning path applies exactly one; remove all but one "
-                "reference from the request or Bible entries in play."
+                f"{len(effective_references)} reference images at once, but "
+                "this conditioning path applies exactly one; remove all but "
+                "one non-zero-strength reference from the request or Bible "
+                "entries in play."
             )
-        primary = references[0]
+        primary = effective_references[0]
         # Likewise, validate_reference_inputs only checks the requested
         # preprocessing is one the manifest declares support for -- it does
         # not know this path never actually applies face_crop/canny/depth
@@ -639,18 +671,7 @@ class ImageGenerator(BaseGenerator):
                 f"{project_id or 'no project'!r}; a reference must belong "
                 "to the same project as the job it conditions."
             )
-        if primary.strength <= 0.0:
-            # ReferenceImageInput.strength=0 means "no effect" -- but img2img
-            # still VAE-encodes the reference and consumes the seeded
-            # generator's random draws to do it, so even diffusers
-            # strength=1.0 (the value this would otherwise invert to) is not
-            # guaranteed to reproduce what a plain text2img call would have
-            # produced. An explicit zero-strength reference is treated as
-            # unconditioned generation -- reported in `considered_references`
-            # for audit purposes, but never routed through img2img -- rather
-            # than as "closest to the reference" at diffusers strength 1.0.
-            return None, None, references
-        return asset.path, primary.strength, references
+        return asset.path, primary.strength, primary.asset_id, references
 
     def _pipeline_accepts_reference_image(self, pipeline: object) -> bool:
         call = getattr(pipeline, "__call__", None)

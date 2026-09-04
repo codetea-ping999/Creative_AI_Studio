@@ -1581,6 +1581,79 @@ class ModelSystemTests(unittest.TestCase):
                 result.metadata["considered_references"][0]["asset_id"], "asset_char_1"
             )
 
+    def test_image_generator_applies_the_only_effective_reference_when_another_is_zero_strength(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, Option A): the one-image limit and
+        # primary selection used to run against every *requested* reference,
+        # so a zero-strength reference (which requests no conditioning at
+        # all) still counted against the limit -- a character reference at
+        # strength=0 alongside a location reference at strength=0.8 raised
+        # UnsupportedImageParameterError instead of applying the one
+        # reference that actually needs conditioning. requested=2,
+        # effective=1, applied=1.
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_root = root / "manifests"
+            model_id = self._write_reference_capable_manifest(manifest_root)
+            composer, _character_id = self._prepare_character_reference(root)
+            location_reference_path = root / "location_reference.png"
+            Image.new("RGB", (16, 16), color=(40, 80, 120)).save(location_reference_path)
+            composer.asset_repository.create_or_update(
+                Asset(
+                    id="asset_loc_1",
+                    job_id="job_fixture",
+                    project_id=None,
+                    media_type="image",
+                    kind="output",
+                    title="location reference fixture",
+                    prompt="a location reference image",
+                    model_id="sdxl",
+                    path=str(location_reference_path),
+                )
+            )
+            output_dir = root / "outputs"
+
+            with patch(
+                "core.models.loader.DiffusersImageLoader.load",
+                new=_fake_diffusers_load_reference_capable,
+            ):
+                service = create_default_model_service(manifest_root=manifest_root)
+                generator = ImageGenerator(
+                    service, output_dir=output_dir, prompt_composer=composer
+                )
+                result = generator.run(
+                    GenerationRequest(
+                        media_type="image",
+                        prompt="Mina on the rooftop",
+                        model_id=model_id,
+                        references=[
+                            ReferenceImageInput(
+                                asset_id="asset_char_1", role="character", strength=0.0
+                            ),
+                            ReferenceImageInput(
+                                asset_id="asset_loc_1", role="location", strength=0.8
+                            ),
+                        ],
+                        params={"steps": 10, "width": 64, "height": 64},
+                    )
+                )
+                runtime = service.get_runtime(model_id, "image", "text-to-image")
+                img2img_pipeline = runtime["img2img_pipeline"]
+
+            self.assertEqual(result.status, "succeeded")
+            self.assertEqual(len(img2img_pipeline.calls), 1)
+            self.assertTrue(result.metadata["reference_conditioning_applied"])
+            self.assertEqual(result.metadata["reference_applied_asset_id"], "asset_loc_1")
+            # Both requested references are still reported for audit (requested=2),
+            # even though only the effective, non-zero-strength one was applied.
+            self.assertEqual(len(result.metadata["considered_references"]), 2)
+            considered_asset_ids = {
+                reference["asset_id"]
+                for reference in result.metadata["considered_references"]
+            }
+            self.assertEqual(considered_asset_ids, {"asset_char_1", "asset_loc_1"})
+
     def test_image_generator_rejects_combined_top_level_and_bible_references(
         self,
     ) -> None:

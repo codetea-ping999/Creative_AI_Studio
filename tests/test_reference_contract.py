@@ -401,6 +401,33 @@ class UnsupportedReferenceRequestApiTests(unittest.TestCase):
         self.assertIn("exactly one reference image", response.text)
         self.assertEqual(self.services.job_repository.list(), [])
 
+    def test_post_generate_image_accepts_a_zero_strength_reference_alongside_an_effective_one(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, Option A): a strength=0 reference
+        # requests no conditioning at all and must not count against
+        # create_job()'s "exactly one reference total" preflight above --
+        # mirroring ImageGenerator._resolve_references_for_conditioning()'s
+        # own effective-vs-requested split. A character reference at
+        # strength=0 alongside a location reference at strength=0.8
+        # previously raised 422 here even though the generator can honor
+        # it (apply the one effective reference, treat the zero-strength
+        # one as unconditioned but still considered for audit).
+        client = self._client()
+        response = client.post(
+            "/generate/image",
+            json={
+                "prompt": "Mina on the rooftop",
+                "model_id": "sdxl",
+                "references": [
+                    {"asset_id": "char-1", "role": "character", "strength": 0.0},
+                    {"asset_id": "loc-1", "role": "location", "strength": 0.8},
+                ],
+            },
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(len(self.services.job_repository.list()), 1)
+
     def test_post_generate_image_deduplicates_repeated_bible_references(self) -> None:
         # Regression (#201 follow-up, tenth Codex round on PR #376, P2):
         # PromptComposer.compose() deduplicates resolved references by
