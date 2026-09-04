@@ -533,8 +533,13 @@ class ImageGenerator(BaseGenerator):
         number more than one -- whether >1 from a single source, or one from
         each source combined -- raises rather than silently applying only
         the first and reporting every one of them as honored. A zero-strength
-        reference requests no conditioning at all (see the effective-vs-
-        requested split below), so it never occupies that one-image slot.
+        reference (strength=0 means "no effect" in the public contract)
+        never occupies that one-image slot and is never selected as the
+        primary conditioning reference, since it never reaches img2img
+        either way (#201 follow-up, confirmed product decision on Codex's
+        fourteenth review round on PR #376) -- it is still validated above
+        and still reported in the returned list for audit/provenance
+        metadata (see the effective-vs-requested split below).
 
         `project_id` re-checks the same project-membership invariant
         `JobService.create_job()` already enforced at job-creation time
@@ -592,13 +597,12 @@ class ImageGenerator(BaseGenerator):
                 "img2img in reference_capability.supported_modes, which is "
                 "the only conditioning mode this path implements."
             )
-        # #201 follow-up (Option A): a zero-strength reference requests no
-        # conditioning (ReferenceImageInput's own contract) and must not
-        # occupy this path's one-image slot. The limit and primary selection
-        # below apply to the *effective* (strength > 0) subset; `references`
-        # -- every reference actually requested, zero-strength ones included
-        # -- is still returned unchanged so job metadata/audit reports every
-        # reference that was considered, not just the one applied.
+        # #201 follow-up (Codex P2, fourteenth round, confirmed product
+        # decision): strength=0 means "no effect", so a zero-strength
+        # reference must not consume the single applied-image slot below or
+        # be selected as `primary` -- it is excluded from the count and
+        # selection here, but stays in `references` (returned unfiltered)
+        # so it is still reported in `considered_references` metadata.
         effective_references = [
             reference for reference in references if reference.strength > 0.0
         ]
@@ -609,7 +613,8 @@ class ImageGenerator(BaseGenerator):
             # strength=1.0 (the value zero would otherwise invert to) is not
             # guaranteed to reproduce what a plain text2img call would have
             # produced. Every requested reference here is zero-strength (or
-            # there were none), so generation stays unconditioned.
+            # there were none), so generation stays unconditioned, with no
+            # primary asset to resolve or apply.
             return None, None, None, references
         if len(effective_references) > 1:
             raise UnsupportedImageParameterError(
@@ -671,6 +676,15 @@ class ImageGenerator(BaseGenerator):
                 f"{project_id or 'no project'!r}; a reference must belong "
                 "to the same project as the job it conditions."
             )
+        # `primary` is drawn from `effective_references` above, so it is
+        # always strength > 0 here -- the strength=0 case (and img2img's own
+        # VAE-encode/seeded-generator side effects that make even diffusers
+        # strength=1.0 an unsafe stand-in for "unconditioned") is handled
+        # above, before any asset is resolved. `primary.asset_id` is
+        # returned explicitly rather than left for the caller to infer as
+        # `considered_references[0]` -- a zero-strength reference can
+        # legitimately be requested first while a later, effective one is
+        # what actually gets applied.
         return asset.path, primary.strength, primary.asset_id, references
 
     def _pipeline_accepts_reference_image(self, pipeline: object) -> bool:

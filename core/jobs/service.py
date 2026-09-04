@@ -289,13 +289,14 @@ class JobService:
                 continue
             seen_combined_references.add(combined_dedupe_key)
             combined_references.append(reference)
-        # #201 follow-up (Option A): a strength=0 reference requests no
-        # conditioning at all (ReferenceImageInput's own contract), so it
-        # must not count against the one-image limit this preflights --
-        # mirrors ImageGenerator._resolve_references_for_conditioning()'s own
-        # effective-vs-requested split, or a combination the generator can
-        # now honor (e.g. one zero-strength reference alongside one at
-        # strength > 0) would still be rejected here before ever reaching it.
+        # #201 follow-up (Codex P2, fourteenth round, confirmed product
+        # decision): strength=0 means "no effect" -- ImageGenerator._resolve_
+        # references_for_conditioning() excludes a zero-strength reference
+        # from its "exactly one reference" limit and primary selection,
+        # since it never reaches img2img either way. Preflighting the raw
+        # (unfiltered) combined count here rejected a request the generator
+        # could actually honor; only non-zero-strength references consume
+        # the single applied-image slot.
         effective_combined_references = [
             reference for reference in combined_references if reference.strength > 0.0
         ]

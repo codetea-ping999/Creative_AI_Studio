@@ -404,15 +404,16 @@ class UnsupportedReferenceRequestApiTests(unittest.TestCase):
     def test_post_generate_image_accepts_a_zero_strength_reference_alongside_an_effective_one(
         self,
     ) -> None:
-        # Regression (#201 follow-up, Option A): a strength=0 reference
-        # requests no conditioning at all and must not count against
-        # create_job()'s "exactly one reference total" preflight above --
-        # mirroring ImageGenerator._resolve_references_for_conditioning()'s
-        # own effective-vs-requested split. A character reference at
-        # strength=0 alongside a location reference at strength=0.8
-        # previously raised 422 here even though the generator can honor
-        # it (apply the one effective reference, treat the zero-strength
-        # one as unconditioned but still considered for audit).
+        # Regression (#201 follow-up, Option A, confirmed product decision):
+        # a strength=0 reference requests no conditioning at all and must
+        # not count against create_job()'s "exactly one reference total"
+        # preflight above -- mirroring ImageGenerator._resolve_references_
+        # for_conditioning()'s own effective-vs-requested split. A character
+        # reference at strength=0 alongside a location reference at
+        # strength=0.8 previously raised 422 here even though the generator
+        # can honor it (apply the one effective reference, treat the
+        # zero-strength one as unconditioned but still considered for
+        # audit): requested=2, effective=1, applied=1.
         client = self._client()
         response = client.post(
             "/generate/image",
