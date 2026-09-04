@@ -13,6 +13,7 @@ from apps.api.routes.generate import resolve_timeline_assets
 from apps.api.routes.jobs import CreateJobResponse
 from bootstrap import ApplicationServices
 from core.jobs import JobRecord
+from core.reference_capabilities import MissingReferenceAssetError, UnsupportedReferenceError
 from core.schemas import GenerationRequest
 from core.story import (
     DEFAULT_CONTEXT_CHARACTER_BUDGET,
@@ -908,9 +909,14 @@ def generate_scene_media(
     scene = _find_scene(story, scene_id)
     generation_request = _scene_generation_request(story, scene, request)
 
-    job = services.job_service.create_job(
-        generation_request, project_id=story.project_id
-    )
+    try:
+        job = services.job_service.create_job(
+            generation_request, project_id=story.project_id
+        )
+    except (UnsupportedReferenceError, MissingReferenceAssetError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
     if story.project_id is not None:
         services.project_repository.add_job(story.project_id, job.id)
     return CreateJobResponse(job_id=job.id, status=job.status)

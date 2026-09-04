@@ -15,6 +15,7 @@ from core.batches import (
     build_batch_template,
     list_batch_templates,
 )
+from core.reference_capabilities import MissingReferenceAssetError, UnsupportedReferenceError
 
 router = APIRouter(prefix="/batches", tags=["batches"])
 
@@ -141,6 +142,10 @@ def create_batch(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
         ) from exc
+    except (UnsupportedReferenceError, MissingReferenceAssetError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
 
     if spec.project_id is not None:
         for item in record.items:
@@ -173,7 +178,12 @@ def advance_batch(
     batch_id: str,
     services: ApplicationServices = Depends(get_services),
 ) -> BatchResponse:
-    record = services.batch_service.advance(batch_id)
+    try:
+        record = services.batch_service.advance(batch_id)
+    except (UnsupportedReferenceError, MissingReferenceAssetError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
     if record is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Batch not found"
