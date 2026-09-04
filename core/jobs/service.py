@@ -14,6 +14,7 @@ from core.reference_capabilities import (
     MissingReferenceAssetError,
     ReferenceImageInput,
     ReferenceRole,
+    UnsupportedReferenceError,
     validate_reference_inputs,
 )
 from core.schemas import GenerationRequest, GenerationResult, GenerationStatus
@@ -102,6 +103,45 @@ class JobService:
         request: GenerationRequest,
         project_id: str | None = None,
     ) -> JobRecord:
+        self.validate_references(request, project_id)
+        now = datetime.now(timezone.utc)
+        job = JobRecord(
+            id=f"job_{uuid4().hex}",
+            project_id=project_id,
+            media_type=request.media_type,
+            status=JOB_STATUS_QUEUED,
+            request=request,
+            progress=0.0,
+            created_at=now,
+            updated_at=now,
+        )
+        created_job = self.job_repository.create(job)
+        self._publish(
+            "job_created",
+            {
+                "job_id": created_job.id,
+                "status": created_job.status,
+                "media_type": created_job.media_type,
+            },
+        )
+        self.enqueue_job(created_job.id)
+        return created_job
+
+    def validate_references(
+        self,
+        request: GenerationRequest,
+        project_id: str | None = None,
+    ) -> None:
+        """Raise if `request`'s references can't be honored by `create_job()`.
+
+        Split out from `create_job()` (#201 follow-up, tenth Codex round on
+        PR #376) so `BatchService` can preflight every expanded item's
+        request *before* creating the batch record or any of its jobs --
+        otherwise a later item's reference failure surfaces after earlier
+        items already queued jobs, leaving orphaned state behind a 4xx
+        response that told the caller nothing was created.
+        """
+
         # #198/#50: a request carrying reference images must fail here, before a
         # job is ever persisted or queued, if the resolved model can't honor
         # them -- not silently once a generator that ignores `references`
@@ -131,6 +171,7 @@ class JobService:
                 self._reject_cross_project_reference_asset(
                     self.asset_repository, reference.asset_id, project_id
                 )
+        bible_reference_inputs: list[ReferenceImageInput] = []
         if (
             request.media_type == "image"
             and self.asset_repository is not None
@@ -157,26 +198,34 @@ class JobService:
             # be rejected for a risk that generator can never act on.
             bible_refs = request.params.get("bible_refs")
             if isinstance(bible_refs, list):
-                bible_reference_inputs: list[ReferenceImageInput] = []
+                seen_bible_references: set[tuple[str, str]] = set()
                 for entry_id in bible_refs:
                     if not isinstance(entry_id, str):
                         continue
                     entry = self.bible_repository.get(entry_id)
                     if entry is None or entry.kind not in REFERENCE_ROLES:
                         continue
+                    role = cast(ReferenceRole, entry.kind)
                     for asset_id in entry.reference_asset_ids:
                         self._reject_cross_project_reference_asset(
                             self.asset_repository, asset_id, project_id
                         )
-                        # Mirrors PromptComposer.compose()'s own construction
-                        # (core/prompting/composer.py) so this validates
-                        # exactly the reference inputs the generator will
-                        # later resolve -- same role/strength, so this
-                        # can't disagree with execution-time behavior.
+                        # Mirrors PromptComposer.compose()'s own dedup+
+                        # construction (core/prompting/composer.py's
+                        # seen_resolved_references) so this validates exactly
+                        # the reference inputs the generator will later
+                        # resolve: two Bible entries naming the same
+                        # (asset, role) collapse to one reference there, so
+                        # counting each occurrence here would reject a
+                        # request the generator can actually honor.
+                        dedupe_key = (asset_id, role)
+                        if dedupe_key in seen_bible_references:
+                            continue
+                        seen_bible_references.add(dedupe_key)
                         bible_reference_inputs.append(
                             ReferenceImageInput(
                                 asset_id=asset_id,
-                                role=cast(ReferenceRole, entry.kind),
+                                role=role,
                                 strength=DEFAULT_REFERENCE_STRENGTH,
                             )
                         )
@@ -197,28 +246,28 @@ class JobService:
                         capability=manifest.reference_capability,
                         model_id=request.model_id or manifest.public_model_id,
                     )
-        now = datetime.now(timezone.utc)
-        job = JobRecord(
-            id=f"job_{uuid4().hex}",
-            project_id=project_id,
-            media_type=request.media_type,
-            status=JOB_STATUS_QUEUED,
-            request=request,
-            progress=0.0,
-            created_at=now,
-            updated_at=now,
-        )
-        created_job = self.job_repository.create(job)
-        self._publish(
-            "job_created",
-            {
-                "job_id": created_job.id,
-                "status": created_job.status,
-                "media_type": created_job.media_type,
-            },
-        )
-        self.enqueue_job(created_job.id)
-        return created_job
+        # #201 follow-up (Codex P2, tenth round): per-role capability
+        # validation (above, for both request.references and Bible-derived
+        # references) allows e.g. one character *and* one location reference
+        # -- each within its own per-role limit -- but
+        # ImageGenerator._resolve_references_for_conditioning() separately
+        # enforces a hard "exactly one reference total" limit across
+        # request.references and Bible-derived references combined,
+        # regardless of role, because this conditioning path only ever
+        # performs a single img2img call. Preflight that same total here
+        # (unconditionally, not nested under the Bible-specific gates above,
+        # so a plain request.references request with more than one entry is
+        # also caught) so a combination that is deterministically doomed at
+        # execution time fails now, synchronously, instead of after the job
+        # is queued.
+        total_reference_count = len(request.references or []) + len(bible_reference_inputs)
+        if total_reference_count > 1:
+            raise UnsupportedReferenceError(
+                f"Model {request.model_id!r}: reference-image conditioning "
+                "honors exactly one reference image per request (across "
+                "`references` and Bible-derived character/location entries "
+                f"combined); got {total_reference_count}."
+            )
 
     def _reject_cross_project_reference_asset(
         self,

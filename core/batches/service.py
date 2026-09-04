@@ -108,6 +108,20 @@ class BatchService:
             stage_index=0,
             id_prefix=f"{batch_id}_item",
         )
+        # #201 follow-up (Codex P2, tenth round): preflight every item's
+        # references before anything is persisted. _enqueue_stage() below
+        # calls JobService.create_job() (which re-validates references
+        # itself) one item at a time -- if an early item's job was already
+        # created and enqueued by the time a later item's reference turns
+        # out invalid, the raised exception still aborts this call with a
+        # 4xx, but the earlier item's job (and this batch's own record) were
+        # already persisted: an invisible queued job the client was never
+        # told about, and a batch id it never received either. Validating
+        # every item up front keeps a reference failure atomic with "nothing
+        # was created," matching the oversized-sweep check expand_items()
+        # already enforces before any of this runs.
+        for item in items:
+            self.job_service.validate_references(item.request, effective_spec.project_id)
 
         now = utc_now()
         record = BatchRecord(
@@ -215,6 +229,15 @@ class BatchService:
             seed_items=winners,
             id_prefix=f"{record.id}_item",
         )
+        # #201 follow-up (Codex P2, tenth round): same preflight as
+        # create_batch() above, for the same reason -- this stage's items
+        # are about to be persisted onto the batch record and enqueued one
+        # at a time, so a later item's reference failure must not leave an
+        # earlier one already queued behind an exception the caller has no
+        # way to partially undo.
+        for new_item in new_items:
+            self.job_service.validate_references(new_item.request, record.spec.project_id)
+
         # Carry each winner's label forward so the refined output is traceable to
         # the probe that earned it. Match on axis values rather than position:
         # expand_items sorts by model_id to protect the runtime cache, so a spec

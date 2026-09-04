@@ -355,6 +355,92 @@ class UnsupportedReferenceRequestApiTests(unittest.TestCase):
         self.assertIn("reference-image conditioning", response.text)
         self.assertEqual(self.services.job_repository.list(), [])
 
+    def test_post_generate_image_rejects_bible_refs_resolving_to_two_roles(self) -> None:
+        # Regression (#201 follow-up, tenth Codex round on PR #376, P2):
+        # manifest-capability validation only checks per-role limits, so one
+        # character reference plus one location reference each pass their
+        # own max_references_per_role=1 -- but
+        # ImageGenerator._resolve_references_for_conditioning() enforces a
+        # separate, hard "exactly one reference total" limit across every
+        # source combined, because this conditioning path only ever
+        # performs a single img2img call. A job carrying both would
+        # previously queue successfully and only fail later, at generation
+        # time.
+        from core.assets import Asset
+
+        client = self._client()
+        for asset_id in ("bible_role_char", "bible_role_loc"):
+            self.services.asset_repository.create_or_update(
+                Asset(
+                    id=asset_id,
+                    job_id="job_fixture",
+                    project_id=None,
+                    media_type="image",
+                    kind="output",
+                    title="reference fixture",
+                    prompt="a reference image",
+                    model_id="sdxl",
+                    path="/tmp/does-not-need-to-exist.png",
+                )
+            )
+        character = self.services.bible_repository.create(
+            kind="character", name="Mina", reference_asset_ids=["bible_role_char"]
+        )
+        location = self.services.bible_repository.create(
+            kind="location", name="Rooftop", reference_asset_ids=["bible_role_loc"]
+        )
+        response = client.post(
+            "/generate/image",
+            json={
+                "prompt": "Mina on the rooftop",
+                "model_id": "sdxl",
+                "params": {"bible_refs": [character.id, location.id]},
+            },
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertIn("exactly one reference image", response.text)
+        self.assertEqual(self.services.job_repository.list(), [])
+
+    def test_post_generate_image_deduplicates_repeated_bible_references(self) -> None:
+        # Regression (#201 follow-up, tenth Codex round on PR #376, P2):
+        # PromptComposer.compose() deduplicates resolved references by
+        # (asset_id, role) before generation, so two Bible entries naming
+        # the same reference asset under the same role collapse to one
+        # reference there. Counting each occurrence here instead would
+        # reject a request the generator can actually honor.
+        from core.assets import Asset
+
+        client = self._client()
+        self.services.asset_repository.create_or_update(
+            Asset(
+                id="bible_dedup_ref",
+                job_id="job_fixture",
+                project_id=None,
+                media_type="image",
+                kind="output",
+                title="reference fixture",
+                prompt="a reference image",
+                model_id="sdxl",
+                path="/tmp/does-not-need-to-exist.png",
+            )
+        )
+        first_entry = self.services.bible_repository.create(
+            kind="character", name="Mina", reference_asset_ids=["bible_dedup_ref"]
+        )
+        second_entry = self.services.bible_repository.create(
+            kind="character", name="Mina (alt)", reference_asset_ids=["bible_dedup_ref"]
+        )
+        response = client.post(
+            "/generate/image",
+            json={
+                "prompt": "a knight",
+                "model_id": "sdxl",
+                "params": {"bible_refs": [first_entry.id, second_entry.id]},
+            },
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(len(self.services.job_repository.list()), 1)
+
     def test_post_jobs_accepts_a_request_with_no_references(self) -> None:
         client = self._client()
         response = client.post(
@@ -659,6 +745,69 @@ class UnsupportedReferenceRequestApiTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 422, response.text)
         self.assertIn("batch_cross_project_ref", response.text)
+
+    def test_post_batches_creates_nothing_when_a_later_items_reference_is_invalid(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, tenth Codex round on PR #376, P2):
+        # BatchService._enqueue_stage() used to call JobService.create_job()
+        # one item at a time -- every expanded item shares the same
+        # bible_refs, so with N items all sharing one bad reference, the
+        # batch record itself (created via batch_repository.create() before
+        # _enqueue_stage ever runs) was still persisted even though the
+        # first item's create_job() call raised immediately and zero jobs
+        # were ever created: an orphaned, empty batch behind a 422 that told
+        # the client nothing was created. BatchService now preflights every
+        # item's references before creating the batch record at all, so a
+        # failure here must leave no batch and no job behind.
+        from core.assets import Asset
+
+        client = self._client()
+        project_a = self.services.project_repository.create("Project A")
+        project_b = self.services.project_repository.create("Project B")
+        self.services.asset_repository.create_or_update(
+            Asset(
+                id="batch_atomic_cross_project_ref",
+                job_id="job_fixture",
+                project_id=project_a.id,
+                media_type="image",
+                kind="output",
+                title="reference fixture",
+                prompt="a reference image",
+                model_id="sdxl",
+                path="/tmp/does-not-need-to-exist.png",
+            )
+        )
+        entry = self.services.bible_repository.create(
+            kind="character",
+            name="Mina",
+            reference_asset_ids=["batch_atomic_cross_project_ref"],
+        )
+        response = client.post(
+            "/batches",
+            json={
+                "spec": {
+                    "name": "atomic cross-project batch",
+                    "media_type": "image",
+                    "model_id": "sdxl",
+                    "project_id": project_b.id,
+                    "prompt": "a knight",
+                    "bible_refs": [entry.id],
+                    "axes": [
+                        {
+                            "name": "style",
+                            "values": [
+                                {"label": "a", "patch": {}},
+                                {"label": "b", "patch": {}},
+                            ],
+                        }
+                    ],
+                }
+            },
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertEqual(self.services.batch_repository.list_all(), [])
+        self.assertEqual(self.services.job_repository.list(), [])
 
 
 if __name__ == "__main__":  # pragma: no cover
