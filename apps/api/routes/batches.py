@@ -136,15 +136,19 @@ def create_batch(
 
     try:
         record = services.batch_service.create_batch(spec)
+    except (UnsupportedReferenceError, MissingReferenceAssetError) as exc:
+        # Both subclass ValueError, so this must come before the plain
+        # `except ValueError` below -- Python matches except clauses in
+        # order, and the broader clause would otherwise catch these first,
+        # making this one unreachable and reporting 400 instead of 422.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
     except ValueError as exc:
         # Expansion refusing an oversized sweep is a client error, and the message
         # already names the count and the cap.
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
-        ) from exc
-    except (UnsupportedReferenceError, MissingReferenceAssetError) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
         ) from exc
 
     if spec.project_id is not None:
