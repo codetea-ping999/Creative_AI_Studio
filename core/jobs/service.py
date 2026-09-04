@@ -25,6 +25,7 @@ from .lanes import LaneConfig, assign_lane
 if TYPE_CHECKING:
     from core.assets import AssetRepository
     from core.bible import BibleRepository
+    from core.models.manifest import ModelManifest
     from core.storage.repositories.job_repository import JobRepository
     from .cancellation import CancellationRegistry
     from .queue import JobQueue
@@ -157,6 +158,7 @@ class JobService:
                 capability=manifest.reference_capability,
                 model_id=request.model_id or manifest.public_model_id,
             )
+            self._require_img2img_mode(manifest, request.model_id)
         if request.references and self.asset_repository is not None:
             # #201 follow-up (Codex P1 on PR #376): a reference asset from a
             # different project must not silently condition a job in this
@@ -246,6 +248,7 @@ class JobService:
                         capability=manifest.reference_capability,
                         model_id=request.model_id or manifest.public_model_id,
                     )
+                    self._require_img2img_mode(manifest, request.model_id)
         # #201 follow-up (Codex P2, tenth round): per-role capability
         # validation (above, for both request.references and Bible-derived
         # references) allows e.g. one character *and* one location reference
@@ -260,13 +263,60 @@ class JobService:
         # also caught) so a combination that is deterministically doomed at
         # execution time fails now, synchronously, instead of after the job
         # is queued.
-        total_reference_count = len(request.references or []) + len(bible_reference_inputs)
-        if total_reference_count > 1:
+        #
+        # #201 follow-up (Codex P2, eleventh round): request.references and
+        # Bible-derived references are independent sources -- a caller can
+        # supply the same (asset, role, strength, preprocessing) explicitly
+        # and also have it resolve through a Bible entry, which is one
+        # semantic lock, not two. ImageGenerator._resolve_references_for_conditioning()
+        # dedupes the same way across the same two sources, so the count
+        # here must match or a request the generator can honor would be
+        # rejected before it ever reaches the generator.
+        seen_combined_references: set[tuple[str, str, float, str]] = set()
+        combined_reference_count = 0
+        for reference in list(request.references or []) + bible_reference_inputs:
+            dedupe_key = (
+                reference.asset_id,
+                reference.role,
+                reference.strength,
+                reference.preprocessing,
+            )
+            if dedupe_key in seen_combined_references:
+                continue
+            seen_combined_references.add(dedupe_key)
+            combined_reference_count += 1
+        if combined_reference_count > 1:
             raise UnsupportedReferenceError(
                 f"Model {request.model_id!r}: reference-image conditioning "
                 "honors exactly one reference image per request (across "
                 "`references` and Bible-derived character/location entries "
-                f"combined); got {total_reference_count}."
+                f"combined); got {combined_reference_count}."
+            )
+
+    def _require_img2img_mode(
+        self,
+        manifest: "ModelManifest",
+        model_id: str,
+    ) -> None:
+        """Raise unless `manifest` advertises img2img reference conditioning.
+
+        `validate_reference_inputs()` only checks that *some* mode is
+        declared (via `capability.enabled`) plus role/strength/preprocessing/
+        count -- it does not require "img2img" specifically. The only
+        reference-conditioning path this codebase implements
+        (`ImageGenerator._resolve_references_for_conditioning()`) only ever
+        performs an img2img-style call, so a manifest advertising e.g. only
+        `ip_adapter` must not pass creation-time validation only to be
+        deterministically rejected once the job executes (#201 follow-up,
+        eleventh Codex round on PR #376).
+        """
+
+        capability = manifest.reference_capability
+        if capability is None or "img2img" not in capability.supported_modes:
+            raise UnsupportedReferenceError(
+                f"Model {model_id or manifest.public_model_id!r} does not "
+                "advertise img2img in reference_capability.supported_modes, "
+                "which is the only conditioning mode this path implements."
             )
 
     def _reject_cross_project_reference_asset(

@@ -536,9 +536,29 @@ class ImageGenerator(BaseGenerator):
         which upstream check (if any) already ran.
         """
 
-        references = list(request.references or []) + list(
+        # #201 follow-up (Codex P2, eleventh round): request.references and
+        # resolved_prompt.resolved_references are independent sources -- a
+        # caller can supply the same (asset, role, strength, preprocessing)
+        # explicitly and also have it resolve through a Bible entry. That is
+        # one semantic lock, not two; counting it twice below would reject a
+        # request this path can actually honor. Bible-internal duplicates are
+        # already collapsed by PromptComposer.compose(), so only the
+        # cross-source case needs handling here.
+        seen_references: set[tuple[str, str, float, str]] = set()
+        references: list["ReferenceImageInput"] = []
+        for reference in list(request.references or []) + list(
             resolved_prompt.resolved_references
-        )
+        ):
+            dedupe_key = (
+                reference.asset_id,
+                reference.role,
+                reference.strength,
+                reference.preprocessing,
+            )
+            if dedupe_key in seen_references:
+                continue
+            seen_references.add(dedupe_key)
+            references.append(reference)
         if not references:
             return None, None, []
 

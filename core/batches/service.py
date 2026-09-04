@@ -15,6 +15,7 @@ from core.jobs.statuses import (
     TERMINAL_JOB_STATUSES,
     is_terminal_status,
 )
+from core.reference_capabilities import MissingReferenceAssetError, UnsupportedReferenceError
 from core.storage.json_files import utc_now
 
 from .expansion import expand_items
@@ -304,7 +305,28 @@ class BatchService:
                 return
             with self._lock:
                 refreshed = self._recompute_and_save(record)
-                self._advance_locked(refreshed)
+                try:
+                    self._advance_locked(refreshed)
+                except (UnsupportedReferenceError, MissingReferenceAssetError) as exc:
+                    # #201 follow-up (Codex P2, eleventh round): the
+                    # stage-advance reference preflight (added this same
+                    # round, in _advance_locked) can raise here, on the job
+                    # runner thread with no HTTP caller to hand a 4xx to.
+                    # Left to the broad except below, that was logged and
+                    # swallowed, leaving the batch stuck in "running"
+                    # forever: its current stage's items all terminal, but
+                    # the next stage never created and no further job event
+                    # will ever retrigger this path. Persist it as failed
+                    # instead so the batch reaches an observable terminal
+                    # state.
+                    refreshed.status = BATCH_STATUS_FAILED
+                    self.batch_repository.save(refreshed)
+                    logger.warning(
+                        "Batch %s failed to advance past stage %d: %s",
+                        refreshed.id,
+                        refreshed.stage_index,
+                        exc,
+                    )
         except Exception:  # pragma: no cover - never break the runner
             logger.exception("Failed to update batch state for job %s.", job_id)
 
