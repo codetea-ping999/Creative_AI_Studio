@@ -542,8 +542,13 @@ class ImageGenerator(BaseGenerator):
         never occupies that one-image slot and is never selected as the
         primary conditioning reference, since it never reaches img2img
         either way (#201 follow-up, confirmed product decision on Codex's
-        fourteenth review round on PR #376) -- it is still validated above
-        and still reported in the returned list for audit/provenance
+        fourteenth review round on PR #376) -- nor does it require
+        `manifest.reference_capability` to support its role/mode at all
+        (#387 hotfix): only the effective references are validated below,
+        so an all-zero-strength request against a non-capable manifest, or a
+        zero-strength reference sharing a role with an effective one, is not
+        rejected for a capability requirement that doesn't apply to it. It
+        is still reported in the returned list for audit/provenance
         metadata (see the effective-vs-requested split below).
 
         `project_id` re-checks the same project-membership invariant
@@ -584,8 +589,36 @@ class ImageGenerator(BaseGenerator):
         if not references:
             return None, None, None, []
 
+        # #387 hotfix (P1): strength=0 means "no effect" and must not require
+        # reference_capability at all -- a zero-strength reference never
+        # reaches img2img regardless of whether the model advertises its
+        # role/mode. Filtering to `effective_references` must happen BEFORE
+        # validate_reference_inputs() and the img2img-mode check below, not
+        # just before the "one reference total" limit further down, or two
+        # cases the generator can actually honor unconditioned were rejected
+        # for a capability requirement that doesn't apply to them: an
+        # all-zero-strength request against a manifest with no (or
+        # non-img2img) reference_capability, and a same-role zero+nonzero
+        # pair that validate_reference_inputs' raw per-role count rejected
+        # even though only the nonzero one needs that role's capacity.
+        effective_references = [
+            reference for reference in references if reference.strength > 0.0
+        ]
+        if not effective_references:
+            # ReferenceImageInput.strength=0 means "no effect" -- but img2img
+            # still VAE-encodes the reference and consumes the seeded
+            # generator's random draws to do it, so even diffusers
+            # strength=1.0 (the value zero would otherwise invert to) is not
+            # guaranteed to reproduce what a plain text2img call would have
+            # produced. Every requested reference here is zero-strength (or
+            # there were none), so generation stays unconditioned, with no
+            # primary asset to resolve or apply -- and no capability/mode
+            # requirement applies to a set of references none of which will
+            # ever reach img2img.
+            return None, None, None, references
+
         validate_reference_inputs(
-            references,
+            effective_references,
             capability=manifest.reference_capability,
             model_id=manifest.public_model_id,
         )
@@ -602,25 +635,6 @@ class ImageGenerator(BaseGenerator):
                 "img2img in reference_capability.supported_modes, which is "
                 "the only conditioning mode this path implements."
             )
-        # #201 follow-up (Codex P2, fourteenth round, confirmed product
-        # decision): strength=0 means "no effect", so a zero-strength
-        # reference must not consume the single applied-image slot below or
-        # be selected as `primary` -- it is excluded from the count and
-        # selection here, but stays in `references` (returned unfiltered)
-        # so it is still reported in `considered_references` metadata.
-        effective_references = [
-            reference for reference in references if reference.strength > 0.0
-        ]
-        if not effective_references:
-            # ReferenceImageInput.strength=0 means "no effect" -- but img2img
-            # still VAE-encodes the reference and consumes the seeded
-            # generator's random draws to do it, so even diffusers
-            # strength=1.0 (the value zero would otherwise invert to) is not
-            # guaranteed to reproduce what a plain text2img call would have
-            # produced. Every requested reference here is zero-strength (or
-            # there were none), so generation stays unconditioned, with no
-            # primary asset to resolve or apply.
-            return None, None, None, references
         if len(effective_references) > 1:
             raise UnsupportedImageParameterError(
                 f"Model {manifest.public_model_id!r} was asked to honor "

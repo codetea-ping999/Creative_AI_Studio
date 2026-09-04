@@ -429,6 +429,57 @@ class UnsupportedReferenceRequestApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 201, response.text)
         self.assertEqual(len(self.services.job_repository.list()), 1)
 
+    def test_post_generate_image_accepts_a_same_role_zero_strength_alongside_a_nonzero_reference(
+        self,
+    ) -> None:
+        # Regression (#387 hotfix, P1): the sibling test above covers two
+        # *different* roles (character/location); validate_reference_inputs()'s
+        # own per-role count is a separate check that still ran against the
+        # raw (unfiltered) list before this hotfix, so two references in the
+        # *same* role ("sdxl" advertises max_references_per_role=1), one
+        # zero-strength and one not, still raised 422 ("supports at most 1
+        # 'character' reference(s) per request; got 2") even though only the
+        # nonzero one has any conditioning effect.
+        client = self._client()
+        response = client.post(
+            "/generate/image",
+            json={
+                "prompt": "Mina on the rooftop",
+                "model_id": "sdxl",
+                "references": [
+                    {"asset_id": "char-1", "role": "character", "strength": 0.0},
+                    {"asset_id": "char-2", "role": "character", "strength": 0.7},
+                ],
+            },
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(len(self.services.job_repository.list()), 1)
+
+    def test_post_generate_image_accepts_an_all_zero_strength_reference_without_capability(
+        self,
+    ) -> None:
+        # Regression (#387 hotfix, P1): strength=0 means "no effect" and
+        # must not require reference_capability at all -- a request whose
+        # only reference is zero-strength has no conditioning effect
+        # regardless of whether the chosen model advertises reference
+        # support, so it must not be rejected for a capability requirement
+        # that doesn't apply to it. "ssd-1b" is the shipped manifest with no
+        # reference_capability at all (see the sibling *rejection* test
+        # above using a nonzero strength).
+        client = self._client()
+        response = client.post(
+            "/generate/image",
+            json={
+                "prompt": "a knight",
+                "model_id": "ssd-1b",
+                "references": [
+                    {"asset_id": "char-1", "role": "character", "strength": 0.0}
+                ],
+            },
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(len(self.services.job_repository.list()), 1)
+
     def test_post_generate_image_deduplicates_repeated_bible_references(self) -> None:
         # Regression (#201 follow-up, tenth Codex round on PR #376, P2):
         # PromptComposer.compose() deduplicates resolved references by

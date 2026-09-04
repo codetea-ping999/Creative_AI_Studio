@@ -1804,6 +1804,125 @@ class ModelSystemTests(unittest.TestCase):
             }
             self.assertEqual(considered_asset_ids, {"asset_char_1", "asset_location_1"})
 
+    def test_image_generator_excludes_a_same_role_zero_strength_reference_from_the_per_role_limit(
+        self,
+    ) -> None:
+        # Regression (#387 hotfix, P1): the #376 Option A fix only excluded
+        # a zero-strength reference from the *combined-total* "exactly one
+        # reference" limit -- but validate_reference_inputs()'s own per-role
+        # count still ran against the raw (unfiltered) list beforehand, so
+        # two references in the *same* role (max_references_per_role=1),
+        # one zero-strength and one not, still raised
+        # UnsupportedReferenceError ("supports at most 1 'character'
+        # reference(s) per request; got 2") even though only the nonzero one
+        # has any conditioning effect. Unlike the sibling tests above (two
+        # *different* roles), this isolates the per-role count specifically.
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_root = root / "manifests"
+            model_id = self._write_reference_capable_manifest(manifest_root)
+            composer, _character_id = self._prepare_character_reference(root)
+            second_reference_path = root / "second_character_reference.png"
+            Image.new("RGB", (16, 16), color=(90, 60, 30)).save(second_reference_path)
+            composer.asset_repository.create_or_update(
+                Asset(
+                    id="asset_char_2",
+                    job_id="job_fixture",
+                    project_id=None,
+                    media_type="image",
+                    kind="output",
+                    title="second character reference fixture",
+                    prompt="a second character reference image",
+                    model_id="sdxl",
+                    path=str(second_reference_path),
+                )
+            )
+            output_dir = root / "outputs"
+
+            with patch(
+                "core.models.loader.DiffusersImageLoader.load",
+                new=_fake_diffusers_load_reference_capable,
+            ):
+                service = create_default_model_service(manifest_root=manifest_root)
+                generator = ImageGenerator(
+                    service, output_dir=output_dir, prompt_composer=composer
+                )
+                result = generator.run(
+                    GenerationRequest(
+                        media_type="image",
+                        prompt="Mina on the rooftop",
+                        model_id=model_id,
+                        references=[
+                            ReferenceImageInput(
+                                asset_id="asset_char_1", role="character", strength=0.0
+                            ),
+                            ReferenceImageInput(
+                                asset_id="asset_char_2", role="character", strength=0.7
+                            ),
+                        ],
+                        params={"steps": 10, "width": 64, "height": 64},
+                    )
+                )
+                runtime = service.get_runtime(model_id, "image", "text-to-image")
+                img2img_pipeline = runtime["img2img_pipeline"]
+
+            self.assertEqual(result.status, "succeeded")
+            self.assertEqual(len(img2img_pipeline.calls), 1)
+            self.assertTrue(result.metadata["reference_conditioning_applied"])
+            self.assertEqual(result.metadata["reference_applied_asset_id"], "asset_char_2")
+            considered_asset_ids = {
+                reference["asset_id"]
+                for reference in result.metadata["considered_references"]
+            }
+            self.assertEqual(considered_asset_ids, {"asset_char_1", "asset_char_2"})
+
+    def test_image_generator_treats_all_zero_strength_refs_as_unconditioned_without_capability(
+        self,
+    ) -> None:
+        # Regression (#387 hotfix, P1): strength=0 means "no effect" and
+        # must not require reference_capability at all -- validate_
+        # reference_inputs() (which raises when `capability is None`) still
+        # ran against the raw (unfiltered) list before this hotfix, so an
+        # all-zero-strength request.references raised UnsupportedReference
+        # Error even though nothing in it will ever reach img2img. "ssd-1b"
+        # is the real shipped manifest with no reference_capability at all
+        # (see test_image_generator_rejects_a_reference_when_the_manifest_
+        # lacks_capability's Bible-derived, nonzero-strength sibling case).
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            composer, _character_id = self._prepare_character_reference(root)
+            output_dir = root / "outputs"
+
+            with patch(
+                "core.models.loader.DiffusersImageLoader.load",
+                new=_fake_diffusers_load_reference_capable,
+            ):
+                service = create_default_model_service()  # real "ssd-1b": no reference_capability
+                generator = ImageGenerator(
+                    service, output_dir=output_dir, prompt_composer=composer
+                )
+                result = generator.run(
+                    GenerationRequest(
+                        media_type="image",
+                        prompt="Mina on the rooftop",
+                        model_id="ssd-1b",
+                        references=[
+                            ReferenceImageInput(
+                                asset_id="asset_char_1", role="character", strength=0.0
+                            )
+                        ],
+                        params={"steps": 1, "width": 64, "height": 64},
+                    )
+                )
+                runtime = service.get_runtime("ssd-1b", "image", "text-to-image")
+                text2img_pipeline = runtime["pipeline"]
+
+            self.assertEqual(result.status, "succeeded")
+            self.assertEqual(text2img_pipeline.steps_invoked, 1)
+            self.assertFalse(result.metadata["reference_conditioning_applied"])
+            self.assertIsNone(result.metadata["reference_applied_asset_id"])
+            self.assertEqual(len(result.metadata["considered_references"]), 1)
+
     def test_image_generator_rejects_a_reference_asset_outside_the_context_project(
         self,
     ) -> None:

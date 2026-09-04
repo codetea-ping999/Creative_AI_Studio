@@ -175,12 +175,31 @@ class JobService:
                         continue
                     seen_direct_references.add(direct_dedupe_key)
                     deduped_direct_references.append(reference)
-                validate_reference_inputs(
-                    deduped_direct_references,
-                    capability=manifest.reference_capability,
-                    model_id=request.model_id or manifest.public_model_id,
-                )
-                self._require_img2img_mode(manifest, request.model_id)
+                # #387 hotfix (P1): strength=0 means "no effect" and must not
+                # require reference_capability at all -- mirroring
+                # ImageGenerator._resolve_references_for_conditioning()'s own
+                # fix, this preflight must filter to non-zero-strength
+                # references BEFORE validate_reference_inputs()/
+                # _require_img2img_mode(), not only before the combined
+                # "exactly one reference" check further below. Otherwise an
+                # all-zero-strength request.references against a manifest
+                # with no (or non-img2img) reference_capability was rejected
+                # for a capability requirement that doesn't apply to it, and
+                # a same-role zero+nonzero pair tripped
+                # validate_reference_inputs' raw per-role count even though
+                # only the nonzero one needs that role's capacity.
+                effective_direct_references = [
+                    reference
+                    for reference in deduped_direct_references
+                    if reference.strength > 0.0
+                ]
+                if effective_direct_references:
+                    validate_reference_inputs(
+                        effective_direct_references,
+                        capability=manifest.reference_capability,
+                        model_id=request.model_id or manifest.public_model_id,
+                    )
+                    self._require_img2img_mode(manifest, request.model_id)
         if request.references and self.asset_repository is not None:
             # #201 follow-up (Codex P1 on PR #376): a reference asset from a
             # different project must not silently condition a job in this
