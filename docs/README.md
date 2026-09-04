@@ -81,6 +81,14 @@ Creative AI Studio のドキュメント案内です。
   — Hybrid Runtime (#350) の memory lifecycle 実験手順。measurement boundary、指標、
   シナリオ、記録形式を固定しています。実測は別 issue です。
 
+### Desktop 版を実装したい
+
+- [desktop/architecture-decision.md](./desktop/architecture-decision.md)
+  — Tauri 2、React/Vite 継続、Python/FastAPI 継続、常駐時の性能不変条件、
+  Live2D Companion、sidecar 境界を定義した Desktop ADR です。
+- [desktop/upstream-sources.md](./desktop/upstream-sources.md)
+  — Desktop 実装で Adopt / Adapt / Reference する OSS とライセンス、移植単位を記録します。
+
 ## 現在の理解ポイント
 
 このリポジトリで最初につまずきやすい点は次の 4 つです。
