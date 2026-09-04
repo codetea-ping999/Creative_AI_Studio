@@ -458,6 +458,61 @@ class SceneGenerationApiTests(unittest.TestCase):
             # a failed job leaves the scene unbound rather than half-bound.
             self.assertEqual(scene["asset_ids"], {})
 
+    def test_scene_visual_reports_422_not_500_for_a_cross_project_bible_reference(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, ninth Codex round on PR #376, P2): a
+        # visual scene's bible_refs are carried into params by
+        # _scene_generation_request() unchanged, so a scene whose bound
+        # Bible entry's reference_asset_ids resolve to an image outside the
+        # story's own project surfaces the project-boundary rejection
+        # JobService.create_job() now raises -- but this route never caught
+        # it, so it fell through as an unhandled 500 instead of 422, exactly
+        # like the /jobs/{id}/rerun and gallery reuse gaps from earlier
+        # rounds.
+        from core.assets import Asset
+
+        story_project_id = self.client.post(
+            "/projects", json={"name": "Story Project"}
+        ).json()["id"]
+        other_project_id = self.client.post(
+            "/projects", json={"name": "Other Project"}
+        ).json()["id"]
+        self.services.asset_repository.create_or_update(
+            Asset(
+                id="scene_cross_project_ref",
+                job_id="job_fixture",
+                project_id=other_project_id,
+                media_type="image",
+                kind="output",
+                title="reference fixture",
+                prompt="a reference image",
+                model_id="sdxl",
+                path="/tmp/does-not-need-to-exist.png",
+            )
+        )
+        entry = self.services.bible_repository.create(
+            kind="character",
+            name="Mina",
+            reference_asset_ids=["scene_cross_project_ref"],
+        )
+
+        story_id = self.client.post(
+            "/stories",
+            json={"title": "Rewind", "premise": "p", "project_id": story_project_id},
+        ).json()["id"]
+        story = self.services.story_repository.get(story_id)
+        story = apply_text_result(story, "scene_list", _SCENES)
+        story.scenes[0].bible_refs = [entry.id]
+        self.services.story_repository.save(story)
+
+        response = self.client.post(
+            f"/stories/{story_id}/scenes/scene_01/generate",
+            json={"role": "visual", "model_id": "sdxl"},
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertIn("scene_cross_project_ref", response.text)
+
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"missing dependency: {IMPORT_ERROR}")
 class SceneAssetStatusApiTests(unittest.TestCase):

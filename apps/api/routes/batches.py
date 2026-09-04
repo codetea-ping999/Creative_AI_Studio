@@ -15,6 +15,7 @@ from core.batches import (
     build_batch_template,
     list_batch_templates,
 )
+from core.reference_capabilities import MissingReferenceAssetError, UnsupportedReferenceError
 
 router = APIRouter(prefix="/batches", tags=["batches"])
 
@@ -49,6 +50,7 @@ class BatchResponse(BaseModel):
     stage_names: list[str]
     aggregate: dict[str, Any]
     items: list[BatchItemResponse]
+    error_message: str | None
     created_at: str
     updated_at: str
 
@@ -67,6 +69,7 @@ class BatchResponse(BaseModel):
                 BatchItemResponse(**item.model_dump(mode="json", exclude={"request"}))
                 for item in record.items
             ],
+            error_message=record.advance_error,
             created_at=record.created_at.isoformat(),
             updated_at=record.updated_at.isoformat(),
         )
@@ -135,6 +138,14 @@ def create_batch(
 
     try:
         record = services.batch_service.create_batch(spec)
+    except (UnsupportedReferenceError, MissingReferenceAssetError) as exc:
+        # Both subclass ValueError, so this must come before the plain
+        # `except ValueError` below -- Python matches except clauses in
+        # order, and the broader clause would otherwise catch these first,
+        # making this one unreachable and reporting 400 instead of 422.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
     except ValueError as exc:
         # Expansion refusing an oversized sweep is a client error, and the message
         # already names the count and the cap.
@@ -173,7 +184,12 @@ def advance_batch(
     batch_id: str,
     services: ApplicationServices = Depends(get_services),
 ) -> BatchResponse:
-    record = services.batch_service.advance(batch_id)
+    try:
+        record = services.batch_service.advance(batch_id)
+    except (UnsupportedReferenceError, MissingReferenceAssetError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
     if record is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Batch not found"

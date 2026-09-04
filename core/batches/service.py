@@ -15,6 +15,7 @@ from core.jobs.statuses import (
     TERMINAL_JOB_STATUSES,
     is_terminal_status,
 )
+from core.reference_capabilities import MissingReferenceAssetError, UnsupportedReferenceError
 from core.storage.json_files import utc_now
 
 from .expansion import expand_items
@@ -108,6 +109,20 @@ class BatchService:
             stage_index=0,
             id_prefix=f"{batch_id}_item",
         )
+        # #201 follow-up (Codex P2, tenth round): preflight every item's
+        # references before anything is persisted. _enqueue_stage() below
+        # calls JobService.create_job() (which re-validates references
+        # itself) one item at a time -- if an early item's job was already
+        # created and enqueued by the time a later item's reference turns
+        # out invalid, the raised exception still aborts this call with a
+        # 4xx, but the earlier item's job (and this batch's own record) were
+        # already persisted: an invisible queued job the client was never
+        # told about, and a batch id it never received either. Validating
+        # every item up front keeps a reference failure atomic with "nothing
+        # was created," matching the oversized-sweep check expand_items()
+        # already enforces before any of this runs.
+        for item in items:
+            self.job_service.validate_references(item.request, effective_spec.project_id)
 
         now = utc_now()
         record = BatchRecord(
@@ -215,6 +230,23 @@ class BatchService:
             seed_items=winners,
             id_prefix=f"{record.id}_item",
         )
+        # #201 follow-up (Codex P2, tenth round): same preflight as
+        # create_batch() above, for the same reason -- this stage's items
+        # are about to be persisted onto the batch record and enqueued one
+        # at a time, so a later item's reference failure must not leave an
+        # earlier one already queued behind an exception the caller has no
+        # way to partially undo.
+        for new_item in new_items:
+            self.job_service.validate_references(new_item.request, record.spec.project_id)
+        # #201 follow-up (Codex P2, thirteenth round): the preflight above
+        # passed, so this is either the first attempt or a retry after an
+        # operator fixed whatever made an earlier attempt's preflight raise
+        # (see handle_job_event()). Clear any stale advance_error from that
+        # earlier attempt now -- otherwise _derive_status() would keep
+        # forcing this batch to "failed" forever even as the code below
+        # creates and enqueues real, live jobs for it.
+        record.advance_error = None
+
         # Carry each winner's label forward so the refined output is traceable to
         # the probe that earned it. Match on axis values rather than position:
         # expand_items sorts by model_id to protect the runtime cache, so a spec
@@ -281,7 +313,37 @@ class BatchService:
                 return
             with self._lock:
                 refreshed = self._recompute_and_save(record)
-                self._advance_locked(refreshed)
+                try:
+                    self._advance_locked(refreshed)
+                except (UnsupportedReferenceError, MissingReferenceAssetError) as exc:
+                    # #201 follow-up (Codex P2, eleventh round): the
+                    # stage-advance reference preflight (added this same
+                    # round, in _advance_locked) can raise here, on the job
+                    # runner thread with no HTTP caller to hand a 4xx to.
+                    # Left to the broad except below, that was logged and
+                    # swallowed, leaving the batch stuck in "running"
+                    # forever: its current stage's items all terminal, but
+                    # the next stage never created and no further job event
+                    # will ever retrigger this path. Persist it as failed
+                    # instead so the batch reaches an observable terminal
+                    # state.
+                    #
+                    # #201 follow-up (Codex P2, twelfth round): setting only
+                    # `status` here was not durable -- the next read calls
+                    # _recompute_and_save(), whose _derive_status() has no
+                    # concept of "the stage transition itself failed" and
+                    # recomputes "running" from a successful current stage
+                    # plus a pending next one, silently reverting this.
+                    # advance_error is what _derive_status() actually checks.
+                    refreshed.advance_error = str(exc)
+                    refreshed.status = BATCH_STATUS_FAILED
+                    self.batch_repository.save(refreshed)
+                    logger.warning(
+                        "Batch %s failed to advance past stage %d: %s",
+                        refreshed.id,
+                        refreshed.stage_index,
+                        exc,
+                    )
         except Exception:  # pragma: no cover - never break the runner
             logger.exception("Failed to update batch state for job %s.", job_id)
 
@@ -319,6 +381,12 @@ def _build_aggregate(items: list[BatchItem]) -> BatchAggregate:
 
 
 def _derive_status(record: BatchRecord) -> str:
+    if record.advance_error is not None:
+        # A stage transition itself failed (see BatchRecord.advance_error) --
+        # authoritative and terminal, regardless of what the items/aggregate
+        # below would otherwise derive (a successful current stage with
+        # another stage still pending would normally compute "running").
+        return BATCH_STATUS_FAILED
     items = record.items
     if not items:
         return BATCH_STATUS_QUEUED

@@ -32,6 +32,7 @@ class GenerationContext:
         on_progress: Callable[[float], None] | None = None,
         min_interval_seconds: float = 0.5,
         min_progress_delta: float = 0.05,
+        project_id: str | None = None,
     ) -> None:
         self._is_cancelled = is_cancelled
         self._on_progress = on_progress
@@ -39,6 +40,15 @@ class GenerationContext:
         self._min_progress_delta = min_progress_delta
         self._last_reported: float | None = None
         self._last_reported_at: float | None = None
+        # The job's project at the time this context was built (#201
+        # follow-up, seventh Codex round on PR #376): a generator that
+        # resolves reference assets can use this to re-check the
+        # project-boundary invariant JobService.create_job() already
+        # enforced at job-creation time -- closing the gap where a mutable
+        # Bible entry's reference_asset_ids changes between job creation and
+        # execution. Set once by JobRunner from the job's own project_id;
+        # never mutated afterward.
+        self.project_id = project_id
 
     def report_progress(self, fraction: float) -> None:
         if self._on_progress is None:

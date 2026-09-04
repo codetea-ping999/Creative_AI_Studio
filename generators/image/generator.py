@@ -9,6 +9,8 @@ import secrets
 from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
+from PIL import Image
+
 from core.models import ModelService
 from core.prompting import PromptComposer
 from core.quality import (
@@ -16,13 +18,23 @@ from core.quality import (
     evaluate_image_output,
     evaluate_image_semantics,
 )
+from core.reference_capabilities import MissingReferenceAssetError, validate_reference_inputs
 from core.schemas import GenerationRequest, GenerationResult
 from generators.base import BaseGenerator
 from generators.common import resolve_generation_prompt
-from generators.image.providers import ImageGenerationSpec, LocalDiffusersImageProvider
+from generators.image.providers import (
+    ImageGenerationSpec,
+    LocalDiffusersImageProvider,
+    UnsupportedImageParameterError,
+    local_diffusers_capabilities,
+    validate_capabilities,
+)
 
 if TYPE_CHECKING:
     from core.jobs.context import GenerationContext
+    from core.models import ModelManifest
+    from core.reference_capabilities import ReferenceImageInput
+    from generators.common.prompting import ResolvedPrompt
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _MAX_VARIATION_COUNT = 4
@@ -105,6 +117,71 @@ class ImageGenerator(BaseGenerator):
             if resolved_prompt.seed is not None
             else secrets.randbits(63)
         )
+        (
+            reference_image_path,
+            reference_strength,
+            reference_applied_asset_id,
+            considered_references,
+        ) = self._resolve_references_for_conditioning(
+            request,
+            resolved_prompt,
+            manifest,
+            project_id=context.project_id if context is not None else None,
+        )
+        # A reference is only actually honored when a dedicated img2img-shaped
+        # runtime exists and its own call signature takes image/strength
+        # (#201: one supported conditioning path, not every image model
+        # family -- StableDiffusionXLPipeline itself never accepts these, see
+        # core/models/loader.py's separate img2img_pipeline). When a
+        # reference was requested but this can't be honored,
+        # `reference_capable` stays False and `capabilities.supports_reference_image`
+        # below stays at its default False -- `validate_capabilities` then
+        # rejects the request before any pipeline call, rather than silently
+        # dropping the reference or passing it into a call that doesn't
+        # accept it.
+        reference_pipeline = runtime_obj.get("img2img_pipeline")
+        reference_capable = (
+            reference_image_path is not None
+            and reference_pipeline is not None
+            and self._pipeline_accepts_reference_image(reference_pipeline)
+        )
+        if reference_capable:
+            # Diffusers img2img's get_timesteps() ignores the computed
+            # `strength` (from the public 0=no-effect/1=follow-closely
+            # contract, see below) whenever `denoising_start` is also set --
+            # and `denoising_end` applies its own cutoff *after* strength has
+            # already selected the timestep range. `timesteps`/`sigmas`
+            # (custom schedules) go further still: diffusers replaces
+            # num_inference_steps with the custom schedule's own length
+            # before applying strength at all, so the floor/progress
+            # denominator computed below (from the *requested*
+            # num_inference_steps) would no longer match what diffusers
+            # actually runs. Every one of these silently breaks the
+            # reference's lock strength or progress reporting, so all are
+            # rejected outright for a reference job rather than forwarded
+            # alongside strength.
+            for incompatible_param in (
+                "denoising_start",
+                "denoising_end",
+                "timesteps",
+                "sigmas",
+            ):
+                if incompatible_param in effective_params:
+                    raise UnsupportedImageParameterError(
+                        f"Model {manifest.public_model_id!r}: "
+                        f"{incompatible_param!r} cannot be combined with "
+                        "reference-image conditioning -- diffusers img2img's "
+                        "timestep selection from denoising_start/denoising_end/"
+                        "timesteps/sigmas does not compose with the computed "
+                        "'strength', so the reference's lock strength would "
+                        f"not be honored. Remove {incompatible_param!r} from "
+                        "params or drop the reference."
+                    )
+        # LoRA is configured on `pipeline` above, but `img2img_pipeline` (see
+        # core/models/loader.py) wraps the *same* unet/text-encoder objects
+        # rather than copies, so a loaded adapter is visible to both --
+        # nothing extra is needed here for "LoRA + reference" to compose.
+        active_pipeline = reference_pipeline if reference_capable else pipeline
         # Route the pipeline call through the provider-neutral contract
         # (generators/image/providers.py) so this local diffusers path and a
         # future cloud provider are invoked and validated the same way; the
@@ -112,7 +189,12 @@ class ImageGenerator(BaseGenerator):
         # contract existed, so behavior is identical to a direct call.
         provider = LocalDiffusersImageProvider(
             model_id=manifest.public_model_id,
-            pipeline=pipeline,
+            pipeline=active_pipeline,
+            capabilities=(
+                local_diffusers_capabilities(supports_reference_image=True)
+                if reference_capable
+                else None
+            ),
         )
         spec_lora_path = lora_metadata["path"]
         spec_lora_scale = lora_metadata["scale"]
@@ -132,16 +214,83 @@ class ImageGenerator(BaseGenerator):
             lora_scale=(
                 float(cast(float, spec_lora_scale)) if spec_lora_scale is not None else 1.0
             ),
-            reference_image_path=None,
+            # Set whenever a reference resolved, regardless of pipeline
+            # support -- this is what makes validate_capabilities() actually
+            # reject an unsupported request instead of validating nothing.
+            reference_image_path=reference_image_path,
         )
+        # Checked here -- before the reference image is even opened, let
+        # alone resized -- rather than only inside generate_image() inside
+        # the variation loop below: an absurd width/height (e.g. 100000)
+        # must be rejected before Pillow attempts a matching allocation, not
+        # after.
+        if provider.capabilities is not None:
+            validate_capabilities(provider.capabilities, request_spec)
+        reference_conditioning_kwargs: dict[str, Any] = {}
+        # Diffusers img2img only ever runs int(num_inference_steps *
+        # strength) denoising steps internally (see the strength comment
+        # below), not the full requested count -- a step callback driven by
+        # the requested count would then top out well under 100% and jump
+        # straight to whatever the *next* variation (or job completion)
+        # reports, never itself reaching a completed fraction. Defaults to
+        # the plain requested count for the non-reference (text2img) path,
+        # where every requested step actually runs.
+        effective_inference_steps = num_inference_steps
+        if reference_capable:
+            # A real img2img call derives its output size from `image`
+            # itself rather than accepting width/height (unlike the text2img
+            # call below), so the reference is resized to the requested
+            # output dimensions instead of forwarding width/height.
+            # ReferenceImageInput.strength is 0=no effect, 1=follow the
+            # reference most closely (core/reference_capabilities.py).
+            # diffusers img2img `strength` is the opposite: the fraction
+            # of denoising applied to the *source* image, so 0=closest to
+            # the reference and 1=ignores it almost entirely. Inverting
+            # here keeps the public contract's meaning intact for callers
+            # regardless of which pipeline convention ends up serving it.
+            # Diffusers computes init_timestep = int(num_inference_steps
+            # * strength) and needs at least one surviving step. An earlier
+            # version of this code floored `img2img_strength` up to whatever
+            # value guaranteed one step, but that silently *replaced* a
+            # strong requested lock with a much weaker one whenever the
+            # step count was too low to represent it (e.g. num_inference_steps
+            # =1 forced every request, regardless of lock strength, to
+            # diffusers strength 1.0 -- the least reference-preserving
+            # setting) while still reporting the lock as applied. Rejecting
+            # the combination outright is more honest: the caller finds out
+            # their steps/strength combination cannot be honored, rather
+            # than silently getting a materially different result than
+            # what they asked for.
+            img2img_strength = 1.0 - cast(float, reference_strength)
+            if int(num_inference_steps * img2img_strength) < 1:
+                raise UnsupportedImageParameterError(
+                    f"Model {manifest.public_model_id!r}: the requested "
+                    f"reference lock strength {reference_strength} combined "
+                    f"with {num_inference_steps} inference step(s) would "
+                    "leave diffusers with zero denoising steps to actually "
+                    "run. Increase num_inference_steps or reduce the "
+                    "reference strength."
+                )
+            reference_conditioning_kwargs = {
+                "image": (
+                    Image.open(cast(str, reference_image_path))
+                    .convert("RGB")
+                    .resize((width, height))
+                ),
+                "strength": img2img_strength,
+            }
+            # Mirrors diffusers' own init_timestep computation, using the
+            # exact same expression checked above so this can never disagree
+            # with it -- the check above already guarantees this is >= 1.
+            effective_inference_steps = int(num_inference_steps * img2img_strength)
         common_generation_kwargs = {
             "prompt": resolved_prompt.prompt,
             "negative_prompt": resolved_prompt.negative_prompt,
-            "width": width,
-            "height": height,
             "guidance_scale": guidance_scale,
             "num_inference_steps": num_inference_steps,
+            **({} if reference_capable else {"width": width, "height": height}),
             **effective_params,
+            **reference_conditioning_kwargs,
         }
         batch_id = f"img_{uuid4().hex}"
         output_paths: list[str] = []
@@ -163,8 +312,8 @@ class ImageGenerator(BaseGenerator):
                     torch,
                 )
                 step_callback = self._build_step_callback(
-                    pipeline,
-                    num_inference_steps,
+                    active_pipeline,
+                    effective_inference_steps,
                     context,
                     variation_index=variation_index,
                     variation_count=variation_count,
@@ -256,14 +405,35 @@ class ImageGenerator(BaseGenerator):
                 "requested_prompt": request.prompt,
                 "prompt_composition": resolved_prompt.composition,
                 "reference_asset_ids": resolved_prompt.reference_asset_ids,
-                # #199: which asset, role (character/location), and strength a
-                # Bible reference resolved to -- recorded even though nothing
-                # downstream conditions on it yet (#201), so a job's metadata
-                # is a complete audit trail of what was asked for.
+                # `considered_references` is whichever source
+                # (request.references or Bible-derived resolved_references,
+                # see _resolve_references_for_conditioning) actually fed
+                # conditioning -- distinct from `resolved_prompt
+                # .resolved_references` above, which is Bible-only audit
+                # trail regardless of which source won. #201:
+                # reference_conditioning_applied is true only when exactly
+                # one reference was considered and reached the pipeline as
+                # image/strength conditioning; more than one considered
+                # reference, or one this pipeline can't honor, already
+                # failed generation before reaching here (see
+                # request_spec.reference_image_path / validate_capabilities
+                # and _resolve_references_for_conditioning's own checks).
                 "resolved_references": [
                     reference.model_dump(mode="json")
                     for reference in resolved_prompt.resolved_references
                 ],
+                "considered_references": [
+                    reference.model_dump(mode="json") for reference in considered_references
+                ],
+                "reference_conditioning_applied": reference_capable,
+                # Not `considered_references[0]` -- a zero-strength reference
+                # can sort first in that list without being the one actually
+                # applied (#201 follow-up, fourteenth Codex round); the
+                # asset id `_resolve_references_for_conditioning` resolved
+                # conditioning against is authoritative here.
+                "reference_applied_asset_id": (
+                    reference_applied_asset_id if reference_capable else None
+                ),
                 "requested_model_id": requested_model_id,
                 "model_id": manifest.public_model_id,
                 "manifest_id": manifest.id,
@@ -273,7 +443,7 @@ class ImageGenerator(BaseGenerator):
                 "model_provider": manifest.provider,
                 "loader": manifest.loader,
                 "runtime_type": type(runtime_obj).__name__,
-                "pipeline_class": type(pipeline).__name__,
+                "pipeline_class": type(active_pipeline).__name__,
                 "device": runtime_obj["device"],
                 "load_dtype": runtime_obj.get("load_dtype"),
                 "torch_dtype": runtime_obj["torch_dtype"],
@@ -329,6 +499,208 @@ class ImageGenerator(BaseGenerator):
         except (TypeError, ValueError):
             return False
         return "callback_on_step_end" in signature.parameters
+
+    def _resolve_references_for_conditioning(
+        self,
+        request: GenerationRequest,
+        resolved_prompt: "ResolvedPrompt",
+        manifest: "ModelManifest",
+        *,
+        project_id: str | None = None,
+    ) -> tuple[str | None, float | None, str | None, list["ReferenceImageInput"]]:
+        """Pick the references to condition on and validate them against the manifest.
+
+        Returns ``(reference_image_path, reference_strength,
+        applied_asset_id, considered_references)``. ``considered_references``
+        is every reference actually requested (zero-strength ones included,
+        for audit); ``applied_asset_id`` is the one reference among those
+        that was actually selected for conditioning, distinct from
+        ``considered_references[0]`` -- a zero-strength reference can
+        legitimately be requested first and a later, non-zero-strength one
+        still be the one applied.
+
+        `request.references` -- the documented top-level field `JobService`
+        already validates against `manifest.reference_capability` before a
+        job is even created -- is combined with Bible-derived
+        `resolved_prompt.resolved_references` rather than one silently
+        replacing the other (#201 follow-up). Both sources already applied
+        to prompt composition and both appear under `resolved_references`
+        in job metadata, so a Bible reference dropped here would receive no
+        pixel conditioning while still looking "considered" everywhere else,
+        and would bypass the one-reference-at-a-time check below entirely.
+        Bible references never go through `JobService`'s check (there is no
+        `request.references` for it to see), so they are validated here
+        against the same `manifest.reference_capability` contract instead of
+        bypassing it entirely.
+
+        This conditioning path honors exactly one *effective* (strength > 0)
+        reference image at a time: a request whose effective references
+        number more than one -- whether >1 from a single source, or one from
+        each source combined -- raises rather than silently applying only
+        the first and reporting every one of them as honored. A zero-strength
+        reference (strength=0 means "no effect" in the public contract)
+        never occupies that one-image slot and is never selected as the
+        primary conditioning reference, since it never reaches img2img
+        either way (#201 follow-up, confirmed product decision on Codex's
+        fourteenth review round on PR #376) -- it is still validated above
+        and still reported in the returned list for audit/provenance
+        metadata (see the effective-vs-requested split below).
+
+        `project_id` re-checks the same project-membership invariant
+        `JobService.create_job()` already enforced at job-creation time
+        (#201 follow-up, seventh Codex round on PR #376): that check
+        resolves a *mutable* Bible entry once at creation, but this method
+        resolves it again here when the job actually executes -- if
+        `PATCH /bible/{entry_id}` changed `reference_asset_ids` to a
+        different project's asset in between, the creation-time check saw
+        only the old asset. Re-checking against the resolved asset itself,
+        right where it is actually used, closes that gap regardless of
+        which upstream check (if any) already ran.
+        """
+
+        # #201 follow-up (Codex P2, eleventh round): request.references and
+        # resolved_prompt.resolved_references are independent sources -- a
+        # caller can supply the same (asset, role, strength, preprocessing)
+        # explicitly and also have it resolve through a Bible entry. That is
+        # one semantic lock, not two; counting it twice below would reject a
+        # request this path can actually honor. Bible-internal duplicates are
+        # already collapsed by PromptComposer.compose(), so only the
+        # cross-source case needs handling here.
+        seen_references: set[tuple[str, str, float, str]] = set()
+        references: list["ReferenceImageInput"] = []
+        for reference in list(request.references or []) + list(
+            resolved_prompt.resolved_references
+        ):
+            dedupe_key = (
+                reference.asset_id,
+                reference.role,
+                reference.strength,
+                reference.preprocessing,
+            )
+            if dedupe_key in seen_references:
+                continue
+            seen_references.add(dedupe_key)
+            references.append(reference)
+        if not references:
+            return None, None, None, []
+
+        validate_reference_inputs(
+            references,
+            capability=manifest.reference_capability,
+            model_id=manifest.public_model_id,
+        )
+        # validate_reference_inputs only checks that *some* mode is declared
+        # (via capability.enabled) plus role/strength/preprocessing/count --
+        # it does not require "img2img" specifically. This conditioning path
+        # only ever performs an img2img-style call (see the img2img_pipeline
+        # probe in generate()), so a manifest that advertises e.g. only
+        # ip_adapter must not be routed through it.
+        capability = manifest.reference_capability
+        if capability is None or "img2img" not in capability.supported_modes:
+            raise UnsupportedImageParameterError(
+                f"Model {manifest.public_model_id!r} does not advertise "
+                "img2img in reference_capability.supported_modes, which is "
+                "the only conditioning mode this path implements."
+            )
+        # #201 follow-up (Codex P2, fourteenth round, confirmed product
+        # decision): strength=0 means "no effect", so a zero-strength
+        # reference must not consume the single applied-image slot below or
+        # be selected as `primary` -- it is excluded from the count and
+        # selection here, but stays in `references` (returned unfiltered)
+        # so it is still reported in `considered_references` metadata.
+        effective_references = [
+            reference for reference in references if reference.strength > 0.0
+        ]
+        if not effective_references:
+            # ReferenceImageInput.strength=0 means "no effect" -- but img2img
+            # still VAE-encodes the reference and consumes the seeded
+            # generator's random draws to do it, so even diffusers
+            # strength=1.0 (the value zero would otherwise invert to) is not
+            # guaranteed to reproduce what a plain text2img call would have
+            # produced. Every requested reference here is zero-strength (or
+            # there were none), so generation stays unconditioned, with no
+            # primary asset to resolve or apply.
+            return None, None, None, references
+        if len(effective_references) > 1:
+            raise UnsupportedImageParameterError(
+                f"Model {manifest.public_model_id!r} was asked to honor "
+                f"{len(effective_references)} reference images at once, but "
+                "this conditioning path applies exactly one; remove all but "
+                "one non-zero-strength reference from the request or Bible "
+                "entries in play."
+            )
+        primary = effective_references[0]
+        # Likewise, validate_reference_inputs only checks the requested
+        # preprocessing is one the manifest declares support for -- it does
+        # not know this path never actually applies face_crop/canny/depth
+        # transforms, only a plain resize. Silently ignoring a declared
+        # preprocessing request would report conditioning as applied while
+        # quietly skipping part of what was asked for.
+        if primary.preprocessing not in ("none", "auto"):
+            raise UnsupportedImageParameterError(
+                f"Model {manifest.public_model_id!r}: reference preprocessing "
+                f"{primary.preprocessing!r} is not implemented by this "
+                "conditioning path (only 'none'/'auto', a plain resize, are)."
+            )
+
+        asset_repository = (
+            self.prompt_composer.asset_repository
+            if self.prompt_composer is not None
+            else None
+        )
+        if asset_repository is None:
+            raise MissingReferenceAssetError(
+                f"Reference asset {primary.asset_id!r} was requested but no "
+                "asset repository is configured to resolve it."
+            )
+        asset = asset_repository.get(primary.asset_id)
+        if asset is None:
+            raise MissingReferenceAssetError(
+                f"Reference asset {primary.asset_id!r} could not be resolved "
+                "(missing or deleted); it may have existed when the prompt "
+                "was composed but is no longer available."
+            )
+        if asset.media_type != "image":
+            # PromptComposer._resolve_reference_asset already enforces this
+            # for Bible-derived references; request.references skips the
+            # composer entirely; enforced here too so it is not the only
+            # source that can point conditioning at a non-image asset.
+            raise MissingReferenceAssetError(
+                f"Reference asset {primary.asset_id!r} is {asset.media_type!r}, "
+                "not image; reference-image conditioning requires an image asset."
+            )
+        if asset.project_id != project_id:
+            # Re-check at the point of actual use, not just at job creation
+            # (see the docstring above) -- covers both request.references
+            # (already checked once by JobService) and Bible-derived
+            # references (only ever checked at job-creation time for
+            # character/location entries; this is authoritative for both).
+            raise MissingReferenceAssetError(
+                f"Reference asset {primary.asset_id!r} belongs to project "
+                f"{asset.project_id or 'no project'!r}, not "
+                f"{project_id or 'no project'!r}; a reference must belong "
+                "to the same project as the job it conditions."
+            )
+        # `primary` is drawn from `effective_references` above, so it is
+        # always strength > 0 here -- the strength=0 case (and img2img's own
+        # VAE-encode/seeded-generator side effects that make even diffusers
+        # strength=1.0 an unsafe stand-in for "unconditioned") is handled
+        # above, before any asset is resolved. `primary.asset_id` is
+        # returned explicitly rather than left for the caller to infer as
+        # `considered_references[0]` -- a zero-strength reference can
+        # legitimately be requested first while a later, effective one is
+        # what actually gets applied.
+        return asset.path, primary.strength, primary.asset_id, references
+
+    def _pipeline_accepts_reference_image(self, pipeline: object) -> bool:
+        call = getattr(pipeline, "__call__", None)
+        if call is None:
+            return False
+        try:
+            signature = inspect.signature(call)
+        except (TypeError, ValueError):
+            return False
+        return "image" in signature.parameters and "strength" in signature.parameters
 
     def _resolve_variation_count(self, params: dict[str, Any]) -> int:
         value = params.get("variation_count", 1)

@@ -351,6 +351,57 @@ class BatchServiceTests(unittest.TestCase):
         self.assertEqual(reconciled.aggregate.succeeded, 1)
         self.assertEqual(reconciled.aggregate.best_item_id, first.id)
 
+    def test_advance_error_survives_reconciliation(self) -> None:
+        # Regression (#201 follow-up, twelfth Codex round on PR #376, P2):
+        # handle_job_event() sets advance_error when a stage transition's
+        # reference preflight rejects it, but every subsequent read calls
+        # _recompute_and_save() -> _derive_status(), which previously had
+        # no concept of a failed stage transition and recomputed a status
+        # from items/aggregate alone -- silently reverting the failure on
+        # the very next read (here, from "failed" back to "queued", since
+        # this batch's items haven't run). advance_error must survive that
+        # recomputation.
+        record = self.service.create_batch(_spec())
+        record.advance_error = "stage 2 reference preflight failed: boom"
+        record.status = "failed"
+        self.batch_repository.save(record)
+
+        reconciled = self.service.get_batch(record.id)
+
+        self.assertEqual(reconciled.status, "failed")
+        self.assertEqual(
+            reconciled.advance_error, "stage 2 reference preflight failed: boom"
+        )
+
+    def test_advance_clears_a_stale_advance_error_on_a_successful_retry(self) -> None:
+        # Regression (#201 follow-up, thirteenth Codex round on PR #376,
+        # P2): advance_error, once set, was never cleared -- if the
+        # operator fixes whatever made an earlier automatic stage
+        # transition fail its reference preflight and retries advance(),
+        # _advance_locked() can succeed (create and enqueue real jobs for
+        # the next stage) but the batch stayed permanently "failed" because
+        # nothing cleared the stale marker _derive_status() checks first.
+        spec = _spec(
+            stages=[
+                Stage(name="probe", param_overrides={"width": 640}, keep_top_n=1),
+                Stage(name="refine", param_overrides={"width": 1024}),
+            ]
+        )
+        record = self.service.create_batch(spec)
+        record.advance_error = "a previous attempt failed: boom"
+        record.status = "failed"
+        self.batch_repository.save(record)
+
+        scores = [55.0, 91.0, 73.0, 12.0]
+        for item, score in zip(record.items, scores):
+            self._succeed(item.job_id, score)
+
+        advanced = self.service.advance(record.id)
+
+        self.assertIsNone(advanced.advance_error)
+        self.assertEqual(advanced.stage_index, 1)
+        self.assertEqual(len(advanced.items_for_stage(1)), 1)
+
     def test_partial_status_when_some_children_fail(self) -> None:
         record = self.service.create_batch(_spec())
         self._succeed(record.items[0].job_id, 70.0)

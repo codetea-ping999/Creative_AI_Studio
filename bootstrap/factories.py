@@ -402,6 +402,7 @@ def create_application_services(
         asset_repository=asset_repository,
         cancellation_registry=cancellation_registry,
         model_service=model_service,
+        bible_repository=bible_repository,
     )
     job_runner = JobRunner(
         job_repository,

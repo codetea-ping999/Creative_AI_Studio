@@ -103,7 +103,7 @@ into -- not the transport call itself.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 import hashlib
 import json
@@ -149,6 +149,7 @@ __all__ = [
     "hash_image_provider_request_inputs",
     "is_local_image_provider",
     "is_retryable_image_provider_error_category",
+    "local_diffusers_capabilities",
     "redact_provider_error",
     "redact_provider_metadata",
     "redact_secrets",
@@ -1238,6 +1239,21 @@ _LOCAL_DIFFUSERS_CAPABILITIES = ImageProviderCapabilities(
     size_step=8,
     max_batch=4,
 )
+
+
+def local_diffusers_capabilities(*, supports_reference_image: bool = False) -> (
+    ImageProviderCapabilities
+):
+    """`_LOCAL_DIFFUSERS_CAPABILITIES`, with reference-image support overridden.
+
+    `supports_reference_image` is not a static property of the local
+    provider -- it depends on whether the specific loaded pipeline object
+    accepts `image`/`strength` (see `ImageGenerator._pipeline_accepts_reference_image`,
+    #201). Callers probe that pipeline first and pass the result here rather
+    than this module guessing it from a model id.
+    """
+
+    return replace(_LOCAL_DIFFUSERS_CAPABILITIES, supports_reference_image=supports_reference_image)
 
 
 class LocalDiffusersImageProvider:

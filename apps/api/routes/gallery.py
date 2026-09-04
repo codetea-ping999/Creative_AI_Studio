@@ -16,6 +16,7 @@ from bootstrap import ApplicationServices
 from core.assets import Asset
 from core.audio_conditioning import inspect_wav_reference
 from core.quality import calibrate_quality_report
+from core.reference_capabilities import MissingReferenceAssetError, UnsupportedReferenceError
 from core.schemas import GenerationRequest
 
 router = APIRouter(prefix="/gallery", tags=["gallery"])
@@ -517,7 +518,12 @@ def reuse_gallery_asset(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Gallery asset not found")
 
     generation_request, project_id = _build_reuse_request(source_asset, services, req)
-    job = services.job_service.create_job(generation_request, project_id=project_id)
+    try:
+        job = services.job_service.create_job(generation_request, project_id=project_id)
+    except (UnsupportedReferenceError, MissingReferenceAssetError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
     if project_id is not None:
         services.project_repository.add_job(project_id, job.id)
     services.asset_repository.mark_reused(

@@ -281,7 +281,10 @@ class UnsupportedReferenceRequestApiTests(unittest.TestCase):
             json={
                 "media_type": "image",
                 "prompt": "a knight",
-                "model_id": "sdxl",
+                # "sdxl" now advertises img2img reference_capability (#201
+                # follow-up); "ssd-1b" is the shipped manifest that still
+                # doesn't, so this exercises the actual no-capability path.
+                "model_id": "ssd-1b",
                 "references": [
                     {"asset_id": "char-1", "role": "character", "strength": 0.8}
                 ],
@@ -299,7 +302,7 @@ class UnsupportedReferenceRequestApiTests(unittest.TestCase):
             "/generate/image",
             json={
                 "prompt": "a knight",
-                "model_id": "sdxl",
+                "model_id": "ssd-1b",
                 "references": [
                     {"asset_id": "char-1", "role": "character", "strength": 0.8}
                 ],
@@ -307,6 +310,493 @@ class UnsupportedReferenceRequestApiTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 422, response.text)
         self.assertIn("reference-image conditioning", response.text)
+        self.assertEqual(self.services.job_repository.list(), [])
+
+    def test_post_generate_image_rejects_a_bible_ref_for_a_model_without_reference_capability(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, ninth Codex round on PR #376, P2): the
+        # two tests above only cover the documented top-level `references`
+        # field. A Bible-derived reference (params.bible_refs) reached
+        # JobService.create_job() with no equivalent manifest-capability
+        # check -- a job against "ssd-1b" (no reference_capability) was
+        # queued successfully and only failed later, asynchronously, once
+        # the generator's own validate_reference_inputs() ran.
+        from core.assets import Asset
+
+        client = self._client()
+        self.services.asset_repository.create_or_update(
+            Asset(
+                id="bible_ref_no_capability",
+                job_id="job_fixture",
+                project_id=None,
+                media_type="image",
+                kind="output",
+                title="reference fixture",
+                prompt="a reference image",
+                model_id="sdxl",
+                path="/tmp/does-not-need-to-exist.png",
+            )
+        )
+        entry = self.services.bible_repository.create(
+            kind="character",
+            name="Mina",
+            reference_asset_ids=["bible_ref_no_capability"],
+        )
+        response = client.post(
+            "/generate/image",
+            json={
+                "prompt": "a knight",
+                "model_id": "ssd-1b",
+                "params": {"bible_refs": [entry.id]},
+            },
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertIn("reference-image conditioning", response.text)
+        self.assertEqual(self.services.job_repository.list(), [])
+
+    def test_post_generate_image_rejects_bible_refs_resolving_to_two_roles(self) -> None:
+        # Regression (#201 follow-up, tenth Codex round on PR #376, P2):
+        # manifest-capability validation only checks per-role limits, so one
+        # character reference plus one location reference each pass their
+        # own max_references_per_role=1 -- but
+        # ImageGenerator._resolve_references_for_conditioning() enforces a
+        # separate, hard "exactly one reference total" limit across every
+        # source combined, because this conditioning path only ever
+        # performs a single img2img call. A job carrying both would
+        # previously queue successfully and only fail later, at generation
+        # time.
+        from core.assets import Asset
+
+        client = self._client()
+        for asset_id in ("bible_role_char", "bible_role_loc"):
+            self.services.asset_repository.create_or_update(
+                Asset(
+                    id=asset_id,
+                    job_id="job_fixture",
+                    project_id=None,
+                    media_type="image",
+                    kind="output",
+                    title="reference fixture",
+                    prompt="a reference image",
+                    model_id="sdxl",
+                    path="/tmp/does-not-need-to-exist.png",
+                )
+            )
+        character = self.services.bible_repository.create(
+            kind="character", name="Mina", reference_asset_ids=["bible_role_char"]
+        )
+        location = self.services.bible_repository.create(
+            kind="location", name="Rooftop", reference_asset_ids=["bible_role_loc"]
+        )
+        response = client.post(
+            "/generate/image",
+            json={
+                "prompt": "Mina on the rooftop",
+                "model_id": "sdxl",
+                "params": {"bible_refs": [character.id, location.id]},
+            },
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertIn("exactly one reference image", response.text)
+        self.assertEqual(self.services.job_repository.list(), [])
+
+    def test_post_generate_image_accepts_a_zero_strength_reference_alongside_an_effective_one(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, Option A, confirmed product decision):
+        # a strength=0 reference requests no conditioning at all and must
+        # not count against create_job()'s "exactly one reference total"
+        # preflight above -- mirroring ImageGenerator._resolve_references_
+        # for_conditioning()'s own effective-vs-requested split. A character
+        # reference at strength=0 alongside a location reference at
+        # strength=0.8 previously raised 422 here even though the generator
+        # can honor it (apply the one effective reference, treat the
+        # zero-strength one as unconditioned but still considered for
+        # audit): requested=2, effective=1, applied=1.
+        client = self._client()
+        response = client.post(
+            "/generate/image",
+            json={
+                "prompt": "Mina on the rooftop",
+                "model_id": "sdxl",
+                "references": [
+                    {"asset_id": "char-1", "role": "character", "strength": 0.0},
+                    {"asset_id": "loc-1", "role": "location", "strength": 0.8},
+                ],
+            },
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(len(self.services.job_repository.list()), 1)
+
+    def test_post_generate_image_deduplicates_repeated_bible_references(self) -> None:
+        # Regression (#201 follow-up, tenth Codex round on PR #376, P2):
+        # PromptComposer.compose() deduplicates resolved references by
+        # (asset_id, role) before generation, so two Bible entries naming
+        # the same reference asset under the same role collapse to one
+        # reference there. Counting each occurrence here instead would
+        # reject a request the generator can actually honor.
+        from core.assets import Asset
+
+        client = self._client()
+        self.services.asset_repository.create_or_update(
+            Asset(
+                id="bible_dedup_ref",
+                job_id="job_fixture",
+                project_id=None,
+                media_type="image",
+                kind="output",
+                title="reference fixture",
+                prompt="a reference image",
+                model_id="sdxl",
+                path="/tmp/does-not-need-to-exist.png",
+            )
+        )
+        first_entry = self.services.bible_repository.create(
+            kind="character", name="Mina", reference_asset_ids=["bible_dedup_ref"]
+        )
+        second_entry = self.services.bible_repository.create(
+            kind="character", name="Mina (alt)", reference_asset_ids=["bible_dedup_ref"]
+        )
+        response = client.post(
+            "/generate/image",
+            json={
+                "prompt": "a knight",
+                "model_id": "sdxl",
+                "params": {"bible_refs": [first_entry.id, second_entry.id]},
+            },
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(len(self.services.job_repository.list()), 1)
+
+    def test_post_generate_image_deduplicates_repeated_direct_references(self) -> None:
+        # Regression (#201 follow-up, fifteenth Codex round on PR #376,
+        # P2): the sibling test above covers duplicate Bible references;
+        # ImageGenerator._resolve_references_for_conditioning() also
+        # collapses two identical entries *within* request.references
+        # itself (same asset_id/role/strength/preprocessing) to one
+        # semantic lock before validating anything -- but this preflight
+        # validated the raw, undeduped list, so the shipped
+        # max_references_per_role=1 rejected a request the generator could
+        # actually honor.
+        from core.assets import Asset
+
+        client = self._client()
+        self.services.asset_repository.create_or_update(
+            Asset(
+                id="direct_dedup_ref",
+                job_id="job_fixture",
+                project_id=None,
+                media_type="image",
+                kind="output",
+                title="reference fixture",
+                prompt="a reference image",
+                model_id="sdxl",
+                path="/tmp/does-not-need-to-exist.png",
+            )
+        )
+        response = client.post(
+            "/generate/image",
+            json={
+                "prompt": "a knight",
+                "model_id": "sdxl",
+                "references": [
+                    {"asset_id": "direct_dedup_ref", "role": "character", "strength": 0.6},
+                    {"asset_id": "direct_dedup_ref", "role": "character", "strength": 0.6},
+                ],
+            },
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(len(self.services.job_repository.list()), 1)
+
+    def test_post_generate_image_deduplicates_the_same_reference_across_sources(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, eleventh Codex round on PR #376, P2):
+        # the same (asset, role, strength, preprocessing) supplied through
+        # both request.references and a Bible entry is one semantic lock,
+        # not two -- counting it twice previously produced a false 422 from
+        # the "exactly one reference total" check above.
+        from core.assets import Asset
+
+        client = self._client()
+        self.services.asset_repository.create_or_update(
+            Asset(
+                id="dual_source_ref",
+                job_id="job_fixture",
+                project_id=None,
+                media_type="image",
+                kind="output",
+                title="reference fixture",
+                prompt="a reference image",
+                model_id="sdxl",
+                path="/tmp/does-not-need-to-exist.png",
+            )
+        )
+        entry = self.services.bible_repository.create(
+            kind="character", name="Mina", reference_asset_ids=["dual_source_ref"]
+        )
+        response = client.post(
+            "/generate/image",
+            json={
+                "prompt": "a knight",
+                "model_id": "sdxl",
+                "references": [{"asset_id": "dual_source_ref", "role": "character"}],
+                "params": {"bible_refs": [entry.id]},
+            },
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(len(self.services.job_repository.list()), 1)
+
+    def test_post_generate_image_rejects_a_reference_for_an_ip_adapter_only_manifest(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, eleventh Codex round on PR #376, P2):
+        # validate_reference_inputs() only checks that *some* mode is
+        # declared (capability.enabled) -- it does not require "img2img"
+        # specifically. ImageGenerator._resolve_references_for_conditioning()
+        # is the only conditioning path implemented and only ever performs
+        # an img2img-style call, so a manifest advertising e.g. only
+        # ip_adapter passed this creation-time check and only failed later,
+        # at generation time.
+        import json
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        from fastapi.testclient import TestClient
+
+        from apps.api.main import create_app
+        from bootstrap import create_application_services
+
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_root = root / "manifests"
+            (manifest_root / "image").mkdir(parents=True)
+            (manifest_root / "image" / "ip-adapter-only.json").write_text(
+                json.dumps(
+                    {
+                        "id": "ip-adapter-only",
+                        "public_id": "ip-adapter-only",
+                        "display_name": "IP-Adapter Only",
+                        "media_type": "image",
+                        "task_type": "text-to-image",
+                        "provider": "local",
+                        "runtime": "diffusers",
+                        "local_path": "./models/image/sdxl",
+                        "loader": "diffusers_image_loader",
+                        "reference_capability": {
+                            "supported_modes": ["ip_adapter"],
+                            "supported_roles": ["character", "location"],
+                            "max_references_per_role": 1,
+                        },
+                        "is_default": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            services = create_application_services(
+                manifest_root=manifest_root,
+                db_path=root / "jobs.db",
+                output_dir=root / "outputs" / "images",
+            )
+            client = TestClient(create_app(services, start_job_runner=False))
+            response = client.post(
+                "/generate/image",
+                json={
+                    "prompt": "a knight",
+                    "model_id": "ip-adapter-only",
+                    "references": [
+                        {"asset_id": "char-1", "role": "character", "strength": 0.8}
+                    ],
+                },
+            )
+            self.assertEqual(response.status_code, 422, response.text)
+            self.assertIn("img2img", response.text)
+            self.assertEqual(services.job_repository.list(), [])
+
+    def test_post_generate_image_rejects_a_reference_strength_that_leaves_zero_steps(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, twelfth Codex round on PR #376, P2):
+        # "sdxl" advertises max_strength=1.0, but diffusers img2img runs
+        # int(num_inference_steps * (1 - strength)) denoising steps --
+        # strength=1.0 always computes to zero, for any step count.
+        # ImageGenerator.generate() already rejects this at execution time;
+        # this creation-time preflight must reject it too, rather than
+        # queue a job deterministically doomed to fail.
+        client = self._client()
+        response = client.post(
+            "/generate/image",
+            json={
+                "prompt": "a knight",
+                "model_id": "sdxl",
+                "references": [
+                    {"asset_id": "char-1", "role": "character", "strength": 1.0}
+                ],
+            },
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertIn("denoising steps", response.text)
+        self.assertEqual(self.services.job_repository.list(), [])
+
+    def test_post_generate_image_reports_422_not_500_for_an_unknown_model_with_a_bible_ref(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, twelfth Codex round on PR #376, P2):
+        # ModelService.get_manifest() raises LookupError for an unknown
+        # model id. The Bible-derived-reference preflight added two rounds
+        # ago calls it too, but every route only catches
+        # (UnsupportedReferenceError, MissingReferenceAssetError) -- an
+        # unknown model_id on an otherwise-valid Bible reference surfaced
+        # as an unhandled 500 instead of a 4xx.
+        from core.assets import Asset
+
+        client = self._client()
+        self.services.asset_repository.create_or_update(
+            Asset(
+                id="unknown_model_ref",
+                job_id="job_fixture",
+                project_id=None,
+                media_type="image",
+                kind="output",
+                title="reference fixture",
+                prompt="a reference image",
+                model_id="sdxl",
+                path="/tmp/does-not-need-to-exist.png",
+            )
+        )
+        entry = self.services.bible_repository.create(
+            kind="character", name="Mina", reference_asset_ids=["unknown_model_ref"]
+        )
+        response = client.post(
+            "/generate/image",
+            json={
+                "prompt": "a knight",
+                "model_id": "does-not-exist",
+                "params": {"bible_refs": [entry.id]},
+            },
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertEqual(self.services.job_repository.list(), [])
+
+    def test_post_generate_image_rejects_unimplemented_preprocessing_at_creation(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, thirteenth Codex round on PR #376,
+        # P2): ImageGenerator.generate() only implements 'none'/'auto'
+        # preprocessing (a plain resize) for this conditioning path, but
+        # the creation-time preflight didn't check it -- a manifest that
+        # *does* advertise face_crop/canny/depth support (the shipped
+        # "sdxl" manifest doesn't, so validate_reference_inputs() alone
+        # wouldn't exercise this gap) let a job queue successfully and
+        # only fail once it executed.
+        import json
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        from fastapi.testclient import TestClient
+
+        from apps.api.main import create_app
+        from bootstrap import create_application_services
+
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_root = root / "manifests"
+            (manifest_root / "image").mkdir(parents=True)
+            (manifest_root / "image" / "face-crop-capable.json").write_text(
+                json.dumps(
+                    {
+                        "id": "face-crop-capable",
+                        "public_id": "face-crop-capable",
+                        "display_name": "Face Crop Capable",
+                        "media_type": "image",
+                        "task_type": "text-to-image",
+                        "provider": "local",
+                        "runtime": "diffusers",
+                        "local_path": "./models/image/sdxl",
+                        "loader": "diffusers_image_loader",
+                        "reference_capability": {
+                            "supported_modes": ["img2img"],
+                            "supported_roles": ["character", "location"],
+                            "supported_preprocessing": ["none", "face_crop"],
+                            "max_references_per_role": 1,
+                        },
+                        "is_default": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            services = create_application_services(
+                manifest_root=manifest_root,
+                db_path=root / "jobs.db",
+                output_dir=root / "outputs" / "images",
+            )
+            client = TestClient(create_app(services, start_job_runner=False))
+            response = client.post(
+                "/generate/image",
+                json={
+                    "prompt": "a knight",
+                    "model_id": "face-crop-capable",
+                    "references": [
+                        {
+                            "asset_id": "char-1",
+                            "role": "character",
+                            "strength": 0.6,
+                            "preprocessing": "face_crop",
+                        }
+                    ],
+                },
+            )
+            self.assertEqual(response.status_code, 422, response.text)
+            self.assertIn("not implemented", response.text)
+            self.assertEqual(services.job_repository.list(), [])
+
+    def test_post_generate_image_rejects_denoising_start_with_a_reference_at_creation(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, thirteenth Codex round on PR #376,
+        # P2): ImageGenerator.generate() rejects denoising_start/
+        # denoising_end/timesteps/sigmas alongside a reference (they don't
+        # compose with the computed strength), but the creation-time
+        # preflight didn't check for them.
+        client = self._client()
+        response = client.post(
+            "/generate/image",
+            json={
+                "prompt": "a knight",
+                "model_id": "sdxl",
+                "references": [
+                    {"asset_id": "char-1", "role": "character", "strength": 0.6}
+                ],
+                "params": {"denoising_start": 0.3},
+            },
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertIn("denoising_start", response.text)
+        self.assertEqual(self.services.job_repository.list(), [])
+
+    def test_post_generate_image_reports_422_not_500_for_a_non_numeric_steps_value(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, thirteenth Codex round on PR #376,
+        # P2): params is an unconstrained dict, so a non-numeric
+        # steps/num_inference_steps value made the creation-time preflight's
+        # int() conversion raise a plain ValueError -- not caught by any
+        # route's (UnsupportedReferenceError, MissingReferenceAssetError)
+        # handler, so it was an unhandled 500 instead of a 4xx.
+        client = self._client()
+        response = client.post(
+            "/generate/image",
+            json={
+                "prompt": "a knight",
+                "model_id": "sdxl",
+                "references": [
+                    {"asset_id": "char-1", "role": "character", "strength": 0.6}
+                ],
+                "params": {"steps": "not-a-number"},
+            },
+        )
+        self.assertEqual(response.status_code, 422, response.text)
         self.assertEqual(self.services.job_repository.list(), [])
 
     def test_post_jobs_accepts_a_request_with_no_references(self) -> None:
@@ -317,6 +807,365 @@ class UnsupportedReferenceRequestApiTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 201, response.text)
         self.assertEqual(len(self.services.job_repository.list()), 1)
+
+    def test_post_jobs_accepts_a_reference_for_sdxl_which_advertises_img2img(self) -> None:
+        # Regression (#201 follow-up, third Codex round on PR #376): every
+        # shipped image manifest omitted reference_capability, so the img2img
+        # conditioning path built for #201 was unreachable by any real model
+        # -- only a test-only manifest could exercise it. "sdxl" (the
+        # is_default manifest) now advertises img2img support.
+        client = self._client()
+        response = client.post(
+            "/jobs",
+            json={
+                "media_type": "image",
+                "prompt": "a knight",
+                "model_id": "sdxl",
+                "references": [
+                    {"asset_id": "char-1", "role": "character", "strength": 0.8}
+                ],
+            },
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(len(self.services.job_repository.list()), 1)
+
+    def test_post_generate_image_rejects_a_reference_from_a_different_project(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, fifth Codex round on PR #376, P1): a
+        # reference asset from a different project must not silently
+        # condition a job in this one. apps/api/routes/generate.py already
+        # enforces the identical project-membership boundary for
+        # assembly-request timeline assets (asset.project_id != project_id);
+        # reference-image conditioning had no such check at all, so a job in
+        # project B could resolve and condition on project A's image.
+        from core.assets import Asset
+
+        client = self._client()
+        project_a = self.services.project_repository.create("Project A")
+        project_b = self.services.project_repository.create("Project B")
+        self.services.asset_repository.create_or_update(
+            Asset(
+                id="cross_project_ref",
+                job_id="job_fixture",
+                project_id=project_a.id,
+                media_type="image",
+                kind="output",
+                title="reference fixture",
+                prompt="a reference image",
+                model_id="sdxl",
+                path="/tmp/does-not-need-to-exist.png",
+            )
+        )
+        response = client.post(
+            "/generate/image",
+            json={
+                "prompt": "a knight",
+                "model_id": "sdxl",
+                "project_id": project_b.id,
+                "references": [
+                    {"asset_id": "cross_project_ref", "role": "character", "strength": 0.8}
+                ],
+            },
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertIn("cross_project_ref", response.text)
+        self.assertEqual(self.services.job_repository.list(), [])
+
+    def test_post_generate_image_accepts_a_reference_from_the_same_project(
+        self,
+    ) -> None:
+        from core.assets import Asset
+
+        client = self._client()
+        project_a = self.services.project_repository.create("Project A")
+        self.services.asset_repository.create_or_update(
+            Asset(
+                id="same_project_ref",
+                job_id="job_fixture",
+                project_id=project_a.id,
+                media_type="image",
+                kind="output",
+                title="reference fixture",
+                prompt="a reference image",
+                model_id="sdxl",
+                path="/tmp/does-not-need-to-exist.png",
+            )
+        )
+        response = client.post(
+            "/generate/image",
+            json={
+                "prompt": "a knight",
+                "model_id": "sdxl",
+                "project_id": project_a.id,
+                "references": [
+                    {"asset_id": "same_project_ref", "role": "character", "strength": 0.8}
+                ],
+            },
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(len(self.services.job_repository.list()), 1)
+
+    def test_post_generate_image_rejects_a_bible_derived_reference_from_a_different_project(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, sixth Codex round on PR #376, P1): the
+        # request.references check above only covers the documented
+        # top-level field. A Bible-derived character/location reference
+        # (params.bible_refs) resolves its asset the same way once
+        # PromptComposer runs inside the generator, with the identical
+        # cross-project exposure risk if left unchecked -- a job in project B
+        # could still resolve a Bible entry whose reference_asset_ids point
+        # at a project-A image and condition on it.
+        from core.assets import Asset
+
+        client = self._client()
+        project_a = self.services.project_repository.create("Project A")
+        project_b = self.services.project_repository.create("Project B")
+        self.services.asset_repository.create_or_update(
+            Asset(
+                id="bible_cross_project_ref",
+                job_id="job_fixture",
+                project_id=project_a.id,
+                media_type="image",
+                kind="output",
+                title="reference fixture",
+                prompt="a reference image",
+                model_id="sdxl",
+                path="/tmp/does-not-need-to-exist.png",
+            )
+        )
+        entry = self.services.bible_repository.create(
+            kind="character",
+            name="Mina",
+            reference_asset_ids=["bible_cross_project_ref"],
+        )
+        response = client.post(
+            "/generate/image",
+            json={
+                "prompt": "a knight",
+                "model_id": "sdxl",
+                "project_id": project_b.id,
+                "params": {"bible_refs": [entry.id]},
+            },
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertIn("bible_cross_project_ref", response.text)
+        self.assertEqual(self.services.job_repository.list(), [])
+
+    def test_post_generate_image_accepts_a_bible_derived_reference_from_the_same_project(
+        self,
+    ) -> None:
+        from core.assets import Asset
+
+        client = self._client()
+        project_a = self.services.project_repository.create("Project A")
+        self.services.asset_repository.create_or_update(
+            Asset(
+                id="bible_same_project_ref",
+                job_id="job_fixture",
+                project_id=project_a.id,
+                media_type="image",
+                kind="output",
+                title="reference fixture",
+                prompt="a reference image",
+                model_id="sdxl",
+                path="/tmp/does-not-need-to-exist.png",
+            )
+        )
+        entry = self.services.bible_repository.create(
+            kind="character",
+            name="Mina",
+            reference_asset_ids=["bible_same_project_ref"],
+        )
+        response = client.post(
+            "/generate/image",
+            json={
+                "prompt": "a knight",
+                "model_id": "sdxl",
+                "project_id": project_a.id,
+                "params": {"bible_refs": [entry.id]},
+            },
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(len(self.services.job_repository.list()), 1)
+
+    def test_post_generate_image_ignores_an_unknown_bible_ref_in_the_project_check(
+        self,
+    ) -> None:
+        # An unknown bible entry id must not be rejected by this early
+        # project-boundary check -- PromptComposer already degrades that to
+        # a warning later (see _resolve_entries), and this check must not
+        # be stricter than the real resolution it is only a fast-fail for.
+        client = self._client()
+        response = client.post(
+            "/generate/image",
+            json={
+                "prompt": "a knight",
+                "model_id": "sdxl",
+                "params": {"bible_refs": ["does-not-exist"]},
+            },
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+
+    def test_post_generate_audio_accepts_a_bible_ref_with_a_cross_project_image(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, seventh Codex round on PR #376, P2):
+        # the Bible-derived project-boundary check must be gated on image
+        # jobs specifically -- no other media type performs reference-image
+        # conditioning at all, so an audio (or text/video) job carrying
+        # bible_refs that happens to name a character/location entry with a
+        # cross-project image reference must not be rejected for a risk
+        # that generator can never act on.
+        from core.assets import Asset
+
+        client = self._client()
+        project_a = self.services.project_repository.create("Project A")
+        project_b = self.services.project_repository.create("Project B")
+        self.services.asset_repository.create_or_update(
+            Asset(
+                id="audio_job_bible_ref",
+                job_id="job_fixture",
+                project_id=project_a.id,
+                media_type="image",
+                kind="output",
+                title="reference fixture",
+                prompt="a reference image",
+                model_id="sdxl",
+                path="/tmp/does-not-need-to-exist.png",
+            )
+        )
+        entry = self.services.bible_repository.create(
+            kind="character",
+            name="Mina",
+            reference_asset_ids=["audio_job_bible_ref"],
+        )
+        response = client.post(
+            "/generate/audio",
+            json={
+                "prompt": "bright synth loop",
+                "model_id": "musicgen-small",
+                "project_id": project_b.id,
+                "output_format": "wav",
+                "params": {"bible_refs": [entry.id], "duration_seconds": 4},
+            },
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+
+    def test_post_batches_reports_422_not_500_for_a_cross_project_bible_reference(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, ninth Codex round on PR #376, P2):
+        # BatchSpec.bible_refs flows unchanged into each expanded item's
+        # params.bible_refs (core/batches/expansion.py), so a batch whose
+        # bible_refs resolve to an image outside the batch's own project
+        # surfaces the project-boundary rejection JobService.create_job()
+        # raises through BatchService.create_batch() -- but this route never
+        # caught it, so it fell through as an unhandled 500 instead of 422,
+        # exactly like the /jobs/{id}/rerun and gallery reuse gaps from
+        # earlier rounds.
+        from core.assets import Asset
+
+        client = self._client()
+        project_a = self.services.project_repository.create("Project A")
+        project_b = self.services.project_repository.create("Project B")
+        self.services.asset_repository.create_or_update(
+            Asset(
+                id="batch_cross_project_ref",
+                job_id="job_fixture",
+                project_id=project_a.id,
+                media_type="image",
+                kind="output",
+                title="reference fixture",
+                prompt="a reference image",
+                model_id="sdxl",
+                path="/tmp/does-not-need-to-exist.png",
+            )
+        )
+        entry = self.services.bible_repository.create(
+            kind="character",
+            name="Mina",
+            reference_asset_ids=["batch_cross_project_ref"],
+        )
+        response = client.post(
+            "/batches",
+            json={
+                "spec": {
+                    "name": "cross-project batch",
+                    "media_type": "image",
+                    "model_id": "sdxl",
+                    "project_id": project_b.id,
+                    "prompt": "a knight",
+                    "bible_refs": [entry.id],
+                }
+            },
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertIn("batch_cross_project_ref", response.text)
+
+    def test_post_batches_creates_nothing_when_a_later_items_reference_is_invalid(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, tenth Codex round on PR #376, P2):
+        # BatchService._enqueue_stage() used to call JobService.create_job()
+        # one item at a time -- every expanded item shares the same
+        # bible_refs, so with N items all sharing one bad reference, the
+        # batch record itself (created via batch_repository.create() before
+        # _enqueue_stage ever runs) was still persisted even though the
+        # first item's create_job() call raised immediately and zero jobs
+        # were ever created: an orphaned, empty batch behind a 422 that told
+        # the client nothing was created. BatchService now preflights every
+        # item's references before creating the batch record at all, so a
+        # failure here must leave no batch and no job behind.
+        from core.assets import Asset
+
+        client = self._client()
+        project_a = self.services.project_repository.create("Project A")
+        project_b = self.services.project_repository.create("Project B")
+        self.services.asset_repository.create_or_update(
+            Asset(
+                id="batch_atomic_cross_project_ref",
+                job_id="job_fixture",
+                project_id=project_a.id,
+                media_type="image",
+                kind="output",
+                title="reference fixture",
+                prompt="a reference image",
+                model_id="sdxl",
+                path="/tmp/does-not-need-to-exist.png",
+            )
+        )
+        entry = self.services.bible_repository.create(
+            kind="character",
+            name="Mina",
+            reference_asset_ids=["batch_atomic_cross_project_ref"],
+        )
+        response = client.post(
+            "/batches",
+            json={
+                "spec": {
+                    "name": "atomic cross-project batch",
+                    "media_type": "image",
+                    "model_id": "sdxl",
+                    "project_id": project_b.id,
+                    "prompt": "a knight",
+                    "bible_refs": [entry.id],
+                    "axes": [
+                        {
+                            "name": "style",
+                            "values": [
+                                {"label": "a", "patch": {}},
+                                {"label": "b", "patch": {}},
+                            ],
+                        }
+                    ],
+                }
+            },
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertEqual(self.services.batch_repository.list_all(), [])
+        self.assertEqual(self.services.job_repository.list(), [])
 
 
 if __name__ == "__main__":  # pragma: no cover

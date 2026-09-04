@@ -113,7 +113,7 @@ class JobRunner:
             )
             return job
 
-        context = self._begin_context(job_id)
+        context = self._begin_context(job_id, project_id=job.project_id)
         try:
             try:
                 if self._update_status(job_id, JOB_STATUS_PREPARING, progress=0.0) is None:
@@ -188,14 +188,35 @@ class JobRunner:
 
         return self.job_service.finalize_cancellation(job_id)
 
-    def _begin_context(self, job_id: str) -> GenerationContext | None:
+    def _begin_context(
+        self, job_id: str, project_id: str | None = None
+    ) -> GenerationContext:
+        # Always builds a context now (#201 follow-up, eighth Codex round on
+        # PR #376): this used to return None outright when no
+        # CancellationRegistry was configured, which meant project_id never
+        # reached the generator either -- a project-bound reference could
+        # pass JobService.create_job()'s same-project validation but then
+        # fail execution-time re-validation because it compared the asset's
+        # project against None instead of the job's real project_id.
+        # Progress reporting and project_id tracking never actually depended
+        # on cancellation support; only "is_cancelled" genuinely does, and
+        # with no registry to ever record a cancellation request in, "never
+        # cancelled" is the correct (not a regressed) answer.
         cancellation_registry = self.cancellation_registry
-        if cancellation_registry is None:
-            return None
-        cancellation_registry.begin(job_id)
+        if cancellation_registry is not None:
+            cancellation_registry.begin(job_id)
+
+            def is_cancelled() -> bool:
+                return cancellation_registry.is_cancelled(job_id)
+        else:
+
+            def is_cancelled() -> bool:
+                return False
+
         return GenerationContext(
-            is_cancelled=lambda: cancellation_registry.is_cancelled(job_id),
+            is_cancelled=is_cancelled,
             on_progress=lambda fraction: self._report_generation_progress(job_id, fraction),
+            project_id=project_id,
         )
 
     def _report_generation_progress(self, job_id: str, fraction: float) -> None:

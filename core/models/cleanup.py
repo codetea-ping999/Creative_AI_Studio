@@ -27,11 +27,26 @@ def release_runtime(model_id: str, runtime_obj: Any) -> None:
     if pipeline is not None:
         _safe(model_id, "move pipeline to cpu", lambda: pipeline.to("cpu"))
 
+    # img2img_pipeline (#201) wraps the *same* unet/vae/text-encoder objects
+    # as "pipeline" via StableDiffusionXLImg2ImgPipeline(**pipeline
+    # .components) rather than owning separate weights, but it is still a
+    # distinct Python object holding its own references to them. Leaving it
+    # in runtime_obj after this function returns would keep every shared
+    # component reachable even once "pipeline" itself is gone, defeating the
+    # point of dropping these keys below.
+    img2img_pipeline = runtime_obj.get("img2img_pipeline")
+    if img2img_pipeline is not None:
+        _safe(
+            model_id,
+            "move img2img pipeline to cpu",
+            lambda: img2img_pipeline.to("cpu"),
+        )
+
     model = runtime_obj.get("model")
     if model is not None:
         _safe(model_id, "move model to cpu", lambda: model.to("cpu"))
 
-    for key in ("pipeline", "model", "processor"):
+    for key in ("pipeline", "img2img_pipeline", "model", "processor"):
         runtime_obj.pop(key, None)
 
     _safe(model_id, "empty accelerator cache", _empty_accelerator_cache)
