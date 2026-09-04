@@ -238,6 +238,14 @@ class BatchService:
         # way to partially undo.
         for new_item in new_items:
             self.job_service.validate_references(new_item.request, record.spec.project_id)
+        # #201 follow-up (Codex P2, thirteenth round): the preflight above
+        # passed, so this is either the first attempt or a retry after an
+        # operator fixed whatever made an earlier attempt's preflight raise
+        # (see handle_job_event()). Clear any stale advance_error from that
+        # earlier attempt now -- otherwise _derive_status() would keep
+        # forcing this batch to "failed" forever even as the code below
+        # creates and enqueues real, live jobs for it.
+        record.advance_error = None
 
         # Carry each winner's label forward so the refined output is traceable to
         # the probe that earned it. Match on axis values rather than position:

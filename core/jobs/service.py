@@ -308,13 +308,57 @@ class JobService:
             # deterministically doomed job before it's queued.
             manifest = self._resolve_manifest_for_references(request)
             if manifest is not None:
-                effective_params = {**manifest.default_params, **request.params}
-                num_inference_steps = int(
-                    effective_params.get(
-                        "num_inference_steps", effective_params.get("steps", 30)
-                    )
-                )
                 primary = combined_references[0]
+                # #201 follow-up (Codex P2, thirteenth round): mirrors
+                # ImageGenerator.generate()'s own preprocessing and
+                # incompatible-param checks -- this conditioning path only
+                # ever performs a plain-resize img2img call, so a
+                # manifest-permitted preprocessing mode it doesn't implement,
+                # or a diffusers timestep-selection param that doesn't
+                # compose with the computed `strength`, must fail here too
+                # rather than only once the job executes.
+                if primary.preprocessing not in ("none", "auto"):
+                    raise UnsupportedReferenceError(
+                        f"Model {request.model_id!r}: reference preprocessing "
+                        f"{primary.preprocessing!r} is not implemented by this "
+                        "conditioning path (only 'none'/'auto', a plain resize, "
+                        "are)."
+                    )
+                effective_params = {**manifest.default_params, **request.params}
+                for incompatible_param in (
+                    "denoising_start",
+                    "denoising_end",
+                    "timesteps",
+                    "sigmas",
+                ):
+                    if incompatible_param in effective_params:
+                        raise UnsupportedReferenceError(
+                            f"Model {request.model_id!r}: {incompatible_param!r} "
+                            "cannot be combined with reference-image "
+                            "conditioning -- diffusers img2img's timestep "
+                            "selection from denoising_start/denoising_end/"
+                            "timesteps/sigmas does not compose with the "
+                            "computed 'strength', so the reference's lock "
+                            f"strength would not be honored. Remove "
+                            f"{incompatible_param!r} from params or drop the "
+                            "reference."
+                        )
+                # #201 follow-up (Codex P2, thirteenth round): a non-numeric
+                # steps/num_inference_steps value (params is an unconstrained
+                # dict) made this raise a plain ValueError -- not caught by
+                # any route's (UnsupportedReferenceError,
+                # MissingReferenceAssetError) handler, so it was an unhandled
+                # 500 instead of a 4xx.
+                raw_steps = effective_params.get(
+                    "num_inference_steps", effective_params.get("steps", 30)
+                )
+                try:
+                    num_inference_steps = int(raw_steps)
+                except (TypeError, ValueError) as exc:
+                    raise UnsupportedReferenceError(
+                        f"Model {request.model_id!r}: num_inference_steps/steps "
+                        f"must be a number, not {raw_steps!r}."
+                    ) from exc
                 img2img_strength = 1.0 - primary.strength
                 if int(num_inference_steps * img2img_strength) < 1:
                     raise UnsupportedReferenceError(

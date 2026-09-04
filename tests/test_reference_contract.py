@@ -611,6 +611,126 @@ class UnsupportedReferenceRequestApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 422, response.text)
         self.assertEqual(self.services.job_repository.list(), [])
 
+    def test_post_generate_image_rejects_unimplemented_preprocessing_at_creation(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, thirteenth Codex round on PR #376,
+        # P2): ImageGenerator.generate() only implements 'none'/'auto'
+        # preprocessing (a plain resize) for this conditioning path, but
+        # the creation-time preflight didn't check it -- a manifest that
+        # *does* advertise face_crop/canny/depth support (the shipped
+        # "sdxl" manifest doesn't, so validate_reference_inputs() alone
+        # wouldn't exercise this gap) let a job queue successfully and
+        # only fail once it executed.
+        import json
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        from fastapi.testclient import TestClient
+
+        from apps.api.main import create_app
+        from bootstrap import create_application_services
+
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_root = root / "manifests"
+            (manifest_root / "image").mkdir(parents=True)
+            (manifest_root / "image" / "face-crop-capable.json").write_text(
+                json.dumps(
+                    {
+                        "id": "face-crop-capable",
+                        "public_id": "face-crop-capable",
+                        "display_name": "Face Crop Capable",
+                        "media_type": "image",
+                        "task_type": "text-to-image",
+                        "provider": "local",
+                        "runtime": "diffusers",
+                        "local_path": "./models/image/sdxl",
+                        "loader": "diffusers_image_loader",
+                        "reference_capability": {
+                            "supported_modes": ["img2img"],
+                            "supported_roles": ["character", "location"],
+                            "supported_preprocessing": ["none", "face_crop"],
+                            "max_references_per_role": 1,
+                        },
+                        "is_default": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            services = create_application_services(
+                manifest_root=manifest_root,
+                db_path=root / "jobs.db",
+                output_dir=root / "outputs" / "images",
+            )
+            client = TestClient(create_app(services, start_job_runner=False))
+            response = client.post(
+                "/generate/image",
+                json={
+                    "prompt": "a knight",
+                    "model_id": "face-crop-capable",
+                    "references": [
+                        {
+                            "asset_id": "char-1",
+                            "role": "character",
+                            "strength": 0.6,
+                            "preprocessing": "face_crop",
+                        }
+                    ],
+                },
+            )
+            self.assertEqual(response.status_code, 422, response.text)
+            self.assertIn("not implemented", response.text)
+            self.assertEqual(services.job_repository.list(), [])
+
+    def test_post_generate_image_rejects_denoising_start_with_a_reference_at_creation(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, thirteenth Codex round on PR #376,
+        # P2): ImageGenerator.generate() rejects denoising_start/
+        # denoising_end/timesteps/sigmas alongside a reference (they don't
+        # compose with the computed strength), but the creation-time
+        # preflight didn't check for them.
+        client = self._client()
+        response = client.post(
+            "/generate/image",
+            json={
+                "prompt": "a knight",
+                "model_id": "sdxl",
+                "references": [
+                    {"asset_id": "char-1", "role": "character", "strength": 0.6}
+                ],
+                "params": {"denoising_start": 0.3},
+            },
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertIn("denoising_start", response.text)
+        self.assertEqual(self.services.job_repository.list(), [])
+
+    def test_post_generate_image_reports_422_not_500_for_a_non_numeric_steps_value(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, thirteenth Codex round on PR #376,
+        # P2): params is an unconstrained dict, so a non-numeric
+        # steps/num_inference_steps value made the creation-time preflight's
+        # int() conversion raise a plain ValueError -- not caught by any
+        # route's (UnsupportedReferenceError, MissingReferenceAssetError)
+        # handler, so it was an unhandled 500 instead of a 4xx.
+        client = self._client()
+        response = client.post(
+            "/generate/image",
+            json={
+                "prompt": "a knight",
+                "model_id": "sdxl",
+                "references": [
+                    {"asset_id": "char-1", "role": "character", "strength": 0.6}
+                ],
+                "params": {"steps": "not-a-number"},
+            },
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertEqual(self.services.job_repository.list(), [])
+
     def test_post_jobs_accepts_a_request_with_no_references(self) -> None:
         client = self._client()
         response = client.post(
