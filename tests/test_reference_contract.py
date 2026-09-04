@@ -15,6 +15,7 @@ from core.reference_capabilities import (  # noqa: E402
     ReferenceCapability,
     ReferenceImageInput,
     UnsupportedReferenceError,
+    select_effective_references,
     validate_reference_inputs,
 )
 from core.schemas import GenerationRequest  # noqa: E402
@@ -159,6 +160,62 @@ class ReferenceCapabilityTests(unittest.TestCase):
         assert manifest.reference_capability is not None
         self.assertTrue(manifest.reference_capability.enabled)
         self.assertEqual(manifest.reference_capability.max_references_per_role, 2)
+
+
+class SelectEffectiveReferencesTests(unittest.TestCase):
+    """#387 P1 hotfix: the effective-set filter shared by JobService and
+    ImageGenerator, exercised as a pure function so its contract holds
+    regardless of which source (direct or Bible-derived) produced a given
+    reference -- including the all-zero and same-role-mixed-strength shapes
+    the regression matrix in #387 describes, whether or not the current
+    request surface can construct every one of those shapes end-to-end.
+    """
+
+    def test_empty_input_returns_empty(self) -> None:
+        self.assertEqual(select_effective_references([]), [])
+
+    def test_drops_zero_strength_entries(self) -> None:
+        zero = ReferenceImageInput(asset_id="a", role="character", strength=0.0)
+        nonzero = ReferenceImageInput(asset_id="b", role="character", strength=0.6)
+        self.assertEqual(select_effective_references([zero, nonzero]), [nonzero])
+
+    def test_all_zero_strength_yields_empty(self) -> None:
+        references = [
+            ReferenceImageInput(asset_id="a", role="character", strength=0.0),
+            ReferenceImageInput(asset_id="b", role="location", strength=0.0),
+        ]
+        self.assertEqual(select_effective_references(references), [])
+
+    def test_preserves_order_and_multiple_effective_entries(self) -> None:
+        # Both nonzero, different roles -- exactly the shape the "exactly one
+        # reference total" check downstream (not this function) is
+        # responsible for rejecting; select_effective_references() itself
+        # does no count enforcement, only strength filtering.
+        character = ReferenceImageInput(asset_id="a", role="character", strength=0.5)
+        location = ReferenceImageInput(asset_id="b", role="location", strength=0.9)
+        self.assertEqual(
+            select_effective_references([character, location]), [character, location]
+        )
+
+    def test_is_agnostic_to_which_source_produced_a_reference(self) -> None:
+        # The function only ever looks at `.strength`; it has no concept of
+        # "direct" vs "Bible-derived". A Bible-shaped reference (the
+        # DEFAULT_REFERENCE_STRENGTH bible_reference_inputs always
+        # constructs) mixed with a zero-strength one sharing its role is
+        # filtered identically to two directly-supplied references -- the
+        # regression matrix's "Bible, same role, 0 + >0" row, which the
+        # current bible_refs contract cannot itself produce a zero-strength
+        # entry for (see core/prompting/composer.py), is covered here at
+        # the shared-logic level instead.
+        from core.reference_capabilities import DEFAULT_REFERENCE_STRENGTH
+
+        bible_shaped = ReferenceImageInput(
+            asset_id="bible-asset", role="character", strength=DEFAULT_REFERENCE_STRENGTH
+        )
+        zero_strength = ReferenceImageInput(asset_id="direct-asset", role="character", strength=0.0)
+        self.assertEqual(
+            select_effective_references([zero_strength, bible_shaped]), [bible_shaped]
+        )
 
 
 class ValidateReferenceInputsTests(unittest.TestCase):
@@ -423,6 +480,101 @@ class UnsupportedReferenceRequestApiTests(unittest.TestCase):
                 "references": [
                     {"asset_id": "char-1", "role": "character", "strength": 0.0},
                     {"asset_id": "loc-1", "role": "location", "strength": 0.8},
+                ],
+            },
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(len(self.services.job_repository.list()), 1)
+
+    def test_post_generate_image_accepts_a_zero_strength_reference_sharing_a_role_with_an_effective_one(
+        self,
+    ) -> None:
+        # Regression (#387 P1 hotfix, case 1): the test above exercises two
+        # *different* roles, which never touches
+        # `max_references_per_role`. Two `character` references -- one
+        # strength=0, one strength=0.8 -- previously tripped "sdxl"'s
+        # max_references_per_role=1 because the zero-strength entry was
+        # counted before effective-reference filtering, even though only
+        # the nonzero one has any conditioning effect.
+        client = self._client()
+        response = client.post(
+            "/generate/image",
+            json={
+                "prompt": "Mina on the rooftop",
+                "model_id": "sdxl",
+                "references": [
+                    {"asset_id": "char-1", "role": "character", "strength": 0.0},
+                    {"asset_id": "char-2", "role": "character", "strength": 0.8},
+                ],
+            },
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(len(self.services.job_repository.list()), 1)
+
+    def test_post_generate_image_accepts_a_zero_strength_direct_reference_sharing_a_role_with_an_effective_bible_reference(
+        self,
+    ) -> None:
+        # Regression (#387 P1 hotfix, case 1, cross-source): the same
+        # zero+nonzero-same-role combination as above, but the nonzero
+        # reference is Bible-derived and the zero-strength one is direct.
+        # Previously request.references and bible_reference_inputs were
+        # each validated separately against their own raw list before ever
+        # being combined, so this specific combination was never actually
+        # exercised by the same-source case above -- a zero-strength direct
+        # reference doesn't share a raw list with a Bible-derived one until
+        # after both per-source validations already ran.
+        from core.assets import Asset
+
+        client = self._client()
+        self.services.asset_repository.create_or_update(
+            Asset(
+                id="bible_char_effective",
+                job_id="job_fixture",
+                project_id=None,
+                media_type="image",
+                kind="output",
+                title="reference fixture",
+                prompt="a reference image",
+                model_id="sdxl",
+                path="/tmp/does-not-need-to-exist.png",
+            )
+        )
+        entry = self.services.bible_repository.create(
+            kind="character", name="Mina", reference_asset_ids=["bible_char_effective"]
+        )
+        response = client.post(
+            "/generate/image",
+            json={
+                "prompt": "Mina on the rooftop",
+                "model_id": "sdxl",
+                "references": [
+                    {"asset_id": "char-1", "role": "character", "strength": 0.0}
+                ],
+                "params": {"bible_refs": [entry.id]},
+            },
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(len(self.services.job_repository.list()), 1)
+
+    def test_post_generate_image_accepts_an_all_zero_strength_reference_on_a_model_without_reference_capability(
+        self,
+    ) -> None:
+        # Regression (#387 P1 hotfix, case 2): a request whose only
+        # reference is strength=0 has no conditioning effect at all and
+        # must succeed via the ordinary unconditioned text-to-image path,
+        # even against "ssd-1b" (the shipped manifest with no
+        # reference_capability whatsoever) -- previously
+        # validate_reference_inputs() ran on the raw list before effective
+        # filtering and rejected this outright, exactly as if the request
+        # had asked for real conditioning it couldn't have.
+        client = self._client()
+        response = client.post(
+            "/generate/image",
+            json={
+                "prompt": "a knight",
+                "model_id": "ssd-1b",
+                "references": [
+                    {"asset_id": "char-1", "role": "character", "strength": 0.0}
                 ],
             },
         )

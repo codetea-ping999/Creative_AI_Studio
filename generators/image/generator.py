@@ -18,7 +18,11 @@ from core.quality import (
     evaluate_image_output,
     evaluate_image_semantics,
 )
-from core.reference_capabilities import MissingReferenceAssetError, validate_reference_inputs
+from core.reference_capabilities import (
+    MissingReferenceAssetError,
+    select_effective_references,
+    validate_reference_inputs,
+)
 from core.schemas import GenerationRequest, GenerationResult
 from generators.base import BaseGenerator
 from generators.common import resolve_generation_prompt
@@ -584,8 +588,31 @@ class ImageGenerator(BaseGenerator):
         if not references:
             return None, None, None, []
 
+        # #387 P1 hotfix: `validate_reference_inputs()` (capability, per-role
+        # count, preprocessing/strength-range) and the img2img-mode check
+        # below now both run against the *effective* (strength > 0) set,
+        # computed before either -- not against the raw `references` list.
+        # Previously they ran on the raw list first: a zero-strength
+        # reference sharing a role with a real one could trip
+        # `max_references_per_role` on its own, and a request whose
+        # references were *all* zero-strength was rejected outright on a
+        # model with no `reference_capability` at all, even though it has no
+        # conditioning effect to honor. `references` itself stays unfiltered
+        # for `considered_references` audit metadata.
+        effective_references = select_effective_references(references)
+        if not effective_references:
+            # ReferenceImageInput.strength=0 means "no effect" -- but img2img
+            # still VAE-encodes the reference and consumes the seeded
+            # generator's random draws to do it, so even diffusers
+            # strength=1.0 (the value zero would otherwise invert to) is not
+            # guaranteed to reproduce what a plain text2img call would have
+            # produced. Every requested reference here is zero-strength, so
+            # generation stays unconditioned, with no primary asset to
+            # resolve or apply and no reference_capability required.
+            return None, None, None, references
+
         validate_reference_inputs(
-            references,
+            effective_references,
             capability=manifest.reference_capability,
             model_id=manifest.public_model_id,
         )
@@ -602,25 +629,6 @@ class ImageGenerator(BaseGenerator):
                 "img2img in reference_capability.supported_modes, which is "
                 "the only conditioning mode this path implements."
             )
-        # #201 follow-up (Codex P2, fourteenth round, confirmed product
-        # decision): strength=0 means "no effect", so a zero-strength
-        # reference must not consume the single applied-image slot below or
-        # be selected as `primary` -- it is excluded from the count and
-        # selection here, but stays in `references` (returned unfiltered)
-        # so it is still reported in `considered_references` metadata.
-        effective_references = [
-            reference for reference in references if reference.strength > 0.0
-        ]
-        if not effective_references:
-            # ReferenceImageInput.strength=0 means "no effect" -- but img2img
-            # still VAE-encodes the reference and consumes the seeded
-            # generator's random draws to do it, so even diffusers
-            # strength=1.0 (the value zero would otherwise invert to) is not
-            # guaranteed to reproduce what a plain text2img call would have
-            # produced. Every requested reference here is zero-strength (or
-            # there were none), so generation stays unconditioned, with no
-            # primary asset to resolve or apply.
-            return None, None, None, references
         if len(effective_references) > 1:
             raise UnsupportedImageParameterError(
                 f"Model {manifest.public_model_id!r} was asked to honor "

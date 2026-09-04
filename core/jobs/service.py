@@ -15,6 +15,7 @@ from core.reference_capabilities import (
     ReferenceImageInput,
     ReferenceRole,
     UnsupportedReferenceError,
+    select_effective_references,
     validate_reference_inputs,
 )
 from core.schemas import GenerationRequest, GenerationResult, GenerationStatus
@@ -141,46 +142,20 @@ class JobService:
         otherwise a later item's reference failure surfaces after earlier
         items already queued jobs, leaving orphaned state behind a 4xx
         response that told the caller nothing was created.
+
+        #387 P1 hotfix: request-shape/provenance checks (the cross-project
+        boundary below) run against every requested reference regardless of
+        strength; everything else -- manifest capability, per-role and
+        total applied-image limits, preprocessing compatibility, primary
+        selection -- runs only against `select_effective_references()`'s
+        output (`strength > 0`). A zero-strength reference is audit-only:
+        it must never require `reference_capability` or consume
+        conditioning capacity, and a request whose references are *all*
+        zero-strength must succeed on a model that advertises no
+        `reference_capability` at all, exactly as if no references had been
+        supplied.
         """
 
-        # #198/#50: a request carrying reference images must fail here, before a
-        # job is ever persisted or queued, if the resolved model can't honor
-        # them -- not silently once a generator that ignores `references`
-        # reaches the front of the queue. model_service is optional (some
-        # tests construct JobService without one); without it we cannot
-        # resolve a manifest, so there is nothing to validate against.
-        if request.references:
-            manifest = self._resolve_manifest_for_references(request)
-            if manifest is not None:
-                # #201 follow-up (Codex P2, fifteenth round): validating the
-                # raw list let two identical entries in request.references
-                # (same asset_id/role/strength/preprocessing) trip the
-                # shipped max_references_per_role=1 here, even though
-                # ImageGenerator._resolve_references_for_conditioning()
-                # already collapses identical entries -- within
-                # request.references, and across it and Bible-derived
-                # references -- to one semantic lock before it validates
-                # anything, so execution could have honored this as one
-                # reference.
-                seen_direct_references: set[tuple[str, str, float, str]] = set()
-                deduped_direct_references: list[ReferenceImageInput] = []
-                for reference in request.references:
-                    direct_dedupe_key = (
-                        reference.asset_id,
-                        reference.role,
-                        reference.strength,
-                        reference.preprocessing,
-                    )
-                    if direct_dedupe_key in seen_direct_references:
-                        continue
-                    seen_direct_references.add(direct_dedupe_key)
-                    deduped_direct_references.append(reference)
-                validate_reference_inputs(
-                    deduped_direct_references,
-                    capability=manifest.reference_capability,
-                    model_id=request.model_id or manifest.public_model_id,
-                )
-                self._require_img2img_mode(manifest, request.model_id)
         if request.references and self.asset_repository is not None:
             # #201 follow-up (Codex P1 on PR #376): a reference asset from a
             # different project must not silently condition a job in this
@@ -253,38 +228,6 @@ class JobService:
                                 strength=DEFAULT_REFERENCE_STRENGTH,
                             )
                         )
-                if bible_reference_inputs:
-                    # #201 follow-up (Codex P2, ninth round): request.references
-                    # is validated against manifest.reference_capability above
-                    # (line ~108), but a Bible-derived reference reached job
-                    # creation with no equivalent check -- a same-project
-                    # reference against a manifest that doesn't support it (or
-                    # the wrong role/strength/count) was queued successfully
-                    # and only failed later, asynchronously, once the
-                    # generator's own validate_reference_inputs() ran.
-                    manifest = self._resolve_manifest_for_references(request)
-                    if manifest is not None:
-                        validate_reference_inputs(
-                            bible_reference_inputs,
-                            capability=manifest.reference_capability,
-                            model_id=request.model_id or manifest.public_model_id,
-                        )
-                        self._require_img2img_mode(manifest, request.model_id)
-        # #201 follow-up (Codex P2, tenth round): per-role capability
-        # validation (above, for both request.references and Bible-derived
-        # references) allows e.g. one character *and* one location reference
-        # -- each within its own per-role limit -- but
-        # ImageGenerator._resolve_references_for_conditioning() separately
-        # enforces a hard "exactly one reference total" limit across
-        # request.references and Bible-derived references combined,
-        # regardless of role, because this conditioning path only ever
-        # performs a single img2img call. Preflight that same total here
-        # (unconditionally, not nested under the Bible-specific gates above,
-        # so a plain request.references request with more than one entry is
-        # also caught) so a combination that is deterministically doomed at
-        # execution time fails now, synchronously, instead of after the job
-        # is queued.
-        #
         # #201 follow-up (Codex P2, eleventh round): request.references and
         # Bible-derived references are independent sources -- a caller can
         # supply the same (asset, role, strength, preprocessing) explicitly
@@ -293,117 +236,135 @@ class JobService:
         # dedupes the same way across the same two sources, so the count
         # here must match or a request the generator can honor would be
         # rejected before it ever reaches the generator.
-        seen_combined_references: set[tuple[str, str, float, str]] = set()
-        combined_references: list[ReferenceImageInput] = []
+        #
+        # #387 P1 hotfix: previously request.references and
+        # bible_reference_inputs were each validated separately, against
+        # their own raw (unfiltered-by-strength) list, before ever being
+        # combined -- a zero-strength reference sharing a role with a real
+        # one inside the *same* source tripped max_references_per_role there
+        # even though the two sources hadn't merged yet. Combining first and
+        # filtering to the effective set once, below, closes that gap
+        # regardless of which source(s) a zero-strength entry came from.
+        seen_requested_references: set[tuple[str, str, float, str]] = set()
+        requested_references: list[ReferenceImageInput] = []
         for reference in list(request.references or []) + bible_reference_inputs:
-            # Named distinctly from the bible-only loop's `dedupe_key` above
-            # (a narrower (str, str) pair) -- mypy infers a variable's type
-            # from its first assignment in the function, so reusing the same
-            # name for this wider (str, str, float, str) tuple was a type
-            # error CI caught (round twelve): "Incompatible types in
-            # assignment" / "Argument 1 to add() ... incompatible type".
-            combined_dedupe_key = (
+            requested_dedupe_key = (
                 reference.asset_id,
                 reference.role,
                 reference.strength,
                 reference.preprocessing,
             )
-            if combined_dedupe_key in seen_combined_references:
+            if requested_dedupe_key in seen_requested_references:
                 continue
-            seen_combined_references.add(combined_dedupe_key)
-            combined_references.append(reference)
-        # #201 follow-up (Codex P2, fourteenth round, confirmed product
-        # decision): strength=0 means "no effect" -- ImageGenerator._resolve_
-        # references_for_conditioning() excludes a zero-strength reference
-        # from its "exactly one reference" limit and primary selection,
-        # since it never reaches img2img either way. Preflighting the raw
-        # (unfiltered) combined count here rejected a request the generator
-        # could actually honor; only non-zero-strength references consume
-        # the single applied-image slot.
-        effective_combined_references = [
-            reference for reference in combined_references if reference.strength > 0.0
-        ]
-        if len(effective_combined_references) > 1:
+            seen_requested_references.add(requested_dedupe_key)
+            requested_references.append(reference)
+
+        # #387 P1 hotfix: manifest capability, per-role/total applied-image
+        # limits, preprocessing compatibility, and primary selection all
+        # operate on `select_effective_references()`'s output, never on
+        # `requested_references` directly -- a zero-strength reference is
+        # audit-only (see the docstring above) and a request whose
+        # references are all strength=0 has no conditioning effect at all,
+        # so it must succeed even against a model with no
+        # `reference_capability` whatsoever, exactly as if no references
+        # had been supplied.
+        effective_references = select_effective_references(requested_references)
+        if not effective_references:
+            return
+        manifest = self._resolve_manifest_for_references(request)
+        if manifest is None:
+            return
+        # #201 follow-up (Codex P2, ninth/tenth rounds): a Bible-derived
+        # reference must be held to the identical
+        # manifest.reference_capability contract request.references already
+        # is -- both sources are validated together here, once, on the
+        # merged effective set, so neither source can end up with a looser
+        # per-role/count check than the other.
+        validate_reference_inputs(
+            effective_references,
+            capability=manifest.reference_capability,
+            model_id=request.model_id or manifest.public_model_id,
+        )
+        self._require_img2img_mode(manifest, request.model_id)
+        if len(effective_references) > 1:
             raise UnsupportedReferenceError(
                 f"Model {request.model_id!r}: reference-image conditioning "
                 "honors exactly one reference image per request (across "
                 "`references` and Bible-derived character/location entries "
-                f"combined); got {len(effective_combined_references)} with "
-                "non-zero strength."
+                "combined; zero-strength references are audit-only and do "
+                f"not count toward this limit); got {len(effective_references)} "
+                "with non-zero strength."
             )
-        if len(effective_combined_references) == 1:
-            # #201 follow-up (Codex P2, twelfth round): diffusers img2img
-            # runs int(num_inference_steps * (1 - strength)) denoising steps
-            # -- ImageGenerator.generate() rejects a combination that leaves
-            # zero (see its own identical computation), but the shipped
-            # "sdxl" manifest advertises max_strength=1.0, which zeroes out
-            # regardless of step count. Preflighting the same computation
-            # here, using the same effective_params merge (manifest defaults
-            # then request.params) the generator uses, catches a
-            # deterministically doomed job before it's queued.
-            manifest = self._resolve_manifest_for_references(request)
-            if manifest is not None:
-                primary = effective_combined_references[0]
-                # #201 follow-up (Codex P2, thirteenth round): mirrors
-                # ImageGenerator.generate()'s own preprocessing and
-                # incompatible-param checks -- this conditioning path only
-                # ever performs a plain-resize img2img call, so a
-                # manifest-permitted preprocessing mode it doesn't implement,
-                # or a diffusers timestep-selection param that doesn't
-                # compose with the computed `strength`, must fail here too
-                # rather than only once the job executes.
-                if primary.preprocessing not in ("none", "auto"):
-                    raise UnsupportedReferenceError(
-                        f"Model {request.model_id!r}: reference preprocessing "
-                        f"{primary.preprocessing!r} is not implemented by this "
-                        "conditioning path (only 'none'/'auto', a plain resize, "
-                        "are)."
-                    )
-                effective_params = {**manifest.default_params, **request.params}
-                for incompatible_param in (
-                    "denoising_start",
-                    "denoising_end",
-                    "timesteps",
-                    "sigmas",
-                ):
-                    if incompatible_param in effective_params:
-                        raise UnsupportedReferenceError(
-                            f"Model {request.model_id!r}: {incompatible_param!r} "
-                            "cannot be combined with reference-image "
-                            "conditioning -- diffusers img2img's timestep "
-                            "selection from denoising_start/denoising_end/"
-                            "timesteps/sigmas does not compose with the "
-                            "computed 'strength', so the reference's lock "
-                            f"strength would not be honored. Remove "
-                            f"{incompatible_param!r} from params or drop the "
-                            "reference."
-                        )
-                # #201 follow-up (Codex P2, thirteenth round): a non-numeric
-                # steps/num_inference_steps value (params is an unconstrained
-                # dict) made this raise a plain ValueError -- not caught by
-                # any route's (UnsupportedReferenceError,
-                # MissingReferenceAssetError) handler, so it was an unhandled
-                # 500 instead of a 4xx.
-                raw_steps = effective_params.get(
-                    "num_inference_steps", effective_params.get("steps", 30)
+        # #201 follow-up (Codex P2, twelfth round): diffusers img2img
+        # runs int(num_inference_steps * (1 - strength)) denoising steps
+        # -- ImageGenerator.generate() rejects a combination that leaves
+        # zero (see its own identical computation), but the shipped
+        # "sdxl" manifest advertises max_strength=1.0, which zeroes out
+        # regardless of step count. Preflighting the same computation
+        # here, using the same effective_params merge (manifest defaults
+        # then request.params) the generator uses, catches a
+        # deterministically doomed job before it's queued.
+        primary = effective_references[0]
+        # #201 follow-up (Codex P2, thirteenth round): mirrors
+        # ImageGenerator.generate()'s own preprocessing and
+        # incompatible-param checks -- this conditioning path only
+        # ever performs a plain-resize img2img call, so a
+        # manifest-permitted preprocessing mode it doesn't implement,
+        # or a diffusers timestep-selection param that doesn't
+        # compose with the computed `strength`, must fail here too
+        # rather than only once the job executes.
+        if primary.preprocessing not in ("none", "auto"):
+            raise UnsupportedReferenceError(
+                f"Model {request.model_id!r}: reference preprocessing "
+                f"{primary.preprocessing!r} is not implemented by this "
+                "conditioning path (only 'none'/'auto', a plain resize, "
+                "are)."
+            )
+        effective_params = {**manifest.default_params, **request.params}
+        for incompatible_param in (
+            "denoising_start",
+            "denoising_end",
+            "timesteps",
+            "sigmas",
+        ):
+            if incompatible_param in effective_params:
+                raise UnsupportedReferenceError(
+                    f"Model {request.model_id!r}: {incompatible_param!r} "
+                    "cannot be combined with reference-image "
+                    "conditioning -- diffusers img2img's timestep "
+                    "selection from denoising_start/denoising_end/"
+                    "timesteps/sigmas does not compose with the "
+                    "computed 'strength', so the reference's lock "
+                    f"strength would not be honored. Remove "
+                    f"{incompatible_param!r} from params or drop the "
+                    "reference."
                 )
-                try:
-                    num_inference_steps = int(raw_steps)
-                except (TypeError, ValueError) as exc:
-                    raise UnsupportedReferenceError(
-                        f"Model {request.model_id!r}: num_inference_steps/steps "
-                        f"must be a number, not {raw_steps!r}."
-                    ) from exc
-                img2img_strength = 1.0 - primary.strength
-                if int(num_inference_steps * img2img_strength) < 1:
-                    raise UnsupportedReferenceError(
-                        f"Model {request.model_id!r}: the requested reference "
-                        f"lock strength {primary.strength} combined with "
-                        f"{num_inference_steps} inference step(s) would leave "
-                        "diffusers with zero denoising steps to actually run. "
-                        "Increase num_inference_steps or reduce the reference "
-                        "strength."
-                    )
+        # #201 follow-up (Codex P2, thirteenth round): a non-numeric
+        # steps/num_inference_steps value (params is an unconstrained
+        # dict) made this raise a plain ValueError -- not caught by
+        # any route's (UnsupportedReferenceError,
+        # MissingReferenceAssetError) handler, so it was an unhandled
+        # 500 instead of a 4xx.
+        raw_steps = effective_params.get(
+            "num_inference_steps", effective_params.get("steps", 30)
+        )
+        try:
+            num_inference_steps = int(raw_steps)
+        except (TypeError, ValueError) as exc:
+            raise UnsupportedReferenceError(
+                f"Model {request.model_id!r}: num_inference_steps/steps "
+                f"must be a number, not {raw_steps!r}."
+            ) from exc
+        img2img_strength = 1.0 - primary.strength
+        if int(num_inference_steps * img2img_strength) < 1:
+            raise UnsupportedReferenceError(
+                f"Model {request.model_id!r}: the requested reference "
+                f"lock strength {primary.strength} combined with "
+                f"{num_inference_steps} inference step(s) would leave "
+                "diffusers with zero denoising steps to actually run. "
+                "Increase num_inference_steps or reduce the reference "
+                "strength."
+            )
 
     def _resolve_manifest_for_references(
         self,
