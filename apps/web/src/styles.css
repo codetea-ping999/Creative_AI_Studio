@@ -2361,6 +2361,12 @@ pre,
   color: var(--text-primary);
 }
 
+.matrix-progress__error {
+  grid-column: 1 / -1;
+  margin: 0;
+  font-size: 12px;
+}
+
 .matrix-progress progress {
   width: 100%;
   height: 8px;
