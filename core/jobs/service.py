@@ -289,14 +289,26 @@ class JobService:
                 continue
             seen_combined_references.add(combined_dedupe_key)
             combined_references.append(reference)
-        if len(combined_references) > 1:
+        # #201 follow-up (Codex P2, fourteenth round, confirmed product
+        # decision): strength=0 means "no effect" -- ImageGenerator._resolve_
+        # references_for_conditioning() excludes a zero-strength reference
+        # from its "exactly one reference" limit and primary selection,
+        # since it never reaches img2img either way. Preflighting the raw
+        # (unfiltered) combined count here rejected a request the generator
+        # could actually honor; only nonzero-strength references consume
+        # the single applied-image slot.
+        effective_combined_references = [
+            reference for reference in combined_references if reference.strength > 0.0
+        ]
+        if len(effective_combined_references) > 1:
             raise UnsupportedReferenceError(
                 f"Model {request.model_id!r}: reference-image conditioning "
                 "honors exactly one reference image per request (across "
                 "`references` and Bible-derived character/location entries "
-                f"combined); got {len(combined_references)}."
+                f"combined); got {len(effective_combined_references)} with "
+                "nonzero strength."
             )
-        if len(combined_references) == 1:
+        if len(effective_combined_references) == 1:
             # #201 follow-up (Codex P2, twelfth round): diffusers img2img
             # runs int(num_inference_steps * (1 - strength)) denoising steps
             # -- ImageGenerator.generate() rejects a combination that leaves
@@ -308,7 +320,7 @@ class JobService:
             # deterministically doomed job before it's queued.
             manifest = self._resolve_manifest_for_references(request)
             if manifest is not None:
-                primary = combined_references[0]
+                primary = effective_combined_references[0]
                 # #201 follow-up (Codex P2, thirteenth round): mirrors
                 # ImageGenerator.generate()'s own preprocessing and
                 # incompatible-param checks -- this conditioning path only

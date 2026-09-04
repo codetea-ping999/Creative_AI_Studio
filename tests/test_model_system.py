@@ -1652,6 +1652,85 @@ class ModelSystemTests(unittest.TestCase):
 
             self.assertEqual(list(output_dir.glob("**/*")), [])
 
+    def test_image_generator_excludes_a_zero_strength_reference_from_the_combined_limit(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, fourteenth Codex round on PR #376,
+        # confirmed product decision): strength=0 means "no effect" in the
+        # public contract, so it must not count toward the "exactly one
+        # reference total" limit the test above exercises, and must not be
+        # selected as the primary conditioning reference -- unlike that
+        # test (both references nonzero), this combination is one this
+        # conditioning path can actually honor: the zero-strength "location"
+        # reference never reaches img2img, only the nonzero Bible-derived
+        # "character" one does.
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_root = root / "manifests"
+            model_id = self._write_reference_capable_manifest(manifest_root)
+            composer, character_id = self._prepare_character_reference(root)
+            second_reference_path = root / "second_reference.png"
+            Image.new("RGB", (16, 16), color=(10, 20, 30)).save(second_reference_path)
+            composer.asset_repository.create_or_update(
+                Asset(
+                    id="asset_location_1",
+                    job_id="job_fixture",
+                    project_id=None,
+                    media_type="image",
+                    kind="output",
+                    title="second reference fixture",
+                    prompt="a second reference image",
+                    model_id="sdxl",
+                    path=str(second_reference_path),
+                )
+            )
+            output_dir = root / "outputs"
+
+            with patch(
+                "core.models.loader.DiffusersImageLoader.load",
+                new=_fake_diffusers_load_reference_capable,
+            ):
+                service = create_default_model_service(manifest_root=manifest_root)
+                generator = ImageGenerator(
+                    service, output_dir=output_dir, prompt_composer=composer
+                )
+                result = generator.run(
+                    GenerationRequest(
+                        media_type="image",
+                        prompt="Mina on the rooftop",
+                        model_id=model_id,
+                        references=[
+                            ReferenceImageInput(
+                                asset_id="asset_location_1",
+                                role="location",
+                                strength=0.0,
+                            )
+                        ],
+                        params={
+                            "steps": 10,
+                            "width": 64,
+                            "height": 64,
+                            "bible_refs": [character_id],
+                        },
+                    )
+                )
+                runtime = service.get_runtime(model_id, "image", "text-to-image")
+                img2img_pipeline = runtime["img2img_pipeline"]
+
+            self.assertEqual(result.status, "succeeded")
+            # Only the nonzero (Bible-derived) reference is applied.
+            self.assertEqual(len(img2img_pipeline.calls), 1)
+            self.assertTrue(result.metadata["reference_conditioning_applied"])
+            self.assertEqual(result.metadata["reference_applied_asset_id"], "asset_char_1")
+            # The zero-strength reference is still reported for audit, not
+            # silently dropped, and did not block the request as a second
+            # conditioning image.
+            considered_asset_ids = {
+                reference["asset_id"]
+                for reference in result.metadata["considered_references"]
+            }
+            self.assertEqual(considered_asset_ids, {"asset_char_1", "asset_location_1"})
+
     def test_image_generator_rejects_a_reference_asset_outside_the_context_project(
         self,
     ) -> None:

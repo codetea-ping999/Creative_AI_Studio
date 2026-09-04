@@ -401,6 +401,55 @@ class UnsupportedReferenceRequestApiTests(unittest.TestCase):
         self.assertIn("exactly one reference image", response.text)
         self.assertEqual(self.services.job_repository.list(), [])
 
+    def test_post_generate_image_accepts_a_zero_strength_reference_alongside_a_nonzero_one(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, fourteenth Codex round on PR #376,
+        # confirmed product decision): strength=0 means "no effect" in the
+        # public contract, so it must not consume the single applied-image
+        # slot the test above exercises -- two references in different
+        # roles where only one is nonzero is not "two reference images at
+        # once" the way that test's both-nonzero combination is; only the
+        # nonzero one will ever reach img2img.
+        from core.assets import Asset
+
+        client = self._client()
+        for asset_id in ("zero_strength_loc", "nonzero_strength_char"):
+            self.services.asset_repository.create_or_update(
+                Asset(
+                    id=asset_id,
+                    job_id="job_fixture",
+                    project_id=None,
+                    media_type="image",
+                    kind="output",
+                    title="reference fixture",
+                    prompt="a reference image",
+                    model_id="sdxl",
+                    path="/tmp/does-not-need-to-exist.png",
+                )
+            )
+        response = client.post(
+            "/generate/image",
+            json={
+                "prompt": "Mina on the rooftop",
+                "model_id": "sdxl",
+                "references": [
+                    {
+                        "asset_id": "zero_strength_loc",
+                        "role": "location",
+                        "strength": 0.0,
+                    },
+                    {
+                        "asset_id": "nonzero_strength_char",
+                        "role": "character",
+                        "strength": 0.6,
+                    },
+                ],
+            },
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(len(self.services.job_repository.list()), 1)
+
     def test_post_generate_image_deduplicates_repeated_bible_references(self) -> None:
         # Regression (#201 follow-up, tenth Codex round on PR #376, P2):
         # PromptComposer.compose() deduplicates resolved references by
