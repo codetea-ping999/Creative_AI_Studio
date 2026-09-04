@@ -120,6 +120,7 @@ class ImageGenerator(BaseGenerator):
         (
             reference_image_path,
             reference_strength,
+            reference_applied_asset_id,
             considered_references,
         ) = self._resolve_references_for_conditioning(
             request,
@@ -425,8 +426,13 @@ class ImageGenerator(BaseGenerator):
                     reference.model_dump(mode="json") for reference in considered_references
                 ],
                 "reference_conditioning_applied": reference_capable,
+                # Not `considered_references[0]` -- a zero-strength reference
+                # can sort first in that list without being the one actually
+                # applied (#201 follow-up, fourteenth Codex round); the
+                # asset id `_resolve_references_for_conditioning` resolved
+                # conditioning against is authoritative here.
                 "reference_applied_asset_id": (
-                    considered_references[0].asset_id if reference_capable else None
+                    reference_applied_asset_id if reference_capable else None
                 ),
                 "requested_model_id": requested_model_id,
                 "model_id": manifest.public_model_id,
@@ -501,8 +507,17 @@ class ImageGenerator(BaseGenerator):
         manifest: "ModelManifest",
         *,
         project_id: str | None = None,
-    ) -> tuple[str | None, float | None, list["ReferenceImageInput"]]:
+    ) -> tuple[str | None, float | None, str | None, list["ReferenceImageInput"]]:
         """Pick the references to condition on and validate them against the manifest.
+
+        Returns `(reference_image_path, reference_strength,
+        applied_asset_id, considered_references)`. `applied_asset_id` is the
+        asset id actually used for conditioning (the same reference
+        `reference_image_path`/`reference_strength` describe) -- distinct
+        from `considered_references[0]`, which the caller must not assume is
+        the applied one: a zero-strength reference can sort first in that
+        list (#201 follow-up, fourteenth Codex round) while a later,
+        nonzero-strength entry is the one actually applied.
 
         `request.references` -- the documented top-level field `JobService`
         already validates against `manifest.reference_capability` before a
@@ -565,7 +580,7 @@ class ImageGenerator(BaseGenerator):
             seen_references.add(dedupe_key)
             references.append(reference)
         if not references:
-            return None, None, []
+            return None, None, None, []
 
         validate_reference_inputs(
             references,
@@ -598,7 +613,7 @@ class ImageGenerator(BaseGenerator):
             # Every reference resolved to strength=0 -- unconditioned
             # generation, exactly as if none had been supplied at all, with
             # no primary asset to resolve or apply.
-            return None, None, references
+            return None, None, None, references
         if len(effective_references) > 1:
             raise UnsupportedImageParameterError(
                 f"Model {manifest.public_model_id!r} was asked to honor "
@@ -666,7 +681,7 @@ class ImageGenerator(BaseGenerator):
         # would otherwise invert to) is not guaranteed to reproduce what a
         # plain text2img call would have produced; the strength=0 case is
         # handled above, before any asset is resolved.
-        return asset.path, primary.strength, references
+        return asset.path, primary.strength, primary.asset_id, references
 
     def _pipeline_accepts_reference_image(self, pipeline: object) -> bool:
         call = getattr(pipeline, "__call__", None)
