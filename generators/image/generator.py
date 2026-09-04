@@ -426,6 +426,11 @@ class ImageGenerator(BaseGenerator):
                     reference.model_dump(mode="json") for reference in considered_references
                 ],
                 "reference_conditioning_applied": reference_capable,
+                # Not `considered_references[0]` -- a zero-strength reference
+                # can sort first in that list without being the one actually
+                # applied (#201 follow-up, fourteenth Codex round); the
+                # asset id `_resolve_references_for_conditioning` resolved
+                # conditioning against is authoritative here.
                 "reference_applied_asset_id": (
                     reference_applied_asset_id if reference_capable else None
                 ),

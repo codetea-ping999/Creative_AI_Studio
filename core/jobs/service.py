@@ -152,8 +152,31 @@ class JobService:
         if request.references:
             manifest = self._resolve_manifest_for_references(request)
             if manifest is not None:
+                # #201 follow-up (Codex P2, fifteenth round): validating the
+                # raw list let two identical entries in request.references
+                # (same asset_id/role/strength/preprocessing) trip the
+                # shipped max_references_per_role=1 here, even though
+                # ImageGenerator._resolve_references_for_conditioning()
+                # already collapses identical entries -- within
+                # request.references, and across it and Bible-derived
+                # references -- to one semantic lock before it validates
+                # anything, so execution could have honored this as one
+                # reference.
+                seen_direct_references: set[tuple[str, str, float, str]] = set()
+                deduped_direct_references: list[ReferenceImageInput] = []
+                for reference in request.references:
+                    direct_dedupe_key = (
+                        reference.asset_id,
+                        reference.role,
+                        reference.strength,
+                        reference.preprocessing,
+                    )
+                    if direct_dedupe_key in seen_direct_references:
+                        continue
+                    seen_direct_references.add(direct_dedupe_key)
+                    deduped_direct_references.append(reference)
                 validate_reference_inputs(
-                    request.references,
+                    deduped_direct_references,
                     capability=manifest.reference_capability,
                     model_id=request.model_id or manifest.public_model_id,
                 )
