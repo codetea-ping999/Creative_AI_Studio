@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Minimal permissions for the Creative AI Studio desktop shell main window. Grants only Tauri core window basics plus autostart state control, which the Phase 1 shell requires.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "autostart:default"
+  ]
+}

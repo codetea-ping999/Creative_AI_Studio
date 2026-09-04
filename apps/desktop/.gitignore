@@ -1,0 +1,6 @@
+# Rust / Cargo build outputs
+/target/
+/gen/schemas/
+
+# Local build artifacts
+dist/
