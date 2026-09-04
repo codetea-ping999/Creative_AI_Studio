@@ -609,6 +609,57 @@ class UnsupportedReferenceRequestApiTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 201, response.text)
 
+    def test_post_batches_reports_422_not_500_for_a_cross_project_bible_reference(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, ninth Codex round on PR #376, P2):
+        # BatchSpec.bible_refs flows unchanged into each expanded item's
+        # params.bible_refs (core/batches/expansion.py), so a batch whose
+        # bible_refs resolve to an image outside the batch's own project
+        # surfaces the project-boundary rejection JobService.create_job()
+        # raises through BatchService.create_batch() -- but this route never
+        # caught it, so it fell through as an unhandled 500 instead of 422,
+        # exactly like the /jobs/{id}/rerun and gallery reuse gaps from
+        # earlier rounds.
+        from core.assets import Asset
+
+        client = self._client()
+        project_a = self.services.project_repository.create("Project A")
+        project_b = self.services.project_repository.create("Project B")
+        self.services.asset_repository.create_or_update(
+            Asset(
+                id="batch_cross_project_ref",
+                job_id="job_fixture",
+                project_id=project_a.id,
+                media_type="image",
+                kind="output",
+                title="reference fixture",
+                prompt="a reference image",
+                model_id="sdxl",
+                path="/tmp/does-not-need-to-exist.png",
+            )
+        )
+        entry = self.services.bible_repository.create(
+            kind="character",
+            name="Mina",
+            reference_asset_ids=["batch_cross_project_ref"],
+        )
+        response = client.post(
+            "/batches",
+            json={
+                "spec": {
+                    "name": "cross-project batch",
+                    "media_type": "image",
+                    "model_id": "sdxl",
+                    "project_id": project_b.id,
+                    "prompt": "a knight",
+                    "bible_refs": [entry.id],
+                }
+            },
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertIn("batch_cross_project_ref", response.text)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

@@ -137,9 +137,10 @@ def create_batch(
     try:
         record = services.batch_service.create_batch(spec)
     except (UnsupportedReferenceError, MissingReferenceAssetError) as exc:
-        # Both inherit from ValueError, so this must be caught before the
-        # broader handler below -- otherwise that clause matches first and
-        # every reference failure returns 400 instead of 422.
+        # Both subclass ValueError, so this must come before the plain
+        # `except ValueError` below -- Python matches except clauses in
+        # order, and the broader clause would otherwise catch these first,
+        # making this one unreachable and reporting 400 instead of 422.
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
         ) from exc
