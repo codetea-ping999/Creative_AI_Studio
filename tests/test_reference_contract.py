@@ -312,6 +312,49 @@ class UnsupportedReferenceRequestApiTests(unittest.TestCase):
         self.assertIn("reference-image conditioning", response.text)
         self.assertEqual(self.services.job_repository.list(), [])
 
+    def test_post_generate_image_rejects_a_bible_ref_for_a_model_without_reference_capability(
+        self,
+    ) -> None:
+        # Regression (#201 follow-up, ninth Codex round on PR #376, P2): the
+        # two tests above only cover the documented top-level `references`
+        # field. A Bible-derived reference (params.bible_refs) reached
+        # JobService.create_job() with no equivalent manifest-capability
+        # check -- a job against "ssd-1b" (no reference_capability) was
+        # queued successfully and only failed later, asynchronously, once
+        # the generator's own validate_reference_inputs() ran.
+        from core.assets import Asset
+
+        client = self._client()
+        self.services.asset_repository.create_or_update(
+            Asset(
+                id="bible_ref_no_capability",
+                job_id="job_fixture",
+                project_id=None,
+                media_type="image",
+                kind="output",
+                title="reference fixture",
+                prompt="a reference image",
+                model_id="sdxl",
+                path="/tmp/does-not-need-to-exist.png",
+            )
+        )
+        entry = self.services.bible_repository.create(
+            kind="character",
+            name="Mina",
+            reference_asset_ids=["bible_ref_no_capability"],
+        )
+        response = client.post(
+            "/generate/image",
+            json={
+                "prompt": "a knight",
+                "model_id": "ssd-1b",
+                "params": {"bible_refs": [entry.id]},
+            },
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertIn("reference-image conditioning", response.text)
+        self.assertEqual(self.services.job_repository.list(), [])
+
     def test_post_jobs_accepts_a_request_with_no_references(self) -> None:
         client = self._client()
         response = client.post(

@@ -5,12 +5,15 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from core.models import ModelService
 from core.reference_capabilities import (
+    DEFAULT_REFERENCE_STRENGTH,
     REFERENCE_ROLES,
     MissingReferenceAssetError,
+    ReferenceImageInput,
+    ReferenceRole,
     validate_reference_inputs,
 )
 from core.schemas import GenerationRequest, GenerationResult, GenerationStatus
@@ -154,6 +157,7 @@ class JobService:
             # be rejected for a risk that generator can never act on.
             bible_refs = request.params.get("bible_refs")
             if isinstance(bible_refs, list):
+                bible_reference_inputs: list[ReferenceImageInput] = []
                 for entry_id in bible_refs:
                     if not isinstance(entry_id, str):
                         continue
@@ -164,6 +168,35 @@ class JobService:
                         self._reject_cross_project_reference_asset(
                             self.asset_repository, asset_id, project_id
                         )
+                        # Mirrors PromptComposer.compose()'s own construction
+                        # (core/prompting/composer.py) so this validates
+                        # exactly the reference inputs the generator will
+                        # later resolve -- same role/strength, so this
+                        # can't disagree with execution-time behavior.
+                        bible_reference_inputs.append(
+                            ReferenceImageInput(
+                                asset_id=asset_id,
+                                role=cast(ReferenceRole, entry.kind),
+                                strength=DEFAULT_REFERENCE_STRENGTH,
+                            )
+                        )
+                if bible_reference_inputs and self.model_service is not None:
+                    # #201 follow-up (Codex P2, ninth round): request.references
+                    # is validated against manifest.reference_capability above
+                    # (line ~108), but a Bible-derived reference reached job
+                    # creation with no equivalent check -- a same-project
+                    # reference against a manifest that doesn't support it (or
+                    # the wrong role/strength/count) was queued successfully
+                    # and only failed later, asynchronously, once the
+                    # generator's own validate_reference_inputs() ran.
+                    manifest = self.model_service.get_manifest(
+                        request.model_id, request.media_type, request.task_type
+                    )
+                    validate_reference_inputs(
+                        bible_reference_inputs,
+                        capability=manifest.reference_capability,
+                        model_id=request.model_id or manifest.public_model_id,
+                    )
         now = datetime.now(timezone.utc)
         job = JobRecord(
             id=f"job_{uuid4().hex}",
