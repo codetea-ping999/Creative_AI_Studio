@@ -490,6 +490,46 @@ class UnsupportedReferenceRequestApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 201, response.text)
         self.assertEqual(len(self.services.job_repository.list()), 1)
 
+    def test_post_generate_image_deduplicates_repeated_direct_references(self) -> None:
+        # Regression (#201 follow-up, fifteenth Codex round on PR #376,
+        # P2): the sibling test above covers duplicate Bible references;
+        # ImageGenerator._resolve_references_for_conditioning() also
+        # collapses two identical entries *within* request.references
+        # itself (same asset_id/role/strength/preprocessing) to one
+        # semantic lock before validating anything -- but this preflight
+        # validated the raw, undeduped list, so the shipped
+        # max_references_per_role=1 rejected a request the generator could
+        # actually honor.
+        from core.assets import Asset
+
+        client = self._client()
+        self.services.asset_repository.create_or_update(
+            Asset(
+                id="direct_dedup_ref",
+                job_id="job_fixture",
+                project_id=None,
+                media_type="image",
+                kind="output",
+                title="reference fixture",
+                prompt="a reference image",
+                model_id="sdxl",
+                path="/tmp/does-not-need-to-exist.png",
+            )
+        )
+        response = client.post(
+            "/generate/image",
+            json={
+                "prompt": "a knight",
+                "model_id": "sdxl",
+                "references": [
+                    {"asset_id": "direct_dedup_ref", "role": "character", "strength": 0.6},
+                    {"asset_id": "direct_dedup_ref", "role": "character", "strength": 0.6},
+                ],
+            },
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(len(self.services.job_repository.list()), 1)
+
     def test_post_generate_image_deduplicates_the_same_reference_across_sources(
         self,
     ) -> None:
