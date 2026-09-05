@@ -79,7 +79,13 @@ class JobRunner:
         job_id = self.job_queue.dequeue(lane=lane)
         if job_id is None:
             return None
-        return self.process_job(job_id)
+        try:
+            return self.process_job(job_id)
+        except Exception:
+            # The queue item is already consumed; record the precise job at
+            # the processing boundary and leave retry policy to a later layer.
+            logger.exception("Job %s processing failed.", job_id)
+            raise
 
     def run_forever(
         self,
@@ -91,7 +97,17 @@ class JobRunner:
         while True:
             if stop_event is not None and stop_event.is_set():
                 return
-            job = self.run_once(lane=lane)
+            try:
+                job = self.run_once(lane=lane)
+            except Exception:
+                # One job's post-completion side effect must not kill the
+                # consumer or cause this already-dequeued job to be retried.
+                logger.exception("Job runner iteration failed; continuing.")
+                if stop_event is None:
+                    time.sleep(max(0.1, poll_interval_seconds))
+                else:
+                    stop_event.wait(max(0.1, poll_interval_seconds))
+                continue
             if job is None:
                 if stop_event is None:
                     time.sleep(poll_interval_seconds)
@@ -113,11 +129,24 @@ class JobRunner:
             )
             return job
 
-        context = self._begin_context(job_id, project_id=job.project_id)
+        cancellation_token = None
         try:
+            # This compare-and-set is the execution claim. Do not put an
+            # in-memory cancellation entry in the registry before owning it.
+            if self._update_status(job_id, JOB_STATUS_PREPARING, progress=0.0) is None:
+                return self.job_repository.get(job_id)
+            if self.cancellation_registry is not None:
+                cancellation_token = self.cancellation_registry.begin(job_id)
+            context = self._begin_context(
+                job_id,
+                project_id=job.project_id,
+                cancellation_token=cancellation_token,
+            )
+            # A cancel can land between claim and registration. The database
+            # remains authoritative, so observe it before doing more work.
+            if self._is_cancelled(job_id):
+                return self._finalize_cancellation(job_id)
             try:
-                if self._update_status(job_id, JOB_STATUS_PREPARING, progress=0.0) is None:
-                    return self._finalize_cancellation(job_id)
                 generator = self.generator_registry.get(job.media_type, job.request.task_type)
                 if self._update_status(job_id, JOB_STATUS_RUNNING, progress=0.1) is None:
                     return self._finalize_cancellation(job_id)
@@ -160,8 +189,8 @@ class JobRunner:
                 return self._finalize_cancellation(job_id)
             return self.job_service.mark_succeeded(job_id, result)
         finally:
-            if self.cancellation_registry is not None:
-                self.cancellation_registry.end(job_id)
+            if self.cancellation_registry is not None and cancellation_token is not None:
+                self.cancellation_registry.end(job_id, cancellation_token)
 
     def _is_cancelled(self, job_id: str) -> bool:
         # `cancel_requested` (in-flight job, cooperative shutdown pending) and
@@ -189,7 +218,10 @@ class JobRunner:
         return self.job_service.finalize_cancellation(job_id)
 
     def _begin_context(
-        self, job_id: str, project_id: str | None = None
+        self,
+        job_id: str,
+        project_id: str | None = None,
+        cancellation_token: Event | None = None,
     ) -> GenerationContext:
         # Always builds a context now (#201 follow-up, eighth Codex round on
         # PR #376): this used to return None outright when no
@@ -204,20 +236,25 @@ class JobRunner:
         # cancelled" is the correct (not a regressed) answer.
         cancellation_registry = self.cancellation_registry
         if cancellation_registry is not None:
-            cancellation_registry.begin(job_id)
+            if cancellation_token is None:
+                cancellation_token = cancellation_registry.begin(job_id)
 
             def is_cancelled() -> bool:
-                return cancellation_registry.is_cancelled(job_id)
+                return (
+                    cancellation_registry.is_cancelled(job_id)
+                    or self._is_cancelled(job_id)
+                )
         else:
 
             def is_cancelled() -> bool:
                 return False
 
-        return GenerationContext(
+        context = GenerationContext(
             is_cancelled=is_cancelled,
             on_progress=lambda fraction: self._report_generation_progress(job_id, fraction),
             project_id=project_id,
         )
+        return context
 
     def _report_generation_progress(self, job_id: str, fraction: float) -> None:
         mapped_progress = (

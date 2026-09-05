@@ -301,6 +301,8 @@ class BibleApiTests(unittest.TestCase):
         }
         if seed is not None:
             metadata["seed"] = seed
+        for status in ("preparing", "running", "postprocessing"):
+            assert studio.services.job_repository.update_status(job.id, status) is not None
         studio.services.job_service.mark_succeeded(
             job.id,
             GenerationResult(

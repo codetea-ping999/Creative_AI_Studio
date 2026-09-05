@@ -10,6 +10,7 @@ import sqlite3
 from typing import Any
 
 from core.jobs.schemas import JobRecord
+from core.jobs.statuses import JOB_STATUSES, is_valid_transition
 from core.schemas import GenerationRequest, GenerationResult, GenerationStatus
 
 _UNSET = object()
@@ -22,6 +23,12 @@ class JobRepository:
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
+
+    @property
+    def data_directory(self) -> Path:
+        """Return the directory containing this repository's SQLite data."""
+
+        return self._db_path.resolve().parent
 
     def create(self, job: JobRecord) -> JobRecord:
         with self._connection() as connection:
@@ -163,8 +170,19 @@ class JobRepository:
     ) -> JobRecord | None:
         assignments: list[str] = []
         parameters: list[Any] = []
+        transition_sources: tuple[str, ...] | None = None
 
         if status is not None:
+            if status not in JOB_STATUSES:
+                return None
+            # A caller's stale read must never become execution authority.
+            # Keep the lifecycle edge in this UPDATE's WHERE clause so every
+            # public and legacy update path shares one SQLite-enforced contract.
+            transition_sources = tuple(
+                current
+                for current in JOB_STATUSES
+                if is_valid_transition(current, status)
+            )
             assignments.append("status = ?")
             parameters.append(status)
 
@@ -195,6 +213,10 @@ class JobRepository:
             placeholders = ", ".join("?" for _ in expected_statuses)
             where_clause += f" AND status IN ({placeholders})"
             parameters.extend(expected_statuses)
+        if transition_sources is not None:
+            placeholders = ", ".join("?" for _ in transition_sources)
+            where_clause += f" AND status IN ({placeholders})"
+            parameters.extend(transition_sources)
 
         with self._connection() as connection:
             cursor = connection.execute(
