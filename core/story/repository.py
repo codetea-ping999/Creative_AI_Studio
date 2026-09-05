@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import json
 from pathlib import Path
+from threading import RLock
 from typing import Any
 import uuid
 
@@ -18,11 +20,29 @@ class StoryRepository:
     Mirrors ``ProjectRepository``: one JSON file per document, atomic writes, and
     a corrupt file is skipped by list operations rather than breaking the whole
     listing.
+
+    A story document can be written by several independent callers in the same
+    process — the story API's PATCH/apply/delete routes, ``SceneBinder``, and
+    any future writer — each doing its own read-modify-write. Without a shared
+    boundary, two such writers can interleave (A reads, B reads, B saves, A
+    saves over B's change) and silently lose one side's update, or resurrect a
+    story a concurrent delete just removed. ``mutate()`` is that boundary: it
+    holds ``_lock`` across the read, the caller's mutation, and the save, so
+    every writer that goes through it is serialized against every other one
+    (including ``delete()``). Plain reads (``get``, ``list_all``) stay
+    lock-free: ``write_json_atomic`` replaces the file in one ``os.replace``,
+    so a concurrent reader only ever sees the fully-old or fully-new file,
+    never a torn write.
     """
 
     def __init__(self, story_dir: str | Path = "data/stories") -> None:
         self.story_dir = Path(story_dir)
         self.story_dir.mkdir(parents=True, exist_ok=True)
+        # Shared across every mutate()/save()/delete() call on this repository
+        # instance, regardless of which story id is touched — see the class
+        # docstring. RLock (not Lock) so save() can be called safely from
+        # within a mutate() callback's own critical section.
+        self._lock = RLock()
 
     def create(
         self,
@@ -62,30 +82,76 @@ class StoryRepository:
         return self._try_load(story_file)
 
     def save(self, story: StoryDocument) -> StoryDocument:
-        updated = story.model_copy(update={"updated_at": utc_now()})
-        self._save(updated)
-        return updated
+        with self._lock:
+            updated = story.model_copy(update={"updated_at": utc_now()})
+            self._save(updated)
+            return updated
+
+    def mutate(
+        self,
+        story_id: str,
+        fn: Callable[[StoryDocument | None], StoryDocument | None],
+    ) -> StoryDocument | None:
+        """Read, apply ``fn``, and atomically save one story as a single step.
+
+        ``fn`` is called with the current document, or ``None`` if it does not
+        exist (never created, or concurrently deleted). Its return value
+        controls what happens next:
+
+        - ``None`` — decline the mutation; nothing is saved and ``mutate()``
+          itself returns ``None``. Use this both when ``current`` was already
+          ``None`` and when the mutation looked at an existing document and
+          decided not to touch it (an unmatched scene id, a stale recovery
+          replay, ...) — either way there is nothing to hand back.
+        - a document equal to ``current`` — nothing is saved (no pointless
+          ``updated_at`` bump), and ``mutate()`` returns that document.
+        - any other document — saved atomically, and the saved (persisted)
+          document is returned.
+
+        The read, the call to ``fn``, and the save all happen while holding
+        the repository's shared lock, so this is the boundary every story
+        writer (API routes, ``SceneBinder``, ...) should go through instead of
+        calling ``get`` + ``save`` on their own — see the class docstring.
+
+        Do not put generation, network, or model work inside ``fn``: it runs
+        while every other writer on this repository instance is blocked,
+        across every story, not just this one.
+
+        If ``fn`` raises, the exception propagates and nothing is saved; the
+        lock is released regardless (``with`` guarantees this even on
+        exception), so a failed mutation never leaves the store partially
+        written or other writers stuck waiting.
+        """
+
+        with self._lock:
+            current = self.get(story_id)
+            updated = fn(current)
+            if updated is None:
+                return None
+            if updated == current:
+                return current
+            return self.save(updated)
 
     def update(self, story_id: str, **fields: Any) -> StoryDocument | None:
-        story = self.get(story_id)
-        if story is None:
-            return None
+        def _apply(story: StoryDocument | None) -> StoryDocument | None:
+            if story is None:
+                return None
 
-        unknown_fields = set(fields) - set(StoryDocument.model_fields)
-        if unknown_fields:
-            raise ValueError(
-                f"Unknown story fields: {', '.join(sorted(unknown_fields))}"
-            )
-        # id and timestamps are owned by the repository, never by a caller patch.
-        for reserved in ("id", "created_at", "updated_at"):
-            fields.pop(reserved, None)
-        if not fields:
-            return story
+            unknown_fields = set(fields) - set(StoryDocument.model_fields)
+            if unknown_fields:
+                raise ValueError(
+                    f"Unknown story fields: {', '.join(sorted(unknown_fields))}"
+                )
+            # id and timestamps are owned by the repository, never by a
+            # caller patch.
+            patch = dict(fields)
+            for reserved in ("id", "created_at", "updated_at"):
+                patch.pop(reserved, None)
+            if not patch:
+                return story
+            return story.model_copy(update=patch)
 
-        updated = story.model_copy(update=fields)
-        if updated == story:
-            return story
-        return self.save(updated)
+        return self.mutate(story_id, _apply)
 
     def list_all(
         self,
@@ -112,11 +178,17 @@ class StoryRepository:
         return stories
 
     def delete(self, story_id: str) -> bool:
-        story_file = self.story_dir / f"{story_id}.json"
-        if story_file.exists():
-            story_file.unlink()
-            return True
-        return False
+        # Shares _lock with mutate()/save() so a concurrent read-modify-write
+        # (SceneBinder, an API PATCH/apply) can never race this: either it
+        # fully completes and this delete then removes what it just wrote, or
+        # this delete runs first and the other side's mutate() observes a
+        # missing story instead of resurrecting it.
+        with self._lock:
+            story_file = self.story_dir / f"{story_id}.json"
+            if story_file.exists():
+                story_file.unlink()
+                return True
+            return False
 
     def _haystack(self, story: StoryDocument) -> str:
         return " ".join(
