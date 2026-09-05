@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from threading import Event
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from generators.registry import GeneratorRegistry
 
@@ -28,6 +28,7 @@ from .statuses import (
     JOB_STATUS_PREPARING,
     JOB_STATUS_QUEUED,
     JOB_STATUS_RUNNING,
+    is_terminal_status,
 )
 
 # The generator's own progress fraction (0.0-1.0) is mapped into this slice of
@@ -130,10 +131,16 @@ class JobRunner:
             return job
 
         cancellation_token = None
+        claimed = False
         try:
             # This compare-and-set is the execution claim. Do not put an
             # in-memory cancellation entry in the registry before owning it.
-            if self._update_status(job_id, JOB_STATUS_PREPARING, progress=0.0) is None:
+            def mark_claimed() -> None:
+                nonlocal claimed
+                claimed = True
+
+            claimed_job = self._claim_job(job_id, on_claimed=mark_claimed)
+            if claimed_job is None:
                 return self.job_repository.get(job_id)
             if self.cancellation_registry is not None:
                 cancellation_token = self.cancellation_registry.begin(job_id)
@@ -188,9 +195,69 @@ class JobRunner:
             if self._update_status(job_id, JOB_STATUS_POSTPROCESSING, progress=0.9) is None:
                 return self._finalize_cancellation(job_id)
             return self.job_service.mark_succeeded(job_id, result)
+        except Exception as exc:
+            if not claimed:
+                raise
+            return self._resolve_claim_failure(job_id, exc)
         finally:
             if self.cancellation_registry is not None and cancellation_token is not None:
                 self.cancellation_registry.end(job_id, cancellation_token)
+
+    def _claim_job(
+        self,
+        job_id: str,
+        *,
+        on_claimed: Callable[[], None],
+    ) -> JobRecord | None:
+        """Persist the execution claim before publishing its progress event."""
+
+        job = self.job_repository.update_if_status(
+            job_id,
+            (JOB_STATUS_QUEUED,),
+            status=JOB_STATUS_PREPARING,
+            progress=0.0,
+        )
+        if job is None:
+            return None
+        # Mark ownership immediately after SQLite CAS succeeds.  If event
+        # publication or any later setup fails, the caller can still resolve
+        # this persisted claim instead of leaving the job in preparing.
+        on_claimed()
+        self._publish(
+            self._event_name_for_status(JOB_STATUS_PREPARING),
+            {"job_id": job.id, "status": job.status, "progress": job.progress},
+        )
+        return job
+
+    def _resolve_claim_failure(self, job_id: str, exc: Exception) -> JobRecord | None:
+        """Resolve every post-claim setup failure without killing the loop."""
+
+        logger.exception("Job %s failed after execution claim.", job_id)
+        current: JobRecord | None = None
+        try:
+            # This preserves the cancellation race contract and is a no-op for
+            # a terminal job.  A cancel request always wins over ordinary
+            # failure resolution.
+            current = self._finalize_cancellation(job_id)
+        except Exception:
+            logger.exception("Could not resolve cancellation for job %s.", job_id)
+
+        if current is not None and is_terminal_status(current.status):
+            return current
+
+        try:
+            failed = self.job_service.mark_failed(job_id, str(exc))
+        except Exception:
+            # Recording failure can itself fail (for example, a transient
+            # SQLite error).  Keep the consumer alive and make the condition
+            # observable; a later reconciliation pass can classify the job.
+            logger.exception("Could not record failure for job %s.", job_id)
+            try:
+                return self.job_repository.get(job_id)
+            except Exception:
+                logger.exception("Could not reread failed job %s.", job_id)
+                return None
+        return failed
 
     def _is_cancelled(self, job_id: str) -> bool:
         # `cancel_requested` (in-flight job, cooperative shutdown pending) and

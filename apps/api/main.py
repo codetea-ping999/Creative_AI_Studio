@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 import logging
 import os
+from pathlib import Path
 from threading import Event, Thread
 
 from fastapi import FastAPI
@@ -25,6 +26,24 @@ from core.remote import AgentProtocol
 from core.storage.ownership import DataDirectoryOwnership
 
 logger = logging.getLogger(__name__)
+
+
+def _configured_db_path() -> Path:
+    """Resolve the configured SQLite path without constructing repositories."""
+
+    return Path(os.getenv("DB_PATH", "data/jobs.db"))
+
+
+def _configured_output_dir() -> Path:
+    """Resolve the configured image output directory without service setup."""
+
+    output_image_dir = os.getenv("OUTPUT_IMAGE_DIR")
+    if output_image_dir:
+        return Path(output_image_dir)
+    output_root = os.getenv("OUTPUT_DIR")
+    if output_root:
+        return Path(output_root) / "images"
+    return Path("outputs/images")
 
 
 def _release_after_worker_stops(worker: Thread, ownership: DataDirectoryOwnership) -> None:
@@ -53,18 +72,34 @@ def create_app(
     *,
     start_job_runner: bool = True,
 ) -> FastAPI:
-    resolved_services = services or create_application_services()
+    # Keep the default service graph lazy.  JobRepository creates and migrates
+    # SQLite during construction, so it must not run until this process owns
+    # the configured data directory.
+    resolved_services = services
+    data_directory = (
+        resolved_services.job_repository.data_directory
+        if resolved_services is not None
+        else _configured_db_path().resolve().parent
+    )
+    output_dir = (
+        resolved_services.output_dir
+        if resolved_services is not None
+        else _configured_output_dir()
+    )
+    ownership = DataDirectoryOwnership(data_directory)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        app.state.services = resolved_services
+        nonlocal resolved_services
         stop_event: Event | None = None
         worker: Thread | None = None
-        ownership = DataDirectoryOwnership(resolved_services.job_repository.data_directory)
         # Even with the runner disabled, startup sync and API writes require
         # exclusive authority. Classification does not activate any recovery.
         ownership.acquire()
         try:
+            if resolved_services is None:
+                resolved_services = create_application_services()
+            app.state.services = resolved_services
             # Preserve the existing gallery-only startup synchronization.
             resolved_services.asset_repository.sync_jobs(
                 resolved_services.job_repository.list()
@@ -102,7 +137,8 @@ def create_app(
                 ownership.release()
 
     app = FastAPI(title="Creative AI Studio API", lifespan=lifespan)
-    app.state.services = resolved_services
+    if resolved_services is not None:
+        app.state.services = resolved_services
     app.state.agent_protocol = AgentProtocol()
 
     app.add_middleware(
@@ -113,7 +149,7 @@ def create_app(
         allow_headers=["*"],
     )
 
-    output_root = resolved_services.output_dir.parent
+    output_root = output_dir.parent
     output_root.mkdir(parents=True, exist_ok=True)
     app.mount("/outputs", StaticFiles(directory=output_root), name="outputs")
 

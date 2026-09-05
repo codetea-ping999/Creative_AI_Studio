@@ -119,14 +119,13 @@ def test_duplicate_consumers_have_one_owner_and_loser_preserves_cancellation(
             repository, queue, GeneratorRegistry({"image": generator}),
             job_service=service, cancellation_registry=cancellation,
         ))
-    original_update = runners[1]._update_status
+    original_claim = runners[1]._claim_job
 
-    def delayed_loser_claim(job_id, status, **kwargs):
-        if status == "preparing":
-            assert generating.wait(5)
-        return original_update(job_id, status, **kwargs)
+    def delayed_loser_claim(job_id, *, on_claimed):
+        assert generating.wait(5)
+        return original_claim(job_id, on_claimed=on_claimed)
 
-    monkeypatch.setattr(runners[1], "_update_status", delayed_loser_claim)
+    monkeypatch.setattr(runners[1], "_claim_job", delayed_loser_claim)
     with ThreadPoolExecutor(max_workers=2) as executor:
         owner = executor.submit(runners[0].run_once)
         loser = executor.submit(runners[1].run_once)
@@ -168,7 +167,9 @@ def test_cancel_between_claim_and_context_registration(tmp_path, monkeypatch):
     assert generator.calls == 0
 
 
-def test_context_construction_failure_releases_only_its_registration(tmp_path, monkeypatch):
+def test_context_construction_failure_resolves_claim_and_releases_registration(
+    tmp_path, monkeypatch,
+):
     repository = JobRepository(tmp_path / "jobs.db")
     queue = JobQueue()
     cancellation = CancellationRegistry()
@@ -185,11 +186,121 @@ def test_context_construction_failure_releases_only_its_registration(tmp_path, m
         raise RuntimeError("injected context construction failure")
 
     monkeypatch.setattr(runner, "_begin_context", fail_context)
-    with pytest.raises(RuntimeError, match="context construction failure"):
-        runner.run_once()
+    assert runner.run_once().status == "failed"
+    assert repository.get(job.id).status == "failed"
 
     cancellation.request_cancel(job.id)
     assert not cancellation.is_cancelled(job.id)
+
+
+@pytest.mark.parametrize("failure_point", ["cancel_read", "publish"])
+def test_claim_setup_failure_does_not_strand_job_or_consumer(
+    tmp_path, monkeypatch, failure_point,
+):
+    repository = JobRepository(tmp_path / "jobs.db")
+    queue = JobQueue()
+    cancellation = CancellationRegistry()
+    stopped = Event()
+    calls = {"count": 0}
+
+    def generate(_context):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            stopped.set()
+
+    generator = FakeGenerator(generate)
+    first = seed_job(repository, job_id="job_first")
+    second = seed_job(repository, job_id="job_second")
+    queue.enqueue(first.id)
+    queue.enqueue(second.id)
+    runner = JobRunner(
+        repository,
+        queue,
+        GeneratorRegistry({"image": generator}),
+        cancellation_registry=cancellation,
+    )
+
+    if failure_point == "cancel_read":
+        original = runner._is_cancelled
+        raised = {"value": False}
+
+        def fail_once(job_id):
+            if not raised["value"]:
+                raised["value"] = True
+                raise RuntimeError("injected persisted cancellation read failure")
+            return original(job_id)
+
+        monkeypatch.setattr(runner, "_is_cancelled", fail_once)
+    else:
+        original = runner._publish
+        raised = {"value": False}
+
+        def fail_once(event_type, payload):
+            if event_type == "job_preparing" and not raised["value"]:
+                raised["value"] = True
+                raise RuntimeError("injected claim publish failure")
+            return original(event_type, payload)
+
+        monkeypatch.setattr(runner, "_publish", fail_once)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(runner.run_forever, stop_event=stopped)
+        assert stopped.wait(5), "consumer did not process the next job"
+        stopped.set()
+        future.result(timeout=5)
+
+    assert repository.get(first.id).status == "failed"
+    assert repository.get(second.id).status == "succeeded"
+    assert calls["count"] == 1
+
+
+def test_failure_recording_error_does_not_kill_consumer(tmp_path, monkeypatch):
+    repository = JobRepository(tmp_path / "jobs.db")
+    queue = JobQueue()
+    stopped = Event()
+    generator = FakeGenerator(lambda _context: stopped.set())
+    first = seed_job(repository, job_id="job_first")
+    second = seed_job(repository, job_id="job_second")
+    queue.enqueue(first.id)
+    queue.enqueue(second.id)
+    service = JobService(repository, queue)
+    runner = JobRunner(
+        repository,
+        queue,
+        GeneratorRegistry({"image": generator}),
+        job_service=service,
+    )
+    original_begin_context = runner._begin_context
+    setup_calls = {"count": 0}
+
+    def fail_setup_once(*args, **kwargs):
+        setup_calls["count"] += 1
+        if setup_calls["count"] == 1:
+            raise RuntimeError("injected setup failure")
+        return original_begin_context(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "_begin_context", fail_setup_once)
+    original_mark_failed = service.mark_failed
+    calls = {"count": 0}
+
+    def fail_recording(job_id, message):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise OSError("injected failure recording error")
+        return original_mark_failed(job_id, message)
+
+    monkeypatch.setattr(service, "mark_failed", fail_recording)
+    # The first job is left preparing because persistence itself failed; the
+    # key contract here is that the loop still consumes and completes the next
+    # job rather than terminating.
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(runner.run_forever, stop_event=stopped)
+        assert stopped.wait(5)
+        stopped.set()
+        future.result(timeout=5)
+
+    assert repository.get(first.id).status == "preparing"
+    assert repository.get(second.id).status == "succeeded"
 
 
 def test_cancel_retries_when_claim_wins_its_cas(tmp_path, monkeypatch):

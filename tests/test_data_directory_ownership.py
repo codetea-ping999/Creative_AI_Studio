@@ -26,6 +26,34 @@ if len(sys.argv) > 2:
 owner.release()
 """
 
+STARTUP_SCRIPT = """
+import os
+from pathlib import Path
+import sys
+from fastapi.testclient import TestClient
+from core.storage.ownership import DataDirectoryInUseError
+
+data_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+os.environ['DB_PATH'] = str(data_dir / 'jobs.db')
+os.environ['OUTPUT_DIR'] = str(data_dir / 'outputs')
+import apps.api.main as main_module
+
+original_factory = main_module.create_application_services
+def observed_factory():
+    marker.write_text('factory-called')
+    return original_factory()
+main_module.create_application_services = observed_factory
+
+try:
+    with TestClient(main_module.create_app(start_job_runner=False)):
+        print('started', flush=True)
+        sys.stdin.read()
+except DataDirectoryInUseError:
+    print('busy', flush=True)
+    raise SystemExit(23)
+"""
+
 
 def child_env():
     return {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
@@ -58,6 +86,42 @@ def test_second_process_is_excluded_until_owner_exits(tmp_path, termination):
         if owner.poll() is None:
             owner.kill()
         owner.communicate(timeout=10)
+
+
+def test_api_startup_claims_ownership_before_repository_initialization(tmp_path):
+    owner_marker = tmp_path / "owner-factory"
+    loser_marker = tmp_path / "loser-factory"
+    owner = subprocess.Popen(
+        [sys.executable, "-c", STARTUP_SCRIPT, str(tmp_path), str(owner_marker)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, env=child_env(), cwd=tmp_path,
+    )
+    try:
+        assert owner.stdout.readline().strip() == "started"
+        assert owner_marker.read_text() == "factory-called"
+
+        loser = subprocess.run(
+            [sys.executable, "-c", STARTUP_SCRIPT, str(tmp_path), str(loser_marker)],
+            input="", capture_output=True, text=True, env=child_env(), cwd=tmp_path,
+            timeout=10,
+        )
+        assert loser.returncode == 23, loser.stderr
+        assert loser.stdout.strip() == "busy"
+        assert not loser_marker.exists(), "loser initialized repositories before ownership"
+    finally:
+        if owner.poll() is None:
+            owner.stdin.close()
+            owner.wait(timeout=10)
+
+    successor_marker = tmp_path / "successor-factory"
+    successor = subprocess.run(
+        [sys.executable, "-c", STARTUP_SCRIPT, str(tmp_path), str(successor_marker)],
+        input="", capture_output=True, text=True, env=child_env(), cwd=tmp_path,
+        timeout=10,
+    )
+    assert successor.returncode == 0, successor.stderr
+    assert successor.stdout.strip() == "started"
+    assert successor_marker.read_text() == "factory-called"
 
 
 def test_independent_directories_and_explicit_release(tmp_path):
@@ -125,6 +189,27 @@ def test_startup_sync_failure_releases_ownership(tmp_path, monkeypatch):
     with pytest.raises(OSError, match="injected startup failure"):
         with TestClient(create_app(services, start_job_runner=False)):
             pass
+    successor = DataDirectoryOwnership(tmp_path)
+    successor.acquire()
+    successor.release()
+
+
+def test_default_service_factory_failure_releases_ownership(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from apps.api import main as main_module
+    from core.storage.ownership import DataDirectoryOwnership
+
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "jobs.db"))
+    monkeypatch.setenv("OUTPUT_DIR", str(tmp_path / "outputs"))
+
+    def fail_factory():
+        raise RuntimeError("injected service construction failure")
+
+    monkeypatch.setattr(main_module, "create_application_services", fail_factory)
+    with pytest.raises(RuntimeError, match="service construction failure"):
+        with TestClient(main_module.create_app(start_job_runner=False)):
+            pass
+
     successor = DataDirectoryOwnership(tmp_path)
     successor.acquire()
     successor.release()
