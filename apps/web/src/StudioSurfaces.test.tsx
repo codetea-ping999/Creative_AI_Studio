@@ -77,6 +77,7 @@ function makeBatch(overrides: Partial<Batch> = {}): Batch {
       best_item_id: "item_0",
     },
     items: [makeItem()],
+    error_message: null,
     created_at: "2026-07-26T00:00:00+00:00",
     updated_at: "2026-07-26T00:00:00+00:00",
     ...overrides,
@@ -559,6 +560,59 @@ describe("MatrixPanel", () => {
     expect(screen.getAllByText("失敗").length).toBeGreaterThan(0);
     // A terminal batch offers no cancel action.
     expect(screen.queryByRole("button", { name: "中断する" })).toBeNull();
+  });
+
+  it("surfaces a stage-advance failure even when no item failed", async () => {
+    // Regression (#390): a batch can be `failed` because the automatic
+    // stage advance itself was rejected (a preflight check, not a job) --
+    // every current-stage item can still be `succeeded`, so nothing in
+    // `aggregate` explains why the batch stopped without this banner.
+    stubFetch([
+      ["/batches/templates", templates],
+      [
+        "/batches",
+        makeBatch({
+          status: "failed",
+          error_message:
+            "Model 'sdxl': reference-image conditioning honors exactly one reference image per request; got 2.",
+          items: [makeItem({ status: "succeeded" })],
+        }),
+        "POST",
+      ],
+    ]);
+    const user = userEvent.setup();
+    render(<MatrixPanel modelId="" pollIntervalMs={100000} />);
+
+    await user.type(await screen.findByLabelText("お題"), "acme logo");
+    await user.click(screen.getByRole("button", { name: "30 件を生成" }));
+
+    expect((await screen.findByRole("alert")).textContent).toContain(
+      "reference-image conditioning",
+    );
+    // The item itself rendered fine -- this is a batch-level explanation,
+    // not a substitute for the item's own state.
+    expect(screen.getAllByText("成功").length).toBeGreaterThan(0);
+  });
+
+  it("does not show a stage-advance banner once a batch succeeds", async () => {
+    stubFetch([
+      ["/batches/templates", templates],
+      [
+        "/batches",
+        makeBatch({ status: "succeeded", error_message: null }),
+        "POST",
+      ],
+    ]);
+    const user = userEvent.setup();
+    render(<MatrixPanel modelId="" pollIntervalMs={100000} />);
+
+    await user.type(await screen.findByLabelText("お題"), "acme logo");
+    await user.click(screen.getByRole("button", { name: "30 件を生成" }));
+
+    await waitFor(() => {
+      expect(screen.getAllByText("成功").length).toBeGreaterThan(0);
+    });
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   it("surfaces a template load failure", async () => {
