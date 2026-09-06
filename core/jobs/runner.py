@@ -24,6 +24,7 @@ from .schemas import JobRecord
 from .statuses import (
     JOB_STATUS_CANCEL_REQUESTED,
     JOB_STATUS_CANCELLED,
+    JOB_STATUS_FAILED,
     JOB_STATUS_POSTPROCESSING,
     JOB_STATUS_PREPARING,
     JOB_STATUS_QUEUED,
@@ -82,7 +83,7 @@ class JobRunner:
             return None
         try:
             return self.process_job(job_id)
-        except Exception:
+        except Exception as exc:
             # process_job() only ever re-raises here for a failure that
             # happened *before* this worker won the execution claim -- its
             # own except clause resolves every failure after that claim to a
@@ -92,7 +93,25 @@ class JobRunner:
             # already popped this job id out of the in-memory queue; without
             # putting it back here, a perfectly healthy `queued` row would
             # have nothing left to ever redeliver it (post-#395 audit, P2).
-            # Requeue into the exact lane it came from -- not the default
+            if self._is_permanent_pre_claim_failure(exc):
+                # Codex exact-HEAD review on the P2 fix above: a *permanent*
+                # failure (the persisted row itself can never be
+                # deserialized/validated) would retry forever if requeued --
+                # the exact same bytes fail identically every time, so this
+                # would starve every other job behind it in this lane and
+                # log without bound. Quarantine instead of requeuing.
+                self._quarantine_poison_job(job_id, exc)
+                logger.error(
+                    "Job %s has a permanent pre-claim failure (%s) and will "
+                    "not be retried.",
+                    job_id,
+                    type(exc).__name__,
+                )
+                raise
+            # Transient (a SQLite operational/locking/I-O error carries no
+            # information about the row's content, unlike a deserialization
+            # or validation failure -- see _is_permanent_pre_claim_failure):
+            # requeue into the exact lane it came from -- not the default
             # lane -- so this holds for a future multi-lane configuration
             # too, not just today's single implicit lane.
             self.job_queue.enqueue(job_id, lane=lane)
@@ -101,6 +120,67 @@ class JobRunner:
                 job_id,
             )
             raise
+
+    def _is_permanent_pre_claim_failure(self, exc: BaseException) -> bool:
+        """Classify a pre-claim failure as permanent (never retry) vs. transient.
+
+        The only two realistic sources of a pre-claim exception are
+        `JobRepository.get()` (its own `json.loads`, or
+        `GenerationRequest`/`GenerationResult.model_validate`) and
+        `transition_if_status()`'s raw SQL execution. The first two only
+        ever fail because of the row's *own persisted content* -- old
+        schema, corrupted bytes -- and both raise a `ValueError` subclass
+        (`json.JSONDecodeError`, `pydantic.ValidationError`); the exact same
+        bytes will fail identically on every future read, so requeuing is
+        pure worker starvation with no chance of ever succeeding.
+        `transition_if_status()` never touches request/result content at
+        all (a plain parameterized `UPDATE`), so a failure there is an
+        execution-level problem -- typically `sqlite3.Error` (locked, busy,
+        disk I/O) -- with no bearing on the row's content, and is exactly
+        the case retrying is *for*.
+        """
+
+        return isinstance(exc, ValueError)
+
+    def _quarantine_poison_job(self, job_id: str, exc: BaseException) -> None:
+        """Best-effort terminal resolution for a job that can never be retried.
+
+        Uses `transition_if_status()` -- the CAS primitive that deliberately
+        never rereads the row after its UPDATE commits -- rather than
+        `JobService.mark_failed()`, since the very failure being quarantined
+        can be a persisted payload that makes any read-back of this same row
+        (including `mark_failed()`'s own trailing reread) raise identically.
+        A job only ever reaches here still `queued` (see `process_job`'s own
+        pre-claim status checks), so `queued -> failed` is the only expected
+        source transition. Failure to even do this is swallowed: it must
+        never itself become a new way to strand the consumer loop, and the
+        job is not requeued either way -- see the caller.
+        """
+
+        try:
+            quarantined = self.job_repository.transition_if_status(
+                job_id,
+                (JOB_STATUS_QUEUED,),
+                status=JOB_STATUS_FAILED,
+                progress=1.0,
+            )
+        except Exception:
+            logger.exception(
+                "Could not quarantine poison job %s; it will not be "
+                "retried, but its persisted status could not be updated.",
+                job_id,
+            )
+            return
+        if quarantined:
+            self._publish(
+                "job_failed",
+                {
+                    "job_id": job_id,
+                    "status": JOB_STATUS_FAILED,
+                    "progress": 1.0,
+                    "error_message": str(exc),
+                },
+            )
 
     def run_forever(
         self,

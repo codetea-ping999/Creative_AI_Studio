@@ -2,6 +2,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+import json
 import sqlite3
 from threading import Barrier, Event
 
@@ -607,3 +608,121 @@ def test_pre_claim_failure_requeues_into_the_same_lane_not_lost_or_misrouted(
     assert queue.size(lane="light") == 1
     assert queue.size(lane="heavy") == 0
     assert JobRepository(db_path).get(job.id).status == "queued"
+
+
+# --- Codex exact-HEAD review on 876327b8: bound retries for permanent ----
+# pre-claim failures.
+#
+# The requeue-on-pre-claim-failure fix above is correct for a *transient*
+# failure (a SQLite operational error) but, on its own, would requeue a
+# *permanent* one (a job row whose persisted `request_json` can never be
+# deserialized/validated -- old schema, corrupted bytes) forever: every
+# redelivery hits the exact same bytes and fails identically, so the queue
+# item would cycle dequeue -> failure -> requeue -> dequeue... forever,
+# starving every job behind it in that lane and spamming the log without
+# bound. `json.JSONDecodeError` and `pydantic.ValidationError` are both
+# `ValueError` subclasses and are the only two realistic sources of a
+# permanent pre-claim failure (`JobRepository._row_to_record`'s `json.loads`
+# and `GenerationRequest`/`GenerationResult.model_validate`) -- a
+# `sqlite3.Error` (locked, busy, disk I/O) carries no information about the
+# row's content and is the only realistic *transient* source, so the two
+# populations are cleanly separated by `isinstance(exc, ValueError)`.
+
+
+def test_permanent_pre_claim_failure_does_not_retry_forever_and_lets_the_next_job_run(
+    tmp_path,
+):
+    """Case 2: a poison job (permanently undeserializable request_json) must
+    not be retried forever, must not starve a healthy job queued behind it,
+    and must land in an observable terminal state -- checked via a raw
+    SQLite read, since `JobRepository.get()` on this exact row raises the
+    same `json.JSONDecodeError` every time by construction.
+    """
+
+    db_path = tmp_path / "jobs.db"
+    repository = JobRepository(db_path)
+    queue = JobQueue()
+    stopped = Event()
+    generator = FakeGenerator(lambda _context: stopped.set())
+    poison = seed_job(repository, job_id="job_poison")
+    healthy = seed_job(repository, job_id="job_healthy")
+
+    with sqlite3.connect(db_path) as raw_connection:
+        raw_connection.execute(
+            "UPDATE jobs SET request_json = ? WHERE id = ?",
+            ("{not valid json", poison.id),
+        )
+        raw_connection.commit()
+
+    queue.enqueue(poison.id)
+    queue.enqueue(healthy.id)
+    runner = JobRunner(repository, queue, GeneratorRegistry({"image": generator}))
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            runner.run_forever, stop_event=stopped, poll_interval_seconds=0.01
+        )
+        try:
+            processed = stopped.wait(5)
+        finally:
+            stopped.set()
+        future.result(timeout=5)
+        assert processed, (
+            "job_healthy was never processed -- the poison job likely "
+            "starved the worker with infinite retries"
+        )
+
+    # The poison job must be gone from the queue exactly once (never
+    # requeued) and the healthy job must have actually run.
+    assert queue.size() == 0
+    assert generator.calls == 1
+
+    raw_status = sqlite3.connect(db_path).execute(
+        "SELECT status FROM jobs WHERE id = ?", (poison.id,)
+    ).fetchone()[0]
+    assert raw_status == "failed"
+    # repository.get() on the poison row still raises identically -- proves
+    # the quarantine path never attempted (or depended on) reading the
+    # corrupted payload back.
+    with pytest.raises(json.JSONDecodeError):
+        repository.get(poison.id)
+
+    assert repository.get(healthy.id).status == "succeeded"
+
+
+def test_permanent_pre_claim_failure_does_not_requeue_and_other_lanes_are_unaffected(
+    tmp_path,
+):
+    """Case 3: the multi-lane requeue contract must hold for both outcomes --
+    a transient failure still goes back to its own lane (covered by
+    `test_pre_claim_failure_requeues_into_the_same_lane_not_lost_or_misrouted`
+    above); a permanent one must not be requeued into *any* lane, and must
+    not block a healthy job already queued in a different lane.
+    """
+
+    db_path = tmp_path / "jobs.db"
+    repository = JobRepository(db_path)
+    queue = JobQueue(lanes=("heavy", "light"))
+    poison = seed_job(repository, job_id="job_poison")
+    other_lane_job = seed_job(repository, job_id="job_other_lane")
+
+    with sqlite3.connect(db_path) as raw_connection:
+        raw_connection.execute(
+            "UPDATE jobs SET request_json = ? WHERE id = ?",
+            ("{not valid json", poison.id),
+        )
+        raw_connection.commit()
+
+    queue.enqueue(poison.id, lane="light")
+    queue.enqueue(other_lane_job.id, lane="heavy")
+    runner = JobRunner(repository, queue, GeneratorRegistry({"image": FakeGenerator()}))
+
+    with pytest.raises(json.JSONDecodeError):
+        runner.run_once(lane="light")
+
+    assert queue.size(lane="light") == 0, "poison job must not be requeued"
+    assert queue.size(lane="heavy") == 1, "the other lane must be untouched"
+
+    result = runner.run_once(lane="heavy")
+    assert result is not None
+    assert result.status == "succeeded"
