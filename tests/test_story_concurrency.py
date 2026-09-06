@@ -223,6 +223,8 @@ class SceneBinderConcurrencyTests(unittest.TestCase):
             params=scene_binding_params(self.story.id, scene_id, role),
         )
         job = self.job_service.create_job(request)
+        for status in ("preparing", "running", "postprocessing"):
+            assert self.job_repository.update_status(job.id, status) is not None
         self.job_service.mark_succeeded(
             job.id,
             GenerationResult(
@@ -414,6 +416,8 @@ class StoryApiConcurrencyTests(unittest.TestCase):
                 params=scene_binding_params(self.story_id, "scene_01", "visual"),
             )
         )
+        for status in ("preparing", "running", "postprocessing"):
+            assert self.services.job_repository.update_status(job.id, status) is not None
 
         def _patch() -> None:
             response = self.client.patch(
