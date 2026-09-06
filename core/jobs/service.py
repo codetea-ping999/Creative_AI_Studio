@@ -55,7 +55,14 @@ _STATUS_TO_EVENT = {
 
 # A result is only committed after generation has crossed the postprocessing
 # boundary. This makes a persisted cancellation request authoritative even if
-# a generator returns a result at the same instant.
+# a generator returns a result at the same instant: losing this CAS to a
+# concurrent cancel leaves the job `cancel_requested`, not `succeeded`.
+# Resolving that `cancel_requested` to a terminal state is deliberately left
+# to the caller (see JobRunner.process_job's check right after calling
+# mark_succeeded, post-#395 audit P1) rather than done unconditionally here:
+# a bare CAS-miss can also mean "already succeeded/failed" or a stale direct
+# call with no runner in the loop, and this method stays a no-op for those
+# (see test_success_only_commits_from_postprocessing).
 _SUCCEEDABLE_JOB_STATUSES = (JOB_STATUS_POSTPROCESSING,)
 
 

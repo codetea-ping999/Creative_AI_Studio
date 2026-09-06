@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from enum import Enum
 import logging
 from threading import Event
 import time
@@ -24,10 +25,12 @@ from .schemas import JobRecord
 from .statuses import (
     JOB_STATUS_CANCEL_REQUESTED,
     JOB_STATUS_CANCELLED,
+    JOB_STATUS_FAILED,
     JOB_STATUS_POSTPROCESSING,
     JOB_STATUS_PREPARING,
     JOB_STATUS_QUEUED,
     JOB_STATUS_RUNNING,
+    JOB_STATUSES,
     is_terminal_status,
 )
 
@@ -38,6 +41,19 @@ _RUNNING_PROGRESS_START = 0.1
 _RUNNING_PROGRESS_SPAN = 0.8
 
 logger = logging.getLogger(__name__)
+
+
+class _QuarantineOutcome(Enum):
+    """Result of a `JobRunner._quarantine_poison_job()` attempt.
+
+    A plain bool would conflate two different reasons a caller must NOT
+    requeue (already settled, one way or another) with the one reason it
+    MUST (the quarantine write itself failed) -- see `run_once()`.
+    """
+
+    QUARANTINED = "quarantined"
+    ALREADY_RESOLVED = "already_resolved"
+    WRITE_FAILED = "write_failed"
 
 
 class JobRunner:
@@ -82,11 +98,207 @@ class JobRunner:
             return None
         try:
             return self.process_job(job_id)
-        except Exception:
-            # The queue item is already consumed; record the precise job at
-            # the processing boundary and leave retry policy to a later layer.
-            logger.exception("Job %s processing failed.", job_id)
+        except Exception as exc:
+            # process_job() only ever re-raises here for a failure that
+            # happened *before* this worker won the execution claim -- its
+            # own except clause resolves every failure after that claim to a
+            # terminal/observable job state via _resolve_claim_failure and
+            # never re-raises (see the `claimed` guard there). A pre-claim
+            # failure never touched ownership, but dequeue() above has
+            # already popped this job id out of the in-memory queue; without
+            # putting it back here, a perfectly healthy `queued` row would
+            # have nothing left to ever redeliver it (post-#395 audit, P2).
+            if self._is_permanent_pre_claim_failure(exc):
+                # Codex exact-HEAD review on the P2 fix above: a *permanent*
+                # failure (the persisted row itself can never be
+                # deserialized/validated) would retry forever if requeued --
+                # the exact same bytes fail identically every time, so this
+                # would starve every other job behind it in this lane and
+                # log without bound. Quarantine instead of requeuing.
+                outcome = self._quarantine_poison_job(job_id, exc)
+                if outcome is _QuarantineOutcome.WRITE_FAILED:
+                    # Second Codex round: the quarantine *write* itself can
+                    # fail transiently (e.g. a SQLite lock/busy/I-O error --
+                    # unrelated to the row's content). Swallowing that would
+                    # recreate exactly the "durable queued row with no queue
+                    # entry" condition this whole fix exists to prevent, so
+                    # fall through to the same transient requeue path used
+                    # below for every other pre-claim failure.
+                    self.job_queue.enqueue(job_id, lane=lane)
+                    logger.error(
+                        "Job %s is permanently unprocessable (%s) but its "
+                        "quarantine write failed transiently; requeued so "
+                        "it is not lost.",
+                        job_id,
+                        type(exc).__name__,
+                    )
+                    raise
+                # QUARANTINED (queued -> failed committed) or
+                # ALREADY_RESOLVED (something else moved the row off
+                # `queued` before the quarantine CAS ran) both mean this job
+                # id must not be requeued -- it is settled, one way or
+                # another.
+                logger.error(
+                    "Job %s has a permanent pre-claim failure (%s) and will "
+                    "not be retried (%s).",
+                    job_id,
+                    type(exc).__name__,
+                    outcome.value,
+                )
+                raise
+            # Transient (a SQLite operational/locking/I-O error carries no
+            # information about the row's content, unlike a deserialization
+            # or validation failure -- see _is_permanent_pre_claim_failure):
+            # requeue into the exact lane it came from -- not the default
+            # lane -- so this holds for a future multi-lane configuration
+            # too, not just today's single implicit lane.
+            self.job_queue.enqueue(job_id, lane=lane)
+            logger.exception(
+                "Job %s failed before execution claim; requeued for redelivery.",
+                job_id,
+            )
             raise
+
+    def _is_permanent_pre_claim_failure(self, exc: BaseException) -> bool:
+        """Classify a pre-claim failure as permanent (never retry) vs. transient.
+
+        The only two realistic sources of a pre-claim exception are
+        `JobRepository.get()` and `transition_if_status()`'s raw SQL
+        execution. `get()` normalizes every failure that can only be caused
+        by *this row's own persisted content*, at any stage of
+        reconstruction -- malformed JSON, a payload schema the current
+        models no longer accept, JSON nested deep enough to overflow the
+        decoder's C stack, a malformed timestamp, or the row as a whole
+        failing `JobRecord`'s own validation (an invalid persisted
+        status/media_type, an out-of-range progress, etc.) -- into one
+        `JobRecordDecodeError` (see `JobRepository._row_to_record`); the
+        exact same bytes will fail identically on every future read, so
+        requeuing is pure worker starvation with no chance of ever
+        succeeding. Classifying on that one boundary type, rather than on
+        `ValueError` directly, is deliberate: `RecursionError` (not a
+        `ValueError`) is one of the content-caused failures `get()` already
+        normalizes, and this must never accidentally widen to catch an
+        unrelated `ValueError`/`RuntimeError` a future change might raise
+        for a completely different, non-content reason.
+        `transition_if_status()` never touches row content at all (a plain
+        parameterized `UPDATE`), so a failure there is an execution-level
+        problem -- typically `sqlite3.Error` (locked, busy, disk I/O) --
+        with no bearing on the row's content, and is exactly the case
+        retrying is *for*.
+        """
+
+        # Deferred import: core/jobs/* deliberately avoids a top-level
+        # runtime import of core.storage.repositories.job_repository
+        # elsewhere in this module and in service.py (see their
+        # TYPE_CHECKING-only imports of JobRepository) to keep this
+        # package's import graph one-directional; this is only needed at
+        # call time, well after both modules have finished loading.
+        from core.storage.repositories.job_repository import JobRecordDecodeError
+
+        return isinstance(exc, JobRecordDecodeError)
+
+    def _quarantine_poison_job(
+        self, job_id: str, exc: BaseException
+    ) -> _QuarantineOutcome:
+        """Best-effort terminal resolution for a job that can never be retried.
+
+        Returns the outcome instead of swallowing it, so the caller can
+        tell a genuinely-settled poison job (quarantined, or already
+        resolved by something else) apart from a quarantine *write* that
+        itself failed -- the latter must still be requeued by the caller,
+        or this best-effort step would recreate the exact "durable queued
+        row with no queue entry" condition this whole fix exists to prevent
+        (Codex exact-HEAD review: the prior version of this method
+        unconditionally swallowed that exception here).
+
+        Uses `transition_if_status()` -- the CAS primitive that deliberately
+        never rereads the row after its UPDATE commits -- rather than
+        `JobService.mark_failed()`, since the very failure being quarantined
+        can be a persisted payload that makes any read-back of this same row
+        (including `mark_failed()`'s own trailing reread) raise identically.
+        `str(exc)` is persisted as `error_message` in the same atomic
+        UPDATE: an event publish alone is not enough, since nothing
+        subscribes to it after the fact, and `GET /jobs/{id}` must be able
+        to show *why* a corrupted-but-now-readable row (e.g. progress alone
+        was out of range) ended up `failed`, exactly like an ordinary
+        `mark_failed()` call would.
+
+        A job only ever reaches here still `queued` (see `process_job`'s own
+        pre-claim status checks) -- unless the row's raw `status` is itself
+        structurally invalid (outside `JOB_STATUSES` entirely), in which
+        case it was never `queued` to begin with and the ordinary CAS below
+        can never match it. Treating that CAS miss as "already resolved"
+        would discard the queue entry while leaving the row stuck in that
+        invalid status forever (Codex exact-HEAD review, second finding) --
+        so a miss falls through to a raw-status check and, only for a
+        genuinely invalid one, a second, narrowly-scoped repair attempt via
+        `quarantine_structurally_invalid_status()`.
+        """
+
+        try:
+            quarantined = self.job_repository.transition_if_status(
+                job_id,
+                (JOB_STATUS_QUEUED,),
+                status=JOB_STATUS_FAILED,
+                progress=1.0,
+                error_message=str(exc),
+            )
+        except Exception:
+            logger.exception(
+                "Could not quarantine poison job %s; its quarantine write "
+                "itself failed.",
+                job_id,
+            )
+            return _QuarantineOutcome.WRITE_FAILED
+        if quarantined:
+            self._publish_quarantined(job_id, exc)
+            return _QuarantineOutcome.QUARANTINED
+
+        try:
+            raw_status = self.job_repository.get_raw_status(job_id)
+        except Exception:
+            logger.exception(
+                "Could not read job %s's raw status while quarantining; "
+                "treating this as a transient failure so it is not lost.",
+                job_id,
+            )
+            return _QuarantineOutcome.WRITE_FAILED
+
+        if raw_status is not None and raw_status not in JOB_STATUSES:
+            try:
+                repaired = self.job_repository.quarantine_structurally_invalid_status(
+                    job_id, error_message=str(exc)
+                )
+            except Exception:
+                logger.exception(
+                    "Could not repair job %s's structurally invalid status "
+                    "%r; its quarantine write itself failed.",
+                    job_id,
+                    raw_status,
+                )
+                return _QuarantineOutcome.WRITE_FAILED
+            if repaired:
+                self._publish_quarantined(job_id, exc)
+                return _QuarantineOutcome.QUARANTINED
+            # Someone else already resolved or repaired it between the two
+            # reads above -- settled either way, not lost.
+            return _QuarantineOutcome.ALREADY_RESOLVED
+
+        # The row's raw status is a genuinely valid one, just not `queued`
+        # (or the row no longer exists) -- something else already resolved
+        # it; not this call's job to reconcile further.
+        return _QuarantineOutcome.ALREADY_RESOLVED
+
+    def _publish_quarantined(self, job_id: str, exc: BaseException) -> None:
+        self._publish(
+            "job_failed",
+            {
+                "job_id": job_id,
+                "status": JOB_STATUS_FAILED,
+                "progress": 1.0,
+                "error_message": str(exc),
+            },
+        )
 
     def run_forever(
         self,
@@ -203,7 +415,25 @@ class JobRunner:
                 return self._finalize_cancellation(job_id)
             if self._update_status(job_id, JOB_STATUS_POSTPROCESSING, progress=0.9) is None:
                 return self._finalize_cancellation(job_id)
-            return self.job_service.mark_succeeded(job_id, result)
+            completion = self.job_service.mark_succeeded(job_id, result)
+            if completion is not None and completion.status == JOB_STATUS_CANCEL_REQUESTED:
+                # mark_succeeded()'s CAS only ever commits from postprocessing
+                # (see _SUCCEEDABLE_JOB_STATUSES), so losing it while this
+                # worker still holds execution ownership means a cancel won
+                # the race in the instant between the postprocessing
+                # transition above and this call -- the only other edge out
+                # of postprocessing (statuses.py's ALLOWED_TRANSITIONS). That
+                # cancellation is authoritative, but nothing else will ever
+                # resolve cancel_requested to a terminal state once this
+                # worker's `finally` below tears down its cancellation
+                # registration and gives up ownership. As the owner of
+                # record for this race, this worker -- not
+                # JobService.mark_succeeded()'s general contract, which stays
+                # a no-op for every other CAS-miss reason -- is responsible
+                # for finalizing it here, exactly like every other
+                # cancellation checkpoint in this method.
+                return self._finalize_cancellation(job_id)
+            return completion
         except Exception as exc:
             if not claimed:
                 raise
