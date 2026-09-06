@@ -461,6 +461,7 @@ class JobPipelineTests(unittest.TestCase):
             from core.batches import BatchRepository, BatchService
             from core.bible import BibleRepository
             from core.feedback import FeedbackRepository
+            from core.jobs.completion import CompletionConverger
             from core.projects import ProjectRepository
             from core.prompting import PromptComposer
             from core.story import SceneBinder, StoryRepository
@@ -469,6 +470,12 @@ class JobPipelineTests(unittest.TestCase):
             story_repository = StoryRepository(root / "stories")
             bible_repository = BibleRepository(root / "bible")
             batch_repository = BatchRepository(root / "batches")
+            scene_binder = SceneBinder(
+                story_repository, repository, asset_repository, event_bus=event_bus
+            )
+            batch_service = BatchService(
+                batch_repository, service, repository, event_bus=event_bus
+            )
             services = ApplicationServices(
                 output_dir=root / "outputs" / "images",
                 model_service=create_default_model_service(),
@@ -484,12 +491,15 @@ class JobPipelineTests(unittest.TestCase):
                 bible_repository=bible_repository,
                 prompt_composer=PromptComposer(bible_repository),
                 story_repository=story_repository,
-                scene_binder=SceneBinder(
-                    story_repository, repository, asset_repository, event_bus=event_bus
-                ),
+                scene_binder=scene_binder,
                 batch_repository=batch_repository,
-                batch_service=BatchService(
-                    batch_repository, service, repository, event_bus=event_bus
+                batch_service=batch_service,
+                completion_converger=CompletionConverger(
+                    repository,
+                    asset_repository,
+                    story_repository=story_repository,
+                    scene_binder=scene_binder,
+                    batch_service=batch_service,
                 ),
             )
             client = TestClient(create_app(services, start_job_runner=False))

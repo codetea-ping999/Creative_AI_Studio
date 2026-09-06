@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from bootstrap import ApplicationServices, create_application_services
+from core.jobs.startup_recovery import run_startup_recovery
 from apps.api.routes.agent import router as agent_router
 from apps.api.routes.batches import router as batches_router
 from apps.api.routes.bible import router as bible_router
@@ -46,8 +47,11 @@ def _configured_output_dir() -> Path:
     return Path("outputs/images")
 
 
-def _release_after_worker_stops(worker: Thread, ownership: DataDirectoryOwnership) -> None:
-    worker.join()
+def _release_after_workers_stop(
+    workers: list[Thread], ownership: DataDirectoryOwnership
+) -> None:
+    for worker in workers:
+        worker.join()
     ownership.release()
 
 
@@ -93,6 +97,8 @@ def create_app(
         nonlocal resolved_services
         stop_event: Event | None = None
         worker: Thread | None = None
+        retry_stop_event: Event | None = None
+        retry_thread: Thread | None = None
         # Even with the runner disabled, startup sync and API writes require
         # exclusive authority. Classification does not activate any recovery.
         ownership.acquire()
@@ -100,10 +106,31 @@ def create_app(
             if resolved_services is None:
                 resolved_services = create_application_services()
             app.state.services = resolved_services
-            # Preserve the existing gallery-only startup synchronization.
-            resolved_services.asset_repository.sync_jobs(
-                resolved_services.job_repository.list()
+
+            # PR3: startup recovery -- poison-row isolation, interrupted/
+            # cancel_requested convergence, completion convergence, and
+            # queued-job status re-check all happen here, synchronously,
+            # strictly before the job runner thread (below) can dequeue
+            # anything. This supersedes the old gallery-only
+            # asset_repository.sync_jobs() call: completion convergence
+            # already syncs every terminal-and-pending job's Asset (a
+            # strict superset), Story-replays it, and reconciles its Batch.
+            recovery_report = run_startup_recovery(
+                resolved_services.job_repository,
+                resolved_services.job_service,
+                resolved_services.completion_converger,
+                batch_service=resolved_services.batch_service,
             )
+            if recovery_report.poison_rows or recovery_report.interrupted_failed or recovery_report.cancel_requested_cancelled:
+                logger.info(
+                    "Startup recovery: %d poison row(s), %d interrupted job(s) "
+                    "failed, %d cancel_requested job(s) cancelled, %d job(s) "
+                    "re-enqueued.",
+                    len(recovery_report.poison_rows),
+                    len(recovery_report.interrupted_failed),
+                    len(recovery_report.cancel_requested_cancelled),
+                    len(recovery_report.requeued),
+                )
 
             if start_job_runner:
                 stop_event = Event()
@@ -115,21 +142,48 @@ def create_app(
                 )
                 worker.start()
 
+                # PR3: a minimal single-thread runtime retry loop for
+                # completion convergence -- not a WorkerPool, not a new
+                # lane. Joined below before ownership is ever released, the
+                # same as the job runner thread.
+                retry_stop_event = Event()
+                retry_thread = Thread(
+                    target=resolved_services.completion_converger.run_retry_loop,
+                    kwargs={"stop_event": retry_stop_event},
+                    daemon=True,
+                    name="creative-ai-completion-retry",
+                )
+                retry_thread.start()
+
             app.state.job_runner_stop_event = stop_event
             app.state.job_runner_thread = worker
+            app.state.completion_retry_stop_event = retry_stop_event
+            app.state.completion_retry_thread = retry_thread
             yield
         finally:
+            if retry_stop_event is not None:
+                retry_stop_event.set()
             if stop_event is not None:
                 stop_event.set()
+            if retry_thread is not None and retry_thread.ident is not None:
+                retry_thread.join(timeout=2.0)
             if worker is not None and worker.ident is not None:
                 worker.join(timeout=2.0)
-            if worker is not None and worker.is_alive():
-                # Lifespan exit is not proof that the daemon worker stopped.
-                # A successor must not classify this live work as abandoned.
-                logger.warning("Job worker is still stopping; retaining data-directory ownership.")
+            still_running = (worker is not None and worker.is_alive()) or (
+                retry_thread is not None and retry_thread.is_alive()
+            )
+            if still_running:
+                # Lifespan exit is not proof either background thread
+                # stopped. A successor must not classify this live work as
+                # abandoned, so ownership is only released once both are
+                # confirmed joined.
+                logger.warning(
+                    "Job worker and/or completion retry loop still stopping; "
+                    "retaining data-directory ownership."
+                )
                 Thread(
-                    target=_release_after_worker_stops,
-                    args=(worker, ownership),
+                    target=_release_after_workers_stop,
+                    args=([t for t in (worker, retry_thread) if t is not None], ownership),
                     daemon=True,
                     name="creative-ai-ownership-release",
                 ).start()

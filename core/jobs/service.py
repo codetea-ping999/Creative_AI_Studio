@@ -128,6 +128,63 @@ class JobService:
         self.enqueue_job(created_job.id)
         return created_job
 
+    def create_or_reuse_job(
+        self,
+        job_id: str,
+        request: GenerationRequest,
+        project_id: str | None = None,
+    ) -> JobRecord:
+        """Create a job under a caller-chosen id, or reuse the existing one.
+
+        For a caller (see `core.batches.service.BatchService`) that must
+        durably persist a *stable* child job id before the job row itself
+        exists, so a crash between "id persisted" and "row created" can
+        resume by re-running this exact call rather than minting a new id
+        and creating a duplicate job.
+
+        If `job_id` already exists, it is reused as-is (never re-enqueued;
+        `run_once()`/`run_forever()` can only ever act on the same id once,
+        and a restart's own queued-job recovery is what re-enqueues an
+        already-`queued` row after a process restart) -- but only if its
+        persisted `request` matches `request` exactly. A mismatch raises
+        rather than silently reusing a different job's content under an id
+        this caller expected to own.
+        """
+
+        existing = self.job_repository.get(job_id)
+        if existing is not None:
+            if existing.request != request:
+                raise ValueError(
+                    f"Job {job_id!r} already exists with a different "
+                    "request; refusing to silently reuse it for a "
+                    "mismatched request."
+                )
+            return existing
+
+        self.validate_references(request, project_id)
+        now = datetime.now(timezone.utc)
+        job = JobRecord(
+            id=job_id,
+            project_id=project_id,
+            media_type=request.media_type,
+            status=JOB_STATUS_QUEUED,
+            request=request,
+            progress=0.0,
+            created_at=now,
+            updated_at=now,
+        )
+        created_job = self.job_repository.create(job)
+        self._publish(
+            "job_created",
+            {
+                "job_id": created_job.id,
+                "status": created_job.status,
+                "media_type": created_job.media_type,
+            },
+        )
+        self.enqueue_job(created_job.id)
+        return created_job
+
     def validate_references(
         self,
         request: GenerationRequest,

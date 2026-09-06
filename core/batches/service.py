@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import os
-from threading import RLock
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -71,6 +70,17 @@ class BatchService:
     The job repository is the source of truth for item state, and batch state is
     re-derived from it on read. That is what keeps a batch correct after a process
     restart, when no in-memory event history survives.
+
+    Every mutation goes through ``BatchRepository.mutate()``/``mutate_by_job_id()``
+    (PR3 exact-HEAD audit): those hold the repository's own lock across a fresh
+    read, the mutation, and the save, so no caller here does its own
+    read-outside-the-lock followed by a possibly-stale save. Child job
+    creation happens *outside* those critical sections (see
+    ``_enqueue_stage``'s two-phase persist-id-then-create split): a child's id
+    is durably assigned to its item first, then the job row is created
+    (or reused) against that exact id, so a crash between the two steps is
+    resumable by simply re-running ``_enqueue_stage`` rather than minting a
+    new id and creating a duplicate job.
     """
 
     def __init__(
@@ -87,10 +97,6 @@ class BatchService:
         self.job_repository = job_repository
         self.event_bus = event_bus
         self.max_items_limit = resolve_max_items_limit(max_items_limit)
-        # Advancing a stage creates jobs, which publish events, which can call back
-        # into this service on the same thread. A reentrant lock keeps that safe
-        # without deadlocking on the nested call.
-        self._lock = RLock()
 
     # ---------------------------------------------------------------- creation
 
@@ -110,17 +116,8 @@ class BatchService:
             id_prefix=f"{batch_id}_item",
         )
         # #201 follow-up (Codex P2, tenth round): preflight every item's
-        # references before anything is persisted. _enqueue_stage() below
-        # calls JobService.create_job() (which re-validates references
-        # itself) one item at a time -- if an early item's job was already
-        # created and enqueued by the time a later item's reference turns
-        # out invalid, the raised exception still aborts this call with a
-        # 4xx, but the earlier item's job (and this batch's own record) were
-        # already persisted: an invisible queued job the client was never
-        # told about, and a batch id it never received either. Validating
-        # every item up front keeps a reference failure atomic with "nothing
-        # was created," matching the oversized-sweep check expand_items()
-        # already enforces before any of this runs.
+        # references before anything is persisted -- see _try_advance_in_place
+        # for the identical reasoning applied to a later stage's items.
         for item in items:
             self.job_service.validate_references(item.request, effective_spec.project_id)
 
@@ -136,20 +133,46 @@ class BatchService:
             updated_at=now,
         )
         record = self.batch_repository.create(record)
-        return self._enqueue_stage(record, stage_index=0)
+        enqueued = self._enqueue_stage(record.id, stage_index=0)
+        # The batch was just created above; nothing else has had a chance
+        # to delete it before this line runs.
+        assert enqueued is not None
+        return enqueued
 
-    def _enqueue_stage(self, record: BatchRecord, *, stage_index: int) -> BatchRecord:
-        for item in record.items:
-            if item.stage_index != stage_index or item.job_id is not None:
-                continue
-            job = self.job_service.create_job(
-                item.request,
-                project_id=record.spec.project_id,
-            )
-            item.job_id = job.id
-            item.status = job.status
-        record.status = BATCH_STATUS_RUNNING
-        return self._recompute_and_save(record)
+    def _enqueue_stage(self, batch_id: str, *, stage_index: int) -> BatchRecord | None:
+        """Idempotently create/reuse this stage's children and enqueue them.
+
+        Two phases, deliberately not one: (1) assign a durable job id to
+        every not-yet-assigned item in this stage, under the repository
+        lock; (2) create-or-reuse the actual job row for each assigned id,
+        outside the lock (job creation publishes events that can reenter
+        this service, and must never happen while a mutate() critical
+        section is open). Re-running this after a crash at any point in
+        either phase resumes correctly: phase 1 only touches items still
+        missing an id, and phase 2's create-or-reuse never creates a
+        second job for an id that already has one (see
+        ``JobService.create_or_reuse_job``).
+        """
+
+        def _assign_ids(record: BatchRecord | None) -> BatchRecord | None:
+            if record is None or record.cancellation_requested:
+                return record
+            for item in record.items:
+                if item.stage_index == stage_index and item.job_id is None:
+                    item.job_id = f"job_{uuid4().hex}"
+            return record
+
+        record = self.batch_repository.mutate(batch_id, _assign_ids)
+        if record is None or record.cancellation_requested:
+            return record
+
+        for item in record.items_for_stage(stage_index):
+            if item.job_id is not None:
+                self.job_service.create_or_reuse_job(
+                    item.job_id, item.request, project_id=record.spec.project_id
+                )
+
+        return self.reconcile(batch_id)
 
     # ------------------------------------------------------------------- reads
 
@@ -168,13 +191,31 @@ class BatchService:
     # --------------------------------------------------------- reconciliation
 
     def reconcile(self, batch_id: str) -> BatchRecord | None:
-        with self._lock:
-            record = self.batch_repository.get(batch_id)
-            if record is None:
-                return None
-            return self._recompute_and_save(record)
+        return self.batch_repository.mutate(batch_id, self._recompute)
 
-    def _recompute_and_save(self, record: BatchRecord) -> BatchRecord:
+    def reconcile_child_job(self, job_id: str) -> BatchRecord | None:
+        """Reconcile the batch owning ``job_id`` from that job's own state.
+
+        The same operation ``handle_job_event()`` performs for a terminal
+        event, exposed directly for a caller with no event to react to --
+        completion convergence reconciling from a job's persisted status,
+        not from the event bus (see ``core.jobs.completion``) -- so a batch
+        whose event was lost (a crash before the event bus delivered it, no
+        subscriber attached yet, ...) still advances. Idempotent: recompute
+        and stage-advance are themselves no-ops once nothing has changed,
+        so calling this for an event that *was* already handled is safe.
+        """
+
+        refreshed = self.batch_repository.mutate_by_job_id(
+            job_id, self._recompute_and_advance_capturing
+        )
+        if refreshed is None:
+            return None
+        return self._enqueue_stage(refreshed.id, stage_index=refreshed.stage_index)
+
+    def _recompute(self, record: BatchRecord | None) -> BatchRecord | None:
+        if record is None:
+            return None
         for item in record.items:
             if item.job_id is None:
                 continue
@@ -195,22 +236,80 @@ class BatchService:
 
         record.aggregate = _build_aggregate(record.items)
         record.status = _derive_status(record)
-        return self.batch_repository.save(record)
+        return record
 
     # ----------------------------------------------------------- stage control
 
     def advance(self, batch_id: str) -> BatchRecord | None:
-        with self._lock:
-            record = self.batch_repository.get(batch_id)
-            if record is None:
-                return None
-            record = self._recompute_and_save(record)
-            return self._advance_locked(record)
+        record = self.batch_repository.mutate(batch_id, self._recompute_and_advance_raising)
+        if record is None:
+            return None
+        self._enqueue_stage(record.id, stage_index=record.stage_index)
+        return self.reconcile(batch_id)
 
-    def _advance_locked(self, record: BatchRecord) -> BatchRecord:
+    def _recompute_and_advance_raising(self, record: BatchRecord | None) -> BatchRecord | None:
+        """recompute(), then attempt to advance a stage, raising a reference
+        preflight failure through to the caller -- the manual ``advance()``
+        API's contract (the API route re-raises this as a 422); it must
+        keep raising, unlike the event-driven path below.
+        """
+
+        if record is None:
+            return None
+        record = self._recompute(record)
+        assert record is not None  # _recompute() only returns None for a None input
+        return self._try_advance_in_place(record)
+
+    def _recompute_and_advance_capturing(self, record: BatchRecord | None) -> BatchRecord | None:
+        """Same attempt, but a reference preflight failure is encoded into
+        ``advance_error``/``status`` on the record instead of raising.
+
+        Used by the event-driven auto-advance path (``handle_job_event``/
+        ``reconcile_child_job``), which runs on the job runner thread with
+        no HTTP caller to hand a 4xx to (#201 follow-up, eleventh Codex
+        round on PR #376) -- left uncaught, the batch would otherwise be
+        stuck "running" forever: its current stage's items all terminal,
+        but the next stage never created and no further job event ever
+        retriggers this path.
+        """
+
+        if record is None:
+            return None
+        record = self._recompute(record)
+        assert record is not None  # _recompute() only returns None for a None input
+        try:
+            return self._try_advance_in_place(record)
+        except (UnsupportedReferenceError, MissingReferenceAssetError) as exc:
+            # Setting only `status` here would not be durable -- the next
+            # read calls _recompute(), whose _derive_status() has no
+            # concept of "the stage transition itself failed" and would
+            # recompute "running" from a successful current stage plus a
+            # pending next one, silently reverting this. advance_error is
+            # what _derive_status() actually checks.
+            record.advance_error = str(exc)
+            record.status = BATCH_STATUS_FAILED
+            logger.warning(
+                "Batch %s failed to advance past stage %d: %s",
+                record.id,
+                record.stage_index,
+                exc,
+            )
+            return record
+
+    def _try_advance_in_place(self, record: BatchRecord) -> BatchRecord:
+        """Pure attempt to advance one stage in place; may raise a reference
+        preflight failure (`UnsupportedReferenceError`/
+        `MissingReferenceAssetError`) -- callers decide whether to let that
+        propagate or catch it (see the two wrappers above).
+        """
+
         stages = record.spec.resolved_stages()
         next_stage_index = record.stage_index + 1
         if next_stage_index >= len(stages):
+            return record
+        if record.cancellation_requested:
+            # Durable cancellation intent suppresses creating a new stage,
+            # even if every current-stage item just finished terminally.
             return record
 
         current_items = record.items_for_stage(record.stage_index)
@@ -232,19 +331,18 @@ class BatchService:
         )
         # #201 follow-up (Codex P2, tenth round): same preflight as
         # create_batch() above, for the same reason -- this stage's items
-        # are about to be persisted onto the batch record and enqueued one
-        # at a time, so a later item's reference failure must not leave an
-        # earlier one already queued behind an exception the caller has no
-        # way to partially undo.
+        # are about to be persisted onto the batch record, so a later
+        # item's reference failure must not leave an earlier one already
+        # assigned a job id behind an exception the caller has no way to
+        # partially undo.
         for new_item in new_items:
             self.job_service.validate_references(new_item.request, record.spec.project_id)
         # #201 follow-up (Codex P2, thirteenth round): the preflight above
         # passed, so this is either the first attempt or a retry after an
-        # operator fixed whatever made an earlier attempt's preflight raise
-        # (see handle_job_event()). Clear any stale advance_error from that
-        # earlier attempt now -- otherwise _derive_status() would keep
-        # forcing this batch to "failed" forever even as the code below
-        # creates and enqueues real, live jobs for it.
+        # operator fixed whatever made an earlier attempt's preflight
+        # raise. Clear any stale advance_error from that earlier attempt
+        # now -- otherwise _derive_status() would keep forcing this batch
+        # to "failed" forever even as real, live jobs get created for it.
         record.advance_error = None
 
         # Carry each winner's label forward so the refined output is traceable to
@@ -263,32 +361,67 @@ class BatchService:
 
         record.items.extend(new_items)
         record.stage_index = next_stage_index
-        record = self.batch_repository.save(record)
-        return self._enqueue_stage(record, stage_index=next_stage_index)
+        return record
 
     def cancel(self, batch_id: str) -> BatchRecord | None:
-        with self._lock:
-            record = self.batch_repository.get(batch_id)
+        def _apply_cancellation_intent(record: BatchRecord | None) -> BatchRecord | None:
             if record is None:
                 return None
+            # Durable intent first, in the same atomic save as marking any
+            # item that will now never get a job id as terminally
+            # cancelled -- both must be persisted before any child job is
+            # actually told to cancel below, so a crash right after this
+            # save still leaves an observable, resumable "cancellation was
+            # requested" record (see resume_pending_cancellations()).
+            record.cancellation_requested = True
             for item in record.items:
-                if item.job_id is None:
+                if item.job_id is None and item.status != JOB_STATUS_CANCELLED:
                     item.status = JOB_STATUS_CANCELLED
-                    continue
-                if not is_terminal_status(item.status):
-                    self.job_service.cancel_job(item.job_id)
-            return self._recompute_and_save(record)
+            return record
+
+        record = self.batch_repository.mutate(batch_id, _apply_cancellation_intent)
+        if record is None:
+            return None
+
+        for item in record.items:
+            if item.job_id is not None and not is_terminal_status(item.status):
+                self.job_service.cancel_job(item.job_id)
+
+        return self.reconcile(batch_id)
+
+    def resume_pending_cancellations(self) -> list[BatchRecord]:
+        """Re-apply cancellation to every batch whose durable intent is set.
+
+        For startup recovery: a crash between persisting
+        ``cancellation_requested`` and actually telling every child job to
+        cancel must not leave those children running forever. Safe to call
+        any number of times -- ``cancel()`` re-marking an
+        already-``cancellation_requested`` batch, and
+        ``JobService.cancel_job()`` re-cancelling an already-cancelled or
+        already-``cancel_requested`` job, are both themselves idempotent
+        no-ops.
+        """
+
+        resumed: list[BatchRecord] = []
+        for record in self.batch_repository.list_all():
+            if not record.cancellation_requested:
+                continue
+            refreshed = self.cancel(record.id)
+            if refreshed is not None:
+                resumed.append(refreshed)
+        return resumed
 
     def promote(self, batch_id: str, item_id: str) -> BatchRecord | None:
-        with self._lock:
-            record = self.batch_repository.get(batch_id)
+        def _mark_promoted_and_recompute(record: BatchRecord | None) -> BatchRecord | None:
             if record is None:
                 return None
             item = next((entry for entry in record.items if entry.id == item_id), None)
             if item is None:
                 raise LookupError(f"Unknown batch item: {item_id}")
             item.promoted = True
-            return self._recompute_and_save(record)
+            return self._recompute(record)
+
+        return self.batch_repository.mutate(batch_id, _mark_promoted_and_recompute)
 
     # ---------------------------------------------------------------- events
 
@@ -308,42 +441,7 @@ class BatchService:
         if not isinstance(job_id, str):
             return
         try:
-            record = self.batch_repository.find_by_job_id(job_id)
-            if record is None:
-                return
-            with self._lock:
-                refreshed = self._recompute_and_save(record)
-                try:
-                    self._advance_locked(refreshed)
-                except (UnsupportedReferenceError, MissingReferenceAssetError) as exc:
-                    # #201 follow-up (Codex P2, eleventh round): the
-                    # stage-advance reference preflight (added this same
-                    # round, in _advance_locked) can raise here, on the job
-                    # runner thread with no HTTP caller to hand a 4xx to.
-                    # Left to the broad except below, that was logged and
-                    # swallowed, leaving the batch stuck in "running"
-                    # forever: its current stage's items all terminal, but
-                    # the next stage never created and no further job event
-                    # will ever retrigger this path. Persist it as failed
-                    # instead so the batch reaches an observable terminal
-                    # state.
-                    #
-                    # #201 follow-up (Codex P2, twelfth round): setting only
-                    # `status` here was not durable -- the next read calls
-                    # _recompute_and_save(), whose _derive_status() has no
-                    # concept of "the stage transition itself failed" and
-                    # recomputes "running" from a successful current stage
-                    # plus a pending next one, silently reverting this.
-                    # advance_error is what _derive_status() actually checks.
-                    refreshed.advance_error = str(exc)
-                    refreshed.status = BATCH_STATUS_FAILED
-                    self.batch_repository.save(refreshed)
-                    logger.warning(
-                        "Batch %s failed to advance past stage %d: %s",
-                        refreshed.id,
-                        refreshed.stage_index,
-                        exc,
-                    )
+            self.reconcile_child_job(job_id)
         except Exception:  # pragma: no cover - never break the runner
             logger.exception("Failed to update batch state for job %s.", job_id)
 
@@ -400,9 +498,12 @@ def _derive_status(record: BatchRecord) -> str:
 
     stages = record.spec.resolved_stages()
     has_further_stage = record.stage_index + 1 < len(stages)
-    if has_further_stage and aggregate.succeeded:
+    if has_further_stage and aggregate.succeeded and not record.cancellation_requested:
         # The current stage is done but the run is not: keep it "running" so the
-        # UI does not claim completion before the refine pass exists.
+        # UI does not claim completion before the refine pass exists. Not when
+        # cancellation was requested, though -- that next stage will never be
+        # created (see _try_advance_in_place), so waiting for it would leave
+        # the batch "running" forever instead of reaching a terminal status.
         return BATCH_STATUS_RUNNING
 
     if aggregate.succeeded == aggregate.total:
