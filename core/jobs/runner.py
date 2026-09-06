@@ -30,6 +30,7 @@ from .statuses import (
     JOB_STATUS_PREPARING,
     JOB_STATUS_QUEUED,
     JOB_STATUS_RUNNING,
+    JOB_STATUSES,
     is_terminal_status,
 )
 
@@ -215,9 +216,23 @@ class JobRunner:
         `JobService.mark_failed()`, since the very failure being quarantined
         can be a persisted payload that makes any read-back of this same row
         (including `mark_failed()`'s own trailing reread) raise identically.
+        `str(exc)` is persisted as `error_message` in the same atomic
+        UPDATE: an event publish alone is not enough, since nothing
+        subscribes to it after the fact, and `GET /jobs/{id}` must be able
+        to show *why* a corrupted-but-now-readable row (e.g. progress alone
+        was out of range) ended up `failed`, exactly like an ordinary
+        `mark_failed()` call would.
+
         A job only ever reaches here still `queued` (see `process_job`'s own
-        pre-claim status checks), so `queued -> failed` is the only expected
-        source transition.
+        pre-claim status checks) -- unless the row's raw `status` is itself
+        structurally invalid (outside `JOB_STATUSES` entirely), in which
+        case it was never `queued` to begin with and the ordinary CAS below
+        can never match it. Treating that CAS miss as "already resolved"
+        would discard the queue entry while leaving the row stuck in that
+        invalid status forever (Codex exact-HEAD review, second finding) --
+        so a miss falls through to a raw-status check and, only for a
+        genuinely invalid one, a second, narrowly-scoped repair attempt via
+        `quarantine_structurally_invalid_status()`.
         """
 
         try:
@@ -226,6 +241,7 @@ class JobRunner:
                 (JOB_STATUS_QUEUED,),
                 status=JOB_STATUS_FAILED,
                 progress=1.0,
+                error_message=str(exc),
             )
         except Exception:
             logger.exception(
@@ -234,8 +250,46 @@ class JobRunner:
                 job_id,
             )
             return _QuarantineOutcome.WRITE_FAILED
-        if not quarantined:
+        if quarantined:
+            self._publish_quarantined(job_id, exc)
+            return _QuarantineOutcome.QUARANTINED
+
+        try:
+            raw_status = self.job_repository.get_raw_status(job_id)
+        except Exception:
+            logger.exception(
+                "Could not read job %s's raw status while quarantining; "
+                "treating this as a transient failure so it is not lost.",
+                job_id,
+            )
+            return _QuarantineOutcome.WRITE_FAILED
+
+        if raw_status is not None and raw_status not in JOB_STATUSES:
+            try:
+                repaired = self.job_repository.quarantine_structurally_invalid_status(
+                    job_id, error_message=str(exc)
+                )
+            except Exception:
+                logger.exception(
+                    "Could not repair job %s's structurally invalid status "
+                    "%r; its quarantine write itself failed.",
+                    job_id,
+                    raw_status,
+                )
+                return _QuarantineOutcome.WRITE_FAILED
+            if repaired:
+                self._publish_quarantined(job_id, exc)
+                return _QuarantineOutcome.QUARANTINED
+            # Someone else already resolved or repaired it between the two
+            # reads above -- settled either way, not lost.
             return _QuarantineOutcome.ALREADY_RESOLVED
+
+        # The row's raw status is a genuinely valid one, just not `queued`
+        # (or the row no longer exists) -- something else already resolved
+        # it; not this call's job to reconcile further.
+        return _QuarantineOutcome.ALREADY_RESOLVED
+
+    def _publish_quarantined(self, job_id: str, exc: BaseException) -> None:
         self._publish(
             "job_failed",
             {
@@ -245,7 +299,6 @@ class JobRunner:
                 "error_message": str(exc),
             },
         )
-        return _QuarantineOutcome.QUARANTINED
 
     def run_forever(
         self,

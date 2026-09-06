@@ -1012,3 +1012,157 @@ def test_out_of_range_progress_is_a_permanent_persisted_row_failure(tmp_path):
     assert generator.calls == 1
     assert _raw_status(db_path, poison.id) == "failed"
     assert repository.get(healthy.id).status == "succeeded"
+
+
+# --- Fourth Codex exact-HEAD review round, on ce216adb: three further ----
+# pre-claim edge cases the row-wide reconstruction fix above still missed.
+
+
+def test_blob_created_at_is_a_permanent_persisted_row_failure_via_typeerror(
+    tmp_path,
+):
+    """P2-1: SQLite's type affinity is advisory -- a BLOB can end up in a
+    TEXT-affinity column despite the schema. `datetime.fromisoformat()`
+    reacts to a non-str value with `TypeError`, not `ValueError`, so the
+    prior `except (ValueError, RecursionError)` missed it entirely and this
+    content-caused, deterministic failure would have been requeued forever.
+    Proven through a real `run_forever` loop, not just a repository-level
+    exception-type check.
+    """
+
+    db_path = tmp_path / "jobs.db"
+    repository = JobRepository(db_path)
+    queue = JobQueue()
+    stopped = Event()
+    generator = FakeGenerator(lambda _context: stopped.set())
+    poison = seed_job(repository, job_id="job_poison")
+    healthy = seed_job(repository, job_id="job_healthy")
+
+    _corrupt_column(db_path, poison.id, "created_at", b"not-a-date-blob")
+    with pytest.raises(JobRecordDecodeError):
+        repository.get(poison.id)
+
+    queue.enqueue(poison.id)
+    queue.enqueue(healthy.id)
+    runner = JobRunner(repository, queue, GeneratorRegistry({"image": generator}))
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            runner.run_forever, stop_event=stopped, poll_interval_seconds=0.01
+        )
+        try:
+            processed = stopped.wait(5)
+        finally:
+            stopped.set()
+        future.result(timeout=5)
+        assert processed, (
+            "job_healthy was never processed -- the BLOB-timestamp poison "
+            "job likely starved the worker with infinite retries"
+        )
+
+    assert queue.size() == 0, "the poison job must not still be queued for retry"
+    assert generator.calls == 1
+    assert _raw_status(db_path, poison.id) == "failed"
+    assert repository.get(healthy.id).status == "succeeded"
+
+
+def test_invalid_raw_status_is_quarantined_without_losing_the_job(tmp_path):
+    """P2-2: a structurally invalid raw `status` (outside `JOB_STATUSES`
+    entirely -- external corruption, a truncated write) is correctly
+    detected as permanent by `_row_to_record()`, but the ordinary quarantine
+    CAS (`expected_statuses=(queued,)`) can never match it, since the row
+    was never `queued` to begin with. Treating that CAS miss as "already
+    resolved" would discard the queue entry while the row stays stuck in
+    the invalid status forever -- proven through a real `run_forever` loop.
+    """
+
+    db_path = tmp_path / "jobs.db"
+    repository = JobRepository(db_path)
+    queue = JobQueue()
+    stopped = Event()
+    generator = FakeGenerator(lambda _context: stopped.set())
+    poison = seed_job(repository, job_id="job_poison")
+    healthy = seed_job(repository, job_id="job_healthy")
+
+    _corrupt_column(db_path, poison.id, "status", "banana")
+    with pytest.raises(JobRecordDecodeError):
+        repository.get(poison.id)
+
+    queue.enqueue(poison.id)
+    queue.enqueue(healthy.id)
+    runner = JobRunner(repository, queue, GeneratorRegistry({"image": generator}))
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            runner.run_forever, stop_event=stopped, poll_interval_seconds=0.01
+        )
+        try:
+            processed = stopped.wait(5)
+        finally:
+            stopped.set()
+        future.result(timeout=5)
+        assert processed, (
+            "job_healthy was never processed -- the invalid-raw-status "
+            "poison job likely starved the worker with infinite retries"
+        )
+
+    assert queue.size() == 0, "the poison job must not still be queued for retry"
+    assert generator.calls == 1
+    assert _raw_status(db_path, poison.id) == "failed"
+    poison_after = repository.get(poison.id)
+    assert poison_after.error_message is not None
+    assert "banana" in poison_after.error_message
+    assert repository.get(healthy.id).status == "succeeded"
+
+
+@pytest.mark.parametrize("status", JOB_STATUSES)
+def test_structurally_invalid_status_repair_never_matches_a_valid_status(
+    tmp_path, status,
+):
+    """P2-2: `quarantine_structurally_invalid_status()` is a deliberately
+    narrow escape hatch, not a general "rewrite any status" helper -- its
+    own WHERE clause must never match a row whose raw status is any of the
+    8 canonical `JOB_STATUSES`, including a valid terminal one.
+    """
+
+    repository = JobRepository(tmp_path / "jobs.db")
+    job = seed_job(repository, status=status)
+
+    repaired = repository.quarantine_structurally_invalid_status(
+        job.id, error_message="should never be applied"
+    )
+
+    assert repaired is False
+    after = repository.get(job.id)
+    assert after.status == status
+    assert after.progress == job.progress
+    assert after.error_message is None
+
+
+def test_quarantine_persists_the_original_error_message_when_the_row_becomes_readable_again(
+    tmp_path,
+):
+    """P2-3: once quarantine's own atomic UPDATE repairs `progress` back
+    into range, `repository.get()` can read the row again -- its
+    `error_message` must show why it failed, not `None`, matching
+    `JobService.mark_failed()`'s own contract. An event publish alone is
+    not a substitute for persistence: nothing replays a past event to a
+    caller reading the job later.
+    """
+
+    db_path = tmp_path / "jobs.db"
+    repository = JobRepository(db_path)
+    queue = JobQueue()
+    poison = seed_job(repository, job_id="job_poison")
+    _corrupt_column(db_path, poison.id, "progress", 2.5)
+    queue.enqueue(poison.id)
+    runner = JobRunner(repository, queue, GeneratorRegistry({"image": FakeGenerator()}))
+
+    with pytest.raises(JobRecordDecodeError):
+        runner.run_once()
+
+    after = repository.get(poison.id)
+    assert after.status == "failed"
+    assert after.progress == 1.0
+    assert after.error_message is not None
+    assert "progress" in after.error_message

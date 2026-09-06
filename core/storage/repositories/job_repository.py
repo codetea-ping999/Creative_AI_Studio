@@ -25,16 +25,18 @@ class JobRecordDecodeError(Exception):
     current `GenerationRequest`/`GenerationResult` models no longer accept
     (`pydantic.ValidationError`) in the request/result payload; JSON nested
     deep enough to overflow the decoder's C stack (`RecursionError`); a
-    malformed `created_at`/`updated_at` timestamp (`datetime.fromisoformat`
-    raising `ValueError`); or the row as a whole failing `JobRecord`'s own
-    validation (an invalid persisted `status`/`media_type` literal, a
-    `progress` outside `[0.0, 1.0]`, etc. -- also `pydantic.ValidationError`).
-    Every one of these is deterministic: the same persisted bytes fail
-    identically on every future read of this row, unlike a `sqlite3.Error`
-    (locked, busy, disk I/O), which says nothing about the row's content.
-    A caller (see `core.jobs.runner.JobRunner`) uses this type, specifically,
-    to tell "retrying can never help" apart from "the database itself had a
-    transient problem."
+    malformed `created_at`/`updated_at` timestamp, whether a bad ISO string
+    (`datetime.fromisoformat` raising `ValueError`) or a non-`str` value --
+    SQLite tolerates a BLOB in a TEXT-affinity column, so a raw byte string
+    there raises `TypeError` instead; or the row as a whole failing
+    `JobRecord`'s own validation (an invalid persisted `status`/`media_type`
+    literal, a `progress` outside `[0.0, 1.0]`, etc. -- also
+    `pydantic.ValidationError`). Every one of these is deterministic: the
+    same persisted bytes fail identically on every future read of this row,
+    unlike a `sqlite3.Error` (locked, busy, disk I/O), which says nothing
+    about the row's content. A caller (see `core.jobs.runner.JobRunner`)
+    uses this type, specifically, to tell "retrying can never help" apart
+    from "the database itself had a transient problem."
     """
 
 
@@ -186,6 +188,7 @@ class JobRepository:
         *,
         status: GenerationStatus,
         progress: float | None = None,
+        error_message: str | None | object = _UNSET,
     ) -> bool:
         """Atomically transition a job and return only whether the CAS won.
 
@@ -193,6 +196,16 @@ class JobRepository:
         reread the job after its UPDATE commits.  Callers that establish
         execution ownership need that boolean before any fallible follow-up
         read can occur.
+
+        ``error_message`` (optional, `_UNSET` by default so ordinary claim/
+        transition callers leave the column untouched) lets a caller
+        quarantining an unreadable row -- see
+        `core.jobs.runner.JobRunner._quarantine_poison_job` -- persist the
+        failure reason in the same atomic UPDATE, without ever needing to
+        read the row back first. Recording *why* a job failed only via a
+        transient event publish is not enough: it must survive in the
+        database exactly like `JobService.mark_failed()`'s own
+        ``error_message`` does.
         """
 
         if not expected_statuses or status not in JOB_STATUSES:
@@ -208,6 +221,9 @@ class JobRepository:
         if progress is not None:
             assignments.append("progress = ?")
             parameters.append(progress)
+        if error_message is not _UNSET:
+            assignments.append("error_message = ?")
+            parameters.append(error_message)
         assignments.append("updated_at = ?")
         parameters.append(self._normalize_timestamp(None))
         parameters.append(job_id)
@@ -226,6 +242,80 @@ class JobRepository:
                   AND status IN ({transition_placeholders})
                 """,
                 parameters,
+            )
+        return cursor.rowcount > 0
+
+    def get_raw_status(self, job_id: str) -> str | None:
+        """Return `job_id`'s persisted `status` column, or `None` if missing.
+
+        A narrow, single-column read that never touches `request_json`/
+        `result_json`/timestamps and never goes through `_row_to_record()`,
+        so it cannot itself raise `JobRecordDecodeError` -- it is exactly
+        what a caller needs to tell a *structurally invalid* raw status
+        (outside `JOB_STATUSES` entirely) apart from a valid one that
+        simply is not the status a CAS expected. Not a general escape
+        hatch: it reads one column for one job id and nothing else.
+        """
+
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT status FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        return None if row is None else row["status"]
+
+    def quarantine_structurally_invalid_status(
+        self,
+        job_id: str,
+        *,
+        error_message: str,
+    ) -> bool:
+        """Terminalize a row whose persisted `status` is outside `JOB_STATUSES`.
+
+        A structurally invalid raw status (never written by this
+        codebase -- external corruption, a truncated write, a downgraded
+        schema) can never equal any expected status in an ordinary CAS, so
+        `transition_if_status()` always reports it as a miss; treating that
+        miss as "already resolved by something else" would discard the
+        queue entry while leaving the row stuck in that invalid status
+        forever -- a lost job (Codex exact-HEAD review). This is a
+        deliberately narrow escape hatch, not a general "rewrite any
+        status" helper:
+
+        - Scoped to exactly one `job_id`.
+        - The UPDATE's own WHERE clause re-checks, transactionally, that the
+          *current* raw status is NOT one of `JOB_STATUSES` -- so this can
+          never match, and can never overwrite, a row already in any valid
+          status (including a valid terminal one). It is not a bypass of
+          the execution-claim or lifecycle-transition contract; it only
+          ever fires for a status that contract was never defined for.
+        - Always sets `status="failed"`, `progress=1.0`, and
+          `error_message` together in the one atomic UPDATE -- there is no
+          reread step for a caller to lose the reason on, matching
+          `transition_if_status()`'s own no-reread design.
+
+        Returns whether this call's UPDATE actually matched a row -- a
+        `False` here means the row was no longer in that invalid status by
+        the time this ran (someone else already resolved or repaired it),
+        not that this call failed.
+        """
+
+        placeholders = ", ".join("?" for _ in JOB_STATUSES)
+        with self._connection() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE jobs
+                SET status = ?, progress = ?, error_message = ?, updated_at = ?
+                WHERE id = ?
+                  AND status NOT IN ({placeholders})
+                """,
+                (
+                    "failed",
+                    1.0,
+                    error_message,
+                    self._normalize_timestamp(None),
+                    job_id,
+                    *JOB_STATUSES,
+                ),
             )
         return cursor.rowcount > 0
 
@@ -403,20 +493,27 @@ class JobRepository:
                 created_at=datetime.fromisoformat(row["created_at"]),
                 updated_at=datetime.fromisoformat(row["updated_at"]),
             )
-        except (ValueError, RecursionError) as exc:
+        except (ValueError, RecursionError, TypeError) as exc:
             # ValueError covers json.JSONDecodeError, every
             # pydantic.ValidationError (request/result payload *and* the
             # final JobRecord construction), and datetime.fromisoformat's
-            # ValueError on a malformed timestamp; RecursionError covers
-            # JSON nested deep enough to overflow the decoder's C stack.
-            # All of these can only be caused by this row's own persisted
-            # values -- never by the read operation itself -- so they are
-            # normalized into one boundary type a caller can classify as
-            # "never retry" without having to know which underlying
-            # library, or which field, raised it. Deliberately scoped to
-            # just these two types: a `sqlite3.Error` (or any other
-            # exception) must keep propagating unchanged, since it says
-            # nothing about this row's content.
+            # ValueError on a malformed-but-string timestamp; RecursionError
+            # covers JSON nested deep enough to overflow the decoder's C
+            # stack; TypeError covers datetime.fromisoformat's own reaction
+            # to a non-str value -- SQLite's type affinity is advisory, so a
+            # BLOB can end up in created_at/updated_at despite the column's
+            # TEXT affinity (Codex exact-HEAD review: this was the one
+            # content-caused exception type this boundary missed). All of
+            # these can only be caused by this row's own persisted values --
+            # never by the read operation itself -- so they are normalized
+            # into one boundary type a caller can classify as "never retry"
+            # without having to know which underlying library, or which
+            # field, raised it. Deliberately scoped to just these three
+            # types: a `sqlite3.Error` (or any other exception) must keep
+            # propagating unchanged, since it says nothing about this row's
+            # content -- and this scoping is safe precisely because nothing
+            # in this method's body performs I/O, so it can never coincide
+            # with a database-level TypeError from somewhere else.
             raise JobRecordDecodeError(
                 f"Job {row['id']!r}'s persisted row could not be "
                 f"reconstructed: {exc}"
