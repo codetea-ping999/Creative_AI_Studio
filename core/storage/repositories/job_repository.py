@@ -16,19 +16,25 @@ from core.schemas import GenerationRequest, GenerationResult, GenerationStatus
 _UNSET = object()
 
 
-class JobPayloadDecodeError(Exception):
-    """A job row's persisted request/result payload could not be restored.
+class JobRecordDecodeError(Exception):
+    """A job row could not be deterministically reconstructed into a `JobRecord`.
 
     Raised by `_row_to_record()` when the row's own stored bytes -- not the
-    read operation itself -- are the problem: malformed JSON
-    (`json.JSONDecodeError`), a schema the current `GenerationRequest`/
-    `GenerationResult` models no longer accept (`pydantic.ValidationError`),
-    or JSON nested deep enough to overflow the decoder's C stack
-    (`RecursionError`). Deliberately distinct from a `sqlite3.Error`: the
-    same persisted bytes will fail identically on every future read of this
-    row, so a caller (see `core.jobs.runner.JobRunner`) can use this type,
-    specifically, to tell "retrying can never help" apart from "the
-    database itself had a transient problem."
+    read operation itself -- are the problem, at any stage of
+    reconstruction: malformed JSON (`json.JSONDecodeError`) or a schema the
+    current `GenerationRequest`/`GenerationResult` models no longer accept
+    (`pydantic.ValidationError`) in the request/result payload; JSON nested
+    deep enough to overflow the decoder's C stack (`RecursionError`); a
+    malformed `created_at`/`updated_at` timestamp (`datetime.fromisoformat`
+    raising `ValueError`); or the row as a whole failing `JobRecord`'s own
+    validation (an invalid persisted `status`/`media_type` literal, a
+    `progress` outside `[0.0, 1.0]`, etc. -- also `pydantic.ValidationError`).
+    Every one of these is deterministic: the same persisted bytes fail
+    identically on every future read of this row, unlike a `sqlite3.Error`
+    (locked, busy, disk I/O), which says nothing about the row's content.
+    A caller (see `core.jobs.runner.JobRunner`) uses this type, specifically,
+    to tell "retrying can never help" apart from "the database itself had a
+    transient problem."
     """
 
 
@@ -364,6 +370,18 @@ class JobRepository:
             yield connection
 
     def _row_to_record(self, row: sqlite3.Row) -> JobRecord:
+        # The entire reconstruction -- payload JSON decode, request/result
+        # model validation, timestamp parsing, and the final JobRecord
+        # construction (itself a Pydantic validation of status/media_type/
+        # progress/id together) -- runs on data already fetched into `row`.
+        # None of it performs I/O or touches SQLite again, so wrapping the
+        # whole method body in one try/except cannot ever catch a
+        # sqlite3.Error: only a deterministic, content-caused failure can
+        # originate here (Codex exact-HEAD review: a malformed
+        # created_at/updated_at or a JobRecord-level validation failure
+        # -- e.g. an invalid persisted status/progress -- was previously
+        # unwrapped, past the payload-only boundary below, and would have
+        # been misclassified as transient and requeued forever).
         try:
             request_payload = self._deserialize_payload(row["request_json"]) or {}
             result_payload = self._deserialize_payload(row["result_json"])
@@ -373,33 +391,36 @@ class JobRepository:
                 if result_payload is not None
                 else None
             )
+            return JobRecord(
+                id=row["id"],
+                project_id=row["project_id"],
+                media_type=row["media_type"],
+                status=row["status"],
+                request=request,
+                result=result,
+                progress=row["progress"],
+                error_message=row["error_message"],
+                created_at=datetime.fromisoformat(row["created_at"]),
+                updated_at=datetime.fromisoformat(row["updated_at"]),
+            )
         except (ValueError, RecursionError) as exc:
-            # ValueError covers json.JSONDecodeError and
-            # pydantic.ValidationError; RecursionError covers JSON nested
-            # deep enough to overflow the decoder's C stack. All three can
-            # only be caused by this row's own persisted bytes -- never by
-            # the read operation itself -- so they are normalized into one
-            # boundary type a caller can classify as "never retry" without
-            # having to know which underlying library raised it. Deliberately
-            # scoped to just these two types: a `sqlite3.Error` (or any other
+            # ValueError covers json.JSONDecodeError, every
+            # pydantic.ValidationError (request/result payload *and* the
+            # final JobRecord construction), and datetime.fromisoformat's
+            # ValueError on a malformed timestamp; RecursionError covers
+            # JSON nested deep enough to overflow the decoder's C stack.
+            # All of these can only be caused by this row's own persisted
+            # values -- never by the read operation itself -- so they are
+            # normalized into one boundary type a caller can classify as
+            # "never retry" without having to know which underlying
+            # library, or which field, raised it. Deliberately scoped to
+            # just these two types: a `sqlite3.Error` (or any other
             # exception) must keep propagating unchanged, since it says
             # nothing about this row's content.
-            raise JobPayloadDecodeError(
-                f"Job {row['id']!r}'s persisted request/result payload could "
-                f"not be deserialized or validated: {exc}"
+            raise JobRecordDecodeError(
+                f"Job {row['id']!r}'s persisted row could not be "
+                f"reconstructed: {exc}"
             ) from exc
-        return JobRecord(
-            id=row["id"],
-            project_id=row["project_id"],
-            media_type=row["media_type"],
-            status=row["status"],
-            request=request,
-            result=result,
-            progress=row["progress"],
-            error_message=row["error_message"],
-            created_at=datetime.fromisoformat(row["created_at"]),
-            updated_at=datetime.fromisoformat(row["updated_at"]),
-        )
 
     def _ensure_column(
         self,

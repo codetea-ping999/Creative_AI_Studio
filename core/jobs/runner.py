@@ -164,23 +164,26 @@ class JobRunner:
         The only two realistic sources of a pre-claim exception are
         `JobRepository.get()` and `transition_if_status()`'s raw SQL
         execution. `get()` normalizes every failure that can only be caused
-        by *this row's own persisted content* -- malformed JSON, a schema
-        the current models no longer accept, JSON nested deep enough to
-        overflow the decoder's C stack -- into one
-        `JobPayloadDecodeError` (see `JobRepository._row_to_record`); the
+        by *this row's own persisted content*, at any stage of
+        reconstruction -- malformed JSON, a payload schema the current
+        models no longer accept, JSON nested deep enough to overflow the
+        decoder's C stack, a malformed timestamp, or the row as a whole
+        failing `JobRecord`'s own validation (an invalid persisted
+        status/media_type, an out-of-range progress, etc.) -- into one
+        `JobRecordDecodeError` (see `JobRepository._row_to_record`); the
         exact same bytes will fail identically on every future read, so
         requeuing is pure worker starvation with no chance of ever
         succeeding. Classifying on that one boundary type, rather than on
-        `ValueError` directly, is deliberate: a `RecursionError` (not a
-        `ValueError`) is one of the payload-content failures `get()` already
+        `ValueError` directly, is deliberate: `RecursionError` (not a
+        `ValueError`) is one of the content-caused failures `get()` already
         normalizes, and this must never accidentally widen to catch an
         unrelated `ValueError`/`RuntimeError` a future change might raise
         for a completely different, non-content reason.
-        `transition_if_status()` never touches request/result content at
-        all (a plain parameterized `UPDATE`), so a failure there is an
-        execution-level problem -- typically `sqlite3.Error` (locked, busy,
-        disk I/O) -- with no bearing on the row's content, and is exactly
-        the case retrying is *for*.
+        `transition_if_status()` never touches row content at all (a plain
+        parameterized `UPDATE`), so a failure there is an execution-level
+        problem -- typically `sqlite3.Error` (locked, busy, disk I/O) --
+        with no bearing on the row's content, and is exactly the case
+        retrying is *for*.
         """
 
         # Deferred import: core/jobs/* deliberately avoids a top-level
@@ -189,9 +192,9 @@ class JobRunner:
         # TYPE_CHECKING-only imports of JobRepository) to keep this
         # package's import graph one-directional; this is only needed at
         # call time, well after both modules have finished loading.
-        from core.storage.repositories.job_repository import JobPayloadDecodeError
+        from core.storage.repositories.job_repository import JobRecordDecodeError
 
-        return isinstance(exc, JobPayloadDecodeError)
+        return isinstance(exc, JobRecordDecodeError)
 
     def _quarantine_poison_job(
         self, job_id: str, exc: BaseException

@@ -12,7 +12,7 @@ from core.jobs import CancellationRegistry, EventBus, JobQueue, JobRunner, JobSe
 from core.jobs.schemas import JobRecord
 from core.jobs.statuses import JOB_STATUSES, is_valid_transition
 from core.schemas import GenerationRequest, GenerationResult
-from core.storage.repositories.job_repository import JobPayloadDecodeError, JobRepository
+from core.storage.repositories.job_repository import JobRecordDecodeError, JobRepository
 from generators.base import BaseGenerator
 from generators.registry import GeneratorRegistry
 
@@ -682,10 +682,10 @@ def test_permanent_pre_claim_failure_does_not_retry_forever_and_lets_the_next_jo
     ).fetchone()[0]
     assert raw_status == "failed"
     # repository.get() on the poison row still raises identically (now
-    # normalized to JobPayloadDecodeError -- see the Codex follow-up round
+    # normalized to JobRecordDecodeError -- see the Codex follow-up round
     # below) -- proves the quarantine path never attempted (or depended on)
     # reading the corrupted payload back.
-    with pytest.raises(JobPayloadDecodeError):
+    with pytest.raises(JobRecordDecodeError):
         repository.get(poison.id)
 
     assert repository.get(healthy.id).status == "succeeded"
@@ -718,7 +718,7 @@ def test_permanent_pre_claim_failure_does_not_requeue_and_other_lanes_are_unaffe
     queue.enqueue(other_lane_job.id, lane="heavy")
     runner = JobRunner(repository, queue, GeneratorRegistry({"image": FakeGenerator()}))
 
-    with pytest.raises(JobPayloadDecodeError):
+    with pytest.raises(JobRecordDecodeError):
         runner.run_once(lane="light")
 
     assert queue.size(lane="light") == 0, "poison job must not be requeued"
@@ -775,7 +775,7 @@ def test_recursion_error_from_deeply_nested_json_is_treated_as_permanent(tmp_pat
 
     with pytest.raises(RecursionError):
         json.loads("[" * depth + "]" * depth)  # confirms the premise directly
-    with pytest.raises(JobPayloadDecodeError):
+    with pytest.raises(JobRecordDecodeError):
         repository.get(poison.id)
 
     queue.enqueue(poison.id)
@@ -888,7 +888,7 @@ def test_quarantine_write_failure_requeues_into_the_same_lane(tmp_path, monkeypa
 
     monkeypatch.setattr(repository, "transition_if_status", always_fail_quarantine_write)
 
-    with pytest.raises(JobPayloadDecodeError):
+    with pytest.raises(JobRecordDecodeError):
         runner.run_once(lane="light")
 
     assert queue.size(lane="light") == 1, (
@@ -899,3 +899,116 @@ def test_quarantine_write_failure_requeues_into_the_same_lane(tmp_path, monkeypa
     assert _raw_status(db_path, poison.id) == "queued", (
         "the row must remain queued -- the quarantine write never committed"
     )
+
+
+def _corrupt_column(db_path, job_id: str, column: str, value) -> None:
+    with sqlite3.connect(db_path) as raw_connection:
+        raw_connection.execute(
+            f"UPDATE jobs SET {column} = ? WHERE id = ?",  # noqa: S608 -- column is a fixed literal from this test file, never external input
+            (value, job_id),
+        )
+        raw_connection.commit()
+
+
+# --- Third Codex exact-HEAD review round, on 5eae5ad8: permanent row- -----
+# reconstruction failures beyond the request/result payload itself.
+#
+# `_row_to_record()` previously only wrapped the payload JSON decode/
+# validate steps; a malformed `created_at`/`updated_at` timestamp
+# (`datetime.fromisoformat` raising `ValueError`) or a `JobRecord`-level
+# validation failure (an invalid persisted `status`/`media_type`, an
+# out-of-range `progress`) raised *outside* that boundary, propagated as a
+# raw `ValueError`, and would have been misclassified transient by
+# `_is_permanent_pre_claim_failure` -- reproducing the exact poison-job
+# infinite-retry regression the payload-only fix already closed, just for a
+# different part of the row.
+
+
+def test_malformed_created_at_timestamp_is_a_permanent_persisted_row_failure(
+    tmp_path,
+):
+    """Case 1: a malformed `created_at` has nothing to do with request_json
+    (which is left completely valid here) -- it must still be classified as
+    a permanent, never-retry failure, proven through a real `run_forever`
+    loop, not just a repository-level exception-type check.
+    """
+
+    db_path = tmp_path / "jobs.db"
+    repository = JobRepository(db_path)
+    queue = JobQueue()
+    stopped = Event()
+    generator = FakeGenerator(lambda _context: stopped.set())
+    poison = seed_job(repository, job_id="job_poison")
+    healthy = seed_job(repository, job_id="job_healthy")
+
+    _corrupt_column(db_path, poison.id, "created_at", "not-a-date")
+    with pytest.raises(JobRecordDecodeError):
+        repository.get(poison.id)
+
+    queue.enqueue(poison.id)
+    queue.enqueue(healthy.id)
+    runner = JobRunner(repository, queue, GeneratorRegistry({"image": generator}))
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            runner.run_forever, stop_event=stopped, poll_interval_seconds=0.01
+        )
+        try:
+            processed = stopped.wait(5)
+        finally:
+            stopped.set()
+        future.result(timeout=5)
+        assert processed, (
+            "job_healthy was never processed -- the malformed-timestamp "
+            "poison job likely starved the worker with infinite retries"
+        )
+
+    assert queue.size() == 0, "the poison job must not still be queued for retry"
+    assert generator.calls == 1
+    assert _raw_status(db_path, poison.id) == "failed"
+    assert repository.get(healthy.id).status == "succeeded"
+
+
+def test_out_of_range_progress_is_a_permanent_persisted_row_failure(tmp_path):
+    """Case 2: request_json and every timestamp are completely valid here --
+    only the persisted `progress` value (2.5, outside JobRecord's
+    `ge=0.0, le=1.0` constraint) is corrupted, so `JobRecord(...)`'s own
+    Pydantic validation is what fails, not payload deserialization. This is
+    the row-reconstruction-in-general failure Codex's finding is about,
+    distinct from (and in addition to) the payload-only case.
+    """
+
+    db_path = tmp_path / "jobs.db"
+    repository = JobRepository(db_path)
+    queue = JobQueue()
+    stopped = Event()
+    generator = FakeGenerator(lambda _context: stopped.set())
+    poison = seed_job(repository, job_id="job_poison")
+    healthy = seed_job(repository, job_id="job_healthy")
+
+    _corrupt_column(db_path, poison.id, "progress", 2.5)
+    with pytest.raises(JobRecordDecodeError):
+        repository.get(poison.id)
+
+    queue.enqueue(poison.id)
+    queue.enqueue(healthy.id)
+    runner = JobRunner(repository, queue, GeneratorRegistry({"image": generator}))
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            runner.run_forever, stop_event=stopped, poll_interval_seconds=0.01
+        )
+        try:
+            processed = stopped.wait(5)
+        finally:
+            stopped.set()
+        future.result(timeout=5)
+        assert processed, (
+            "job_healthy was never processed -- the invalid-progress poison "
+            "job likely starved the worker with infinite retries"
+        )
+
+    assert queue.size() == 0, "the poison job must not still be queued for retry"
+    assert generator.calls == 1
+    assert _raw_status(db_path, poison.id) == "failed"
+    assert repository.get(healthy.id).status == "succeeded"
