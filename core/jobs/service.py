@@ -149,6 +149,19 @@ class JobService:
         persisted `request` matches `request` exactly. A mismatch raises
         rather than silently reusing a different job's content under an id
         this caller expected to own.
+
+        Two concurrent callers can both observe "no row for this id" from
+        the check below and both fall through to insert it -- a terminal
+        event handler racing a completion-retry pass over the same stable
+        Batch child id, for instance. The insert itself goes through
+        `JobRepository.create_if_absent()`, which resolves that race
+        atomically at the database layer (one caller's INSERT commits, the
+        other's `sqlite3.IntegrityError` is caught and rereads the winner's
+        row) rather than both proceeding as if each had created the row: a
+        naive `get()`-then-`create()` here would let the loser's `create()`
+        raise an unhandled `sqlite3.IntegrityError`, or -- if that were
+        merely swallowed -- double-publish `"job_created"`/double-enqueue
+        the same id. Only the actual winner does either.
         """
 
         existing = self.job_repository.get(job_id)
@@ -173,7 +186,15 @@ class JobService:
             created_at=now,
             updated_at=now,
         )
-        created_job = self.job_repository.create(job)
+        created_job, was_created = self.job_repository.create_if_absent(job)
+        if not was_created:
+            if created_job.request != request:
+                raise ValueError(
+                    f"Job {job_id!r} already exists with a different "
+                    "request; refusing to silently reuse it for a "
+                    "mismatched request."
+                )
+            return created_job
         self._publish(
             "job_created",
             {

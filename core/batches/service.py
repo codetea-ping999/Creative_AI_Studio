@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from enum import Enum
 import logging
 import os
 from typing import TYPE_CHECKING, Any
@@ -43,6 +44,32 @@ logger = logging.getLogger(__name__)
 _TERMINAL_EVENT_TYPES = frozenset(
     {"job_succeeded", "job_failed", "job_cancelled"}
 )
+
+
+class BatchReconciliationOutcome(Enum):
+    """Result of one `BatchService.reconcile_child_job()` attempt.
+
+    A caller reconciling a Job's completion (`core.jobs.completion.
+    CompletionConverger`) must not conflate "no parent Batch, nothing to
+    do" with "a parent Batch might exist but a transient storage failure
+    prevented finding/reconciling it" -- collapsing both to the same
+    signal (as a bare `BatchRecord | None` return does) let a transient
+    Batch-file read failure be silently treated as "reconciliation
+    succeeded," permanently excluding the job from every future
+    completion retry (Codex exact-HEAD review).
+    """
+
+    # This job does not belong to any Batch -- completion may proceed.
+    NO_PARENT = "no_parent"
+    # A parent Batch was found and this reconciliation step itself ran
+    # (its own further effects, e.g. advancing a stage, may still be
+    # pending independently -- that is tracked by the Batch's own state,
+    # not by this outcome).
+    RECONCILED = "reconciled"
+    # The owning Batch, if any, could not be read right now (a transient
+    # storage failure, not a confirmed absence) -- completion must stay
+    # pending and retry later.
+    RETRYABLE_FAILURE = "retryable_failure"
 
 
 def resolve_max_items_limit(configured: int | None = None) -> int:
@@ -167,10 +194,42 @@ class BatchService:
             return record
 
         for item in record.items_for_stage(stage_index):
-            if item.job_id is not None:
-                self.job_service.create_or_reuse_job(
-                    item.job_id, item.request, project_id=record.spec.project_id
-                )
+            if item.job_id is None:
+                continue
+            # Fresh recheck immediately before materializing this specific
+            # child -- `record` above is a snapshot from phase 1; `cancel()`
+            # can durably persist `cancellation_requested` at any point
+            # after that snapshot was taken and before this exact
+            # create-or-reuse call runs (PR3 exact-HEAD audit P1-2). Without
+            # this, a batch already marked for cancellation could still have
+            # a new child materialized and enqueued afterward, with nothing
+            # left to ever cancel it -- cancel()'s own cancel loop already
+            # ran against an earlier snapshot that did not yet include this
+            # item's job. Stopping here (not just skipping this one item)
+            # also means every later item in this stage is left with only
+            # its durably-persisted id and no Job row, which cancel()'s own
+            # `_apply_cancellation_intent` (see `cancel()` below) now
+            # explicitly converges to cancelled.
+            current = self.batch_repository.get(batch_id)
+            if current is not None and current.cancellation_requested:
+                break
+            created = self.job_service.create_or_reuse_job(
+                item.job_id, item.request, project_id=record.spec.project_id
+            )
+            # Closes the remaining window: cancellation_requested could have
+            # been persisted by a concurrent cancel() call *during* the
+            # create_or_reuse_job() call above -- after this loop's recheck
+            # committed to proceeding, but before the row above committed.
+            # cancel_job() is idempotent, so this is harmless even if
+            # cancel()'s own loop already reached (or will yet reach) this
+            # exact job itself.
+            after_create = self.batch_repository.get(batch_id)
+            if (
+                after_create is not None
+                and after_create.cancellation_requested
+                and not is_terminal_status(created.status)
+            ):
+                self.job_service.cancel_job(created.id)
 
         return self.reconcile(batch_id)
 
@@ -193,7 +252,9 @@ class BatchService:
     def reconcile(self, batch_id: str) -> BatchRecord | None:
         return self.batch_repository.mutate(batch_id, self._recompute)
 
-    def reconcile_child_job(self, job_id: str) -> BatchRecord | None:
+    def reconcile_child_job(
+        self, job_id: str
+    ) -> tuple[BatchRecord | None, BatchReconciliationOutcome]:
         """Reconcile the batch owning ``job_id`` from that job's own state.
 
         The same operation ``handle_job_event()`` performs for a terminal
@@ -204,14 +265,24 @@ class BatchService:
         subscriber attached yet, ...) still advances. Idempotent: recompute
         and stage-advance are themselves no-ops once nothing has changed,
         so calling this for an event that *was* already handled is safe.
+
+        Returns ``(record_or_none, outcome)`` -- see
+        ``BatchReconciliationOutcome`` for what each outcome means and why
+        a caller must not collapse them to a single ``None``/not-``None``
+        check (PR3 exact-HEAD audit P1-5): a transient failure reading the
+        owning Batch must be reported as ``RETRYABLE_FAILURE``, never
+        conflated with the genuine ``NO_PARENT`` case.
         """
 
-        refreshed = self.batch_repository.mutate_by_job_id(
+        refreshed, uncertain = self.batch_repository.mutate_by_job_id_diagnosed(
             job_id, self._recompute_and_advance_capturing
         )
         if refreshed is None:
-            return None
-        return self._enqueue_stage(refreshed.id, stage_index=refreshed.stage_index)
+            if uncertain:
+                return None, BatchReconciliationOutcome.RETRYABLE_FAILURE
+            return None, BatchReconciliationOutcome.NO_PARENT
+        enqueued = self._enqueue_stage(refreshed.id, stage_index=refreshed.stage_index)
+        return enqueued, BatchReconciliationOutcome.RECONCILED
 
     def _recompute(self, record: BatchRecord | None) -> BatchRecord | None:
         if record is None:
@@ -368,14 +439,32 @@ class BatchService:
             if record is None:
                 return None
             # Durable intent first, in the same atomic save as marking any
-            # item that will now never get a job id as terminally
-            # cancelled -- both must be persisted before any child job is
-            # actually told to cancel below, so a crash right after this
-            # save still leaves an observable, resumable "cancellation was
-            # requested" record (see resume_pending_cancellations()).
+            # item that will now never get a job id -- or never get its Job
+            # row created -- as terminally cancelled; both must be
+            # persisted before any child job is actually told to cancel
+            # below, so a crash right after this save still leaves an
+            # observable, resumable "cancellation was requested" record
+            # (see resume_pending_cancellations()).
             record.cancellation_requested = True
             for item in record.items:
-                if item.job_id is None and item.status != JOB_STATUS_CANCELLED:
+                if item.status == JOB_STATUS_CANCELLED:
+                    continue
+                if item.job_id is None:
+                    item.status = JOB_STATUS_CANCELLED
+                    continue
+                # A stable child id can be durably persisted (see
+                # _enqueue_stage()'s two-phase id-then-row split) before its
+                # Job row is ever created -- a crash, or this exact
+                # cancellation racing that creation, can leave it that way
+                # permanently (PR3 exact-HEAD audit P1-3). Such an item can
+                # never run: _assign_ids() only assigns an id to an item
+                # that does not already have one, and _enqueue_stage()'s own
+                # cancellation recheck (see above) now durably refuses to
+                # create a row for it once this intent is set. cancel_job()
+                # itself returns None for a missing row, so nothing would
+                # ever terminalize it without this check -- it would stay
+                # "pending" forever, and so would the batch.
+                if self.job_repository.get(item.job_id) is None:
                     item.status = JOB_STATUS_CANCELLED
             return record
 
@@ -389,7 +478,7 @@ class BatchService:
 
         return self.reconcile(batch_id)
 
-    def resume_pending_cancellations(self) -> list[BatchRecord]:
+    def resume_pending_cancellations(self) -> tuple[list[BatchRecord], bool]:
         """Re-apply cancellation to every batch whose durable intent is set.
 
         For startup recovery: a crash between persisting
@@ -400,13 +489,58 @@ class BatchService:
         ``JobService.cancel_job()`` re-cancelling an already-cancelled or
         already-``cancel_requested`` job, are both themselves idempotent
         no-ops.
+
+        Returns ``(resumed, scan_was_fully_reliable)``. Uses the tolerant
+        scan (``BatchRepository.list_all_tolerant()``), not ``list_all()``:
+        the latter silently *skips* a batch file that hits a transient
+        ``OSError`` while being read, which could hide one with a durable
+        ``cancellation_requested=True`` -- startup recovery would then
+        proceed as if there were nothing left to resume and re-enqueue that
+        batch's still-queued children, running generation despite a
+        persisted cancel intent it never got the chance to see (PR3
+        exact-HEAD audit P1-6). ``scan_was_fully_reliable=False`` tells the
+        caller exactly that: a transient read failure occurred, so "no
+        cancellation intent found" cannot be trusted this pass.
+        """
+
+        records, _malformed_ids, scan_was_fully_reliable = (
+            self.batch_repository.list_all_tolerant()
+        )
+        resumed: list[BatchRecord] = []
+        for record in records:
+            if not record.cancellation_requested:
+                continue
+            refreshed = self.cancel(record.id)
+            if refreshed is not None:
+                resumed.append(refreshed)
+        return resumed, scan_was_fully_reliable
+
+    def resume_current_stage_for_all_batches(self) -> list[BatchRecord]:
+        """Resume every batch's current stage -- for startup recovery.
+
+        A crash can leave a Batch record persisted (``create_batch()``'s
+        ``BatchRepository.create()`` call committed) with no child Job rows
+        created yet at all, or with a stable child id persisted
+        (``_enqueue_stage()``'s phase 1) but the Job row for it never
+        created (phase 2 never ran, or crashed partway through) (PR3
+        exact-HEAD audit P1-1). Nothing in an ordinary
+        ``list_batches()``/``reconcile()`` pass will ever notice or fix
+        this: ``_recompute()`` only reads *existing* job rows, it never
+        creates one, and the in-memory ``JobQueue`` a ``queued`` row would
+        otherwise be re-enqueued onto does not survive a restart anyway.
+        Without this, such a batch stays permanently stuck pending.
+
+        Safe to call unconditionally, for every batch, on every startup:
+        ``_enqueue_stage()`` is itself idempotent (phase 1 only assigns an
+        id to an item that does not already have one; phase 2's
+        create-or-reuse never creates a second job for an id that already
+        has one), and it already refuses to materialize anything for a
+        batch whose durable ``cancellation_requested`` is set.
         """
 
         resumed: list[BatchRecord] = []
         for record in self.batch_repository.list_all():
-            if not record.cancellation_requested:
-                continue
-            refreshed = self.cancel(record.id)
+            refreshed = self._enqueue_stage(record.id, stage_index=record.stage_index)
             if refreshed is not None:
                 resumed.append(refreshed)
         return resumed
@@ -538,4 +672,4 @@ def _rank_winners(
     return ranked[:keep_top_n]
 
 
-__all__ = ["BatchService", "resolve_max_items_limit"]
+__all__ = ["BatchReconciliationOutcome", "BatchService", "resolve_max_items_limit"]

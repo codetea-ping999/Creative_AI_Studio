@@ -330,6 +330,153 @@ def test_repeated_startup_recovery_never_reruns_the_generator_for_a_succeeded_jo
     assert repository.get(job.id).completion_state == "done"
 
 
+# --- PR3 exact-HEAD audit P1-1: resume persisted stages on startup -------
+
+
+def test_startup_materializes_a_batch_child_row_that_was_never_created(tmp_path, monkeypatch):
+    """A crash between `create_batch()` persisting the batch record (and its
+    items' stable ids) and phase 2 actually creating the Job row leaves the
+    batch permanently `queued` under the old startup-recovery contract --
+    nothing in an ordinary reconcile pass creates a missing row. Startup
+    recovery must resume/materialize it under the exact same id.
+    """
+
+    from core.batches.schemas import BatchSpec
+
+    services = _build_services(tmp_path)
+    batch_service = services["batch_service"]
+
+    def always_fail(*args, **kwargs):
+        raise RuntimeError("injected: crash between id persist and row creation")
+
+    monkeypatch.setattr(services["job_service"], "create_or_reuse_job", always_fail)
+    with pytest.raises(RuntimeError, match="injected"):
+        batch_service.create_batch(
+            BatchSpec(name="crashed", media_type="image", model_id="fake", prompt="x", limit=1)
+        )
+    batch = batch_service.batch_repository.list_all()[0]
+    persisted_job_id = batch.items[0].job_id
+    assert persisted_job_id is not None
+    assert services["job_repository"].get(persisted_job_id) is None
+    monkeypatch.undo()
+
+    report = run_startup_recovery(
+        services["job_repository"], services["job_service"], services["completion_converger"],
+        batch_service=batch_service,
+    )
+
+    assert batch.id in report.batches_resumed_current_stage
+    materialized = services["job_repository"].get(persisted_job_id)
+    assert materialized is not None
+    assert materialized.status == "queued"
+    assert services["job_queue"].dequeue() == persisted_job_id
+
+
+def test_repeated_startup_recovery_never_duplicates_a_previously_uncreated_child(
+    tmp_path, monkeypatch
+):
+    from core.batches.schemas import BatchSpec
+
+    services = _build_services(tmp_path)
+    batch_service = services["batch_service"]
+
+    def always_fail(*args, **kwargs):
+        raise RuntimeError("injected: crash between id persist and row creation")
+
+    monkeypatch.setattr(services["job_service"], "create_or_reuse_job", always_fail)
+    with pytest.raises(RuntimeError, match="injected"):
+        batch_service.create_batch(
+            BatchSpec(name="crashed", media_type="image", model_id="fake", prompt="x", limit=1)
+        )
+    batch_id = batch_service.batch_repository.list_all()[0].id
+    persisted_job_id = batch_service.batch_repository.get(batch_id).items[0].job_id
+    monkeypatch.undo()
+
+    for _ in range(3):
+        run_startup_recovery(
+            services["job_repository"], services["job_service"],
+            services["completion_converger"], batch_service=batch_service,
+        )
+
+    matching = [job for job in services["job_repository"].list() if job.id == persisted_job_id]
+    assert len(matching) == 1
+    refreshed = batch_service.get_batch(batch_id)
+    assert refreshed.items[0].job_id == persisted_job_id
+
+
+# --- PR3 exact-HEAD audit P1-6: transient Batch scan failures -------------
+
+
+def test_startup_does_not_enqueue_queued_jobs_when_the_cancellation_scan_is_unreliable(
+    tmp_path, monkeypatch
+):
+    """A durable `cancellation_requested=True` batch whose file is
+    transiently unreadable during `resume_pending_cancellations()`'s scan
+    must not let startup recovery re-enqueue *any* queued job this pass --
+    the hidden batch's own still-queued child could be exactly the job a
+    generic queued-job sweep would otherwise put back to work despite a
+    cancellation intent this pass never got the chance to see.
+    """
+
+    from core.batches.schemas import BatchSpec
+
+    services = _build_services(tmp_path)
+    batch_service = services["batch_service"]
+    batch = batch_service.create_batch(
+        BatchSpec(name="cancel-me", media_type="image", model_id="fake", prompt="x", limit=1)
+    )
+    child_job_id = batch.items[0].job_id
+    services["job_queue"].dequeue()  # simulate "never enqueued" (a fresh restart)
+
+    # Durable intent persisted, but the child was never actually told to
+    # cancel -- the exact crash window resume_pending_cancellations() exists
+    # to close.
+    def _mark_cancellation_requested_only(record):
+        record.cancellation_requested = True
+        return record
+
+    batch_service.batch_repository.mutate(batch.id, _mark_cancellation_requested_only)
+    assert services["job_repository"].get(child_job_id).status == "queued"
+
+    original_try_load_diagnosed = batch_service.batch_repository._try_load_diagnosed
+
+    def flaky_try_load_diagnosed(batch_file):
+        if batch_file.stem == batch.id:
+            return None, True  # simulate a transient OSError reading this exact file
+        return original_try_load_diagnosed(batch_file)
+
+    monkeypatch.setattr(
+        batch_service.batch_repository, "_try_load_diagnosed", flaky_try_load_diagnosed
+    )
+
+    report = run_startup_recovery(
+        services["job_repository"], services["job_service"], services["completion_converger"],
+        batch_service=batch_service,
+    )
+
+    assert report.batch_cancellation_scan_was_fully_reliable is False
+    assert batch.id not in report.batches_resumed_cancelling
+    assert report.queued_enqueue_skipped_due_to_unreliable_batch_scan is True
+    assert child_job_id not in report.requeued
+    assert services["job_queue"].dequeue() is None  # nothing was put back in the queue
+    # The row itself is untouched -- still safely resumable later, not lost.
+    assert services["job_repository"].get(child_job_id).status == "queued"
+
+    monkeypatch.undo()  # storage "recovers"
+
+    second = run_startup_recovery(
+        services["job_repository"], services["job_service"], services["completion_converger"],
+        batch_service=batch_service,
+    )
+
+    assert second.batch_cancellation_scan_was_fully_reliable is True
+    assert batch.id in second.batches_resumed_cancelling
+    assert services["job_repository"].get(child_job_id).status in (
+        "cancel_requested", "cancelled",
+    )
+    assert services["job_queue"].dequeue() is None  # never enqueued despite recovering
+
+
 def test_repeated_startup_recovery_keeps_the_same_batch_child_job_id(tmp_path):
     from core.batches.schemas import BatchSpec
 

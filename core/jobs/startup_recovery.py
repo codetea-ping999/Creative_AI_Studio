@@ -9,7 +9,14 @@ constructing services and starting the job runner thread (see
    cannot even be decoded.
 2. Batch-persisted cancellation intent is re-applied (a crash between
    persisting ``cancellation_requested`` and actually cancelling every
-   child must not leave those children running forever).
+   child must not leave those children running forever). Uses a tolerant
+   scan that reports whether it was fully reliable -- a transient failure
+   reading any batch file here could be hiding a durable cancellation
+   intent, which step 6 below must not silently ignore.
+2b. Every batch's current stage is resumed/materialized (a crash can leave
+   a batch record persisted, or a stable child id persisted, with its Job
+   row never actually created -- nothing in an ordinary reconcile pass
+   would ever notice or fix that).
 3. Every interrupted job (``preparing``/``running``/``postprocessing`` --
    the process that owned it is confirmed dead) resolves to ``failed``;
    every ``cancel_requested`` job (same reasoning) resolves to
@@ -24,7 +31,8 @@ constructing services and starting the job runner thread (see
    its children's now-final state.
 6. Every job still (confirmed fresh) ``queued`` is re-enqueued under its
    existing id -- never a new one; ``JobQueue`` is purely in-memory and does
-   not survive a restart on its own.
+   not survive a restart on its own. Skipped entirely if step 2's scan was
+   not fully reliable (see step 2's note).
 
 ``classify_job()`` (``core/jobs/recovery.py``) stays pure classification;
 none of its logic is duplicated or second-guessed here -- this module is the
@@ -77,6 +85,9 @@ class StartupRecoveryReport:
     completion_outcomes: dict[str, CompletionOutcome] = field(default_factory=dict)
     requeued: list[str] = field(default_factory=list)
     batches_resumed_cancelling: list[str] = field(default_factory=list)
+    batches_resumed_current_stage: list[str] = field(default_factory=list)
+    batch_cancellation_scan_was_fully_reliable: bool = True
+    queued_enqueue_skipped_due_to_unreliable_batch_scan: bool = False
 
 
 def run_startup_recovery(
@@ -104,10 +115,25 @@ def run_startup_recovery(
     # individual interrupted jobs below, so a batch's own children are
     # cancelled (not left to fail with a generic "process_interrupted").
     if batch_service is not None:
-        resumed = batch_service.resume_pending_cancellations()
+        resumed, scan_was_fully_reliable = batch_service.resume_pending_cancellations()
         report.batches_resumed_cancelling = [record.id for record in resumed]
+        report.batch_cancellation_scan_was_fully_reliable = scan_was_fully_reliable
+
+        # 2b. Resume/materialize every batch's current stage: a crash can
+        # leave a batch record persisted with a child id assigned but its
+        # Job row never created (or never created at all) -- nothing in an
+        # ordinary reconcile pass ever notices or fixes that (PR3
+        # exact-HEAD audit P1-1). Each batch's own `_enqueue_stage()` call
+        # re-reads that exact batch fresh before deciding to materialize
+        # anything, so this step needs no reliability gate of its own: a
+        # batch this pass cannot currently read is simply skipped by
+        # `list_all()`, not acted on incorrectly.
+        stage_resumed = batch_service.resume_current_stage_for_all_batches()
+        report.batches_resumed_current_stage = [record.id for record in stage_resumed]
+
         # cancel_job() may have moved some of this pass's `records` from an
-        # active status to cancel_requested; reread once more before step 3
+        # active status to cancel_requested, and resuming a stage above may
+        # have created brand-new queued rows; reread once more before step 3
         # classifies them.
         records, _third_pass_failures = job_repository.list_tolerant()
 
@@ -157,6 +183,22 @@ def run_startup_recovery(
     # exact pass's step 1 quarantine attempt itself failed transiently on)
     # must never block re-enqueuing every other, perfectly healthy queued
     # job.
+    #
+    # Skipped entirely if step 2's batch-cancellation scan was not fully
+    # reliable (PR3 exact-HEAD audit P1-6): a transient failure reading
+    # some batch file there could be hiding a durable
+    # `cancellation_requested=True` this pass never got the chance to
+    # apply to that batch's children. Re-enqueuing a queued job right now
+    # cannot distinguish "genuinely fine to run" from "belongs to a batch
+    # whose cancellation intent this pass silently missed" -- a queued job
+    # left un-enqueued is always safely resumable (nothing about it is
+    # lost; the very next startup, or a later retry once storage recovers,
+    # tries again), whereas running generation for an already-cancelled
+    # batch is not undoable.
+    if batch_service is not None and not report.batch_cancellation_scan_was_fully_reliable:
+        report.queued_enqueue_skipped_due_to_unreliable_batch_scan = True
+        return report
+
     queued_candidates, _requeue_scan_failures = job_repository.list_tolerant()
     for job in queued_candidates:
         if job.status != JOB_STATUS_QUEUED:

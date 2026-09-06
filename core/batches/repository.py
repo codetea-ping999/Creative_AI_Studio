@@ -131,6 +131,39 @@ class BatchRepository:
                 return updated
             return self.save(updated)
 
+    def mutate_by_job_id_diagnosed(
+        self,
+        job_id: str,
+        fn: Callable[[BatchRecord], BatchRecord | None],
+    ) -> tuple[BatchRecord | None, bool]:
+        """Like `mutate_by_job_id()`, but tells "no parent Batch" apart from
+        "a scan failure means a parent might exist but wasn't found".
+
+        Returns `(result, uncertain)`. `uncertain=True` means at least one
+        batch file could not be read due to a transient `OSError` during
+        the lookup -- the file `job_id` actually belongs to, if any, could
+        be exactly that unreadable one. A caller (completion convergence)
+        must treat `(None, True)` as "retry later," never as "genuinely no
+        parent Batch, proceed" -- seeing `(None, False)` -- otherwise a job
+        whose owning Batch is merely having a transient read hiccup gets
+        marked completion-done and is excluded from every future retry.
+
+        The lookup, the call to `fn`, and the save all happen under one
+        critical section, exactly like `mutate_by_job_id()`.
+        """
+
+        with self._lock:
+            current, uncertain = self.find_by_job_id_or_diagnose(job_id)
+            if current is None:
+                return None, uncertain
+            snapshot = current.model_copy(deep=True)
+            updated = fn(current)
+            if updated is None:
+                return None, False
+            if updated == snapshot:
+                return updated, False
+            return self.save(updated), False
+
     def list_all(
         self,
         *,
@@ -163,6 +196,64 @@ class BatchRepository:
                 return record
         return None
 
+    def list_all_tolerant(
+        self,
+        *,
+        project_id: str | None = None,
+    ) -> tuple[list[BatchRecord], list[str], bool]:
+        """Like `list_all()`, but reports *why* any file failed to load.
+
+        Returns `(records, malformed_ids, scan_was_fully_reliable)``.
+        `malformed_ids` lists the batch id (filename stem) of every file
+        whose content is deterministically invalid (bad JSON, or content
+        that no longer matches `BatchRecord`'s schema) -- the same content
+        will fail to load identically on every future attempt, exactly
+        like `list_all()` already silently tolerates for ordinary listing.
+
+        `scan_was_fully_reliable` is `False` if *any* file instead hit a
+        transient `OSError` while being read -- meaning some batch (one
+        this scan cannot even identify by id, since reading it is what
+        failed) was not observed by this pass at all. A caller about to
+        treat "not currently seen as cancelling" as "safe to proceed" (see
+        `BatchService.resume_pending_cancellations`) must check this flag
+        first: a transient read failure must never be silently treated as
+        "there is nothing left to resume."
+        """
+
+        records: list[BatchRecord] = []
+        malformed_ids: list[str] = []
+        scan_was_fully_reliable = True
+        for batch_file in sorted(self.batch_dir.glob("*.json")):
+            record, transient_failure = self._try_load_diagnosed(batch_file)
+            if record is None:
+                if transient_failure:
+                    scan_was_fully_reliable = False
+                else:
+                    malformed_ids.append(batch_file.stem)
+                continue
+            if project_id and record.spec.project_id != project_id:
+                continue
+            records.append(record)
+
+        records.sort(key=lambda entry: entry.updated_at, reverse=True)
+        return records, malformed_ids, scan_was_fully_reliable
+
+    def find_by_job_id_or_diagnose(self, job_id: str) -> tuple[BatchRecord | None, bool]:
+        """Like `find_by_job_id()`, but tells "no owner" apart from "unsure".
+
+        Returns `(batch_or_none, uncertain)`. `uncertain=True` means at
+        least one batch file could not be read (a transient `OSError`)
+        during this scan -- the true owner of `job_id`, if any, could be
+        exactly that unreadable file, so `None` here must not be read as
+        "confirmed: no parent Batch."
+        """
+
+        records, _malformed_ids, scan_was_fully_reliable = self.list_all_tolerant()
+        for record in records:
+            if any(item.job_id == job_id for item in record.items):
+                return record, False
+        return None, not scan_was_fully_reliable
+
     def delete(self, batch_id: str) -> bool:
         # Shares _lock with mutate()/mutate_by_job_id()/save() so a
         # concurrent read-modify-write can never race this delete into
@@ -187,6 +278,28 @@ class BatchRepository:
             )
         except (OSError, json.JSONDecodeError, ValueError):
             return None
+
+    def _try_load_diagnosed(self, batch_file: Path) -> tuple[BatchRecord | None, bool]:
+        """Load one batch file, distinguishing malformed content from a
+        transient read failure -- see `list_all_tolerant()`.
+
+        Returns `(record, transient_failure)`. `record` is `None` on
+        either kind of failure; `transient_failure=True` only for an
+        `OSError` (the file exists but could not be read right now --
+        permissions, a concurrent replace, disk I/O), never for malformed
+        JSON or schema content, which fails the same deterministic way on
+        every future attempt too.
+        """
+
+        try:
+            return (
+                BatchRecord.model_validate_json(batch_file.read_text(encoding="utf-8")),
+                False,
+            )
+        except OSError:
+            return None, True
+        except (json.JSONDecodeError, ValueError):
+            return None, False
 
 
 __all__ = ["BatchRepository"]

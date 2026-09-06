@@ -1166,3 +1166,64 @@ def test_quarantine_persists_the_original_error_message_when_the_row_becomes_rea
     assert after.progress == 1.0
     assert after.error_message is not None
     assert "progress" in after.error_message
+
+
+# --- PR3 exact-HEAD audit finding P2-3: create-or-reuse under a race ------
+
+
+def test_concurrent_create_or_reuse_job_converges_on_exactly_one_row(tmp_path):
+    """Two callers racing to materialize the same stable child job id (a
+    terminal event handler racing a completion-retry pass over the same
+    Batch item, for instance) must both observe success and leave exactly
+    one persisted row -- not one 500 from an unhandled
+    `sqlite3.IntegrityError` and not two Job rows under one id.
+    """
+
+    job_repository = JobRepository(tmp_path / "jobs.db")
+    job_queue = JobQueue()
+    event_bus = EventBus()
+    job_service = JobService(job_repository, job_queue, event_bus)
+
+    request = GenerationRequest(media_type="image", prompt="shared", model_id="fake")
+    job_id = "job_shared_child"
+    barrier = Barrier(2)
+    results: list[JobRecord] = []
+    errors: list[BaseException] = []
+
+    def _create_or_reuse():
+        try:
+            barrier.wait(timeout=5)
+            results.append(job_service.create_or_reuse_job(job_id, request))
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(_create_or_reuse) for _ in range(2)]
+        for future in futures:
+            future.result(timeout=5)
+
+    assert errors == []
+    assert len(results) == 2
+    assert results[0].id == job_id
+    assert results[1].id == job_id
+    matching_rows = [job for job in job_repository.list() if job.id == job_id]
+    assert len(matching_rows) == 1
+
+
+def test_create_or_reuse_job_still_raises_on_a_genuine_request_mismatch(tmp_path):
+    """The race-safe path (`create_if_absent`) must not silently paper over
+    a real content mismatch -- only a losing caller whose request matches
+    the winner's exactly may reuse the row.
+    """
+
+    job_repository = JobRepository(tmp_path / "jobs.db")
+    job_service = JobService(job_repository, JobQueue(), EventBus())
+    job_id = "job_mismatch"
+    job_service.create_or_reuse_job(
+        job_id, GenerationRequest(media_type="image", prompt="first", model_id="fake")
+    )
+
+    with pytest.raises(ValueError, match="different request"):
+        job_service.create_or_reuse_job(
+            job_id, GenerationRequest(media_type="image", prompt="second", model_id="fake")
+        )

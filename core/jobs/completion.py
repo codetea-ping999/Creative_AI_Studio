@@ -143,7 +143,7 @@ class CompletionConverger:
                 # the already-persisted GenerationResult.
                 self.asset_repository.sync_job(job)
                 story_outcome_converged, story_outcome_retryable = self._converge_story(job)
-            self._reconcile_batch(job_id)
+            batch_reconciliation_retryable = self._reconcile_batch(job_id)
         except Exception as exc:
             self.job_repository.mark_completion_pending_with_error(job_id, str(exc))
             logger.exception("Completion convergence failed for job %s.", job_id)
@@ -162,6 +162,20 @@ class CompletionConverger:
                 if story_outcome_retryable
                 else CompletionOutcome.UNRESOLVED
             )
+
+        if batch_reconciliation_retryable:
+            # The owning Batch, if any, could not be read just now (a
+            # transient storage failure, not a confirmed "no parent") --
+            # marking completion done here would permanently exclude this
+            # job from every future retry (PR3 exact-HEAD audit P1-5),
+            # even though the Batch's own state never actually reflected
+            # this job's terminal outcome.
+            self.job_repository.mark_completion_pending_with_error(
+                job_id,
+                "Owning Batch could not be reconciled right now (transient "
+                "storage failure); will retry.",
+            )
+            return CompletionOutcome.RETRYABLE_FAILURE
 
         self.job_repository.mark_completion_done(job_id)
         return CompletionOutcome.DONE
@@ -190,10 +204,26 @@ class CompletionConverger:
             return False, True
         return False, False
 
-    def _reconcile_batch(self, job_id: str) -> None:
+    def _reconcile_batch(self, job_id: str) -> bool:
+        """Reconcile `job_id`'s owning Batch, if any.
+
+        Returns whether this step is retryable -- i.e. whether the caller
+        must *not* let completion proceed to "done" this attempt. `False`
+        covers both "no parent Batch" and "reconciled successfully";
+        only a genuinely uncertain read (see `BatchReconciliationOutcome.
+        RETRYABLE_FAILURE`) returns `True`.
+        """
+
         if self.batch_service is None:
-            return
-        self.batch_service.reconcile_child_job(job_id)
+            return False
+
+        # Local import: mirrors _converge_story()'s core.story import
+        # above -- avoids a core.jobs <-> core.batches import-order
+        # dependency at module load time.
+        from core.batches.service import BatchReconciliationOutcome
+
+        _record, outcome = self.batch_service.reconcile_child_job(job_id)
+        return outcome is BatchReconciliationOutcome.RETRYABLE_FAILURE
 
     def run_retry_loop(self, *, stop_event, poll_interval_seconds: float = 5.0) -> None:
         """Periodically retry every terminal job still completion-pending.

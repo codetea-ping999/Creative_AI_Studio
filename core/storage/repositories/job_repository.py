@@ -104,6 +104,34 @@ class JobRepository:
             raise RuntimeError(f"Job {job.id!r} was not persisted.")
         return created_job
 
+    def create_if_absent(self, job: JobRecord) -> tuple[JobRecord, bool]:
+        """Insert `job`, or return the existing row if its id already exists.
+
+        Closes a race `create()` alone cannot: two callers racing to
+        materialize the same stable id (e.g. two concurrent
+        `_enqueue_stage()` passes for the same Batch item, or a terminal-
+        event handler racing a completion-retry pass) can both observe "no
+        row for this id" via a prior `get()` and both then attempt
+        `create()` -- one wins the INSERT, the other hits
+        `sqlite3.IntegrityError` on the primary key. Catching that here and
+        rereading the winner's row -- rather than letting it propagate as
+        an API 500 -- makes concurrent create-or-reuse callers converge on
+        the one row that actually exists.
+
+        Returns `(record, was_created)`: `was_created=True` only for the
+        caller whose INSERT actually committed; every other, losing caller
+        gets the winner's already-persisted row and `was_created=False`, so
+        only the true creator publishes `"job_created"`/enqueues it.
+        """
+
+        try:
+            return self.create(job), True
+        except sqlite3.IntegrityError:
+            existing = self.get(job.id)
+            if existing is None:  # pragma: no cover - row can't vanish mid-race
+                raise
+            return existing, False
+
     def get(self, job_id: str) -> JobRecord | None:
         with self._connection() as connection:
             row = connection.execute(
@@ -330,6 +358,38 @@ class JobRepository:
                 "SELECT status FROM jobs WHERE id = ?", (job_id,)
             ).fetchone()
         return None if row is None else row["status"]
+
+    def peek_raw_request_params(
+        self, job_id: str
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        """Lightweight raw peek at one row's `status` and request `params`.
+
+        Deliberately does not go through `_row_to_record()`: this exists
+        for judging the relevance of a row `list_tolerant()` already
+        reported as undecodable (see `core.story.replay_selection`), and
+        routing that same row back through full reconstruction would just
+        raise `JobRecordDecodeError` again. Reads only what a relevance
+        check needs -- the `status` column, and the `params` key inside
+        `request_json` -- tolerating a broken `request_json` payload by
+        returning `(status, None)` rather than raising, so a caller can
+        treat "can't tell" as "assume relevant" instead of crashing.
+
+        Returns `(None, None)` if the row does not exist at all.
+        """
+
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT status, request_json FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        if row is None:
+            return None, None
+        status = row["status"]
+        try:
+            payload = self._deserialize_payload(row["request_json"])
+        except (ValueError, RecursionError, TypeError):
+            return status, None
+        params = payload.get("params") if isinstance(payload, dict) else None
+        return status, params if isinstance(params, dict) else None
 
     def quarantine_structurally_invalid_status(
         self,
