@@ -2,6 +2,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+import sqlite3
 from threading import Barrier, Event
 
 import pytest
@@ -121,9 +122,9 @@ def test_duplicate_consumers_have_one_owner_and_loser_preserves_cancellation(
         ))
     original_claim = runners[1]._claim_job
 
-    def delayed_loser_claim(job_id, *, on_claimed):
+    def delayed_loser_claim(job_id):
         assert generating.wait(5)
-        return original_claim(job_id, on_claimed=on_claimed)
+        return original_claim(job_id)
 
     monkeypatch.setattr(runners[1], "_claim_job", delayed_loser_claim)
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -138,6 +139,57 @@ def test_duplicate_consumers_have_one_owner_and_loser_preserves_cancellation(
         assert owner.result(timeout=5).status == "cancelled"
     assert generator.calls == 1
     assert not cancellation.is_cancelled(job.id), "owner must release its entry"
+
+
+def test_claim_reread_failure_resolves_owned_job_and_continues_consumer(
+    tmp_path, monkeypatch,
+):
+    repository = JobRepository(tmp_path / "jobs.db")
+    queue = JobQueue()
+    stopped = Event()
+    generator = FakeGenerator(lambda _context: stopped.set())
+    first = seed_job(repository, job_id="job_first")
+    second = seed_job(repository, job_id="job_second")
+    queue.enqueue(first.id)
+    queue.enqueue(second.id)
+    runner = JobRunner(repository, queue, GeneratorRegistry({"image": generator}))
+    original_get = repository.get
+    first_job_reads = {"count": 0}
+
+    def fail_claim_reread_once(job_id):
+        if job_id == first.id:
+            first_job_reads["count"] += 1
+            if first_job_reads["count"] == 2:
+                raise RuntimeError("injected post-CAS reread failure")
+        return original_get(job_id)
+
+    monkeypatch.setattr(repository, "get", fail_claim_reread_once)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(runner.run_forever, stop_event=stopped)
+        assert stopped.wait(5), "consumer did not process the next job"
+        stopped.set()
+        future.result(timeout=5)
+
+    assert repository.get(first.id).status == "failed"
+    assert repository.get(second.id).status == "succeeded"
+    assert generator.calls == 1
+
+
+def test_claim_cas_failure_is_not_resolved_as_owned_job(tmp_path, monkeypatch):
+    repository = JobRepository(tmp_path / "jobs.db")
+    queue = JobQueue()
+    job = seed_job(repository)
+    queue.enqueue(job.id)
+    runner = JobRunner(repository, queue, GeneratorRegistry({"image": FakeGenerator()}))
+
+    def fail_before_cas(*args, **kwargs):
+        raise sqlite3.OperationalError("injected pre-commit CAS failure")
+
+    monkeypatch.setattr(repository, "transition_if_status", fail_before_cas)
+    with pytest.raises(sqlite3.OperationalError, match="pre-commit CAS failure"):
+        runner.run_once()
+
+    assert repository.get(job.id).status == "queued"
 
 
 def test_cancel_between_claim_and_context_registration(tmp_path, monkeypatch):

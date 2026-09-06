@@ -157,6 +157,56 @@ class JobRepository:
             expected_statuses=expected_statuses,
         )
 
+    def transition_if_status(
+        self,
+        job_id: str,
+        expected_statuses: tuple[str, ...],
+        *,
+        status: GenerationStatus,
+        progress: float | None = None,
+    ) -> bool:
+        """Atomically transition a job and return only whether the CAS won.
+
+        Unlike ``update_if_status()``, this primitive deliberately does not
+        reread the job after its UPDATE commits.  Callers that establish
+        execution ownership need that boolean before any fallible follow-up
+        read can occur.
+        """
+
+        if not expected_statuses or status not in JOB_STATUSES:
+            return False
+
+        transition_sources = tuple(
+            current
+            for current in JOB_STATUSES
+            if is_valid_transition(current, status)
+        )
+        assignments = ["status = ?"]
+        parameters: list[Any] = [status]
+        if progress is not None:
+            assignments.append("progress = ?")
+            parameters.append(progress)
+        assignments.append("updated_at = ?")
+        parameters.append(self._normalize_timestamp(None))
+        parameters.append(job_id)
+        expected_placeholders = ", ".join("?" for _ in expected_statuses)
+        transition_placeholders = ", ".join("?" for _ in transition_sources)
+        parameters.extend(expected_statuses)
+        parameters.extend(transition_sources)
+
+        with self._connection() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE jobs
+                SET {', '.join(assignments)}
+                WHERE id = ?
+                  AND status IN ({expected_placeholders})
+                  AND status IN ({transition_placeholders})
+                """,
+                parameters,
+            )
+        return cursor.rowcount > 0
+
     def _update(
         self,
         job_id: str,

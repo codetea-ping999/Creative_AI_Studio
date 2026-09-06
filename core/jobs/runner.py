@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from threading import Event
 import time
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING
 
 from generators.registry import GeneratorRegistry
 
@@ -135,13 +135,22 @@ class JobRunner:
         try:
             # This compare-and-set is the execution claim. Do not put an
             # in-memory cancellation entry in the registry before owning it.
-            def mark_claimed() -> None:
-                nonlocal claimed
-                claimed = True
-
-            claimed_job = self._claim_job(job_id, on_claimed=mark_claimed)
-            if claimed_job is None:
+            if not self._claim_job(job_id):
                 return self.job_repository.get(job_id)
+            # This is the execution-ownership boundary.  Do it before the
+            # fallible reread below: SQLite has already committed the CAS.
+            claimed = True
+            claimed_job = self.job_repository.get(job_id)
+            if claimed_job is None:
+                raise RuntimeError(f"Claimed job {job_id!r} disappeared.")
+            self._publish(
+                self._event_name_for_status(JOB_STATUS_PREPARING),
+                {
+                    "job_id": claimed_job.id,
+                    "status": JOB_STATUS_PREPARING,
+                    "progress": 0.0,
+                },
+            )
             if self.cancellation_registry is not None:
                 cancellation_token = self.cancellation_registry.begin(job_id)
             context = self._begin_context(
@@ -206,28 +215,15 @@ class JobRunner:
     def _claim_job(
         self,
         job_id: str,
-        *,
-        on_claimed: Callable[[], None],
-    ) -> JobRecord | None:
-        """Persist the execution claim before publishing its progress event."""
+    ) -> bool:
+        """Return whether this runner won the persisted execution claim."""
 
-        job = self.job_repository.update_if_status(
+        return self.job_repository.transition_if_status(
             job_id,
             (JOB_STATUS_QUEUED,),
             status=JOB_STATUS_PREPARING,
             progress=0.0,
         )
-        if job is None:
-            return None
-        # Mark ownership immediately after SQLite CAS succeeds.  If event
-        # publication or any later setup fails, the caller can still resolve
-        # this persisted claim instead of leaving the job in preparing.
-        on_claimed()
-        self._publish(
-            self._event_name_for_status(JOB_STATUS_PREPARING),
-            {"job_id": job.id, "status": job.status, "progress": job.progress},
-        )
-        return job
 
     def _resolve_claim_failure(self, job_id: str, exc: Exception) -> JobRecord | None:
         """Resolve every post-claim setup failure without killing the loop."""
