@@ -495,6 +495,14 @@ def update_story(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
         ) from exc
+    if story is None:
+        # Existed at the check above but a concurrent delete removed it
+        # before update() ran its own read; StoryRepository.mutate() already
+        # refused to resurrect it, so this route reports the same 404 a
+        # request arriving just slightly later would have gotten on its own.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Story not found"
+        )
     return StorySummaryResponse.from_story(story)
 
 
@@ -628,36 +636,52 @@ def apply_story_result(
         if isinstance(raw_as_of_chapter_id, str):
             continuity_as_of_chapter_id = raw_as_of_chapter_id
 
-    if task in SCENE_SCOPED_TASKS:
-        # The scene was chosen when the job was queued; the model's payload has
-        # no way to name it, so the target is restored from the request here.
-        scene_id = job_params.get("scene_id")
-        if isinstance(scene_id, str) and scene_id:
-            structured = {**structured, "scene_id": scene_id}
-        elif not _names_a_scene(story, structured):
-            # Merging would park the lines in metadata["unassigned_script_lines"],
-            # where no route can read them back into a scene: the dialogue would be
-            # generated, reported as applied, and lost. Refusing with the stage to
-            # re-run keeps the work recoverable.
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=_no_scene_target_detail(story, request.job_id, task),
-            )
+    def _apply(current: StoryDocument | None) -> StoryDocument | None:
+        if current is None:
+            return None
 
-    try:
-        merged = apply_text_result(
-            story,
+        merge_structured = structured
+        if task in SCENE_SCOPED_TASKS:
+            # The scene was chosen when the job was queued; the model's
+            # payload has no way to name it, so the target is restored from
+            # the request here. Checked against the freshest document (not
+            # the one read before this callback ran) so a scene list that was
+            # regenerated moments ago is judged correctly.
+            scene_id = job_params.get("scene_id")
+            if isinstance(scene_id, str) and scene_id:
+                merge_structured = {**structured, "scene_id": scene_id}
+            elif not _names_a_scene(current, structured):
+                # Merging would park the lines in
+                # metadata["unassigned_script_lines"], where no route can read
+                # them back into a scene: the dialogue would be generated,
+                # reported as applied, and lost. Refusing with the stage to
+                # re-run keeps the work recoverable.
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=_no_scene_target_detail(current, request.job_id, task),
+                )
+
+        return apply_text_result(
+            current,
             task,
-            structured,
+            merge_structured,
             job_id=job.id,
             continuity_as_of_chapter_id=continuity_as_of_chapter_id,
         )
+
+    try:
+        saved = services.story_repository.mutate(story_id, _apply)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
         ) from exc
-
-    saved = services.story_repository.save(merged)
+    if saved is None:
+        # Existed at the _get_story() check above but a concurrent delete
+        # removed it before this mutation ran; mutate() already refused to
+        # resurrect it.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Story not found"
+        )
     return StoryDetailResponse(
         story=saved.model_dump(mode="json"),
         missing_assets=missing_scene_assets(saved),
@@ -700,13 +724,28 @@ def acknowledge_stale_chapter(
     chapter = _find_chapter(story, chapter_id)
 
     if chapter.stale_after_chapter_id is not None:
-        chapters = [
-            entry.model_copy(update={"stale_after_chapter_id": None})
-            if entry.id == chapter_id
-            else entry
-            for entry in story.chapters
-        ]
-        story = services.story_repository.update(story_id, chapters=chapters) or story
+
+        def _clear_stale_flag(current: StoryDocument | None) -> StoryDocument | None:
+            if current is None:
+                return None
+            # Rebuilt from the freshest chapters, not the ones read above:
+            # another writer may have changed this story between that read
+            # and this mutation running, and blindly saving the outer,
+            # possibly-stale list back would discard that change.
+            chapters = [
+                entry.model_copy(update={"stale_after_chapter_id": None})
+                if entry.id == chapter_id
+                else entry
+                for entry in current.chapters
+            ]
+            return current.model_copy(update={"chapters": chapters})
+
+        updated = services.story_repository.mutate(story_id, _clear_stale_flag)
+        if updated is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Story not found"
+            )
+        story = updated
 
     return StoryDetailResponse(
         story=story.model_dump(mode="json"),
