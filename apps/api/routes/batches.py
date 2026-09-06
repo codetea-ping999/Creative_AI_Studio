@@ -12,6 +12,7 @@ from bootstrap import ApplicationServices
 from core.batches import (
     BatchRecord,
     BatchSpec,
+    BatchStageMaterializationError,
     build_batch_template,
     list_batch_templates,
 )
@@ -189,6 +190,16 @@ def advance_batch(
     except (UnsupportedReferenceError, MissingReferenceAssetError) as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
+    except BatchStageMaterializationError as exc:
+        # The stage advance itself persisted, but materializing its Job
+        # rows could not be confirmed right now (a transient storage
+        # failure, not a permanent reference problem) -- distinct from a
+        # 404 (the batch is confirmed gone) and a 422 (a permanent
+        # preflight failure): retrying the same request once storage
+        # recovers is the correct next step.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
         ) from exc
     if record is None:
         raise HTTPException(

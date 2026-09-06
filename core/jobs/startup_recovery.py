@@ -26,6 +26,12 @@ constructing services and starting the job runner thread (see
    pass just finalized in step 3, and any older ``succeeded``/``failed``/
    ``cancelled`` job whose Asset sync / Story replay / Batch reconciliation
    never completed.
+4b. An Asset-repair pass runs for every decodable *succeeded* job,
+   independent of ``completion_state`` -- step 4 alone intentionally skips
+   a job already ``completion_state="done"``, so it cannot repair an Asset
+   record lost or corrupted *after* that convergence already ran once.
+   Never calls a generator; never touches ``completion_state``/Story/Batch
+   state.
 5. Every remaining batch gets one reconcile pass, so a batch whose
    completion-convergence step (4) never touched it directly still reflects
    its children's now-final state.
@@ -54,11 +60,13 @@ from .statuses import (
     JOB_STATUS_PREPARING,
     JOB_STATUS_QUEUED,
     JOB_STATUS_RUNNING,
+    JOB_STATUS_SUCCEEDED,
     JOB_STATUSES,
     TERMINAL_JOB_STATUSES,
 )
 
 if TYPE_CHECKING:
+    from core.assets import AssetRepository
     from core.batches import BatchService
     from core.storage.repositories.job_repository import JobRepository
 
@@ -88,6 +96,7 @@ class StartupRecoveryReport:
     batches_resumed_current_stage: list[str] = field(default_factory=list)
     batch_cancellation_scan_was_fully_reliable: bool = True
     queued_enqueue_skipped_due_to_unreliable_batch_scan: bool = False
+    assets_repaired: int = 0
 
 
 def run_startup_recovery(
@@ -167,6 +176,13 @@ def run_startup_recovery(
     for job in job_repository.list_terminal_pending_completion():
         report.completion_outcomes[job.id] = completion_converger.converge_job(job.id)
 
+    # 4b. Asset repair, independent of completion_state (PR3 exact-HEAD
+    # audit, third round, P2-1) -- see _repair_assets_for_succeeded_jobs()'s
+    # own docstring for why step 4 alone cannot provide this guarantee.
+    report.assets_repaired = _repair_assets_for_succeeded_jobs(
+        job_repository, completion_converger.asset_repository
+    )
+
     # 5. One reconcile pass over every batch, so a batch not directly
     # touched by step 4 (e.g. all its children were already "done" before
     # this restart, but the batch record itself was never re-read) still
@@ -213,6 +229,55 @@ def run_startup_recovery(
         report.requeued.append(job.id)
 
     return report
+
+
+def _repair_assets_for_succeeded_jobs(
+    job_repository: "JobRepository", asset_repository: "AssetRepository"
+) -> int:
+    """Idempotently re-sync every decodable succeeded job's Asset records.
+
+    Independent of `completion_state` -- PR3's regular convergence pass
+    (`CompletionConverger.converge_job()`) intentionally skips a job once
+    `completion_state="done"`, so it alone cannot repair an Asset record
+    lost or corrupted *after* that convergence already ran once. The
+    pre-PR3 startup path did exactly this for every succeeded job
+    unconditionally (`asset_repository.sync_jobs(job_repository.list())`);
+    this restores that guarantee without reviving the old undifferentiated
+    call: `list_tolerant()`, not `list()`, so one poison row never aborts
+    repair for every other succeeded job (PR3 exact-HEAD audit, third
+    round, P2-1).
+
+    Never calls a generator (`AssetRepository.sync_job()` only reads the
+    already-persisted `GenerationResult`), never touches
+    `completion_state`/`completion_error` (repairing an Asset is
+    orthogonal to whether convergence itself is "done"), and never touches
+    Story/Batch state (`sync_job()` is Asset-only). `sync_job()` is itself
+    idempotent (it derives each Asset's id deterministically from the job
+    id and output path), so re-running this on every single startup for
+    every succeeded job ever created is safe, not just safe-once.
+
+    Returns the count of Asset *records* (re-)synced -- not the count of
+    jobs: one succeeded job can have more than one output and therefore
+    more than one Asset record (see `AssetRepository.sync_job()`, which
+    returns one Asset per output), and undercounting those by job would
+    understate the true repair blast radius reported to an operator
+    (found via adversarial review of this same round's own fix).
+    """
+
+    records, _failures = job_repository.list_tolerant()
+    repaired = 0
+    for job in records:
+        if job.status != JOB_STATUS_SUCCEEDED:
+            continue
+        try:
+            synced_assets = asset_repository.sync_job(job)
+        except Exception:
+            logger.exception(
+                "Startup asset repair failed for job %s; continuing.", job.id
+            )
+            continue
+        repaired += len(synced_assets)
+    return repaired
 
 
 def _quarantine_poison_row_safely(

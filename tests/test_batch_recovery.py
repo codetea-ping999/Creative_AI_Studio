@@ -9,11 +9,17 @@ matching `tests/test_story_concurrency.py`'s own established pattern for
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import sqlite3
 from threading import Barrier, Event, Thread
 
 import pytest
 
-from core.batches import BatchReconciliationOutcome, BatchRepository, BatchService
+from core.batches import (
+    BatchReconciliationOutcome,
+    BatchRepository,
+    BatchService,
+    BatchStageMaterializationError,
+)
 from core.batches.schemas import BatchSpec
 from core.jobs import EventBus, JobQueue, JobRunner, JobService
 from core.schemas import GenerationResult
@@ -532,3 +538,302 @@ def test_startup_resume_never_reassigns_an_id_to_a_legacy_cancelled_item(tmp_pat
     assert resumed.items[0].status == "cancelled"
     assert len(job_repository.list()) == rows_before  # no new row was ever created
     assert job_queue.dequeue() is None  # nothing new was ever enqueued
+
+
+# --- PR3 exact-HEAD audit, third round, P1-1: re-enqueue a reused queued
+# child during runtime recovery ----------------------------------------------
+
+
+def test_runtime_retry_safely_reenqueues_a_reused_queued_child(tmp_path, monkeypatch):
+    """A reused row that is still genuinely `queued` (because an earlier
+    `enqueue_job()` call raised *after* materialization) must be safely
+    (re-)enqueued on a later `_enqueue_stage()` call -- not silently
+    skipped just because this call did not create the row itself. This is
+    a *runtime* retry, not a restart: the same `BatchService`/`JobQueue`
+    instances, exactly as `reconcile_child_job()`'s own completion-retry
+    path would re-drive `_enqueue_stage()`.
+    """
+
+    job_repository, job_queue, job_service, batch_repository, batch_service = _build(tmp_path)
+    generator = _CountingGenerator()
+    job_runner = JobRunner(
+        job_repository, job_queue, GeneratorRegistry({"image": generator}),
+        job_service=job_service,
+    )
+
+    original_enqueue_job = job_service.enqueue_job
+    calls = {"count": 0}
+
+    def flaky_enqueue_job(job_id):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("injected: enqueue_job fails after materialization")
+        return original_enqueue_job(job_id)
+
+    monkeypatch.setattr(job_service, "enqueue_job", flaky_enqueue_job)
+
+    with pytest.raises(RuntimeError, match="injected"):
+        batch_service.create_batch(_spec())
+
+    batch_id = batch_repository.list_all()[0].id
+    job_id = batch_repository.get(batch_id).items[0].job_id
+    assert job_id is not None
+    materialized = job_repository.get(job_id)
+    assert materialized is not None
+    assert materialized.status == "queued"
+    assert job_queue.dequeue() is None  # never actually reached the queue
+
+    resumed = batch_service._enqueue_stage(batch_id, stage_index=0)
+
+    assert resumed is not None
+
+    matching_rows = [job for job in job_repository.list() if job.id == job_id]
+    assert len(matching_rows) == 1  # same stable id, never duplicated
+
+    # Draining with a real runner is itself the proof the job reached the
+    # queue this time (a dequeue-then-check would consume the only copy
+    # before the runner ever saw it).
+    _drain_queue(job_runner)
+    assert generator.calls == 1  # exactly one execution, no duplicate delivery
+    assert job_repository.get(job_id).status == "succeeded"
+
+
+# --- PR3 exact-HEAD audit, third round, P1-2: cancellation check and queue
+# exposure are atomic ---------------------------------------------------------
+
+
+def test_cancellation_and_enqueue_exposure_are_mutually_exclusive(tmp_path, monkeypatch):
+    """Deterministic proof (via `threading.Event`, no sleep) that the
+    authorize-and-expose step and `cancel()`'s own durable-intent mutation
+    cannot interleave: force the canceller thread to attempt its mutation
+    *while* the main thread is inside the atomic authorize-and-expose
+    critical section, and confirm it genuinely could not have completed
+    before that section finishes and releases the lock.
+    """
+
+    job_repository, job_queue, job_service, batch_repository, batch_service = _build(tmp_path)
+
+    def always_fail(*args, **kwargs):
+        raise RuntimeError("injected: crash before the row is ever created")
+
+    monkeypatch.setattr(job_service, "create_or_reuse_job_without_enqueue", always_fail)
+    with pytest.raises(RuntimeError, match="injected"):
+        batch_service.create_batch(_spec())
+    monkeypatch.undo()
+
+    batch_id = batch_repository.list_all()[0].id
+    job_id = batch_repository.get(batch_id).items[0].job_id
+    assert job_repository.get(job_id) is None
+
+    inside_critical_section = Event()
+    cancel_attempted = Event()
+    observed_cancellation_state = []
+    original_enqueue_job = job_service.enqueue_job
+
+    def paused_enqueue_job(job_id_arg):
+        inside_critical_section.set()
+        # Give the canceller thread every opportunity to interleave -- if
+        # the exclusion boundary were not real (the pre-fix code), this is
+        # exactly the window its own race let cancel() slip through.
+        cancel_attempted.wait(timeout=0.5)
+        current = batch_repository.get(batch_id)
+        observed_cancellation_state.append(
+            current.cancellation_requested if current is not None else None
+        )
+        return original_enqueue_job(job_id_arg)
+
+    monkeypatch.setattr(job_service, "enqueue_job", paused_enqueue_job)
+
+    def _attempt_cancel():
+        assert inside_critical_section.wait(timeout=5)
+        batch_service.cancel(batch_id)
+        cancel_attempted.set()
+
+    canceller = Thread(target=_attempt_cancel)
+    canceller.start()
+    batch_service._enqueue_stage(batch_id, stage_index=0)
+    canceller.join(timeout=5)
+
+    # The read taken from inside the same critical section as the enqueue
+    # itself must never observe a cancellation that landed *during* that
+    # section -- proving the two operations are genuinely mutually
+    # exclusive, not just separately (and non-atomically) rechecked.
+    assert observed_cancellation_state == [False]
+    # This exact job legitimately started before any cancellation intent
+    # existed -- expected and correct; cancel()'s own cooperative
+    # cancel_job() loop (which ran right after, once unblocked by our lock
+    # release) is what handles it from here.
+    assert job_queue.dequeue() == job_id
+
+
+# --- PR3 exact-HEAD audit, third round, P1-3: treat an unreadable
+# cancellation recheck as unsafe ---------------------------------------------
+
+
+def test_unreadable_authorize_recheck_never_enqueues_the_child(tmp_path, monkeypatch):
+    """Materialization succeeds, but the atomic authorize-and-expose step's
+    own diagnosed read hits a transient failure -- must be treated the
+    same as "possibly cancelled", never as "confirmed not cancelled".
+    """
+
+    job_repository, job_queue, job_service, batch_repository, batch_service = _build(tmp_path)
+    generator = _CountingGenerator()
+    job_runner = JobRunner(
+        job_repository, job_queue, GeneratorRegistry({"image": generator}),
+        job_service=job_service,
+    )
+
+    def always_fail(*args, **kwargs):
+        raise RuntimeError("injected: crash before the row is ever created")
+
+    monkeypatch.setattr(job_service, "create_or_reuse_job_without_enqueue", always_fail)
+    with pytest.raises(RuntimeError, match="injected"):
+        batch_service.create_batch(_spec())
+    monkeypatch.undo()
+
+    batch_id = batch_repository.list_all()[0].id
+    job_id = batch_repository.get(batch_id).items[0].job_id
+    assert job_repository.get(job_id) is None
+
+    # Materialization itself uses the plain (non-diagnosed) `_try_load()`
+    # path (via `mutate()` -> `get()`); only the authorize step's own
+    # `get_or_diagnose()` -> `_try_load_diagnosed()` read is injected here,
+    # so the per-item loop genuinely reaches the authorize step this time.
+    original_try_load_diagnosed = batch_repository._try_load_diagnosed
+
+    def flaky_try_load_diagnosed(batch_file):
+        if batch_file.stem == batch_id:
+            return None, True
+        return original_try_load_diagnosed(batch_file)
+
+    monkeypatch.setattr(batch_repository, "_try_load_diagnosed", flaky_try_load_diagnosed)
+
+    batch_service._enqueue_stage(batch_id, stage_index=0)
+
+    materialized = job_repository.get(job_id)
+    assert materialized is not None  # materialization itself succeeded
+    assert materialized.status == "queued"
+    assert job_queue.dequeue() is None  # never exposed -- uncertainty is not "not cancelled"
+
+    _drain_queue(job_runner)
+    assert generator.calls == 0
+
+    monkeypatch.undo()  # storage "recovers"
+
+    batch_service._enqueue_stage(batch_id, stage_index=0)
+
+    assert job_queue.dequeue() == job_id  # now safely (re-)enqueued
+
+
+# --- PR3 exact-HEAD audit, third round, P1-6: propagate manual
+# stage-enqueue failures -------------------------------------------------
+
+
+def test_manual_advance_raises_when_stage_materialization_cannot_be_confirmed(
+    tmp_path, monkeypatch
+):
+    job_repository, _job_queue, job_service, batch_repository, batch_service = _build(tmp_path)
+    batch = batch_service.create_batch(
+        _spec(stages=[{"name": "probe"}, {"name": "refine"}])
+    )
+    job_id = batch.items[0].job_id
+    job_repository.update_status(job_id, "preparing")
+    job_repository.update_status(job_id, "running")
+    job_repository.update_status(job_id, "postprocessing")
+    job_repository.update(
+        job_id, status="succeeded", progress=1.0,
+        result=GenerationResult(job_id=job_id, status="succeeded", outputs=["a.png"]),
+    )
+
+    # advance()'s own stage-advance mutation and _enqueue_stage()'s
+    # materialization both read this batch via the same `_try_load()`
+    # (via `get()`) path -- to let the *advance* persist and only the
+    # *following* materialization fail, count calls and only start
+    # failing from the second one for this exact batch.
+    original_try_load = batch_repository._try_load
+    call_count = {"n": 0}
+
+    def flaky_try_load(batch_file):
+        if batch_file.stem == batch.id:
+            call_count["n"] += 1
+            if call_count["n"] >= 2:
+                return None
+        return original_try_load(batch_file)
+
+    monkeypatch.setattr(batch_repository, "_try_load", flaky_try_load)
+
+    with pytest.raises(BatchStageMaterializationError):
+        batch_service.advance(batch.id)
+
+    monkeypatch.undo()
+
+    # The advance itself really did persist despite the injected failure.
+    advanced_only = batch_repository.get(batch.id)
+    assert advanced_only.stage_index == 1
+    refine_item = next(item for item in advanced_only.items if item.stage_index == 1)
+    assert refine_item.job_id is None  # never materialized while the read was flaky
+
+    # Repair + retry converges to the same stable stage/child, no
+    # duplicates.
+    second = batch_service.advance(batch.id)
+
+    assert second.stage_index == 1
+    refine_item_after = next(item for item in second.items if item.stage_index == 1)
+    assert refine_item_after.job_id is not None
+    assert job_repository.get(refine_item_after.job_id) is not None
+    assert len([item for item in second.items if item.stage_index == 1]) == 1
+
+
+# --- PR3 exact-HEAD audit, third round, follow-up (found via adversarial
+# review): cancel() survives a poisoned sibling child -----------------------
+
+
+def test_cancel_survives_a_poisoned_sibling_child_and_still_cancels_the_others(
+    tmp_path,
+):
+    """`cancel()`'s own child-row read (inside `_apply_cancellation_intent`)
+    needs the same `JobRecordDecodeError` guard `_recompute()`/
+    `_enqueue_stage()` already got this round -- otherwise one poisoned
+    sibling anywhere in the batch aborts the *entire* `cancel()` call,
+    including durably persisting `cancellation_requested` and cancelling
+    every *other*, healthy item. Also reachable from
+    `resume_pending_cancellations()` -> `run_startup_recovery()`, which
+    would otherwise crash the whole application's startup on every future
+    restart until the poisoned row is fixed by hand.
+    """
+
+    job_repository, _job_queue, _job_service, batch_repository, batch_service = _build(
+        tmp_path
+    )
+    batch = batch_service.create_batch(
+        _spec(
+            limit=2,
+            axes=[{"name": "variant", "values": [{"label": "a"}, {"label": "b"}]}],
+        )
+    )
+    assert len(batch.items) == 2
+    healthy_job_id = batch.items[0].job_id
+    poison_job_id = batch.items[1].job_id
+
+    with sqlite3.connect(tmp_path / "jobs.db") as raw:
+        raw.execute(
+            "UPDATE jobs SET request_json = ? WHERE id = ?",
+            ("{not valid json", poison_job_id),
+        )
+        raw.commit()
+
+    # This must not raise -- the whole point of the fix.
+    refreshed = batch_service.cancel(batch.id)
+
+    assert refreshed is not None
+    assert refreshed.cancellation_requested is True
+    # The healthy sibling is still cancelled despite the poisoned one.
+    assert job_repository.get(healthy_job_id).status == "cancelled"
+    healthy_item = next(item for item in refreshed.items if item.job_id == healthy_job_id)
+    assert healthy_item.status in ("cancel_requested", "cancelled")
+
+    # Repeated cancellation (as resume_pending_cancellations() would do on
+    # every restart) keeps converging, never crashing again.
+    refreshed_again = batch_service.cancel(batch.id)
+    assert refreshed_again is not None
+    assert refreshed_again.cancellation_requested is True

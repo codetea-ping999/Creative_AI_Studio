@@ -11,12 +11,14 @@ from uuid import uuid4
 from core.jobs.statuses import (
     JOB_STATUS_CANCELLED,
     JOB_STATUS_FAILED,
+    JOB_STATUS_QUEUED,
     JOB_STATUS_SUCCEEDED,
     TERMINAL_JOB_STATUSES,
     is_terminal_status,
 )
 from core.reference_capabilities import MissingReferenceAssetError, UnsupportedReferenceError
 from core.storage.json_files import utc_now
+from core.storage.repositories.job_repository import JobRecordDecodeError
 
 from .expansion import expand_items
 from .repository import BatchRepository
@@ -70,6 +72,24 @@ class BatchReconciliationOutcome(Enum):
     # storage failure, not a confirmed absence) -- completion must stay
     # pending and retry later.
     RETRYABLE_FAILURE = "retryable_failure"
+
+
+class BatchStageMaterializationError(RuntimeError):
+    """A stage advance persisted, but materializing its children could not
+    be confirmed right now (a transient storage failure) -- retry the same
+    call once resolved.
+
+    Distinct from `UnsupportedReferenceError`/`MissingReferenceAssetError`
+    (a permanent reference-preflight failure a retry can never fix on its
+    own) and from `advance()` returning `None` (the batch itself is
+    confirmed gone): this means neither -- the batch still exists, the
+    stage transition itself succeeded and was persisted, but its new
+    stage's Job rows are not yet confirmed to exist (PR3 exact-HEAD audit,
+    third round, P1-6). Reporting a normal-looking successful result here
+    would silently leave the batch stuck with no Job to ever finish it and
+    no runtime retry scheduled, since the triggering job may already be
+    `completion_state="done"`.
+    """
 
 
 def resolve_max_items_limit(configured: int | None = None) -> int:
@@ -217,52 +237,130 @@ class BatchService:
         for item in record.items_for_stage(stage_index):
             if item.job_id is None:
                 continue
-            # Fresh recheck immediately before materializing this specific
-            # child -- `record` above is a snapshot from phase 1; `cancel()`
-            # can durably persist `cancellation_requested` at any point
-            # after that snapshot was taken and before this exact
-            # create-or-reuse call runs (PR3 exact-HEAD audit P1-2). Without
-            # this, a batch already marked for cancellation could still have
-            # a new child materialized and enqueued afterward, with nothing
-            # left to ever cancel it -- cancel()'s own cancel loop already
-            # ran against an earlier snapshot that did not yet include this
-            # item's job. Stopping here (not just skipping this one item)
-            # also means every later item in this stage is left with only
-            # its durably-persisted id and no Job row, which cancel()'s own
-            # `_apply_cancellation_intent` (see `cancel()` below) now
-            # explicitly converges to cancelled.
+            # Cheap, lock-free pre-check -- purely an optimization to skip
+            # unnecessary Job-row materialization for a batch already known
+            # to be cancelling. This is *not* the safety boundary (see
+            # `_authorize_and_expose()` below, which is): a stale or
+            # momentarily-unreadable read here just means this item's
+            # materialization is skipped one pass early, which is always
+            # safe to retry later.
             current = self.batch_repository.get(batch_id)
-            if current is not None and current.cancellation_requested:
+            if current is None or current.cancellation_requested:
                 break
             # Materialize the row *without* enqueuing it yet (PR3 exact-HEAD
-            # audit, second round, P1-1): the combined create-and-enqueue
-            # call used here previously exposed a freshly-created job to a
-            # worker immediately, before the recheck below ever ran -- a
-            # durable cancellation landing in that exact window could still
-            # lose the race to a worker that had already claimed and begun
-            # generating. Nothing below can be observed by `JobRunner` until
-            # `enqueue_job()` is actually called, so this recheck runs
-            # against a row that is, by construction, still invisible to
-            # every worker.
-            created, was_created = self.job_service.create_or_reuse_job_without_enqueue(
-                item.job_id, item.request, project_id=record.spec.project_id
-            )
-            after_create = self.batch_repository.get(batch_id)
-            if after_create is not None and after_create.cancellation_requested:
-                # cancel_job() is idempotent, so this is harmless even if
-                # cancel()'s own loop already reached (or will yet reach)
-                # this exact job itself via a durably-persisted id with no
-                # row (see `cancel()`'s `_apply_cancellation_intent` below).
-                # Crucially: `enqueue_job()` is *never* called on this path,
-                # so no worker can ever have claimed this row in the first
-                # place -- there is nothing here for `cancel_job()` to race.
+            # audit, second round, P1-1): nothing below can be observed by
+            # `JobRunner` until `enqueue_job()` is actually called inside
+            # `_authorize_and_expose()`, so that call's own fresh
+            # cancellation check runs against a row that is, by
+            # construction, still invisible to every worker.
+            try:
+                created, _was_created = self.job_service.create_or_reuse_job_without_enqueue(
+                    item.job_id, item.request, project_id=record.spec.project_id
+                )
+            except JobRecordDecodeError:
+                # This item's stable id already has a Job row on disk, but
+                # it cannot currently be decoded (PR3 exact-HEAD audit,
+                # third round, P1-5) -- PR #397's own quarantine
+                # primitives (via job-level startup recovery) are what
+                # eventually resolve this; this loop must not re-derive
+                # that logic, nor guess at (or overwrite) the row's true
+                # content by trying to recreate it. Skip just this one
+                # item and continue with the rest of the stage -- one
+                # poisoned child must never abort materialization for
+                # every other item, in this batch or any other.
+                logger.warning(
+                    "Batch %s: child job %s's row could not be decoded "
+                    "while materializing stage %d; leaving it for a "
+                    "later retry.",
+                    batch_id,
+                    item.job_id,
+                    stage_index,
+                )
+                continue
+            # The authoritative gate (PR3 exact-HEAD audit, third round):
+            # decide whether to expose this job to a worker under the exact
+            # same lock `cancel()`'s own durable-intent mutation uses, so no
+            # cancellation can land in the gap between checking and
+            # enqueuing -- closing the race a lock-free "check, then
+            # enqueue" sequence cannot. Checked by job *status*, not by
+            # whether this call is what created the row: a reused row that
+            # is still genuinely `queued` (e.g. a prior `enqueue_job()` call
+            # raised after materialization but before this exact attempt)
+            # is re-attempted here too, not just a freshly-created one
+            # (P1-1) -- `JobQueue.enqueue()` is itself idempotent for an id
+            # already pending in the same lane, so this can never duplicate
+            # delivery, and the CAS-guarded execution claim (`JobRepository
+            # .transition_if_status()`) already makes a duplicate *delivery*
+            # safe against duplicate *execution* regardless.
+            decision = self._authorize_and_expose(batch_id, created.id, created.status)
+            if decision in ("cancelled", "absent"):
+                # A confirmed cancellation or a confirmed-deleted batch --
+                # either way this row can never run; terminalize it now
+                # rather than leave it queued-but-unexposed forever.
                 if not is_terminal_status(created.status):
                     self.job_service.cancel_job(created.id)
-                continue
-            if was_created:
-                self.job_service.enqueue_job(created.id)
+                break
+            if decision == "unreadable":
+                # The batch's cancellation state could not be confirmed
+                # right now -- must never be treated the same as "not
+                # cancelled" (PR3 exact-HEAD audit, third round, P1-3).
+                # Leave the row exactly as-is (materialized, unexposed) for
+                # a later retry once storage recovers; do not guess either
+                # way by cancelling or enqueuing it.
+                break
+            # decision in ("enqueued", "not_queued") -- proceed to the next
+            # item in this stage.
 
         return self.reconcile(batch_id)
+
+    def _authorize_and_expose(self, batch_id: str, job_id: str, job_status: str) -> str:
+        """Atomically decide whether `job_id` may become worker-visible
+        right now, and expose it if so.
+
+        Runs under `BatchRepository.run_exclusive()` -- the exact same lock
+        `cancel()`'s own durable-intent mutation uses -- so this decision
+        and any concurrent `cancel()` call are strictly linearized: either
+        `cancel()` fully commits `cancellation_requested=True` before this
+        call's own read (which then correctly declines), or this call's
+        `enqueue_job()` fully completes before `cancel()` even starts
+        (which is legitimate -- that job started before any cancellation
+        intent existed, and `cancel()`'s own cooperative `cancel_job()`
+        loop is what reaches it from there). No lock-free "check, then act"
+        window exists in between (PR3 exact-HEAD audit, third round: the
+        prior round's separate pre/post checks still had exactly this gap).
+
+        Returns one of:
+        - ``"enqueued"`` -- exposed to the worker queue just now.
+        - ``"not_queued"`` -- `job_status` was not `queued` (already active
+          or terminal); nothing to do.
+        - ``"cancelled"`` -- the batch's cancellation intent is durably
+          set; never enqueued.
+        - ``"absent"`` -- the batch record is confirmed gone.
+        - ``"unreadable"`` -- the batch could not be read right now (a
+          transient failure); the caller must not enqueue and must not
+          assume either "cancelled" or "not cancelled".
+
+        `enqueue_job()` is safe to call from inside this lock:
+        `JobQueue.enqueue()` is itself idempotent for an id already pending
+        in the same lane, and the ``"job_queued"`` event it publishes is
+        not subscribed to by anything that calls back into this repository
+        (`BatchService.handle_job_event`/`CompletionConverger.
+        handle_job_event` both filter to terminal event types only), so
+        there is no reentrancy or deadlock risk.
+        """
+
+        def _decide() -> str:
+            record, uncertain = self.batch_repository.get_or_diagnose(batch_id)
+            if record is None:
+                return "unreadable" if uncertain else "absent"
+            if record.cancellation_requested:
+                return "cancelled"
+            if job_status != JOB_STATUS_QUEUED:
+                return "not_queued"
+            self.job_service.enqueue_job(job_id)
+            return "enqueued"
+
+        return self.batch_repository.run_exclusive(_decide)
 
     # ------------------------------------------------------------------- reads
 
@@ -346,7 +444,28 @@ class BatchService:
         for item in record.items:
             if item.job_id is None:
                 continue
-            job = self.job_repository.get(item.job_id)
+            try:
+                job = self.job_repository.get(item.job_id)
+            except JobRecordDecodeError:
+                # A poison row (PR #397's own quarantine primitives are
+                # what eventually resolve this, via job-level startup
+                # recovery / the runtime retry loop -- this method must
+                # not re-derive that logic, only avoid raising because of
+                # it). Leave this item's last-known state exactly as it
+                # was: recomputing the batch's aggregate/status from a row
+                # that cannot currently be decoded is exactly as safe as
+                # recomputing it before this job's row was ever touched,
+                # and never guesses at (or overwrites) its true past
+                # outcome. Without this, one poisoned child could abort
+                # reconciliation for every other batch in the same sweep
+                # (PR3 exact-HEAD audit, third round, P1-5).
+                logger.warning(
+                    "Batch %s: child job %s could not be decoded during "
+                    "reconciliation; leaving its last-known state as-is.",
+                    record.id,
+                    item.job_id,
+                )
+                continue
             if job is None:
                 continue
             item.status = job.status
@@ -371,7 +490,25 @@ class BatchService:
         record = self.batch_repository.mutate(batch_id, self._recompute_and_advance_raising)
         if record is None:
             return None
-        self._enqueue_stage(record.id, stage_index=record.stage_index)
+        enqueued = self._enqueue_stage(record.id, stage_index=record.stage_index)
+        if enqueued is None:
+            # The stage-advance mutation above already persisted -- this
+            # batch is not simply "not found" -- but materializing the new
+            # stage's children could not be confirmed (PR3 exact-HEAD
+            # audit, third round, P1-6). Unlike `reconcile_child_job()`,
+            # there is no runtime retry scheduled to pick this back up on
+            # its own if the triggering condition was itself a completed
+            # job: the caller here is a synchronous manual API call, so it
+            # must learn about the failure now rather than receive a
+            # normal-looking (but incompletely-materialized) result.
+            still_exists, uncertain = self.batch_repository.get_or_diagnose(record.id)
+            if still_exists is None and not uncertain:
+                return None
+            raise BatchStageMaterializationError(
+                f"Batch {record.id!r} advanced to stage {record.stage_index}, "
+                "but materializing its Job rows could not be confirmed "
+                "right now (a transient storage failure); retry."
+            )
         return self.reconcile(batch_id)
 
     def _recompute_and_advance_raising(self, record: BatchRecord | None) -> BatchRecord | None:
@@ -520,7 +657,36 @@ class BatchService:
                 # itself returns None for a missing row, so nothing would
                 # ever terminalize it without this check -- it would stay
                 # "pending" forever, and so would the batch.
-                if self.job_repository.get(item.job_id) is None:
+                try:
+                    row_exists = self.job_repository.get(item.job_id) is not None
+                except JobRecordDecodeError:
+                    # This item's row exists but cannot currently be
+                    # decoded (found via adversarial review of the third
+                    # round's own poison-tolerance fixes elsewhere in this
+                    # method): must not be treated the same as "no row"
+                    # (which would wrongly mark it cancelled based on a
+                    # guess about undecodable content), and must not be
+                    # allowed to abort this entire cancellation pass --
+                    # `BatchRepository.mutate()` propagates any exception
+                    # from this closure uncaught, which would otherwise
+                    # durably lose the cancellation intent for every other
+                    # item in the batch, and (via
+                    # `resume_pending_cancellations()` ->
+                    # `run_startup_recovery()`) crash the whole
+                    # application's startup on every future restart until
+                    # the row is fixed by hand. Leave this item's status
+                    # exactly as-is; PR #397's own quarantine primitives
+                    # (via job-level startup recovery) are what eventually
+                    # resolve a poisoned row.
+                    logger.warning(
+                        "Batch %s: child job %s's row could not be "
+                        "decoded while applying cancellation intent; "
+                        "leaving its status as-is.",
+                        record.id,
+                        item.job_id,
+                    )
+                    continue
+                if not row_exists:
                     item.status = JOB_STATUS_CANCELLED
             return record
 
@@ -529,8 +695,28 @@ class BatchService:
             return None
 
         for item in record.items:
-            if item.job_id is not None and not is_terminal_status(item.status):
+            if item.job_id is None or is_terminal_status(item.status):
+                continue
+            try:
                 self.job_service.cancel_job(item.job_id)
+            except JobRecordDecodeError:
+                # JobService.cancel_job() itself reads the row first
+                # (`get_job()`) before ever mutating anything -- a poisoned
+                # row raises here before any state is touched, so simply
+                # skipping it is safe (found via adversarial review of
+                # this same round's poison-tolerance fixes: the closure
+                # above already tolerates this exact row, but this second,
+                # outside-the-lock loop calls a completely different
+                # method that performs its own unguarded read and was
+                # still able to abort cancellation of every other item).
+                logger.warning(
+                    "Batch %s: child job %s's row could not be decoded "
+                    "while issuing its cancel signal; leaving it for a "
+                    "later retry.",
+                    record.id,
+                    item.job_id,
+                )
+                continue
 
         return self.reconcile(batch_id)
 
@@ -563,13 +749,32 @@ class BatchService:
             self.batch_repository.list_all_tolerant()
         )
         resumed: list[BatchRecord] = []
+        fully_reliable = scan_was_fully_reliable
         for record in records:
             if not record.cancellation_requested:
                 continue
             refreshed = self.cancel(record.id)
             if refreshed is not None:
                 resumed.append(refreshed)
-        return resumed, scan_was_fully_reliable
+                continue
+            # `cancel()` failed to confirm re-application of a durable
+            # cancellation intent this exact tolerant scan already
+            # discovered (PR3 exact-HEAD audit, third round, P1-4): either
+            # the batch was genuinely deleted in the interim (fine --
+            # nothing left to cancel), or `cancel()`'s own fresh
+            # read/mutate hit a transient failure (not fine -- the
+            # cancellation this record already told us about was never
+            # actually reapplied to its children this pass). Only a
+            # *confirmed* deletion may be treated as "no problem" here;
+            # anything else must downgrade the overall result, since a
+            # caller trusting `scan_was_fully_reliable=True` (see
+            # `run_startup_recovery()`'s queued-job sweep) would otherwise
+            # re-enqueue this exact batch's still-queued children despite
+            # its cancellation intent never having reached them.
+            still_exists, uncertain = self.batch_repository.get_or_diagnose(record.id)
+            if still_exists is not None or uncertain:
+                fully_reliable = False
+        return resumed, fully_reliable
 
     def resume_current_stage_for_all_batches(self) -> list[BatchRecord]:
         """Resume every batch's current stage -- for startup recovery.
@@ -728,4 +933,9 @@ def _rank_winners(
     return ranked[:keep_top_n]
 
 
-__all__ = ["BatchReconciliationOutcome", "BatchService", "resolve_max_items_limit"]
+__all__ = [
+    "BatchReconciliationOutcome",
+    "BatchService",
+    "BatchStageMaterializationError",
+    "resolve_max_items_limit",
+]

@@ -108,27 +108,37 @@ def create_app(
             app.state.services = resolved_services
 
             # PR3: startup recovery -- poison-row isolation, interrupted/
-            # cancel_requested convergence, completion convergence, and
+            # cancel_requested convergence, completion convergence, an
+            # Asset-repair pass for every succeeded job (independent of
+            # completion_state -- see run_startup_recovery()'s own
+            # docstring, step 4b: completion convergence alone skips a job
+            # already completion_state="done", so it cannot repair an
+            # Asset record lost or corrupted after that convergence
+            # already ran once; this replaces the old gallery-only
+            # asset_repository.sync_jobs() call for that specific
+            # guarantee, PR3 exact-HEAD audit third round P2-1), and
             # queued-job status re-check all happen here, synchronously,
             # strictly before the job runner thread (below) can dequeue
-            # anything. This supersedes the old gallery-only
-            # asset_repository.sync_jobs() call: completion convergence
-            # already syncs every terminal-and-pending job's Asset (a
-            # strict superset), Story-replays it, and reconciles its Batch.
+            # anything.
             recovery_report = run_startup_recovery(
                 resolved_services.job_repository,
                 resolved_services.job_service,
                 resolved_services.completion_converger,
                 batch_service=resolved_services.batch_service,
             )
-            if recovery_report.poison_rows or recovery_report.interrupted_failed or recovery_report.cancel_requested_cancelled:
+            if (
+                recovery_report.poison_rows
+                or recovery_report.interrupted_failed
+                or recovery_report.cancel_requested_cancelled
+            ):
                 logger.info(
                     "Startup recovery: %d poison row(s), %d interrupted job(s) "
-                    "failed, %d cancel_requested job(s) cancelled, %d job(s) "
-                    "re-enqueued.",
+                    "failed, %d cancel_requested job(s) cancelled, %d asset(s) "
+                    "repaired, %d job(s) re-enqueued.",
                     len(recovery_report.poison_rows),
                     len(recovery_report.interrupted_failed),
                     len(recovery_report.cancel_requested_cancelled),
+                    recovery_report.assets_repaired,
                     len(recovery_report.requeued),
                 )
 

@@ -496,3 +496,229 @@ def test_repeated_startup_recovery_keeps_the_same_batch_child_job_id(tmp_path):
     refreshed = services["batch_service"].get_batch(batch.id)
     assert refreshed.items[0].job_id == child_job_id
     assert len([job for job in services["job_repository"].list() if job.id == child_job_id]) == 1
+
+
+# --- PR3 exact-HEAD audit, third round, P1-4: propagate failures while
+# reapplying discovered cancellation -----------------------------------------
+
+
+def test_startup_treats_a_failed_cancellation_reapplication_as_unreliable(
+    tmp_path, monkeypatch
+):
+    """The tolerant scan itself can successfully observe
+    `cancellation_requested=True`, but `cancel()`'s own subsequent
+    read/mutate can still hit a transient failure -- that must downgrade
+    the overall reliability result too, not just a failure in the initial
+    scan.
+    """
+
+    from core.batches.schemas import BatchSpec
+
+    services = _build_services(tmp_path)
+    batch_service = services["batch_service"]
+    batch_repository = services["batch_repository"]
+    batch = batch_service.create_batch(
+        BatchSpec(name="cancel-me", media_type="image", model_id="fake", prompt="x", limit=1)
+    )
+    child_job_id = batch.items[0].job_id
+    services["job_queue"].dequeue()  # simulate a fresh restart's empty queue
+
+    # Durable intent persisted directly, without going through cancel()'s
+    # own child-cancelling loop -- simulating "discovered by the tolerant
+    # scan, but the child was never actually told to cancel yet" (the
+    # exact crash window this whole mechanism exists to close).
+    def _mark_cancellation_requested_only(record):
+        record.cancellation_requested = True
+        return record
+
+    batch_repository.mutate(batch.id, _mark_cancellation_requested_only)
+    assert services["job_repository"].get(child_job_id).status == "queued"
+
+    # The initial tolerant scan (list_all_tolerant() -> _try_load_diagnosed())
+    # must still succeed and observe cancellation_requested=True; only
+    # cancel()'s own subsequent mutate() -> get() -> _try_load() read is
+    # injected to fail here.
+    original_try_load = batch_repository._try_load
+
+    def flaky_try_load(batch_file):
+        if batch_file.stem == batch.id:
+            return None
+        return original_try_load(batch_file)
+
+    monkeypatch.setattr(batch_repository, "_try_load", flaky_try_load)
+
+    report = run_startup_recovery(
+        services["job_repository"], services["job_service"], services["completion_converger"],
+        batch_service=batch_service,
+    )
+
+    assert report.batch_cancellation_scan_was_fully_reliable is False
+    assert report.queued_enqueue_skipped_due_to_unreliable_batch_scan is True
+    assert child_job_id not in report.requeued
+    assert services["job_queue"].dequeue() is None  # never enqueued
+    assert services["job_repository"].get(child_job_id).status == "queued"  # left alone
+
+    monkeypatch.undo()  # storage "recovers"
+
+    second = run_startup_recovery(
+        services["job_repository"], services["job_service"], services["completion_converger"],
+        batch_service=batch_service,
+    )
+
+    assert second.batch_cancellation_scan_was_fully_reliable is True
+    assert services["job_repository"].get(child_job_id).status in (
+        "cancel_requested", "cancelled",
+    )
+    assert services["job_queue"].dequeue() is None  # never enqueued despite recovering
+
+
+# --- PR3 exact-HEAD audit, third round, P1-5: isolate poisoned batch
+# children during the final startup sweep ------------------------------------
+
+
+def test_startup_batch_sweep_survives_one_poison_child_and_recovers_the_others(tmp_path):
+    from core.batches.schemas import BatchSpec
+
+    services = _build_services(tmp_path)
+    batch_service = services["batch_service"]
+    job_repository = services["job_repository"]
+
+    batch_a = batch_service.create_batch(
+        BatchSpec(name="poison", media_type="image", model_id="fake", prompt="x", limit=1)
+    )
+    batch_b = batch_service.create_batch(
+        BatchSpec(name="healthy", media_type="image", model_id="fake", prompt="x", limit=1)
+    )
+    poison_job_id = batch_a.items[0].job_id
+    healthy_job_id = batch_b.items[0].job_id
+    # Simulate a fresh restart: the in-memory queue starts empty regardless
+    # of what create_batch() enqueued a "process" ago -- otherwise the
+    # poison job's *original*, pre-corruption queue entry would still be
+    # sitting there for `_drain_queue()` to trip over below, which is not
+    # what this test is about.
+    services["job_queue"].dequeue()
+    services["job_queue"].dequeue()
+
+    # Simulate step 1's own quarantine outcome for a malformed queued Job
+    # belonging to a batch: raw status flipped to "failed" (exactly what
+    # step 1 already does), but the malformed request_json deliberately
+    # left untouched -- exactly what the finding describes as still
+    # tripping up an unconditional `_recompute()` read afterward.
+    with sqlite3.connect(services["db_path"]) as raw:
+        raw.execute(
+            "UPDATE jobs SET status = ?, request_json = ? WHERE id = ?",
+            ("failed", "{not valid json", poison_job_id),
+        )
+        raw.commit()
+
+    # This must not raise -- the whole point of the fix.
+    run_startup_recovery(
+        job_repository, services["job_service"], services["completion_converger"],
+        batch_service=batch_service,
+    )
+
+    # Batch B's healthy child was never lost -- it converges normally.
+    _drain_queue(services)
+    assert job_repository.get(healthy_job_id).status == "succeeded"
+    assert (
+        services["completion_converger"].converge_job(healthy_job_id)
+        == CompletionOutcome.DONE
+    )
+    healthy_refreshed = batch_service.get_batch(batch_b.id)
+    assert healthy_refreshed.status == "succeeded"
+
+    # Batch A survives being read (not aborted) even though its own child
+    # cannot currently be decoded -- isolated, not resurrected or crashed.
+    poisoned_refreshed = batch_service.get_batch(batch_a.id)
+    assert poisoned_refreshed is not None
+
+
+# --- PR3 exact-HEAD audit, third round, P2-1: preserve startup Asset
+# repair for completed jobs --------------------------------------------------
+
+
+def test_startup_restores_a_deleted_asset_for_an_already_done_succeeded_job(tmp_path):
+    services = _build_services(tmp_path)
+    repository = services["job_repository"]
+    job = _seed(
+        repository, "succeeded", "job_a",
+        result=GenerationResult(job_id="job_a", status="succeeded", outputs=["a.png"]),
+    )
+
+    run_startup_recovery(repository, services["job_service"], services["completion_converger"])
+    assert repository.get(job.id).completion_state == "done"
+
+    asset_repository = services["completion_converger"].asset_repository
+    original_asset = asset_repository.get_primary_by_job(job.id)
+    assert original_asset is not None
+    asset_path = tmp_path / "assets" / f"{original_asset.id}.json"
+    asset_path.unlink()
+    assert asset_repository.get(original_asset.id) is None
+
+    second = run_startup_recovery(
+        repository, services["job_service"], services["completion_converger"],
+    )
+
+    assert second.assets_repaired >= 1
+    restored = asset_repository.get_primary_by_job(job.id)
+    assert restored is not None
+    assert restored.id == original_asset.id
+    # Never re-derived completion_state, never re-ran the generator.
+    assert repository.get(job.id).completion_state == "done"
+    _drain_queue(services)
+    assert services["generator"].calls == 0
+
+
+def test_startup_repairs_a_malformed_asset_for_an_already_done_succeeded_job(tmp_path):
+    services = _build_services(tmp_path)
+    repository = services["job_repository"]
+    job = _seed(
+        repository, "succeeded", "job_a",
+        result=GenerationResult(job_id="job_a", status="succeeded", outputs=["a.png"]),
+    )
+    run_startup_recovery(repository, services["job_service"], services["completion_converger"])
+    asset_repository = services["completion_converger"].asset_repository
+    original_asset = asset_repository.get_primary_by_job(job.id)
+    asset_path = tmp_path / "assets" / f"{original_asset.id}.json"
+    asset_path.write_text("{not valid json", encoding="utf-8")
+    assert asset_repository.get(original_asset.id) is None
+
+    second = run_startup_recovery(
+        repository, services["job_service"], services["completion_converger"],
+    )
+
+    assert second.assets_repaired >= 1
+    repaired = asset_repository.get_primary_by_job(job.id)
+    assert repaired is not None
+    assert repaired.id == original_asset.id
+    _drain_queue(services)
+    assert services["generator"].calls == 0
+
+
+def test_startup_asset_repair_is_not_aborted_by_one_poison_succeeded_job(tmp_path):
+    services = _build_services(tmp_path)
+    repository = services["job_repository"]
+    healthy = _seed(
+        repository, "succeeded", "job_healthy",
+        result=GenerationResult(job_id="job_healthy", status="succeeded", outputs=["a.png"]),
+    )
+    poison = _seed(
+        repository, "succeeded", "job_poison",
+        result=GenerationResult(job_id="job_poison", status="succeeded", outputs=["b.png"]),
+    )
+    with sqlite3.connect(services["db_path"]) as raw:
+        raw.execute(
+            "UPDATE jobs SET result_json = ? WHERE id = ?", ("{also not valid", poison.id)
+        )
+        raw.commit()
+
+    asset_repository = services["completion_converger"].asset_repository
+    report = run_startup_recovery(
+        repository, services["job_service"], services["completion_converger"],
+    )
+
+    assert report.assets_repaired >= 1
+    healthy_asset = asset_repository.get_primary_by_job(healthy.id)
+    assert healthy_asset is not None
+    _drain_queue(services)
+    assert services["generator"].calls == 0

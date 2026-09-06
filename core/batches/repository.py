@@ -6,10 +6,13 @@ from collections.abc import Callable
 import json
 from pathlib import Path
 from threading import RLock
+from typing import TypeVar
 
 from core.storage.json_files import utc_now, write_json_atomic
 
 from .schemas import BatchRecord
+
+_T = TypeVar("_T")
 
 
 class BatchRepository:
@@ -66,6 +69,43 @@ class BatchRepository:
         if not batch_file.exists():
             return None, False
         return self._try_load_diagnosed(batch_file)
+
+    def run_exclusive(self, fn: Callable[[], _T]) -> _T:
+        """Run `fn()` while holding this repository's own lock.
+
+        For a caller that must linearize a multi-step decision -- reading
+        this repository's state, deciding based on it, then taking an
+        action *outside* this repository (e.g. exposing a Job to a worker
+        queue) -- against every write that already goes through
+        `mutate()`/`mutate_by_job_id()`/`mutate_by_job_id_diagnosed()` on
+        this same instance. `fn` takes no arguments; its return value is
+        passed straight through.
+
+        This is a narrow, general-purpose exclusive-execution primitive --
+        not a new distributed-locking mechanism, not a runtime lease or
+        WorkerPool coordination point, and not itself aware of
+        cancellation or Job queues. It exists because a plain `get()`
+        (lock-free) followed by a separate action, with nothing
+        serializing them against a concurrent `mutate()`, is exactly the
+        race the exact-HEAD audit (third round) identified between
+        persisting `cancellation_requested` and exposing a not-yet-queued
+        child Job to a worker: `mutate()`'s own critical section can
+        complete in the gap between an ordinary `get()` and whatever the
+        caller does with its result. Running both the read and the action
+        under this same lock closes that gap for any caller that needs it
+        (see `BatchService._authorize_and_expose()`), without every future
+        caller having to reimplement it.
+
+        Do not call back into this repository's own `mutate()`/
+        `mutate_by_job_id()`/`mutate_by_job_id_diagnosed()` from within
+        `fn` unless you are certain of the reentrancy implications: the
+        lock is an `RLock`, so same-thread reentry will not deadlock, but
+        can still produce surprising nested-mutation ordering. Prefer a
+        plain `get()`/`get_or_diagnose()` read inside `fn` instead.
+        """
+
+        with self._lock:
+            return fn()
 
     def save(self, record: BatchRecord) -> BatchRecord:
         with self._lock:
