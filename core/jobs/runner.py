@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from enum import Enum
 import logging
 from threading import Event
 import time
@@ -39,6 +40,19 @@ _RUNNING_PROGRESS_START = 0.1
 _RUNNING_PROGRESS_SPAN = 0.8
 
 logger = logging.getLogger(__name__)
+
+
+class _QuarantineOutcome(Enum):
+    """Result of a `JobRunner._quarantine_poison_job()` attempt.
+
+    A plain bool would conflate two different reasons a caller must NOT
+    requeue (already settled, one way or another) with the one reason it
+    MUST (the quarantine write itself failed) -- see `run_once()`.
+    """
+
+    QUARANTINED = "quarantined"
+    ALREADY_RESOLVED = "already_resolved"
+    WRITE_FAILED = "write_failed"
 
 
 class JobRunner:
@@ -100,12 +114,35 @@ class JobRunner:
                 # the exact same bytes fail identically every time, so this
                 # would starve every other job behind it in this lane and
                 # log without bound. Quarantine instead of requeuing.
-                self._quarantine_poison_job(job_id, exc)
+                outcome = self._quarantine_poison_job(job_id, exc)
+                if outcome is _QuarantineOutcome.WRITE_FAILED:
+                    # Second Codex round: the quarantine *write* itself can
+                    # fail transiently (e.g. a SQLite lock/busy/I-O error --
+                    # unrelated to the row's content). Swallowing that would
+                    # recreate exactly the "durable queued row with no queue
+                    # entry" condition this whole fix exists to prevent, so
+                    # fall through to the same transient requeue path used
+                    # below for every other pre-claim failure.
+                    self.job_queue.enqueue(job_id, lane=lane)
+                    logger.error(
+                        "Job %s is permanently unprocessable (%s) but its "
+                        "quarantine write failed transiently; requeued so "
+                        "it is not lost.",
+                        job_id,
+                        type(exc).__name__,
+                    )
+                    raise
+                # QUARANTINED (queued -> failed committed) or
+                # ALREADY_RESOLVED (something else moved the row off
+                # `queued` before the quarantine CAS ran) both mean this job
+                # id must not be requeued -- it is settled, one way or
+                # another.
                 logger.error(
                     "Job %s has a permanent pre-claim failure (%s) and will "
-                    "not be retried.",
+                    "not be retried (%s).",
                     job_id,
                     type(exc).__name__,
+                    outcome.value,
                 )
                 raise
             # Transient (a SQLite operational/locking/I-O error carries no
@@ -125,14 +162,20 @@ class JobRunner:
         """Classify a pre-claim failure as permanent (never retry) vs. transient.
 
         The only two realistic sources of a pre-claim exception are
-        `JobRepository.get()` (its own `json.loads`, or
-        `GenerationRequest`/`GenerationResult.model_validate`) and
-        `transition_if_status()`'s raw SQL execution. The first two only
-        ever fail because of the row's *own persisted content* -- old
-        schema, corrupted bytes -- and both raise a `ValueError` subclass
-        (`json.JSONDecodeError`, `pydantic.ValidationError`); the exact same
-        bytes will fail identically on every future read, so requeuing is
-        pure worker starvation with no chance of ever succeeding.
+        `JobRepository.get()` and `transition_if_status()`'s raw SQL
+        execution. `get()` normalizes every failure that can only be caused
+        by *this row's own persisted content* -- malformed JSON, a schema
+        the current models no longer accept, JSON nested deep enough to
+        overflow the decoder's C stack -- into one
+        `JobPayloadDecodeError` (see `JobRepository._row_to_record`); the
+        exact same bytes will fail identically on every future read, so
+        requeuing is pure worker starvation with no chance of ever
+        succeeding. Classifying on that one boundary type, rather than on
+        `ValueError` directly, is deliberate: a `RecursionError` (not a
+        `ValueError`) is one of the payload-content failures `get()` already
+        normalizes, and this must never accidentally widen to catch an
+        unrelated `ValueError`/`RuntimeError` a future change might raise
+        for a completely different, non-content reason.
         `transition_if_status()` never touches request/result content at
         all (a plain parameterized `UPDATE`), so a failure there is an
         execution-level problem -- typically `sqlite3.Error` (locked, busy,
@@ -140,10 +183,29 @@ class JobRunner:
         the case retrying is *for*.
         """
 
-        return isinstance(exc, ValueError)
+        # Deferred import: core/jobs/* deliberately avoids a top-level
+        # runtime import of core.storage.repositories.job_repository
+        # elsewhere in this module and in service.py (see their
+        # TYPE_CHECKING-only imports of JobRepository) to keep this
+        # package's import graph one-directional; this is only needed at
+        # call time, well after both modules have finished loading.
+        from core.storage.repositories.job_repository import JobPayloadDecodeError
 
-    def _quarantine_poison_job(self, job_id: str, exc: BaseException) -> None:
+        return isinstance(exc, JobPayloadDecodeError)
+
+    def _quarantine_poison_job(
+        self, job_id: str, exc: BaseException
+    ) -> _QuarantineOutcome:
         """Best-effort terminal resolution for a job that can never be retried.
+
+        Returns the outcome instead of swallowing it, so the caller can
+        tell a genuinely-settled poison job (quarantined, or already
+        resolved by something else) apart from a quarantine *write* that
+        itself failed -- the latter must still be requeued by the caller,
+        or this best-effort step would recreate the exact "durable queued
+        row with no queue entry" condition this whole fix exists to prevent
+        (Codex exact-HEAD review: the prior version of this method
+        unconditionally swallowed that exception here).
 
         Uses `transition_if_status()` -- the CAS primitive that deliberately
         never rereads the row after its UPDATE commits -- rather than
@@ -152,9 +214,7 @@ class JobRunner:
         (including `mark_failed()`'s own trailing reread) raise identically.
         A job only ever reaches here still `queued` (see `process_job`'s own
         pre-claim status checks), so `queued -> failed` is the only expected
-        source transition. Failure to even do this is swallowed: it must
-        never itself become a new way to strand the consumer loop, and the
-        job is not requeued either way -- see the caller.
+        source transition.
         """
 
         try:
@@ -166,21 +226,23 @@ class JobRunner:
             )
         except Exception:
             logger.exception(
-                "Could not quarantine poison job %s; it will not be "
-                "retried, but its persisted status could not be updated.",
+                "Could not quarantine poison job %s; its quarantine write "
+                "itself failed.",
                 job_id,
             )
-            return
-        if quarantined:
-            self._publish(
-                "job_failed",
-                {
-                    "job_id": job_id,
-                    "status": JOB_STATUS_FAILED,
-                    "progress": 1.0,
-                    "error_message": str(exc),
-                },
-            )
+            return _QuarantineOutcome.WRITE_FAILED
+        if not quarantined:
+            return _QuarantineOutcome.ALREADY_RESOLVED
+        self._publish(
+            "job_failed",
+            {
+                "job_id": job_id,
+                "status": JOB_STATUS_FAILED,
+                "progress": 1.0,
+                "error_message": str(exc),
+            },
+        )
+        return _QuarantineOutcome.QUARANTINED
 
     def run_forever(
         self,

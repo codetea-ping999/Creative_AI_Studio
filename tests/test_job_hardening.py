@@ -12,7 +12,7 @@ from core.jobs import CancellationRegistry, EventBus, JobQueue, JobRunner, JobSe
 from core.jobs.schemas import JobRecord
 from core.jobs.statuses import JOB_STATUSES, is_valid_transition
 from core.schemas import GenerationRequest, GenerationResult
-from core.storage.repositories.job_repository import JobRepository
+from core.storage.repositories.job_repository import JobPayloadDecodeError, JobRepository
 from generators.base import BaseGenerator
 from generators.registry import GeneratorRegistry
 
@@ -681,10 +681,11 @@ def test_permanent_pre_claim_failure_does_not_retry_forever_and_lets_the_next_jo
         "SELECT status FROM jobs WHERE id = ?", (poison.id,)
     ).fetchone()[0]
     assert raw_status == "failed"
-    # repository.get() on the poison row still raises identically -- proves
-    # the quarantine path never attempted (or depended on) reading the
-    # corrupted payload back.
-    with pytest.raises(json.JSONDecodeError):
+    # repository.get() on the poison row still raises identically (now
+    # normalized to JobPayloadDecodeError -- see the Codex follow-up round
+    # below) -- proves the quarantine path never attempted (or depended on)
+    # reading the corrupted payload back.
+    with pytest.raises(JobPayloadDecodeError):
         repository.get(poison.id)
 
     assert repository.get(healthy.id).status == "succeeded"
@@ -717,7 +718,7 @@ def test_permanent_pre_claim_failure_does_not_requeue_and_other_lanes_are_unaffe
     queue.enqueue(other_lane_job.id, lane="heavy")
     runner = JobRunner(repository, queue, GeneratorRegistry({"image": FakeGenerator()}))
 
-    with pytest.raises(json.JSONDecodeError):
+    with pytest.raises(JobPayloadDecodeError):
         runner.run_once(lane="light")
 
     assert queue.size(lane="light") == 0, "poison job must not be requeued"
@@ -726,3 +727,175 @@ def test_permanent_pre_claim_failure_does_not_requeue_and_other_lanes_are_unaffe
     result = runner.run_once(lane="heavy")
     assert result is not None
     assert result.status == "succeeded"
+
+
+def _corrupt_request_json(db_path, job_id: str, broken_payload: str) -> None:
+    with sqlite3.connect(db_path) as raw_connection:
+        raw_connection.execute(
+            "UPDATE jobs SET request_json = ? WHERE id = ?",
+            (broken_payload, job_id),
+        )
+        raw_connection.commit()
+
+
+def _raw_status(db_path, job_id: str) -> str:
+    return sqlite3.connect(db_path).execute(
+        "SELECT status FROM jobs WHERE id = ?", (job_id,)
+    ).fetchone()[0]
+
+
+# --- Second Codex exact-HEAD review round, on 5e7e9465: two further ------
+# pre-claim edge cases in the classify-and-quarantine fix above.
+
+
+def test_recursion_error_from_deeply_nested_json_is_treated_as_permanent(tmp_path):
+    """Finding 3: a RecursionError from json.loads() is a permanent, not a
+    transient, pre-claim failure -- the prior isinstance(exc, ValueError)
+    classifier missed it (RecursionError subclasses RuntimeError, not
+    ValueError), so it fell through to the transient branch and would have
+    been requeued forever. Reproduced via the real code path: a genuinely
+    deep JSON array, through the actual json.loads() call inside
+    JobRepository._row_to_record() -- not a monkeypatched substitute.
+    """
+
+    db_path = tmp_path / "jobs.db"
+    repository = JobRepository(db_path)
+    queue = JobQueue()
+    stopped = Event()
+    generator = FakeGenerator(lambda _context: stopped.set())
+    poison = seed_job(repository, job_id="job_poison")
+    healthy = seed_job(repository, job_id="job_healthy")
+
+    # Deep enough to overflow the C json decoder's own stack guard --
+    # verified to raise RecursionError cleanly (no interpreter crash) in
+    # well under a second; sys.getrecursionlimit() is irrelevant here since
+    # the C accelerator's stack usage, not Python frame count, trips first.
+    depth = 2_000_000
+    _corrupt_request_json(db_path, poison.id, "[" * depth + "]" * depth)
+
+    with pytest.raises(RecursionError):
+        json.loads("[" * depth + "]" * depth)  # confirms the premise directly
+    with pytest.raises(JobPayloadDecodeError):
+        repository.get(poison.id)
+
+    queue.enqueue(poison.id)
+    queue.enqueue(healthy.id)
+    runner = JobRunner(repository, queue, GeneratorRegistry({"image": generator}))
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            runner.run_forever, stop_event=stopped, poll_interval_seconds=0.01
+        )
+        try:
+            processed = stopped.wait(5)
+        finally:
+            stopped.set()
+        future.result(timeout=5)
+        assert processed, "job_healthy was never processed"
+
+    assert queue.size() == 0, "the poison job must not still be queued for retry"
+    assert generator.calls == 1
+    assert _raw_status(db_path, poison.id) == "failed"
+    assert repository.get(healthy.id).status == "succeeded"
+
+
+def test_transient_quarantine_write_failure_requeues_instead_of_losing_the_poison_job(
+    tmp_path, monkeypatch,
+):
+    """Finding 2: if the quarantine write itself hits a transient failure
+    (e.g. a SQLite lock), the poison job must be requeued rather than left
+    `queued` in the database with no queue entry -- exactly the lost-job
+    condition this whole fix exists to prevent. Once the quarantine write
+    is retried and succeeds, it must still converge to `failed`, and a
+    healthy job queued behind it must still be processed.
+    """
+
+    db_path = tmp_path / "jobs.db"
+    repository = JobRepository(db_path)
+    queue = JobQueue()
+    stopped = Event()
+    generator = FakeGenerator()
+    poison = seed_job(repository, job_id="job_poison")
+    healthy = seed_job(repository, job_id="job_healthy")
+    _corrupt_request_json(db_path, poison.id, "{not valid json")
+
+    queue.enqueue(poison.id)
+    queue.enqueue(healthy.id)
+    runner = JobRunner(repository, queue, GeneratorRegistry({"image": generator}))
+
+    original_transition = repository.transition_if_status
+    quarantine_attempts = {"count": 0}
+
+    def fail_first_quarantine_write(job_id, expected_statuses, **kwargs):
+        if job_id != poison.id or kwargs.get("status") != "failed":
+            return original_transition(job_id, expected_statuses, **kwargs)
+        quarantine_attempts["count"] += 1
+        if quarantine_attempts["count"] == 1:
+            raise sqlite3.OperationalError(
+                "injected transient quarantine write failure"
+            )
+        result = original_transition(job_id, expected_statuses, **kwargs)
+        # This is the second (successful) quarantine attempt. By
+        # construction it can only run after job_healthy -- queued behind
+        # the poison job's first, requeued-to-tail attempt -- has already
+        # been processed, since run_forever() is strictly sequential.
+        stopped.set()
+        return result
+
+    monkeypatch.setattr(repository, "transition_if_status", fail_first_quarantine_write)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            runner.run_forever, stop_event=stopped, poll_interval_seconds=0.01
+        )
+        try:
+            converged = stopped.wait(5)
+        finally:
+            stopped.set()
+        future.result(timeout=5)
+        assert converged, (
+            "the poison job's quarantine was never retried to a successful "
+            "conclusion -- it was likely lost after the first write failure"
+        )
+
+    assert quarantine_attempts["count"] == 2
+    assert queue.size() == 0
+    assert _raw_status(db_path, poison.id) == "failed"
+    assert repository.get(healthy.id).status == "succeeded"
+
+
+def test_quarantine_write_failure_requeues_into_the_same_lane(tmp_path, monkeypatch):
+    """Finding 2, multi-lane: a quarantine write failure's requeue must
+    follow the same "exact lane it came from" contract as any other
+    transient pre-claim failure, and must not touch a different lane's job.
+    The row must remain genuinely `queued` (not silently marked `failed`)
+    since the quarantine write never actually committed.
+    """
+
+    db_path = tmp_path / "jobs.db"
+    repository = JobRepository(db_path)
+    queue = JobQueue(lanes=("heavy", "light"))
+    poison = seed_job(repository, job_id="job_poison")
+    other_lane_job = seed_job(repository, job_id="job_other_lane")
+    _corrupt_request_json(db_path, poison.id, "{not valid json")
+
+    queue.enqueue(poison.id, lane="light")
+    queue.enqueue(other_lane_job.id, lane="heavy")
+    runner = JobRunner(repository, queue, GeneratorRegistry({"image": FakeGenerator()}))
+
+    def always_fail_quarantine_write(job_id, expected_statuses, **kwargs):
+        raise sqlite3.OperationalError("injected transient quarantine write failure")
+
+    monkeypatch.setattr(repository, "transition_if_status", always_fail_quarantine_write)
+
+    with pytest.raises(JobPayloadDecodeError):
+        runner.run_once(lane="light")
+
+    assert queue.size(lane="light") == 1, (
+        "must be requeued into its own lane, not lost, when the quarantine "
+        "write itself fails"
+    )
+    assert queue.size(lane="heavy") == 1, "the other lane must be untouched"
+    assert _raw_status(db_path, poison.id) == "queued", (
+        "the row must remain queued -- the quarantine write never committed"
+    )

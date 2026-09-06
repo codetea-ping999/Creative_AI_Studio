@@ -16,6 +16,22 @@ from core.schemas import GenerationRequest, GenerationResult, GenerationStatus
 _UNSET = object()
 
 
+class JobPayloadDecodeError(Exception):
+    """A job row's persisted request/result payload could not be restored.
+
+    Raised by `_row_to_record()` when the row's own stored bytes -- not the
+    read operation itself -- are the problem: malformed JSON
+    (`json.JSONDecodeError`), a schema the current `GenerationRequest`/
+    `GenerationResult` models no longer accept (`pydantic.ValidationError`),
+    or JSON nested deep enough to overflow the decoder's C stack
+    (`RecursionError`). Deliberately distinct from a `sqlite3.Error`: the
+    same persisted bytes will fail identically on every future read of this
+    row, so a caller (see `core.jobs.runner.JobRunner`) can use this type,
+    specifically, to tell "retrying can never help" apart from "the
+    database itself had a transient problem."
+    """
+
+
 class JobRepository:
     """Persist and retrieve job records from SQLite."""
 
@@ -348,14 +364,30 @@ class JobRepository:
             yield connection
 
     def _row_to_record(self, row: sqlite3.Row) -> JobRecord:
-        request_payload = self._deserialize_payload(row["request_json"]) or {}
-        result_payload = self._deserialize_payload(row["result_json"])
-        request = GenerationRequest.model_validate(request_payload)
-        result = (
-            GenerationResult.model_validate(result_payload)
-            if result_payload is not None
-            else None
-        )
+        try:
+            request_payload = self._deserialize_payload(row["request_json"]) or {}
+            result_payload = self._deserialize_payload(row["result_json"])
+            request = GenerationRequest.model_validate(request_payload)
+            result = (
+                GenerationResult.model_validate(result_payload)
+                if result_payload is not None
+                else None
+            )
+        except (ValueError, RecursionError) as exc:
+            # ValueError covers json.JSONDecodeError and
+            # pydantic.ValidationError; RecursionError covers JSON nested
+            # deep enough to overflow the decoder's C stack. All three can
+            # only be caused by this row's own persisted bytes -- never by
+            # the read operation itself -- so they are normalized into one
+            # boundary type a caller can classify as "never retry" without
+            # having to know which underlying library raised it. Deliberately
+            # scoped to just these two types: a `sqlite3.Error` (or any other
+            # exception) must keep propagating unchanged, since it says
+            # nothing about this row's content.
+            raise JobPayloadDecodeError(
+                f"Job {row['id']!r}'s persisted request/result payload could "
+                f"not be deserialized or validated: {exc}"
+            ) from exc
         return JobRecord(
             id=row["id"],
             project_id=row["project_id"],
