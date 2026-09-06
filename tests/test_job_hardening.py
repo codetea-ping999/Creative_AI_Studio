@@ -423,3 +423,187 @@ def test_recovery_classification_is_pure(tmp_path, status, expected):
     assert classify_job(job) == expected
     assert job.model_dump_json() == before
     assert repository.get(job.id) == job
+
+
+# --- Post-#395 audit: P1/P2 lifecycle-gap regressions --------------------
+#
+# Found by an exact-HEAD adversarial audit of the merged #395 job-lifecycle
+# hardening. Both gaps sit *after* execution ownership is already
+# established -- the `claimed` boundary #395 introduced is correct and is
+# deliberately not touched here.
+
+
+def test_cancel_winning_after_postprocessing_resolves_to_a_terminal_state(
+    tmp_path, monkeypatch,
+):
+    """P1: cancel_requested must never survive a lost mark_succeeded() CAS.
+
+    Reproduces, deterministically: generation finishes -> running ->
+    postprocessing commits -> a cancel lands in that exact instant
+    (postprocessing -> cancel_requested) -> mark_succeeded()'s CAS (which
+    only ever commits from postprocessing) loses. Before the fix,
+    process_job() returned mark_succeeded()'s stale cancel_requested read
+    as-is and the `finally` block tore down cancellation ownership, leaving
+    the job non-terminal with no owner left to ever resolve it. The
+    contract (statuses.py: cancel_requested -> cancelled|failed, never back
+    to active, never succeeded) requires this to land on a terminal state.
+    """
+
+    repository = JobRepository(tmp_path / "jobs.db")
+    queue = JobQueue()
+    cancellation = CancellationRegistry()
+    service = JobService(repository, queue, cancellation_registry=cancellation)
+    job = seed_job(repository)
+    queue.enqueue(job.id)
+    generator = FakeGenerator()
+    runner = JobRunner(
+        repository, queue, GeneratorRegistry({"image": generator}),
+        job_service=service, cancellation_registry=cancellation,
+    )
+
+    original_update_if_status = repository.update_if_status
+
+    def race_cancel_the_instant_postprocessing_commits(job_id, expected_statuses, **kwargs):
+        result = original_update_if_status(job_id, expected_statuses, **kwargs)
+        # Target only the runner's own running -> postprocessing transition
+        # (see JobRunner._update_status) so mark_succeeded()'s own
+        # postprocessing -> succeeded CAS just below is left untouched.
+        if (
+            result is not None
+            and kwargs.get("status") == "postprocessing"
+            and expected_statuses == ("running",)
+        ):
+            assert service.cancel_job(job_id).status == "cancel_requested"
+        return result
+
+    monkeypatch.setattr(
+        repository, "update_if_status", race_cancel_the_instant_postprocessing_commits
+    )
+
+    result = runner.run_once()
+
+    assert result is not None
+    assert result.status == "cancelled"
+    assert repository.get(job.id).status == "cancelled"
+    assert generator.calls == 1
+    # Ownership must actually be released -- not just the return value.
+    assert not cancellation.is_cancelled(job.id)
+
+
+def test_pre_claim_repository_read_failure_under_run_forever_does_not_lose_the_job(
+    tmp_path, monkeypatch,
+):
+    """P2 (Case B): a pre-claim `repository.get()` failure must not orphan
+    the durable `queued` row once `job_queue.dequeue()` has already popped
+    it out of the in-memory queue.
+    """
+
+    repository = JobRepository(tmp_path / "jobs.db")
+    queue = JobQueue()
+    stopped = Event()
+    generator = FakeGenerator(lambda _context: stopped.set())
+    job = seed_job(repository, job_id="job_a")
+    queue.enqueue(job.id)
+    runner = JobRunner(repository, queue, GeneratorRegistry({"image": generator}))
+
+    original_get = repository.get
+    reads = {"count": 0}
+
+    def fail_first_pre_claim_read(job_id):
+        if job_id == job.id:
+            reads["count"] += 1
+            if reads["count"] == 1:
+                raise sqlite3.OperationalError("injected pre-claim read failure")
+        return original_get(job_id)
+
+    monkeypatch.setattr(repository, "get", fail_first_pre_claim_read)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            runner.run_forever, stop_event=stopped, poll_interval_seconds=0.01
+        )
+        try:
+            processed = stopped.wait(5)
+        finally:
+            # Stop the loop regardless of outcome -- otherwise a failed
+            # assertion below leaves `run_forever` spinning forever and the
+            # executor's own context-manager shutdown (which joins it)
+            # hangs the test run instead of reporting the failure.
+            stopped.set()
+        future.result(timeout=5)
+        assert processed, "job_a was lost instead of being redelivered"
+
+    assert repository.get(job.id).status == "succeeded"
+    assert generator.calls == 1
+
+
+def test_pre_commit_cas_failure_under_run_forever_does_not_lose_the_job(
+    tmp_path, monkeypatch,
+):
+    """P2 (Case C): a pre-commit `transition_if_status()` failure under
+    `run_forever` must not leave a `queued` row with no queue entry left to
+    ever redeliver it. `test_claim_cas_failure_is_not_resolved_as_owned_job`
+    above proves the single `run_once()` call raises and leaves the row
+    `queued`; this proves the *loop* actually recovers the job rather than
+    silently losing it forever.
+    """
+
+    repository = JobRepository(tmp_path / "jobs.db")
+    queue = JobQueue()
+    stopped = Event()
+    generator = FakeGenerator(lambda _context: stopped.set())
+    job = seed_job(repository, job_id="job_a")
+    queue.enqueue(job.id)
+    runner = JobRunner(repository, queue, GeneratorRegistry({"image": generator}))
+
+    original_transition = repository.transition_if_status
+    attempts = {"count": 0}
+
+    def fail_first_claim_commit(job_id, expected_statuses, **kwargs):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise sqlite3.OperationalError("injected pre-commit CAS failure")
+        return original_transition(job_id, expected_statuses, **kwargs)
+
+    monkeypatch.setattr(repository, "transition_if_status", fail_first_claim_commit)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            runner.run_forever, stop_event=stopped, poll_interval_seconds=0.01
+        )
+        try:
+            processed = stopped.wait(5)
+        finally:
+            stopped.set()
+        future.result(timeout=5)
+        assert processed, "job_a was lost instead of being redelivered"
+
+    assert repository.get(job.id).status == "succeeded"
+    assert generator.calls == 1
+
+
+def test_pre_claim_failure_requeues_into_the_same_lane_not_lost_or_misrouted(
+    tmp_path, monkeypatch,
+):
+    """A pre-claim failure's requeue must preserve original lane semantics:
+    it must land back in the exact lane it was dequeued from, not the
+    default/first lane, and the durable row must stay untouched (`queued`).
+    """
+
+    db_path = tmp_path / "jobs.db"
+    repository = JobRepository(db_path)
+    queue = JobQueue(lanes=("heavy", "light"))
+    job = seed_job(repository, job_id="job_a")
+    queue.enqueue(job.id, lane="light")
+    runner = JobRunner(repository, queue, GeneratorRegistry({"image": FakeGenerator()}))
+
+    def fail_read(job_id):
+        raise sqlite3.OperationalError("injected pre-claim read failure")
+
+    monkeypatch.setattr(repository, "get", fail_read)
+    with pytest.raises(sqlite3.OperationalError):
+        runner.run_once(lane="light")
+
+    assert queue.size(lane="light") == 1
+    assert queue.size(lane="heavy") == 0
+    assert JobRepository(db_path).get(job.id).status == "queued"

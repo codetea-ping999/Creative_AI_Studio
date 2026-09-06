@@ -83,9 +83,23 @@ class JobRunner:
         try:
             return self.process_job(job_id)
         except Exception:
-            # The queue item is already consumed; record the precise job at
-            # the processing boundary and leave retry policy to a later layer.
-            logger.exception("Job %s processing failed.", job_id)
+            # process_job() only ever re-raises here for a failure that
+            # happened *before* this worker won the execution claim -- its
+            # own except clause resolves every failure after that claim to a
+            # terminal/observable job state via _resolve_claim_failure and
+            # never re-raises (see the `claimed` guard there). A pre-claim
+            # failure never touched ownership, but dequeue() above has
+            # already popped this job id out of the in-memory queue; without
+            # putting it back here, a perfectly healthy `queued` row would
+            # have nothing left to ever redeliver it (post-#395 audit, P2).
+            # Requeue into the exact lane it came from -- not the default
+            # lane -- so this holds for a future multi-lane configuration
+            # too, not just today's single implicit lane.
+            self.job_queue.enqueue(job_id, lane=lane)
+            logger.exception(
+                "Job %s failed before execution claim; requeued for redelivery.",
+                job_id,
+            )
             raise
 
     def run_forever(
@@ -203,7 +217,25 @@ class JobRunner:
                 return self._finalize_cancellation(job_id)
             if self._update_status(job_id, JOB_STATUS_POSTPROCESSING, progress=0.9) is None:
                 return self._finalize_cancellation(job_id)
-            return self.job_service.mark_succeeded(job_id, result)
+            completion = self.job_service.mark_succeeded(job_id, result)
+            if completion is not None and completion.status == JOB_STATUS_CANCEL_REQUESTED:
+                # mark_succeeded()'s CAS only ever commits from postprocessing
+                # (see _SUCCEEDABLE_JOB_STATUSES), so losing it while this
+                # worker still holds execution ownership means a cancel won
+                # the race in the instant between the postprocessing
+                # transition above and this call -- the only other edge out
+                # of postprocessing (statuses.py's ALLOWED_TRANSITIONS). That
+                # cancellation is authoritative, but nothing else will ever
+                # resolve cancel_requested to a terminal state once this
+                # worker's `finally` below tears down its cancellation
+                # registration and gives up ownership. As the owner of
+                # record for this race, this worker -- not
+                # JobService.mark_succeeded()'s general contract, which stays
+                # a no-op for every other CAS-miss reason -- is responsible
+                # for finalizing it here, exactly like every other
+                # cancellation checkpoint in this method.
+                return self._finalize_cancellation(job_id)
+            return completion
         except Exception as exc:
             if not claimed:
                 raise
