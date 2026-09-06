@@ -49,6 +49,24 @@ class BatchRepository:
             return None
         return self._try_load(batch_file)
 
+    def get_or_diagnose(self, batch_id: str) -> tuple[BatchRecord | None, bool]:
+        """Like `get()`, but tells confirmed absence apart from unreadable.
+
+        Returns `(record, uncertain)`. `uncertain=True` means the file
+        exists but could not be read right now (a transient `OSError`) --
+        `record is None` in that case must not be read as "this batch was
+        deleted." A single-file counterpart to `list_all_tolerant()` /
+        `find_by_job_id_or_diagnose()`, for a caller (`BatchService.
+        reconcile_child_job()`) that already knows the exact id it cares
+        about and does not need a full directory scan to find it (PR3
+        exact-HEAD audit, second round, P1-2).
+        """
+
+        batch_file = self.batch_dir / f"{batch_id}.json"
+        if not batch_file.exists():
+            return None, False
+        return self._try_load_diagnosed(batch_file)
+
     def save(self, record: BatchRecord) -> BatchRecord:
         with self._lock:
             updated = record.model_copy(update={"updated_at": utc_now()})

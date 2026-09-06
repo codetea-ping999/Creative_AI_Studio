@@ -249,6 +249,72 @@ def test_candidate_selection_picks_the_newest_when_none_applied_yet(tmp_path):
     assert bound.scenes[0].asset_ids.get("visual") == newer_asset.id
 
 
+# --- PR3 exact-HEAD audit, second round, P2-1: exclude outputless jobs
+# from replay winner selection -----------------------------------------------
+
+
+def test_outputless_candidate_never_wins_over_a_usable_older_one(tmp_path):
+    job_repository, asset_repository, story_repository, scene_binder, converger = _build(tmp_path)
+    story = _create_bound_story(story_repository)
+    scene_id = story.scenes[0].id
+    params = scene_binding_params(story.id, scene_id, "visual")
+
+    older_usable = _seed_succeeded_job(
+        job_repository, "job_older", created_at=datetime.now(timezone.utc) - timedelta(hours=1),
+        params=params, outputs=("older.png",),
+    )
+    newer_outputless = _seed_succeeded_job(
+        job_repository, "job_newer", created_at=datetime.now(timezone.utc),
+        params=params, outputs=(),
+    )
+
+    # Converge the outputless (but chronologically newer) one first -- it
+    # can never produce an Asset, so it stays retryable on its own; this is
+    # unrelated to the bug and unaffected by the fix.
+    assert converger.converge_job(newer_outputless.id) == CompletionOutcome.RETRYABLE_FAILURE
+
+    # The usable older candidate must still win the role -- not lose a
+    # "newest wins" race to a candidate that can never actually fill it.
+    outcome_older = converger.converge_job(older_usable.id)
+    assert outcome_older == CompletionOutcome.DONE
+
+    bound = story_repository.get(story.id)
+    older_asset = asset_repository.get_primary_by_job(older_usable.id)
+    assert older_asset is not None
+    assert bound.scenes[0].asset_ids.get("visual") == older_asset.id
+
+    # Converging the outputless one again must not disturb the binding --
+    # the role-already-resolved check now finds it resolved.
+    assert converger.converge_job(newer_outputless.id) == CompletionOutcome.DONE
+    bound_after = story_repository.get(story.id)
+    assert bound_after.scenes[0].asset_ids.get("visual") == older_asset.id
+
+
+def test_outputless_candidate_never_wins_regardless_of_processing_order(tmp_path):
+    job_repository, asset_repository, story_repository, scene_binder, converger = _build(tmp_path)
+    story = _create_bound_story(story_repository)
+    scene_id = story.scenes[0].id
+    params = scene_binding_params(story.id, scene_id, "visual")
+
+    older_usable = _seed_succeeded_job(
+        job_repository, "job_older", created_at=datetime.now(timezone.utc) - timedelta(hours=1),
+        params=params, outputs=("older.png",),
+    )
+    newer_outputless = _seed_succeeded_job(
+        job_repository, "job_newer", created_at=datetime.now(timezone.utc),
+        params=params, outputs=(),
+    )
+
+    # Converge the usable OLDER one first this time -- the outputless newer
+    # sibling must still never have been considered a viable winner.
+    assert converger.converge_job(older_usable.id) == CompletionOutcome.DONE
+    assert converger.converge_job(newer_outputless.id) == CompletionOutcome.DONE
+
+    bound = story_repository.get(story.id)
+    older_asset = asset_repository.get_primary_by_job(older_usable.id)
+    assert bound.scenes[0].asset_ids.get("visual") == older_asset.id
+
+
 # --- Case 14: EventBus subscriber failure != completion done --------------
 
 
@@ -536,3 +602,84 @@ def test_no_parent_batch_still_converges_to_done(tmp_path):
 
     assert outcome == CompletionOutcome.DONE
     assert job_repository.get(job.id).completion_state == "done"
+
+
+# --- PR3 exact-HEAD audit, second round, P1-2: propagate failures from the
+# stage-enqueue phase --------------------------------------------------------
+
+
+def test_transient_stage_enqueue_failure_keeps_completion_pending_not_done(
+    tmp_path, monkeypatch
+):
+    """The stage *advance* itself can persist successfully while the
+    subsequent `_enqueue_stage()` call -- materializing the new stage's
+    children -- fails on its own transient read. `reconcile_child_job()`
+    must not report `RECONCILED` (and thus let completion be marked done)
+    just because the advance half succeeded.
+    """
+
+    from core.batches import BatchRepository, BatchService
+    from core.batches.schemas import BatchSpec
+    from core.jobs import JobQueue, JobService
+
+    job_repository = JobRepository(tmp_path / "jobs.db")
+    asset_repository = AssetRepository(tmp_path / "assets")
+    batch_repository = BatchRepository(tmp_path / "batches")
+    job_service = JobService(job_repository, JobQueue())
+    batch_service = BatchService(batch_repository, job_service, job_repository)
+    converger = CompletionConverger(job_repository, asset_repository, batch_service=batch_service)
+
+    batch = batch_service.create_batch(
+        BatchSpec(
+            name="two-stage", media_type="image", model_id="fake", prompt="x", limit=1,
+            stages=[{"name": "probe"}, {"name": "refine"}],
+        )
+    )
+    job_id = batch.items[0].job_id
+    job_repository.update_status(job_id, "preparing")
+    job_repository.update_status(job_id, "running")
+    job_repository.update_status(job_id, "postprocessing")
+    job_repository.update(
+        job_id, status="succeeded", progress=1.0,
+        result=GenerationResult(job_id=job_id, status="succeeded", outputs=["a.png"]),
+    )
+
+    # Injected transient OSError, surgically scoped: _try_load() backs
+    # _enqueue_stage()'s own `mutate()` call (get() -> _try_load()), while
+    # the stage-advance step uses the separate `_try_load_diagnosed()` path
+    # (via `mutate_by_job_id_diagnosed()` -> `list_all_tolerant()`) and is
+    # left untouched -- so the advance genuinely persists and only the
+    # *following* stage-materialization read fails.
+    original_try_load = batch_repository._try_load
+
+    def flaky_try_load(batch_file):
+        if batch_file.stem == batch.id:
+            return None  # what _try_load() returns after catching an OSError
+        return original_try_load(batch_file)
+
+    monkeypatch.setattr(batch_repository, "_try_load", flaky_try_load)
+
+    outcome = converger.converge_job(job_id)
+
+    assert outcome == CompletionOutcome.RETRYABLE_FAILURE
+    after = job_repository.get(job_id)
+    assert after.completion_state == "pending"
+    assert after.completion_error is not None
+
+    # Confirm the advance really did persist despite the injected failure --
+    # a direct (untouched-path) read shows the new stage exists with its
+    # child not yet materialized.
+    monkeypatch.undo()
+    advanced_only = batch_repository.get(batch.id)
+    assert advanced_only.stage_index == 1
+    refine_item = next(item for item in advanced_only.items if item.stage_index == 1)
+    assert refine_item.job_id is None
+
+    second = converger.converge_job(job_id)
+
+    assert second == CompletionOutcome.DONE
+    assert job_repository.get(job_id).completion_state == "done"
+    materialized = batch_repository.get(batch.id)
+    refine_item_after = next(item for item in materialized.items if item.stage_index == 1)
+    assert refine_item_after.job_id is not None
+    assert job_repository.get(refine_item_after.job_id) is not None

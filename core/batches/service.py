@@ -185,8 +185,29 @@ class BatchService:
             if record is None or record.cancellation_requested:
                 return record
             for item in record.items:
-                if item.stage_index == stage_index and item.job_id is None:
-                    item.job_id = f"job_{uuid4().hex}"
+                if item.stage_index != stage_index or item.job_id is not None:
+                    continue
+                if is_terminal_status(item.status):
+                    # A pre-PR3 ("legacy") batch record has no
+                    # `cancellation_requested` field on disk -- pydantic
+                    # defaults it to `False` on load, exactly like a batch
+                    # that was never cancelled at all. The old `cancel()`
+                    # implementation, which predates the durable-intent
+                    # flag, persisted a cancelled item as `job_id=None`,
+                    # `status="cancelled"` directly, with nothing else
+                    # recording that intent. Without this check, resuming
+                    # such a batch (`resume_current_stage_for_all_batches()`
+                    # at startup, or any other `_enqueue_stage()` call) would
+                    # see "no job_id" and mint a *brand new* id for an item
+                    # that was deliberately terminalized, silently
+                    # resurrecting a generation the operator already
+                    # cancelled (PR3 exact-HEAD audit, second round, P1-3).
+                    # A `job_id is None` item reaching a terminal status is
+                    # otherwise impossible going forward (this class's own
+                    # `cancel()`/`_recompute()` never do it), so this only
+                    # ever fires for genuinely legacy data.
+                    continue
+                item.job_id = f"job_{uuid4().hex}"
             return record
 
         record = self.batch_repository.mutate(batch_id, _assign_ids)
@@ -213,23 +234,33 @@ class BatchService:
             current = self.batch_repository.get(batch_id)
             if current is not None and current.cancellation_requested:
                 break
-            created = self.job_service.create_or_reuse_job(
+            # Materialize the row *without* enqueuing it yet (PR3 exact-HEAD
+            # audit, second round, P1-1): the combined create-and-enqueue
+            # call used here previously exposed a freshly-created job to a
+            # worker immediately, before the recheck below ever ran -- a
+            # durable cancellation landing in that exact window could still
+            # lose the race to a worker that had already claimed and begun
+            # generating. Nothing below can be observed by `JobRunner` until
+            # `enqueue_job()` is actually called, so this recheck runs
+            # against a row that is, by construction, still invisible to
+            # every worker.
+            created, was_created = self.job_service.create_or_reuse_job_without_enqueue(
                 item.job_id, item.request, project_id=record.spec.project_id
             )
-            # Closes the remaining window: cancellation_requested could have
-            # been persisted by a concurrent cancel() call *during* the
-            # create_or_reuse_job() call above -- after this loop's recheck
-            # committed to proceeding, but before the row above committed.
-            # cancel_job() is idempotent, so this is harmless even if
-            # cancel()'s own loop already reached (or will yet reach) this
-            # exact job itself.
             after_create = self.batch_repository.get(batch_id)
-            if (
-                after_create is not None
-                and after_create.cancellation_requested
-                and not is_terminal_status(created.status)
-            ):
-                self.job_service.cancel_job(created.id)
+            if after_create is not None and after_create.cancellation_requested:
+                # cancel_job() is idempotent, so this is harmless even if
+                # cancel()'s own loop already reached (or will yet reach)
+                # this exact job itself via a durably-persisted id with no
+                # row (see `cancel()`'s `_apply_cancellation_intent` below).
+                # Crucially: `enqueue_job()` is *never* called on this path,
+                # so no worker can ever have claimed this row in the first
+                # place -- there is nothing here for `cancel_job()` to race.
+                if not is_terminal_status(created.status):
+                    self.job_service.cancel_job(created.id)
+                continue
+            if was_created:
+                self.job_service.enqueue_job(created.id)
 
         return self.reconcile(batch_id)
 
@@ -272,6 +303,17 @@ class BatchService:
         check (PR3 exact-HEAD audit P1-5): a transient failure reading the
         owning Batch must be reported as ``RETRYABLE_FAILURE``, never
         conflated with the genuine ``NO_PARENT`` case.
+
+        The stage-advance mutation above can succeed (a new stage is
+        persisted) while the *following* ``_enqueue_stage()`` call --
+        materializing that new stage's children -- fails on its own
+        transient read (PR3 exact-HEAD audit, second round, P1-2): without
+        this final check, ``RECONCILED`` was returned unconditionally
+        whenever the advance itself persisted, even if ``_enqueue_stage()``
+        came back empty-handed. ``CompletionConverger`` treats
+        ``RECONCILED`` as "nothing left to retry" and marks the *job's*
+        completion done -- permanently excluding it from every future
+        retry despite the batch's new stage never having been created.
         """
 
         refreshed, uncertain = self.batch_repository.mutate_by_job_id_diagnosed(
@@ -282,6 +324,20 @@ class BatchService:
                 return None, BatchReconciliationOutcome.RETRYABLE_FAILURE
             return None, BatchReconciliationOutcome.NO_PARENT
         enqueued = self._enqueue_stage(refreshed.id, stage_index=refreshed.stage_index)
+        if enqueued is None:
+            # _enqueue_stage() failed to confirm/materialize the (possibly
+            # just-advanced) stage. Positively confirm the batch is
+            # actually gone -- not merely unreadable this instant -- before
+            # ever reporting the non-retryable NO_PARENT outcome; anything
+            # else (still exists, or currently unreadable) must stay
+            # retryable, since the next stage may not have been
+            # materialized.
+            still_exists, still_uncertain = self.batch_repository.get_or_diagnose(
+                refreshed.id
+            )
+            if still_exists is None and not still_uncertain:
+                return None, BatchReconciliationOutcome.NO_PARENT
+            return None, BatchReconciliationOutcome.RETRYABLE_FAILURE
         return enqueued, BatchReconciliationOutcome.RECONCILED
 
     def _recompute(self, record: BatchRecord | None) -> BatchRecord | None:

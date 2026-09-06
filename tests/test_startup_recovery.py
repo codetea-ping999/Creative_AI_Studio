@@ -349,7 +349,7 @@ def test_startup_materializes_a_batch_child_row_that_was_never_created(tmp_path,
     def always_fail(*args, **kwargs):
         raise RuntimeError("injected: crash between id persist and row creation")
 
-    monkeypatch.setattr(services["job_service"], "create_or_reuse_job", always_fail)
+    monkeypatch.setattr(services["job_service"], "create_or_reuse_job_without_enqueue", always_fail)
     with pytest.raises(RuntimeError, match="injected"):
         batch_service.create_batch(
             BatchSpec(name="crashed", media_type="image", model_id="fake", prompt="x", limit=1)
@@ -383,7 +383,7 @@ def test_repeated_startup_recovery_never_duplicates_a_previously_uncreated_child
     def always_fail(*args, **kwargs):
         raise RuntimeError("injected: crash between id persist and row creation")
 
-    monkeypatch.setattr(services["job_service"], "create_or_reuse_job", always_fail)
+    monkeypatch.setattr(services["job_service"], "create_or_reuse_job_without_enqueue", always_fail)
     with pytest.raises(RuntimeError, match="injected"):
         batch_service.create_batch(
             BatchSpec(name="crashed", media_type="image", model_id="fake", prompt="x", limit=1)

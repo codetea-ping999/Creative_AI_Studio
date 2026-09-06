@@ -142,13 +142,52 @@ class JobService:
         resume by re-running this exact call rather than minting a new id
         and creating a duplicate job.
 
-        If `job_id` already exists, it is reused as-is (never re-enqueued;
-        `run_once()`/`run_forever()` can only ever act on the same id once,
-        and a restart's own queued-job recovery is what re-enqueues an
-        already-`queued` row after a process restart) -- but only if its
-        persisted `request` matches `request` exactly. A mismatch raises
-        rather than silently reusing a different job's content under an id
-        this caller expected to own.
+        Thin wrapper around `create_or_reuse_job_without_enqueue()` that
+        enqueues immediately on a fresh creation -- the ordinary contract
+        every caller other than `BatchService._enqueue_stage()` wants (see
+        that method's own two-step use of the split primitive for why it
+        needs the two halves kept apart).
+        """
+
+        created_job, was_created = self.create_or_reuse_job_without_enqueue(
+            job_id, request, project_id
+        )
+        if was_created:
+            self.enqueue_job(created_job.id)
+        return created_job
+
+    def create_or_reuse_job_without_enqueue(
+        self,
+        job_id: str,
+        request: GenerationRequest,
+        project_id: str | None = None,
+    ) -> tuple[JobRecord, bool]:
+        """Materialize `job_id`'s row, but never enqueue it -- see
+        `create_or_reuse_job()` for the create-or-reuse contract itself
+        (reuse validates `existing.request == request`, a mismatch raises).
+
+        For a caller that needs a strict happens-before ordering between
+        "the Job row exists" and "a worker can observe it" -- specifically,
+        `BatchService._enqueue_stage()`'s fresh cancellation recheck in
+        between (PR3 exact-HEAD audit, second round, P1-1): the combined
+        `create_or_reuse_job()` used to create *and* enqueue a fresh row in
+        one call, so a durable cancellation that landed in the exact window
+        between that call returning and the caller's own post-create
+        recheck could still race a worker that had already claimed the
+        now-enqueued job and begun generating -- `cancel_job()` on an
+        already-`preparing`/`running` job only requests cooperative
+        cancellation, it does not undo work already started. Splitting
+        "materialize" from "expose to a worker" closes that window: nothing
+        calls `JobQueue.enqueue()` until the caller has confirmed, on a
+        provably later read, that the batch is not durably cancelled.
+
+        Returns `(record, was_created)`. The caller owns calling
+        `enqueue_job(record.id)` itself when `was_created` is `True` and it
+        has confirmed the job should still run; on reuse
+        (`was_created=False`) the caller must not enqueue at all -- exactly
+        like `create_or_reuse_job()` -- since a restart's own queued-job
+        recovery is what re-enqueues an already-`queued`-but-never-enqueued
+        row.
 
         Two concurrent callers can both observe "no row for this id" from
         the check below and both fall through to insert it -- a terminal
@@ -160,8 +199,8 @@ class JobService:
         row) rather than both proceeding as if each had created the row: a
         naive `get()`-then-`create()` here would let the loser's `create()`
         raise an unhandled `sqlite3.IntegrityError`, or -- if that were
-        merely swallowed -- double-publish `"job_created"`/double-enqueue
-        the same id. Only the actual winner does either.
+        merely swallowed -- double-publish `"job_created"` for the same id.
+        Only the actual winner does either.
         """
 
         existing = self.job_repository.get(job_id)
@@ -172,7 +211,7 @@ class JobService:
                     "request; refusing to silently reuse it for a "
                     "mismatched request."
                 )
-            return existing
+            return existing, False
 
         self.validate_references(request, project_id)
         now = datetime.now(timezone.utc)
@@ -194,7 +233,7 @@ class JobService:
                     "request; refusing to silently reuse it for a "
                     "mismatched request."
                 )
-            return created_job
+            return created_job, False
         self._publish(
             "job_created",
             {
@@ -203,8 +242,7 @@ class JobService:
                 "media_type": created_job.media_type,
             },
         )
-        self.enqueue_job(created_job.id)
-        return created_job
+        return created_job, True
 
     def validate_references(
         self,

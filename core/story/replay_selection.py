@@ -143,6 +143,29 @@ def _succeeded_candidates_for_role(
     return candidates, has_unresolvable_poison_sibling
 
 
+def _has_usable_output(
+    candidate: "JobRecord", asset_repository: "AssetRepository"
+) -> bool:
+    """Whether `candidate` could ever actually fill the role it targets.
+
+    A succeeded job with no outputs at all (`result.outputs` empty, or no
+    `result`) will never produce a synced Asset -- `AssetRepository.
+    sync_job()` has nothing to sync. Letting such a job win a winner
+    selection (PR3 exact-HEAD audit, second round, P2-1) lets it "win" a
+    role it can never actually fill: the loser gives up permanently
+    (`converge_scene_binding()`'s own rule below never revisits a lost
+    race), while the winner stays `RETRYABLE` forever waiting for an Asset
+    that will never arrive -- the role never gets filled by anyone.
+    Checking the Asset repository first (not just `candidate.result`)
+    also covers a candidate whose Asset already exists from an earlier
+    sync, independent of what its `result` payload currently says.
+    """
+
+    if asset_repository.get_primary_by_job(candidate.id) is not None:
+        return True
+    return bool(candidate.result is not None and any(candidate.result.outputs))
+
+
 def _select_winner(candidates: list["JobRecord"]) -> "JobRecord":
     """Deterministically pick one candidate to actually attempt replay.
 
@@ -238,9 +261,17 @@ def converge_scene_binding(
             role,
         )
         return ReplayOutcome.UNRESOLVED
-    if not candidates:  # pragma: no cover - job itself always matches
-        candidates = [job]
-    winner = _select_winner(candidates)
+    usable_candidates = [
+        candidate for candidate in candidates
+        if _has_usable_output(candidate, asset_repository)
+    ]
+    if not usable_candidates:  # pragma: no cover - job itself always usable here
+        # `job` reached this point only after its own Asset was already
+        # confirmed to exist (see the check above), so it is always a
+        # usable candidate; this only fires if `job` itself were somehow
+        # missing from `candidates` entirely.
+        usable_candidates = [job]
+    winner = _select_winner(usable_candidates)
     if winner.id != job.id:
         # This job lost the race to a candidate that will (or already did)
         # bind the role -- nothing for this job to do; when the winner's

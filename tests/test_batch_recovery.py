@@ -9,15 +9,35 @@ matching `tests/test_story_concurrency.py`'s own established pattern for
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
+from threading import Barrier, Event, Thread
 
 import pytest
 
 from core.batches import BatchReconciliationOutcome, BatchRepository, BatchService
 from core.batches.schemas import BatchSpec
-from core.jobs import EventBus, JobQueue, JobService
+from core.jobs import EventBus, JobQueue, JobRunner, JobService
 from core.schemas import GenerationResult
 from core.storage.repositories.job_repository import JobRepository
+from generators.base import BaseGenerator
+from generators.registry import GeneratorRegistry
+
+
+class _CountingGenerator(BaseGenerator):
+    def __init__(self):
+        self.calls = 0
+
+    def validate_request(self, request):
+        pass
+
+    def prepare(self, request):
+        pass
+
+    def cleanup(self, request):
+        pass
+
+    def generate(self, request, context=None):
+        self.calls += 1
+        return GenerationResult(job_id="fake", status="succeeded", outputs=["a.png"])
 
 
 def _build(tmp_path):
@@ -28,6 +48,11 @@ def _build(tmp_path):
     batch_repository = BatchRepository(tmp_path / "batches")
     batch_service = BatchService(batch_repository, job_service, job_repository, event_bus=event_bus)
     return job_repository, job_queue, job_service, batch_repository, batch_service
+
+
+def _drain_queue(job_runner) -> None:
+    while job_runner.run_once() is not None:
+        pass
 
 
 def _spec(**overrides):
@@ -45,7 +70,7 @@ def test_child_job_id_is_persisted_even_when_job_creation_then_fails(tmp_path, m
     def always_fail(*args, **kwargs):
         raise RuntimeError("injected: job row creation never completes")
 
-    monkeypatch.setattr(job_service, "create_or_reuse_job", always_fail)
+    monkeypatch.setattr(job_service, "create_or_reuse_job_without_enqueue", always_fail)
 
     with pytest.raises(RuntimeError, match="injected"):
         batch_service.create_batch(_spec())
@@ -66,13 +91,13 @@ def test_crash_after_id_persist_resumes_with_the_same_id(tmp_path, monkeypatch):
     def always_fail(*args, **kwargs):
         raise RuntimeError("injected: job row creation never completes")
 
-    monkeypatch.setattr(job_service, "create_or_reuse_job", always_fail)
+    monkeypatch.setattr(job_service, "create_or_reuse_job_without_enqueue", always_fail)
     with pytest.raises(RuntimeError, match="injected"):
         batch_service.create_batch(_spec())
     batch_id = batch_repository.list_all()[0].id
     persisted_job_id = batch_repository.get(batch_id).items[0].job_id
 
-    monkeypatch.undo()  # restore the real create_or_reuse_job
+    monkeypatch.undo()  # restore the real create_or_reuse_job_without_enqueue
     resumed = batch_service._enqueue_stage(batch_id, stage_index=0)
 
     assert resumed.items[0].job_id == persisted_job_id
@@ -277,7 +302,7 @@ def test_cancel_terminalizes_a_stable_child_id_whose_job_row_was_never_created(
     def always_fail(*args, **kwargs):
         raise RuntimeError("injected: job row creation never completes")
 
-    monkeypatch.setattr(job_service, "create_or_reuse_job", always_fail)
+    monkeypatch.setattr(job_service, "create_or_reuse_job_without_enqueue", always_fail)
     with pytest.raises(RuntimeError, match="injected"):
         batch_service.create_batch(_spec())
     monkeypatch.undo()
@@ -317,7 +342,7 @@ def test_enqueue_stage_stops_materializing_children_once_cancellation_lands(
     def always_fail(*args, **kwargs):
         raise RuntimeError("injected: crash before any child row is created")
 
-    monkeypatch.setattr(job_service, "create_or_reuse_job", always_fail)
+    monkeypatch.setattr(job_service, "create_or_reuse_job_without_enqueue", always_fail)
     with pytest.raises(RuntimeError, match="injected"):
         batch_service.create_batch(
             _spec(
@@ -334,7 +359,7 @@ def test_enqueue_stage_stops_materializing_children_once_cancellation_lands(
     assert job_repository.get(first_id) is None
     assert job_repository.get(second_id) is None
 
-    original_create_or_reuse = job_service.create_or_reuse_job
+    original_create_or_reuse = job_service.create_or_reuse_job_without_enqueue
     calls: list[str] = []
 
     def racing_create_or_reuse(job_id, request, project_id=None):
@@ -343,11 +368,13 @@ def test_enqueue_stage_stops_materializing_children_once_cancellation_lands(
         # Simulate a concurrent cancel() landing in the exact window PR3
         # exact-HEAD audit finding P1-2 identifies: after the persisted-
         # record check that let this loop start, but before the *next*
-        # item's own create_or_reuse_job() call.
+        # item's own create_or_reuse_job_without_enqueue() call.
         batch_service.cancel(batch.id)
         return result
 
-    monkeypatch.setattr(job_service, "create_or_reuse_job", racing_create_or_reuse)
+    monkeypatch.setattr(
+        job_service, "create_or_reuse_job_without_enqueue", racing_create_or_reuse
+    )
 
     batch_service._enqueue_stage(batch.id, stage_index=0)
 
@@ -365,6 +392,79 @@ def test_enqueue_stage_stops_materializing_children_once_cancellation_lands(
     # nothing is left permanently pending either.
     second_item = next(item for item in refreshed.items if item.job_id == second_id)
     assert second_item.status == "cancelled"
+
+
+# --- PR3 exact-HEAD audit, second round, P1-1: keep new children off the
+# queue until cancellation is rechecked ------------------------------------
+
+
+def test_batch_never_lets_a_worker_claim_a_child_created_for_a_cancelled_batch(
+    tmp_path, monkeypatch
+):
+    """Deterministic two-thread race (`threading.Event`, no sleep): durable
+    cancellation lands exactly between a child's Job row being materialized
+    and it ever being exposed to a worker via `enqueue_job()`. A real
+    `JobRunner` proves the worker can never see -- let alone claim or run --
+    that row; the old combined create-and-enqueue call could let a worker
+    claim it before the post-create cancel signal ever landed.
+    """
+
+    job_repository, job_queue, job_service, batch_repository, batch_service = _build(tmp_path)
+    generator = _CountingGenerator()
+    job_runner = JobRunner(
+        job_repository, job_queue, GeneratorRegistry({"image": generator}),
+        job_service=job_service,
+    )
+
+    def always_fail(*args, **kwargs):
+        raise RuntimeError("injected: crash before the row is ever created")
+
+    monkeypatch.setattr(job_service, "create_or_reuse_job_without_enqueue", always_fail)
+    with pytest.raises(RuntimeError, match="injected"):
+        batch_service.create_batch(_spec())
+    monkeypatch.undo()
+
+    batch_id = batch_repository.list_all()[0].id
+    persisted_job_id = batch_repository.get(batch_id).items[0].job_id
+    assert persisted_job_id is not None
+    assert job_repository.get(persisted_job_id) is None
+
+    original = job_service.create_or_reuse_job_without_enqueue
+    row_materialized = Event()
+    cancellation_landed = Event()
+
+    def racing(job_id, request, project_id=None):
+        result = original(job_id, request, project_id=project_id)
+        # The row now exists in the database, but _enqueue_stage() has not
+        # yet called enqueue_job() on it -- no worker can see it yet.
+        row_materialized.set()
+        assert cancellation_landed.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(job_service, "create_or_reuse_job_without_enqueue", racing)
+
+    def _cancel_once_row_exists():
+        assert row_materialized.wait(timeout=5)
+        batch_service.cancel(batch_id)
+        cancellation_landed.set()
+
+    canceller = Thread(target=_cancel_once_row_exists)
+    canceller.start()
+    batch_service._enqueue_stage(batch_id, stage_index=0)
+    canceller.join(timeout=5)
+
+    # The row was created, but must never have been exposed to a worker.
+    assert job_repository.get(persisted_job_id) is not None
+    assert job_queue.dequeue() is None
+
+    # Draining the (empty) queue with a real runner proves no generation
+    # ever happened -- not merely that cancel_job() was eventually called.
+    _drain_queue(job_runner)
+    assert generator.calls == 0
+
+    refreshed = batch_repository.get(batch_id)
+    assert refreshed.cancellation_requested is True
+    assert refreshed.items[0].status in ("cancel_requested", "cancelled")
 
 
 def test_terminal_child_with_no_event_still_reconciles_via_direct_call(tmp_path):
@@ -389,3 +489,46 @@ def test_terminal_child_with_no_event_still_reconciles_via_direct_call(tmp_path)
     assert outcome == BatchReconciliationOutcome.RECONCILED
     assert refreshed.status == "succeeded"
     assert refreshed.aggregate.succeeded == 1
+
+
+# --- PR3 exact-HEAD audit, second round, P1-3: skip terminal items when
+# resuming legacy batches ---------------------------------------------------
+
+
+def test_startup_resume_never_reassigns_an_id_to_a_legacy_cancelled_item(tmp_path):
+    """A pre-PR3 ("legacy") batch record has no `cancellation_requested`
+    field on disk -- pydantic defaults it to `False` on load, exactly like a
+    batch that was never cancelled. The old `cancel()` implementation
+    persisted a cancelled item as `job_id=None`, `status="cancelled"`
+    directly, with nothing else recording that intent. Resuming such a
+    batch must never mint a fresh id (and materialize/enqueue a new Job)
+    for that already-terminalized item.
+    """
+
+    job_repository, job_queue, job_service, batch_repository, batch_service = _build(tmp_path)
+    batch = batch_service.create_batch(_spec())
+    job_queue.dequeue()  # drain the original create_batch() enqueue
+
+    def _simulate_legacy_cancelled_item(record):
+        # This is exactly the on-disk shape a pre-PR3 cancel() left behind:
+        # no durable batch-level intent, just the item's own status set
+        # directly, with its job_id cleared.
+        record.cancellation_requested = False
+        record.items[0].job_id = None
+        record.items[0].status = "cancelled"
+        return record
+
+    legacy = batch_repository.mutate(batch.id, _simulate_legacy_cancelled_item)
+    assert legacy.cancellation_requested is False
+    assert legacy.items[0].job_id is None
+    assert legacy.items[0].status == "cancelled"
+    rows_before = len(job_repository.list())
+
+    for _ in range(3):
+        batch_service.resume_current_stage_for_all_batches()
+
+    resumed = batch_repository.get(batch.id)
+    assert resumed.items[0].job_id is None
+    assert resumed.items[0].status == "cancelled"
+    assert len(job_repository.list()) == rows_before  # no new row was ever created
+    assert job_queue.dequeue() is None  # nothing new was ever enqueued
