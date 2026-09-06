@@ -10,6 +10,7 @@ import sqlite3
 from typing import Any
 
 from core.jobs.schemas import JobRecord
+from core.jobs.statuses import JOB_STATUSES, is_valid_transition
 from core.schemas import GenerationRequest, GenerationResult, GenerationStatus
 
 _UNSET = object()
@@ -22,6 +23,12 @@ class JobRepository:
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
+
+    @property
+    def data_directory(self) -> Path:
+        """Return the directory containing this repository's SQLite data."""
+
+        return self._db_path.resolve().parent
 
     def create(self, job: JobRecord) -> JobRecord:
         with self._connection() as connection:
@@ -150,6 +157,56 @@ class JobRepository:
             expected_statuses=expected_statuses,
         )
 
+    def transition_if_status(
+        self,
+        job_id: str,
+        expected_statuses: tuple[str, ...],
+        *,
+        status: GenerationStatus,
+        progress: float | None = None,
+    ) -> bool:
+        """Atomically transition a job and return only whether the CAS won.
+
+        Unlike ``update_if_status()``, this primitive deliberately does not
+        reread the job after its UPDATE commits.  Callers that establish
+        execution ownership need that boolean before any fallible follow-up
+        read can occur.
+        """
+
+        if not expected_statuses or status not in JOB_STATUSES:
+            return False
+
+        transition_sources = tuple(
+            current
+            for current in JOB_STATUSES
+            if is_valid_transition(current, status)
+        )
+        assignments = ["status = ?"]
+        parameters: list[Any] = [status]
+        if progress is not None:
+            assignments.append("progress = ?")
+            parameters.append(progress)
+        assignments.append("updated_at = ?")
+        parameters.append(self._normalize_timestamp(None))
+        parameters.append(job_id)
+        expected_placeholders = ", ".join("?" for _ in expected_statuses)
+        transition_placeholders = ", ".join("?" for _ in transition_sources)
+        parameters.extend(expected_statuses)
+        parameters.extend(transition_sources)
+
+        with self._connection() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE jobs
+                SET {', '.join(assignments)}
+                WHERE id = ?
+                  AND status IN ({expected_placeholders})
+                  AND status IN ({transition_placeholders})
+                """,
+                parameters,
+            )
+        return cursor.rowcount > 0
+
     def _update(
         self,
         job_id: str,
@@ -163,8 +220,19 @@ class JobRepository:
     ) -> JobRecord | None:
         assignments: list[str] = []
         parameters: list[Any] = []
+        transition_sources: tuple[str, ...] | None = None
 
         if status is not None:
+            if status not in JOB_STATUSES:
+                return None
+            # A caller's stale read must never become execution authority.
+            # Keep the lifecycle edge in this UPDATE's WHERE clause so every
+            # public and legacy update path shares one SQLite-enforced contract.
+            transition_sources = tuple(
+                current
+                for current in JOB_STATUSES
+                if is_valid_transition(current, status)
+            )
             assignments.append("status = ?")
             parameters.append(status)
 
@@ -195,6 +263,10 @@ class JobRepository:
             placeholders = ", ".join("?" for _ in expected_statuses)
             where_clause += f" AND status IN ({placeholders})"
             parameters.extend(expected_statuses)
+        if transition_sources is not None:
+            placeholders = ", ".join("?" for _ in transition_sources)
+            where_clause += f" AND status IN ({placeholders})"
+            parameters.extend(transition_sources)
 
         with self._connection() as connection:
             cursor = connection.execute(

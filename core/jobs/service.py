@@ -53,17 +53,10 @@ _STATUS_TO_EVENT = {
     JOB_STATUS_CANCELLED: "job_cancelled",
 }
 
-# Statuses from which a job may still be reported as `succeeded` (#207).
-# Deliberately ACTIVE_JOB_STATUSES minus `cancel_requested`: once a cancel has
-# been requested against an in-flight job, `is_valid_transition` (see
-# `core/jobs/statuses.py`) forbids that job from ever resolving to
-# `succeeded` -- a generation that races a cancel request must not be
-# reported as a success. Enforcing that here (rather than only via
-# `JobRunner`'s own pre-check) means a late/racing `mark_succeeded` call can
-# never violate the contract, regardless of caller.
-_SUCCEEDABLE_JOB_STATUSES = tuple(
-    status for status in ACTIVE_JOB_STATUSES if status != JOB_STATUS_CANCEL_REQUESTED
-)
+# A result is only committed after generation has crossed the postprocessing
+# boundary. This makes a persisted cancellation request authoritative even if
+# a generator returns a result at the same instant.
+_SUCCEEDABLE_JOB_STATUSES = (JOB_STATUS_POSTPROCESSING,)
 
 
 class JobService:
@@ -605,30 +598,36 @@ class JobService:
           an error and never a new transition (#206).
         """
 
-        job = self.get_job(job_id)
-        if job is None:
-            return None
+        updated: JobRecord | None = None
+        changed = False
+        while True:
+            job = self.get_job(job_id)
+            if job is None:
+                return None
 
-        if job.status == JOB_STATUS_QUEUED:
-            target_status: str | None = JOB_STATUS_CANCELLED
-        elif job.status in (JOB_STATUS_PREPARING, JOB_STATUS_RUNNING, JOB_STATUS_POSTPROCESSING):
-            target_status = JOB_STATUS_CANCEL_REQUESTED
-        else:
-            target_status = None
+            if job.status == JOB_STATUS_QUEUED:
+                target_status: str | None = JOB_STATUS_CANCELLED
+            elif job.status in (
+                JOB_STATUS_PREPARING,
+                JOB_STATUS_RUNNING,
+                JOB_STATUS_POSTPROCESSING,
+            ):
+                target_status = JOB_STATUS_CANCEL_REQUESTED
+            else:
+                updated = job
+                break
 
-        updated: JobRecord | None = job
-        if target_status is not None:
             updated = self.job_repository.update_if_status(
                 job_id,
                 (job.status,),
                 status=target_status,
                 progress=1.0 if target_status == JOB_STATUS_CANCELLED else None,
             )
-            if updated is None:
-                # The status moved on between the read above and this write
-                # (e.g. the job finished, or another cancel request already
-                # landed) -- report whatever it is now rather than raising.
-                updated = self.get_job(job_id)
+            if updated is not None:
+                changed = True
+                break
+            # A queued worker may claim the job between our read and CAS. Read
+            # again and turn that newly active state into cancel_requested.
 
         # A running worker has already registered its Event on begin(). For a
         # queued job, or a job that already reached a terminal/cancel_requested
@@ -636,7 +635,7 @@ class JobService:
         if self.cancellation_registry is not None:
             self.cancellation_registry.request_cancel(job_id)
 
-        if updated is not None and target_status is not None:
+        if updated is not None and changed:
             self._publish(
                 _STATUS_TO_EVENT.get(updated.status, "job_status_updated"),
                 {
