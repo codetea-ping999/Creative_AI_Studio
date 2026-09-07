@@ -21,7 +21,12 @@ from .schemas import (
     BatchSpec,
     Stage,
 )
-from .service import BatchService, resolve_max_items_limit
+from .service import (
+    BatchReconciliationOutcome,
+    BatchService,
+    BatchStageMaterializationError,
+    resolve_max_items_limit,
+)
 from .templates import (
     PROBE_STAGE_PARAMS,
     REFINE_STAGE_PARAMS,
@@ -46,10 +51,12 @@ __all__ = [
     "AxisValue",
     "BatchAggregate",
     "BatchItem",
+    "BatchReconciliationOutcome",
     "BatchRecord",
     "BatchRepository",
     "BatchService",
     "BatchSpec",
+    "BatchStageMaterializationError",
     "Stage",
     "build_batch_template",
     "expand_items",

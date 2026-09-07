@@ -10,6 +10,7 @@ from core.assets import AssetRepository
 from core.batches import BatchRepository, BatchService
 from core.bible import BibleRepository
 from core.jobs import CancellationRegistry, EventBus, JobQueue, JobRunner, JobService
+from core.jobs.completion import CompletionConverger
 from core.models import (
     ModelRuntimeCache,
     ModelRegistry,
@@ -52,6 +53,7 @@ class ApplicationServices:
     scene_binder: SceneBinder
     batch_repository: BatchRepository
     batch_service: BatchService
+    completion_converger: CompletionConverger
 
 
 def _resolve_manifest_root(manifest_root: str | Path | None) -> str | Path | None:
@@ -435,6 +437,18 @@ def create_application_services(
     # Subscribing means a scene picks up its image or narration the moment that
     # job finishes, no matter who started it.
     scene_binder.attach_to_event_bus()
+    completion_converger = CompletionConverger(
+        job_repository,
+        asset_repository,
+        story_repository=story_repository,
+        scene_binder=scene_binder,
+        batch_service=batch_service,
+    )
+    # Subscribing means "succeeded Job != completion fully applied" gets
+    # resolved live, the moment a job finishes, via the exact same
+    # convergence path startup recovery and a runtime retry pass also use --
+    # not a second, divergent live-only implementation.
+    completion_converger.attach_to_event_bus(event_bus)
     return ApplicationServices(
         output_dir=resolved_output_dir,
         model_service=model_service,
@@ -453,6 +467,7 @@ def create_application_services(
         scene_binder=scene_binder,
         batch_repository=batch_repository,
         batch_service=batch_service,
+        completion_converger=completion_converger,
     )
 
 __all__ = [

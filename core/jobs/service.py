@@ -128,6 +128,122 @@ class JobService:
         self.enqueue_job(created_job.id)
         return created_job
 
+    def create_or_reuse_job(
+        self,
+        job_id: str,
+        request: GenerationRequest,
+        project_id: str | None = None,
+    ) -> JobRecord:
+        """Create a job under a caller-chosen id, or reuse the existing one.
+
+        For a caller (see `core.batches.service.BatchService`) that must
+        durably persist a *stable* child job id before the job row itself
+        exists, so a crash between "id persisted" and "row created" can
+        resume by re-running this exact call rather than minting a new id
+        and creating a duplicate job.
+
+        Thin wrapper around `create_or_reuse_job_without_enqueue()` that
+        enqueues immediately on a fresh creation -- the ordinary contract
+        every caller other than `BatchService._enqueue_stage()` wants (see
+        that method's own two-step use of the split primitive for why it
+        needs the two halves kept apart).
+        """
+
+        created_job, was_created = self.create_or_reuse_job_without_enqueue(
+            job_id, request, project_id
+        )
+        if was_created:
+            self.enqueue_job(created_job.id)
+        return created_job
+
+    def create_or_reuse_job_without_enqueue(
+        self,
+        job_id: str,
+        request: GenerationRequest,
+        project_id: str | None = None,
+    ) -> tuple[JobRecord, bool]:
+        """Materialize `job_id`'s row, but never enqueue it -- see
+        `create_or_reuse_job()` for the create-or-reuse contract itself
+        (reuse validates `existing.request == request`, a mismatch raises).
+
+        For a caller that needs a strict happens-before ordering between
+        "the Job row exists" and "a worker can observe it" -- specifically,
+        `BatchService._enqueue_stage()`'s fresh cancellation recheck in
+        between (PR3 exact-HEAD audit, second round, P1-1): the combined
+        `create_or_reuse_job()` used to create *and* enqueue a fresh row in
+        one call, so a durable cancellation that landed in the exact window
+        between that call returning and the caller's own post-create
+        recheck could still race a worker that had already claimed the
+        now-enqueued job and begun generating -- `cancel_job()` on an
+        already-`preparing`/`running` job only requests cooperative
+        cancellation, it does not undo work already started. Splitting
+        "materialize" from "expose to a worker" closes that window: nothing
+        calls `JobQueue.enqueue()` until the caller has confirmed, on a
+        provably later read, that the batch is not durably cancelled.
+
+        Returns `(record, was_created)`. The caller owns calling
+        `enqueue_job(record.id)` itself when `was_created` is `True` and it
+        has confirmed the job should still run; on reuse
+        (`was_created=False`) the caller must not enqueue at all -- exactly
+        like `create_or_reuse_job()` -- since a restart's own queued-job
+        recovery is what re-enqueues an already-`queued`-but-never-enqueued
+        row.
+
+        Two concurrent callers can both observe "no row for this id" from
+        the check below and both fall through to insert it -- a terminal
+        event handler racing a completion-retry pass over the same stable
+        Batch child id, for instance. The insert itself goes through
+        `JobRepository.create_if_absent()`, which resolves that race
+        atomically at the database layer (one caller's INSERT commits, the
+        other's `sqlite3.IntegrityError` is caught and rereads the winner's
+        row) rather than both proceeding as if each had created the row: a
+        naive `get()`-then-`create()` here would let the loser's `create()`
+        raise an unhandled `sqlite3.IntegrityError`, or -- if that were
+        merely swallowed -- double-publish `"job_created"` for the same id.
+        Only the actual winner does either.
+        """
+
+        existing = self.job_repository.get(job_id)
+        if existing is not None:
+            if existing.request != request:
+                raise ValueError(
+                    f"Job {job_id!r} already exists with a different "
+                    "request; refusing to silently reuse it for a "
+                    "mismatched request."
+                )
+            return existing, False
+
+        self.validate_references(request, project_id)
+        now = datetime.now(timezone.utc)
+        job = JobRecord(
+            id=job_id,
+            project_id=project_id,
+            media_type=request.media_type,
+            status=JOB_STATUS_QUEUED,
+            request=request,
+            progress=0.0,
+            created_at=now,
+            updated_at=now,
+        )
+        created_job, was_created = self.job_repository.create_if_absent(job)
+        if not was_created:
+            if created_job.request != request:
+                raise ValueError(
+                    f"Job {job_id!r} already exists with a different "
+                    "request; refusing to silently reuse it for a "
+                    "mismatched request."
+                )
+            return created_job, False
+        self._publish(
+            "job_created",
+            {
+                "job_id": created_job.id,
+                "status": created_job.status,
+                "media_type": created_job.media_type,
+            },
+        )
+        return created_job, True
+
     def validate_references(
         self,
         request: GenerationRequest,

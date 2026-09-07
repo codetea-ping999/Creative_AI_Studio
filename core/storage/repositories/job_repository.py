@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 import json
@@ -10,10 +11,19 @@ import sqlite3
 from typing import Any
 
 from core.jobs.schemas import JobRecord
-from core.jobs.statuses import JOB_STATUSES, is_valid_transition
+from core.jobs.statuses import JOB_STATUSES, TERMINAL_JOB_STATUSES, is_valid_transition
 from core.schemas import GenerationRequest, GenerationResult, GenerationStatus
 
 _UNSET = object()
+
+# Shared column list for every full-row SELECT (get/list/list_tolerant/
+# list_terminal_pending_completion) so adding a column only means editing
+# this one place plus `_row_to_record()`.
+_SELECT_COLUMNS = (
+    "id, project_id, media_type, status, request_json, result_json, "
+    "progress, error_message, completion_state, completion_error, "
+    "created_at, updated_at"
+)
 
 
 class JobRecordDecodeError(Exception):
@@ -67,9 +77,11 @@ class JobRepository:
                     result_json,
                     progress,
                     error_message,
+                    completion_state,
+                    completion_error,
                     created_at,
                     updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job.id,
@@ -80,6 +92,8 @@ class JobRepository:
                     self._serialize_payload(job.result),
                     job.progress,
                     job.error_message,
+                    job.completion_state,
+                    job.completion_error,
                     self._normalize_timestamp(job.created_at),
                     self._normalize_timestamp(job.updated_at),
                 ),
@@ -90,21 +104,39 @@ class JobRepository:
             raise RuntimeError(f"Job {job.id!r} was not persisted.")
         return created_job
 
+    def create_if_absent(self, job: JobRecord) -> tuple[JobRecord, bool]:
+        """Insert `job`, or return the existing row if its id already exists.
+
+        Closes a race `create()` alone cannot: two callers racing to
+        materialize the same stable id (e.g. two concurrent
+        `_enqueue_stage()` passes for the same Batch item, or a terminal-
+        event handler racing a completion-retry pass) can both observe "no
+        row for this id" via a prior `get()` and both then attempt
+        `create()` -- one wins the INSERT, the other hits
+        `sqlite3.IntegrityError` on the primary key. Catching that here and
+        rereading the winner's row -- rather than letting it propagate as
+        an API 500 -- makes concurrent create-or-reuse callers converge on
+        the one row that actually exists.
+
+        Returns `(record, was_created)`: `was_created=True` only for the
+        caller whose INSERT actually committed; every other, losing caller
+        gets the winner's already-persisted row and `was_created=False`, so
+        only the true creator publishes `"job_created"`/enqueues it.
+        """
+
+        try:
+            return self.create(job), True
+        except sqlite3.IntegrityError:
+            existing = self.get(job.id)
+            if existing is None:  # pragma: no cover - row can't vanish mid-race
+                raise
+            return existing, False
+
     def get(self, job_id: str) -> JobRecord | None:
         with self._connection() as connection:
             row = connection.execute(
-                """
-                SELECT
-                    id,
-                    project_id,
-                    media_type,
-                    status,
-                    request_json,
-                    result_json,
-                    progress,
-                    error_message,
-                    created_at,
-                    updated_at
+                f"""
+                SELECT {_SELECT_COLUMNS}
                 FROM jobs
                 WHERE id = ?
                 """,
@@ -118,24 +150,88 @@ class JobRepository:
     def list(self) -> list[JobRecord]:
         with self._connection() as connection:
             rows = connection.execute(
-                """
-                SELECT
-                    id,
-                    project_id,
-                    media_type,
-                    status,
-                    request_json,
-                    result_json,
-                    progress,
-                    error_message,
-                    created_at,
-                    updated_at
+                f"""
+                SELECT {_SELECT_COLUMNS}
                 FROM jobs
                 ORDER BY created_at DESC
                 """
             ).fetchall()
 
         return [self._row_to_record(row) for row in rows]
+
+    def list_tolerant(
+        self,
+    ) -> tuple[
+        "builtins.list[JobRecord]", "builtins.list[tuple[str, JobRecordDecodeError]]"
+    ]:
+        """Row-by-row read of every job, tolerating a per-row decode failure.
+
+        Annotated via ``builtins.list`` (not the bare ``list[...]``
+        generic): this class already defines a method named ``list()``,
+        which shadows the builtin type of the same name for any annotation
+        appearing later in this class body under
+        ``from __future__ import annotations``.
+
+        Unlike `list()`, a single poison row (see `JobRecordDecodeError`)
+        never aborts the whole read -- it is reported alongside its `id`
+        instead, so a caller (startup recovery, Story replay candidate
+        selection) can still see and process every other row. A `sqlite3`-
+        level failure fetching the rows in the first place still propagates
+        normally: that is a transient, whole-scan problem, not a per-row
+        content one, and must not be silently treated as "scan complete."
+        Only for recovery/best-effort scanning; ordinary reads should keep
+        using `get()`/`list()`.
+        """
+
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT {_SELECT_COLUMNS}
+                FROM jobs
+                ORDER BY created_at DESC
+                """
+            ).fetchall()
+
+        records: list[JobRecord] = []
+        failures: list[tuple[str, JobRecordDecodeError]] = []
+        for row in rows:
+            try:
+                records.append(self._row_to_record(row))
+            except JobRecordDecodeError as exc:
+                failures.append((row["id"], exc))
+        return records, failures
+
+    def list_terminal_pending_completion(self) -> "builtins.list[JobRecord]":
+        """Terminal jobs whose completion convergence has not committed yet.
+
+        A narrow, indexed-by-column filter (`completion_state = 'pending'`
+        AND a terminal `status`) for the runtime/retry convergence loop, so
+        it does not need to decode the whole table on every pass. A poison
+        row here is silently skipped (not reported) -- it is
+        `list_tolerant()`'s job, via startup recovery, to quarantine those;
+        this method is read-only best-effort convergence input.
+        """
+
+        placeholders = ", ".join("?" for _ in TERMINAL_JOB_STATUSES)
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT {_SELECT_COLUMNS}
+                FROM jobs
+                WHERE completion_state = 'pending'
+                  AND status IN ({placeholders})
+                ORDER BY created_at ASC
+                """,
+                tuple(TERMINAL_JOB_STATUSES),
+            ).fetchall()
+
+        records: list[JobRecord] = []
+        for row in rows:
+            try:
+                records.append(self._row_to_record(row))
+            except JobRecordDecodeError:
+                continue
+        return records
 
     def update(
         self,
@@ -263,6 +359,66 @@ class JobRepository:
             ).fetchone()
         return None if row is None else row["status"]
 
+    def get_raw_error_message(self, job_id: str) -> str | None:
+        """Return `job_id`'s persisted `error_message` column as-is.
+
+        Same narrow shape as `get_raw_status()` -- `error_message` is a
+        plain `TEXT` column, populated once by `JobRunner`/`JobService` at
+        the moment a job reaches a terminal outcome, never touched again
+        afterwards, and independently readable without decoding
+        `request_json`/`result_json` -- so a caller that already knows a
+        row cannot currently be decoded (`JobRecordDecodeError`) can still
+        recover its real, previously-recorded diagnostic message instead
+        of fabricating a generic placeholder in its place (PR3 exact-HEAD
+        audit, fourth round, adversarial self-review: a job that legitimately
+        failed with a real message, and only *later* became undecodable for
+        an unrelated reason, must not lose that message just because the
+        rest of its row currently cannot be reconstructed).
+
+        Returns `None` if the row does not exist, or if no error message
+        was ever recorded for it (both indistinguishable from this single
+        column alone, which matches every other caller's existing
+        treatment of "no error message" as `None`).
+        """
+
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT error_message FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        return None if row is None else row["error_message"]
+
+    def peek_raw_request_params(
+        self, job_id: str
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        """Lightweight raw peek at one row's `status` and request `params`.
+
+        Deliberately does not go through `_row_to_record()`: this exists
+        for judging the relevance of a row `list_tolerant()` already
+        reported as undecodable (see `core.story.replay_selection`), and
+        routing that same row back through full reconstruction would just
+        raise `JobRecordDecodeError` again. Reads only what a relevance
+        check needs -- the `status` column, and the `params` key inside
+        `request_json` -- tolerating a broken `request_json` payload by
+        returning `(status, None)` rather than raising, so a caller can
+        treat "can't tell" as "assume relevant" instead of crashing.
+
+        Returns `(None, None)` if the row does not exist at all.
+        """
+
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT status, request_json FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        if row is None:
+            return None, None
+        status = row["status"]
+        try:
+            payload = self._deserialize_payload(row["request_json"])
+        except (ValueError, RecursionError, TypeError):
+            return status, None
+        params = payload.get("params") if isinstance(payload, dict) else None
+        return status, params if isinstance(params, dict) else None
+
     def quarantine_structurally_invalid_status(
         self,
         job_id: str,
@@ -316,6 +472,56 @@ class JobRepository:
                     job_id,
                     *JOB_STATUSES,
                 ),
+            )
+        return cursor.rowcount > 0
+
+    def mark_completion_done(self, job_id: str) -> bool:
+        """Record that `job_id`'s post-terminal convergence fully applied.
+
+        Only ever flips `completion_state`/`completion_error`; never
+        touches `status`/`result`/`error_message` -- convergence succeeding
+        or failing must never look like the generation itself changed
+        outcome. Scoped to a terminal `status` so this can never mark an
+        active job "done" by mistake.
+        """
+
+        placeholders = ", ".join("?" for _ in TERMINAL_JOB_STATUSES)
+        with self._connection() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE jobs
+                SET completion_state = 'done', completion_error = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                  AND status IN ({placeholders})
+                """,
+                (self._normalize_timestamp(None), job_id, *TERMINAL_JOB_STATUSES),
+            )
+        return cursor.rowcount > 0
+
+    def mark_completion_pending_with_error(self, job_id: str, error_message: str) -> bool:
+        """Record a retryable/ambiguous completion failure, staying `pending`.
+
+        `completion_state` is left exactly as it already is ('pending' by
+        construction for anything that has not converged yet) -- this only
+        records *why* the last attempt did not reach 'done', so a later
+        retry (or an operator) can see it via `JobRepository.get()` without
+        needing to have been listening for an event at the time. Never
+        touches `status`/`result`/`error_message`: a completion failure
+        must never look like the generation itself failed.
+        """
+
+        placeholders = ", ".join("?" for _ in TERMINAL_JOB_STATUSES)
+        with self._connection() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE jobs
+                SET completion_error = ?, updated_at = ?
+                WHERE id = ?
+                  AND status IN ({placeholders})
+                  AND completion_state = 'pending'
+                """,
+                (error_message, self._normalize_timestamp(None), job_id, *TERMINAL_JOB_STATUSES),
             )
         return cursor.rowcount > 0
 
@@ -441,6 +647,40 @@ class JobRepository:
             self._ensure_column(connection, "project_id", "TEXT")
             self._ensure_column(connection, "media_type", "TEXT NOT NULL DEFAULT 'image'")
             self._ensure_column(connection, "error_message", "TEXT")
+            # PR3: completion convergence tracking, separate from the
+            # generation-level `status` (see `JobRecord.completion_state`).
+            # `ALTER TABLE ... ADD COLUMN ... DEFAULT 'pending'` backfills
+            # every pre-existing row with 'pending' too -- the safe default
+            # for a legacy row (see the schema docstring for why).
+            self._ensure_column(connection, "completion_state", "TEXT NOT NULL DEFAULT 'pending'")
+            self._ensure_column(connection, "completion_error", "TEXT")
+            # PR3 exact-HEAD audit, fourth round: `run_retry_loop()` (see
+            # core/jobs/completion.py) executes
+            # `list_terminal_pending_completion()`'s query every few
+            # seconds; without an index beyond the primary key, SQLite must
+            # scan and sort the entire table on every single poll, even
+            # once nearly every job is already `completion_state='done'`.
+            # `CREATE INDEX IF NOT EXISTS` is itself idempotent -- safe on
+            # a fresh DB and on a legacy DB being upgraded in place, since
+            # this always runs after the `_ensure_column()` calls above,
+            # so `completion_state` is guaranteed to already exist.
+            # Column order (`completion_state`, `status`, `created_at`)
+            # matches the query's own shape: `completion_state` is always
+            # equality-filtered and `status` is filtered via `IN (...)`
+            # over `TERMINAL_JOB_STATUSES`, so SQLite can seek straight to
+            # each matching sub-range instead of scanning the whole table.
+            # Empirically verified (`EXPLAIN QUERY PLAN`, PR3 exact-HEAD
+            # audit, fourth round, adversarial self-review): because the
+            # `status IN (...)` spans multiple values, each per-status
+            # sub-range is only locally sorted by `created_at`, so SQLite
+            # still adds `USE TEMP B-TREE FOR ORDER BY` to merge them --
+            # this index removes the full-table scan, not the sort.
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_jobs_completion_retry
+                ON jobs (completion_state, status, created_at)
+                """
+            )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self._db_path)
@@ -490,6 +730,8 @@ class JobRepository:
                 result=result,
                 progress=row["progress"],
                 error_message=row["error_message"],
+                completion_state=row["completion_state"],
+                completion_error=row["completion_error"],
                 created_at=datetime.fromisoformat(row["created_at"]),
                 updated_at=datetime.fromisoformat(row["updated_at"]),
             )

@@ -81,6 +81,28 @@ class StoryRepository:
             return None
         return self._try_load(story_file)
 
+    def get_for_recovery(self, story_id: str) -> tuple[StoryDocument | None, bool]:
+        """Read one story for a recovery/convergence caller, distinguishing
+        confirmed absence from an unreadable file.
+
+        Plain ``get()`` collapses both into ``None``, which is fine for API
+        routes (a 404 either way), but a recovery caller deciding whether to
+        ever try again needs the difference: a file that genuinely does not
+        exist has been deleted and will never come back, while one that
+        exists but fails to parse right now (a transient ``OSError``, or
+        JSON mid-write) may well be readable on the next attempt.
+
+        Returns ``(story, confirmed_absent)``. ``story`` is ``None`` in both
+        failure cases; when it is, ``confirmed_absent`` tells them apart —
+        ``True`` only when the file is confirmed not to exist, ``False`` when
+        it exists but could not be loaded.
+        """
+
+        story_file = self.story_dir / f"{story_id}.json"
+        if not story_file.exists():
+            return None, True
+        return self._try_load(story_file), False
+
     def save(self, story: StoryDocument) -> StoryDocument:
         with self._lock:
             updated = story.model_copy(update={"updated_at": utc_now()})
