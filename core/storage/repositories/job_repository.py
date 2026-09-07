@@ -359,6 +359,34 @@ class JobRepository:
             ).fetchone()
         return None if row is None else row["status"]
 
+    def get_raw_error_message(self, job_id: str) -> str | None:
+        """Return `job_id`'s persisted `error_message` column as-is.
+
+        Same narrow shape as `get_raw_status()` -- `error_message` is a
+        plain `TEXT` column, populated once by `JobRunner`/`JobService` at
+        the moment a job reaches a terminal outcome, never touched again
+        afterwards, and independently readable without decoding
+        `request_json`/`result_json` -- so a caller that already knows a
+        row cannot currently be decoded (`JobRecordDecodeError`) can still
+        recover its real, previously-recorded diagnostic message instead
+        of fabricating a generic placeholder in its place (PR3 exact-HEAD
+        audit, fourth round, adversarial self-review: a job that legitimately
+        failed with a real message, and only *later* became undecodable for
+        an unrelated reason, must not lose that message just because the
+        rest of its row currently cannot be reconstructed).
+
+        Returns `None` if the row does not exist, or if no error message
+        was ever recorded for it (both indistinguishable from this single
+        column alone, which matches every other caller's existing
+        treatment of "no error message" as `None`).
+        """
+
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT error_message FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        return None if row is None else row["error_message"]
+
     def peek_raw_request_params(
         self, job_id: str
     ) -> tuple[str | None, dict[str, Any] | None]:
@@ -626,6 +654,33 @@ class JobRepository:
             # for a legacy row (see the schema docstring for why).
             self._ensure_column(connection, "completion_state", "TEXT NOT NULL DEFAULT 'pending'")
             self._ensure_column(connection, "completion_error", "TEXT")
+            # PR3 exact-HEAD audit, fourth round: `run_retry_loop()` (see
+            # core/jobs/completion.py) executes
+            # `list_terminal_pending_completion()`'s query every few
+            # seconds; without an index beyond the primary key, SQLite must
+            # scan and sort the entire table on every single poll, even
+            # once nearly every job is already `completion_state='done'`.
+            # `CREATE INDEX IF NOT EXISTS` is itself idempotent -- safe on
+            # a fresh DB and on a legacy DB being upgraded in place, since
+            # this always runs after the `_ensure_column()` calls above,
+            # so `completion_state` is guaranteed to already exist.
+            # Column order (`completion_state`, `status`, `created_at`)
+            # matches the query's own shape: `completion_state` is always
+            # equality-filtered and `status` is filtered via `IN (...)`
+            # over `TERMINAL_JOB_STATUSES`, so SQLite can seek straight to
+            # each matching sub-range instead of scanning the whole table.
+            # Empirically verified (`EXPLAIN QUERY PLAN`, PR3 exact-HEAD
+            # audit, fourth round, adversarial self-review): because the
+            # `status IN (...)` spans multiple values, each per-status
+            # sub-range is only locally sorted by `created_at`, so SQLite
+            # still adds `USE TEMP B-TREE FOR ORDER BY` to merge them --
+            # this index removes the full-table scan, not the sort.
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_jobs_completion_retry
+                ON jobs (completion_state, status, created_at)
+                """
+            )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self._db_path)

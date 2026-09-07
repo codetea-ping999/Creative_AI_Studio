@@ -20,7 +20,7 @@ from core.jobs.completion import CompletionConverger, CompletionOutcome
 from core.jobs.schemas import JobRecord
 from core.jobs.startup_recovery import run_startup_recovery
 from core.schemas import GenerationRequest, GenerationResult
-from core.storage.repositories.job_repository import JobRepository
+from core.storage.repositories.job_repository import JobRecordDecodeError, JobRepository
 from generators.base import BaseGenerator
 from generators.registry import GeneratorRegistry
 
@@ -43,6 +43,25 @@ class FakeGenerator(BaseGenerator):
         return GenerationResult(job_id="fake", status="succeeded")
 
 
+class FailingGenerator(BaseGenerator):
+    def __init__(self, message):
+        self.calls = 0
+        self._message = message
+
+    def validate_request(self, request):
+        pass
+
+    def prepare(self, request):
+        pass
+
+    def cleanup(self, request):
+        pass
+
+    def generate(self, request, context=None):
+        self.calls += 1
+        raise RuntimeError(self._message)
+
+
 def _seed(repository, status, job_id, **overrides):
     now = datetime.now(timezone.utc)
     fields = dict(
@@ -57,12 +76,12 @@ def _seed(repository, status, job_id, **overrides):
     return repository.create(JobRecord(**fields))
 
 
-def _build_services(tmp_path):
+def _build_services(tmp_path, generator=None):
     db_path = tmp_path / "jobs.db"
     job_repository = JobRepository(db_path)
     job_queue = JobQueue()
     event_bus = EventBus()
-    generator = FakeGenerator()
+    generator = generator if generator is not None else FakeGenerator()
     job_service = JobService(job_repository, job_queue, event_bus)
     job_runner = JobRunner(
         job_repository, job_queue, GeneratorRegistry({"image": generator}),
@@ -722,3 +741,292 @@ def test_startup_asset_repair_is_not_aborted_by_one_poison_succeeded_job(tmp_pat
     assert healthy_asset is not None
     _drain_queue(services)
     assert services["generator"].calls == 0
+
+
+# --- PR3 exact-HEAD audit, fourth round, finding 1: treat malformed batch
+# scans as unsafe for requeue -----------------------------------------------
+
+
+def test_startup_treats_a_malformed_batch_scan_as_unsafe_for_generic_requeue(
+    tmp_path, caplog
+):
+    from core.batches.schemas import BatchSpec
+
+    services = _build_services(tmp_path)
+    batch_service = services["batch_service"]
+    batch_repository = services["batch_repository"]
+    job_repository = services["job_repository"]
+
+    batch_a = batch_service.create_batch(
+        BatchSpec(name="malformed", media_type="image", model_id="fake", prompt="x", limit=1)
+    )
+    poison_job_id = batch_a.items[0].job_id
+    batch_b = batch_service.create_batch(
+        BatchSpec(name="healthy", media_type="image", model_id="fake", prompt="x", limit=1)
+    )
+    healthy_job_id = batch_b.items[0].job_id
+
+    # Durable intent persisted before the file becomes malformed --
+    # simulating "corruption after cancellation_requested was saved but
+    # before cancel_job() ran", exactly as the finding describes.
+    def _mark_cancellation_requested_only(record):
+        record.cancellation_requested = True
+        return record
+
+    batch_repository.mutate(batch_a.id, _mark_cancellation_requested_only)
+    assert job_repository.get(poison_job_id).status == "queued"
+
+    # Simulate a fresh restart: the in-memory queue starts empty.
+    services["job_queue"].dequeue()
+    services["job_queue"].dequeue()
+
+    # Save the last-known-good content (cancellation_requested=True) before
+    # corrupting it -- used to "repair" the file later in this same test.
+    batch_file = tmp_path / "batches" / f"{batch_a.id}.json"
+    good_content = batch_file.read_text(encoding="utf-8")
+    batch_file.write_text("{not valid json", encoding="utf-8")
+
+    with caplog.at_level("WARNING", logger="core.batches.service"):
+        report = run_startup_recovery(
+            job_repository, services["job_service"], services["completion_converger"],
+            batch_service=batch_service,
+        )
+
+    assert report.batch_cancellation_scan_was_fully_reliable is False
+    assert report.queued_enqueue_skipped_due_to_unreliable_batch_scan is True
+    assert poison_job_id not in report.requeued
+
+    # Observability follow-up (adversarial self-review): the malformed
+    # batch's own id must be named in a warning, not just silently
+    # suppress the whole generic sweep with no trace of why.
+    assert any(
+        batch_a.id in record.getMessage() for record in caplog.records
+    )
+
+    # The poisoned batch's child never becomes worker-visible; the
+    # healthy batch's own child still recovers via its own per-batch
+    # resume (independent of the suppressed generic sweep).
+    _drain_queue(services)
+    assert services["generator"].calls == 1
+    assert job_repository.get(poison_job_id).status == "queued"  # untouched
+    assert job_repository.get(healthy_job_id).status == "succeeded"
+
+    # Repair the batch file -- the next recovery pass observes and applies
+    # the cancellation intent that was there all along.
+    batch_file.write_text(good_content, encoding="utf-8")
+
+    second = run_startup_recovery(
+        job_repository, services["job_service"], services["completion_converger"],
+        batch_service=batch_service,
+    )
+
+    assert second.batch_cancellation_scan_was_fully_reliable is True
+    assert job_repository.get(poison_job_id).status in ("cancel_requested", "cancelled")
+
+
+# --- PR3 exact-HEAD audit, fourth round, finding 2: reflect quarantined
+# child status in its batch ---------------------------------------------
+
+
+def test_startup_reflects_a_quarantined_terminal_status_into_its_batch_item(tmp_path):
+    from core.batches.schemas import BatchSpec
+
+    services = _build_services(tmp_path)
+    batch_service = services["batch_service"]
+    job_repository = services["job_repository"]
+
+    batch = batch_service.create_batch(
+        BatchSpec(name="quarantine-me", media_type="image", model_id="fake", prompt="x", limit=1)
+    )
+    job_id = batch.items[0].job_id
+    services["job_queue"].dequeue()  # simulate a fresh restart's empty queue
+
+    # Corrupt the persisted payload so the row can no longer be decoded.
+    with sqlite3.connect(services["db_path"]) as raw:
+        raw.execute(
+            "UPDATE jobs SET request_json = ? WHERE id = ?", ("{not valid json", job_id)
+        )
+        raw.commit()
+
+    # Startup's own step 1 quarantines it: raw status -> "failed", payload
+    # deliberately left broken.
+    run_startup_recovery(
+        job_repository, services["job_service"], services["completion_converger"],
+        batch_service=batch_service,
+    )
+
+    assert _raw_status(services["db_path"], job_id) == "failed"
+    with pytest.raises(JobRecordDecodeError):
+        job_repository.get(job_id)
+
+    # The batch item reflects that quarantined terminal outcome instead of
+    # staying stuck at its stale pre-quarantine "queued"/"pending" status.
+    refreshed = batch_service.get_batch(batch.id)
+    assert refreshed is not None
+    assert refreshed.items[0].status == "failed"
+    assert refreshed.status == "failed"
+
+    # Repeated reconciliation is idempotent.
+    refreshed_again = batch_service.get_batch(batch.id)
+    assert refreshed_again.items[0].status == "failed"
+    assert refreshed_again.status == "failed"
+
+
+def test_quarantine_reflection_preserves_a_real_pre_existing_error_message(tmp_path):
+    """A child job that legitimately failed (with a real, specific
+    `error_message` already recorded) and only *later* becomes undecodable
+    for an unrelated reason must keep that real diagnostic message.
+
+    `get_raw_status()` deliberately reads only the `status` column, never
+    `error_message` -- it cannot tell "this row was PR #397-quarantined
+    with no real message" apart from "this row failed normally, with a
+    real message, and only later became undecodable". Unconditionally
+    overwriting `item.error_message` with the generic "(quarantined)"
+    placeholder would destroy real diagnostic information that is still
+    sitting in the DB (PR3 exact-HEAD audit, fourth round, adversarial
+    self-review of this round's own finding-2 fix).
+    """
+    from core.batches.schemas import BatchSpec
+
+    real_message = "injected: out of disk space while writing output"
+    services = _build_services(tmp_path, generator=FailingGenerator(real_message))
+    batch_service = services["batch_service"]
+    job_repository = services["job_repository"]
+
+    batch = batch_service.create_batch(
+        BatchSpec(name="legit-failure", media_type="image", model_id="fake", prompt="x", limit=1)
+    )
+    job_id = batch.items[0].job_id
+
+    # The job genuinely fails (not via quarantine) and the batch reconciles
+    # normally, capturing the real error message.
+    _drain_queue(services)
+    assert job_repository.get(job_id).status == "failed"
+    assert job_repository.get(job_id).error_message == real_message
+
+    reconciled = batch_service.get_batch(batch.id)
+    assert reconciled.items[0].status == "failed"
+    assert reconciled.items[0].error_message == real_message
+
+    # Only *afterwards* -- unrelated to the original failure -- does the
+    # row's payload become undecodable.
+    with sqlite3.connect(services["db_path"]) as raw:
+        raw.execute(
+            "UPDATE jobs SET request_json = ? WHERE id = ?", ("{not valid json", job_id)
+        )
+        raw.commit()
+    assert _raw_status(services["db_path"], job_id) == "failed"
+    with pytest.raises(JobRecordDecodeError):
+        job_repository.get(job_id)
+
+    # The real error message must survive -- not be replaced by the
+    # generic quarantine placeholder.
+    refreshed = batch_service.get_batch(batch.id)
+    assert refreshed.items[0].status == "failed"
+    assert refreshed.items[0].error_message == real_message
+
+
+def test_quarantine_reflection_recovers_the_real_message_on_the_very_first_reconcile(
+    tmp_path,
+):
+    """Even on the *first* reconcile pass ever to observe a row after it
+    became undecodable -- so the batch item's own cached `error_message`
+    is still its pristine, never-populated default -- the real message
+    already sitting in the job's DB row must still be recovered, not
+    replaced by the generic placeholder.
+
+    Simulates a job reaching a real terminal failure through a path that
+    never notified this batch at all (e.g. a crash between persisting the
+    terminal row and the in-memory event bus delivering it -- exactly the
+    class of gap `BatchService`'s own docstring already describes for
+    `reconcile_child_job()`), with the row's payload becoming undecodable
+    before any reconcile ever ran while it was still readable.
+
+    Found via adversarial review of this round's own first attempt at
+    this fix: that version fell back to the batch item's own possibly-
+    stale *cached* `error_message` (a falsy check) rather than reading
+    the DB's authoritative `error_message` column directly -- which
+    happens to work once a normal reconcile has already run at least
+    once while the row was still decodable (see the test right above
+    this one), but loses the real message entirely on a first-ever
+    reconcile like this one.
+    """
+    from core.batches.schemas import BatchSpec
+
+    real_message = "injected: model checkpoint failed to load"
+    services = _build_services(tmp_path)
+    batch_service = services["batch_service"]
+    job_repository = services["job_repository"]
+
+    batch = batch_service.create_batch(
+        BatchSpec(name="legit-failure-no-event", media_type="image", model_id="fake", prompt="x", limit=1)
+    )
+    job_id = batch.items[0].job_id
+    services["job_queue"].dequeue()  # never actually run by JobRunner
+
+    # The job reaches a real terminal failure with a real message, but
+    # through a path that never notifies this batch (no event bus
+    # delivery) -- and its payload becomes undecodable before any
+    # reconcile ever observes it. `item.error_message` is therefore still
+    # its pristine, never-populated default when the batch is first
+    # reconciled below.
+    with sqlite3.connect(services["db_path"]) as raw:
+        raw.execute(
+            "UPDATE jobs SET status = ?, error_message = ?, request_json = ? "
+            "WHERE id = ?",
+            ("failed", real_message, "{not valid json", job_id),
+        )
+        raw.commit()
+    assert _raw_status(services["db_path"], job_id) == "failed"
+    with pytest.raises(JobRecordDecodeError):
+        job_repository.get(job_id)
+
+    # The real message -- read directly from the DB's own
+    # `error_message` column, never from the batch item's own
+    # never-populated cache -- must be recovered here.
+    refreshed = batch_service.get_batch(batch.id)
+    assert refreshed.items[0].status == "failed"
+    assert refreshed.items[0].error_message == real_message
+
+
+def test_quarantine_reflection_preserves_a_legitimately_empty_error_message(tmp_path):
+    """An `error_message` column that was legitimately recorded as an
+    empty string (a generator that raised a message-less exception --
+    `JobRunner` persists `error_message=str(exc)`, which is `""` for
+    `raise RuntimeError()`) is still a real, recorded outcome and must
+    not be replaced by the generic quarantine placeholder.
+
+    Found via adversarial review of this round's own fix: naively
+    treating "falsy" (`get_raw_error_message() or placeholder`) as
+    equivalent to "never recorded" (`None`) would conflate the two,
+    since `""` is also falsy -- the fix must check `is not None`
+    specifically.
+    """
+    from core.batches.schemas import BatchSpec
+
+    services = _build_services(tmp_path, generator=FailingGenerator(""))
+    batch_service = services["batch_service"]
+    job_repository = services["job_repository"]
+
+    batch = batch_service.create_batch(
+        BatchSpec(name="legit-empty-message", media_type="image", model_id="fake", prompt="x", limit=1)
+    )
+    job_id = batch.items[0].job_id
+
+    _drain_queue(services)
+    assert job_repository.get(job_id).status == "failed"
+    assert job_repository.get(job_id).error_message == ""
+
+    with sqlite3.connect(services["db_path"]) as raw:
+        raw.execute(
+            "UPDATE jobs SET request_json = ? WHERE id = ?", ("{not valid json", job_id)
+        )
+        raw.commit()
+    with pytest.raises(JobRecordDecodeError):
+        job_repository.get(job_id)
+
+    # The legitimately-empty message must survive as `""`, not be
+    # replaced by the generic placeholder text.
+    refreshed = batch_service.get_batch(batch.id)
+    assert refreshed.items[0].status == "failed"
+    assert refreshed.items[0].error_message == ""

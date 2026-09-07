@@ -9,6 +9,7 @@ matching `tests/test_story_concurrency.py`'s own established pattern for
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 import sqlite3
 from threading import Barrier, Event, Thread
 
@@ -20,9 +21,11 @@ from core.batches import (
     BatchService,
     BatchStageMaterializationError,
 )
-from core.batches.schemas import BatchSpec
+from core.batches.schemas import Axis, AxisValue, BatchSpec
 from core.jobs import EventBus, JobQueue, JobRunner, JobService
-from core.schemas import GenerationResult
+from core.jobs.schemas import JobRecord
+from core.reference_capabilities import UnsupportedReferenceError
+from core.schemas import GenerationRequest, GenerationResult
 from core.storage.repositories.job_repository import JobRepository
 from generators.base import BaseGenerator
 from generators.registry import GeneratorRegistry
@@ -837,3 +840,338 @@ def test_cancel_survives_a_poisoned_sibling_child_and_still_cancels_the_others(
     refreshed_again = batch_service.cancel(batch.id)
     assert refreshed_again is not None
     assert refreshed_again.cancellation_requested is True
+
+
+# --- PR3 exact-HEAD audit, fourth round, finding 3: isolate permanent
+# materialization failures during startup ------------------------------------
+
+
+def test_startup_isolates_a_permanent_unsupported_reference_failure_per_batch(
+    tmp_path, monkeypatch
+):
+    """Case A: model/reference capabilities changed across a restart, so
+    materializing a batch item's persisted-but-not-yet-created stable id
+    now raises `UnsupportedReferenceError`. One such permanently-broken
+    batch must not abort startup recovery for every other batch.
+    """
+
+    job_repository, job_queue, job_service, batch_repository, batch_service = _build(
+        tmp_path
+    )
+    generator = _CountingGenerator()
+    job_runner = JobRunner(
+        job_repository, job_queue, GeneratorRegistry({"image": generator}),
+        job_service=job_service,
+    )
+
+    def always_fail(*args, **kwargs):
+        raise RuntimeError("injected: crash before the row is ever created")
+
+    monkeypatch.setattr(job_service, "create_or_reuse_job_without_enqueue", always_fail)
+    with pytest.raises(RuntimeError, match="injected"):
+        batch_service.create_batch(_spec())
+    monkeypatch.undo()
+
+    broken_batch_id = batch_repository.list_all()[0].id
+    broken_job_id = batch_repository.get(broken_batch_id).items[0].job_id
+    assert job_repository.get(broken_job_id) is None
+
+    healthy_batch = batch_service.create_batch(_spec())
+    healthy_job_id = healthy_batch.items[0].job_id
+    job_queue.dequeue()  # simulate a fresh restart's empty in-memory queue
+
+    def always_unsupported(*args, **kwargs):
+        raise UnsupportedReferenceError(
+            "injected: capability no longer supported after restart"
+        )
+
+    monkeypatch.setattr(job_service, "validate_references", always_unsupported)
+
+    # This must not raise -- the whole point of the fix. (The healthy
+    # batch's own row already exists, so its create-or-reuse never calls
+    # validate_references() at all -- only the broken batch's does.)
+    resumed = batch_service.resume_current_stage_for_all_batches()
+
+    assert job_repository.get(broken_job_id) is None  # never materialized
+    broken_refreshed = batch_repository.get(broken_batch_id)
+    assert broken_refreshed.status == "failed"
+    assert broken_refreshed.advance_error is not None
+    assert any(record.id == healthy_batch.id for record in resumed)
+
+    monkeypatch.undo()
+    _drain_queue(job_runner)
+    assert generator.calls == 1  # only the healthy job ran
+    assert job_repository.get(healthy_job_id).status == "succeeded"
+
+    # Repeated startup does not crash again -- the same permanent failure
+    # is re-observed and re-isolated, never escaping.
+    monkeypatch.setattr(job_service, "validate_references", always_unsupported)
+    resumed_again = batch_service.resume_current_stage_for_all_batches()
+    assert resumed_again is not None
+    assert batch_repository.get(broken_batch_id).status == "failed"
+
+
+def test_startup_isolates_a_permanent_stable_id_request_mismatch_per_batch(
+    tmp_path, monkeypatch
+):
+    """Case B: a Job row already exists under a batch item's stable id, but
+    with different content than the batch currently expects. One such
+    permanently-broken batch must not abort startup recovery for every
+    other batch.
+    """
+
+    job_repository, job_queue, job_service, batch_repository, batch_service = _build(
+        tmp_path
+    )
+    generator = _CountingGenerator()
+    job_runner = JobRunner(
+        job_repository, job_queue, GeneratorRegistry({"image": generator}),
+        job_service=job_service,
+    )
+
+    def always_fail(*args, **kwargs):
+        raise RuntimeError("injected: crash before the row is ever created")
+
+    monkeypatch.setattr(job_service, "create_or_reuse_job_without_enqueue", always_fail)
+    with pytest.raises(RuntimeError, match="injected"):
+        batch_service.create_batch(_spec())
+    monkeypatch.undo()
+
+    mismatched_batch_id = batch_repository.list_all()[0].id
+    stable_job_id = batch_repository.get(mismatched_batch_id).items[0].job_id
+    assert job_repository.get(stable_job_id) is None
+
+    healthy_batch = batch_service.create_batch(_spec())
+    healthy_job_id = healthy_batch.items[0].job_id
+    job_queue.dequeue()  # simulate a fresh restart's empty in-memory queue
+
+    # Under the exact same stable id, a Job row now exists with different
+    # content than the batch item currently expects.
+    different_request = GenerationRequest(
+        media_type="image", prompt="a completely different prompt", model_id="fake"
+    )
+    now = datetime.now(timezone.utc)
+    job_repository.create(
+        JobRecord(
+            id=stable_job_id,
+            status="queued",
+            media_type="image",
+            request=different_request,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+
+    # This must not raise -- the whole point of the fix.
+    resumed = batch_service.resume_current_stage_for_all_batches()
+
+    mismatched_refreshed = batch_repository.get(mismatched_batch_id)
+    assert mismatched_refreshed.status == "failed"
+    assert mismatched_refreshed.advance_error is not None
+    assert any(record.id == healthy_batch.id for record in resumed)
+
+    _drain_queue(job_runner)
+    assert generator.calls == 1  # only the healthy job ran
+    assert job_repository.get(healthy_job_id).status == "succeeded"
+
+    # Repeated startup does not crash again.
+    resumed_again = batch_service.resume_current_stage_for_all_batches()
+    assert resumed_again is not None
+    assert batch_repository.get(mismatched_batch_id).status == "failed"
+
+
+# --- PR3 exact-HEAD audit, fourth round, adversarial self-review of finding
+# 3: a materialization failure must be clearable once retried successfully --
+
+
+def test_a_recovered_materialization_failure_does_not_permanently_fail_a_single_stage_batch(
+    tmp_path, monkeypatch
+):
+    """A batch whose stage materialization fails once (e.g. a transient
+    validation error at startup) and then succeeds on a later retry must
+    converge to its real outcome, not stay permanently reported as
+    ``failed``.
+
+    `_spec()` has no ``stages`` override, so `BatchSpec.resolved_stages()`
+    defaults to exactly one stage -- the common case, and the one where
+    `_try_advance_in_place()`'s own `advance_error = None` clear line is
+    structurally unreachable (there is no *next* stage to advance into).
+    Without a dedicated clearing path, `_persist_stage_materialization_
+    failure()` marking this single-stage batch failed once would leave it
+    misreported as failed forever, even after the underlying job goes on
+    to succeed (found via adversarial review of this round's own finding-3
+    fix, before this test existed to guard it).
+    """
+
+    job_repository, job_queue, job_service, batch_repository, batch_service = _build(
+        tmp_path
+    )
+    generator = _CountingGenerator()
+    job_runner = JobRunner(
+        job_repository, job_queue, GeneratorRegistry({"image": generator}),
+        job_service=job_service,
+    )
+
+    def always_fail(*args, **kwargs):
+        raise RuntimeError("injected: crash before the row is ever created")
+
+    monkeypatch.setattr(job_service, "create_or_reuse_job_without_enqueue", always_fail)
+    with pytest.raises(RuntimeError, match="injected"):
+        batch_service.create_batch(_spec())
+    monkeypatch.undo()
+
+    batch_id = batch_repository.list_all()[0].id
+    job_id = batch_repository.get(batch_id).items[0].job_id
+    assert job_repository.get(job_id) is None
+
+    def always_unsupported(*args, **kwargs):
+        raise UnsupportedReferenceError("injected: transient at this restart only")
+
+    monkeypatch.setattr(job_service, "validate_references", always_unsupported)
+    resumed = batch_service.resume_current_stage_for_all_batches()
+    assert not any(record.id == batch_id for record in resumed)
+
+    failed_once = batch_repository.get(batch_id)
+    assert failed_once.status == "failed"
+    assert failed_once.advance_error is not None
+    monkeypatch.undo()
+
+    # The condition that caused the failure is gone -- a later restart's
+    # retry succeeds this time.
+    resumed_again = batch_service.resume_current_stage_for_all_batches()
+    assert any(record.id == batch_id for record in resumed_again)
+
+    _drain_queue(job_runner)
+    assert generator.calls == 1
+    assert job_repository.get(job_id).status == "succeeded"
+
+    converged = batch_service.get_batch(batch_id)
+    assert converged.status == "succeeded"
+    assert converged.advance_error is None
+
+    # Idempotent: reconciling again changes nothing further.
+    assert batch_service.get_batch(batch_id).status == "succeeded"
+
+
+def test_a_retry_that_never_reaches_the_still_broken_item_does_not_clear_its_marker(
+    tmp_path, monkeypatch
+):
+    """A stage-materialization retry that `break`s early for an unrelated,
+    transient reason -- before ever reaching the specific item whose
+    permanent failure was previously persisted -- must not clear that
+    marker.
+
+    Uses a 3-item single-stage batch (a single ``Axis`` with 3 values):
+    item 1 materializes fine, item 2's materialization is permanently
+    broken, item 3 is never reached this pass (`_enqueue_stage()` exits
+    via the uncaught exception as soon as item 2 raises). On a later
+    retry, item 2's own problem is resolved -- but a fresh, *unrelated*
+    transient condition (simulated here as `_authorize_and_expose()`
+    reporting "unreadable" for item 1's already-materialized row) makes
+    the loop `break` right after item 1, before item 2 is ever
+    reattempted this pass. Without gating the clear on the loop
+    completing every item without an early exit,
+    `_clear_stale_materialization_failure()` would wrongly wipe item 2's
+    marker even though its actual problem was never re-tested this pass
+    (found via adversarial review of this round's own Fix A, before this
+    test existed to guard it).
+    """
+
+    job_repository, job_queue, job_service, batch_repository, batch_service = _build(
+        tmp_path
+    )
+    generator = _CountingGenerator()
+    job_runner = JobRunner(
+        job_repository, job_queue, GeneratorRegistry({"image": generator}),
+        job_service=job_service,
+    )
+
+    spec = BatchSpec(
+        name="multi-item",
+        media_type="image",
+        model_id="fake",
+        prompt="x",
+        axes=[
+            Axis(
+                name="variant",
+                values=[
+                    AxisValue(label="v1", patch={"prompt": "item one"}),
+                    AxisValue(label="v2", patch={"prompt": "item two"}),
+                    AxisValue(label="v3", patch={"prompt": "item three"}),
+                ],
+            )
+        ],
+    )
+
+    def always_fail(*args, **kwargs):
+        raise RuntimeError("injected: crash before any row is ever created")
+
+    monkeypatch.setattr(job_service, "create_or_reuse_job_without_enqueue", always_fail)
+    with pytest.raises(RuntimeError, match="injected"):
+        batch_service.create_batch(spec)
+    monkeypatch.undo()
+
+    batch_id = batch_repository.list_all()[0].id
+    items = batch_repository.get(batch_id).items
+    item1_id, item2_id, item3_id = (item.job_id for item in items)
+    for job_id in (item1_id, item2_id, item3_id):
+        assert job_repository.get(job_id) is None
+
+    real_create_or_reuse = job_service.create_or_reuse_job_without_enqueue
+
+    def fail_only_item2(job_id, request, **kwargs):
+        if job_id == item2_id:
+            raise UnsupportedReferenceError("injected: item 2 permanently unsupported")
+        return real_create_or_reuse(job_id, request, **kwargs)
+
+    monkeypatch.setattr(job_service, "create_or_reuse_job_without_enqueue", fail_only_item2)
+
+    # First resume: item 1 materializes fine, item 2 raises (item 3 is
+    # never even reached this pass) -- the caller persists the failure.
+    resumed = batch_service.resume_current_stage_for_all_batches()
+    assert not any(record.id == batch_id for record in resumed)
+    assert job_repository.get(item1_id) is not None
+    assert job_repository.get(item2_id) is None
+    assert job_repository.get(item3_id) is None
+
+    failed_once = batch_repository.get(batch_id)
+    assert failed_once.status == "failed"
+    assert failed_once.advance_error is not None
+    monkeypatch.undo()
+
+    # Item 2's own problem is now resolved -- but an unrelated, transient
+    # condition makes this retry break right after item 1, before item 2
+    # is ever reattempted.
+    real_authorize = batch_service._authorize_and_expose
+
+    def force_unreadable_for_item1(batch_id_arg, job_id_arg, job_status_arg):
+        if job_id_arg == item1_id:
+            return "unreadable"
+        return real_authorize(batch_id_arg, job_id_arg, job_status_arg)
+
+    monkeypatch.setattr(batch_service, "_authorize_and_expose", force_unreadable_for_item1)
+    resumed_early_break = batch_service.resume_current_stage_for_all_batches()
+    assert any(record.id == batch_id for record in resumed_early_break)
+    monkeypatch.undo()
+
+    # The marker must survive: item 2's actual problem was never
+    # re-tested this pass, so its previously-persisted failure is still
+    # exactly as unresolved as before.
+    assert job_repository.get(item2_id) is None
+    still_failed = batch_repository.get(batch_id)
+    assert still_failed.status == "failed"
+    assert still_failed.advance_error is not None
+
+    # A genuinely clean retry (no early break, item 2 reattempted and
+    # succeeding) does clear it.
+    resumed_clean = batch_service.resume_current_stage_for_all_batches()
+    assert any(record.id == batch_id for record in resumed_clean)
+
+    _drain_queue(job_runner)
+    assert generator.calls == 3
+    for job_id in (item1_id, item2_id, item3_id):
+        assert job_repository.get(job_id).status == "succeeded"
+
+    converged = batch_service.get_batch(batch_id)
+    assert converged.status == "succeeded"
+    assert converged.advance_error is None

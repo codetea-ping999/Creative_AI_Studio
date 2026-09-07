@@ -47,6 +47,18 @@ _TERMINAL_EVENT_TYPES = frozenset(
     {"job_succeeded", "job_failed", "job_cancelled"}
 )
 
+# Distinguishes an `advance_error` set by `_persist_stage_materialization_
+# failure()` (retryable -- a later, successful `_enqueue_stage()` call for
+# the *same* stage clears it, see `_clear_stale_materialization_failure()`)
+# from one set by `_try_advance_in_place()` for a genuine stage-*transition*
+# preflight failure (only ever cleared by that method itself, on the next
+# successful transition attempt -- found via adversarial review of this
+# round's own fix: reusing `advance_error` unprefixed meant a single-stage
+# (or last-stage) batch's materialization failure could never be cleared at
+# all, since `_try_advance_in_place()`'s own clear line is unreachable
+# without a next stage to advance into).
+_MATERIALIZATION_FAILURE_PREFIX = "Stage materialization failed (resumable): "
+
 
 class BatchReconciliationOutcome(Enum):
     """Result of one `BatchService.reconcile_child_job()` attempt.
@@ -234,6 +246,17 @@ class BatchService:
         if record is None or record.cancellation_requested:
             return record
 
+        # Tracks whether this loop ran every item in the stage to
+        # completion without an early `break` -- a materialization
+        # failure was, by construction, persisted from an item this loop
+        # never even reached this pass (any item still unattempted after
+        # a `break`) must not be reported as resolved (found via
+        # adversarial review of this round's own fix: an early break for
+        # an entirely unrelated, transient reason -- e.g. a momentary
+        # cancellation-read hiccup on an *earlier* item -- must not
+        # silently clear a *later* item's still-untested permanent
+        # failure marker).
+        completed_stage_without_early_exit = True
         for item in record.items_for_stage(stage_index):
             if item.job_id is None:
                 continue
@@ -246,6 +269,7 @@ class BatchService:
             # safe to retry later.
             current = self.batch_repository.get(batch_id)
             if current is None or current.cancellation_requested:
+                completed_stage_without_early_exit = False
                 break
             # Materialize the row *without* enqueuing it yet (PR3 exact-HEAD
             # audit, second round, P1-1): nothing below can be observed by
@@ -299,6 +323,7 @@ class BatchService:
                 # rather than leave it queued-but-unexposed forever.
                 if not is_terminal_status(created.status):
                     self.job_service.cancel_job(created.id)
+                completed_stage_without_early_exit = False
                 break
             if decision == "unreadable":
                 # The batch's cancellation state could not be confirmed
@@ -307,11 +332,49 @@ class BatchService:
                 # Leave the row exactly as-is (materialized, unexposed) for
                 # a later retry once storage recovers; do not guess either
                 # way by cancelling or enqueuing it.
+                completed_stage_without_early_exit = False
                 break
             # decision in ("enqueued", "not_queued") -- proceed to the next
             # item in this stage.
 
+        if completed_stage_without_early_exit:
+            # This attempt reached and re-attempted every item in the
+            # stage (including whichever one previously raised the
+            # permanent-looking exception `_persist_stage_materialization_
+            # failure()` records) without re-raising it -- if a prior
+            # attempt (via `resume_current_stage_for_all_batches()`) left
+            # this stage's marker set, the condition that caused it has
+            # evidently been resolved (found via adversarial review of
+            # this round's own fix: without this, a single-stage -- or
+            # last-stage -- batch's materialization failure could never
+            # be cleared at all, since `_try_advance_in_place()`'s own
+            # clear line is unreachable without a next stage to advance
+            # into).
+            self._clear_stale_materialization_failure(batch_id)
         return self.reconcile(batch_id)
+
+    def _clear_stale_materialization_failure(self, batch_id: str) -> None:
+        """Clear a previously-persisted materialization-failure marker (see
+        `_persist_stage_materialization_failure()`) now that `_enqueue_stage()`
+        has completed this attempt without re-raising the same exception.
+
+        Only ever clears the specific, prefixed marker this class itself
+        sets for a materialization failure -- never a stage-*transition*
+        failure `_try_advance_in_place()` set (a differently-worded,
+        unprefixed message), which stays exactly as authoritative as
+        before and is only ever cleared by that method's own successful-
+        transition path.
+        """
+
+        def _clear_if_marked(record: BatchRecord | None) -> BatchRecord | None:
+            if record is None or record.advance_error is None:
+                return record
+            if not record.advance_error.startswith(_MATERIALIZATION_FAILURE_PREFIX):
+                return record
+            record.advance_error = None
+            return record
+
+        self.batch_repository.mutate(batch_id, _clear_if_marked)
 
     def _authorize_and_expose(self, batch_id: str, job_id: str, job_status: str) -> str:
         """Atomically decide whether `job_id` may become worker-visible
@@ -451,14 +514,71 @@ class BatchService:
                 # what eventually resolve this, via job-level startup
                 # recovery / the runtime retry loop -- this method must
                 # not re-derive that logic, only avoid raising because of
-                # it). Leave this item's last-known state exactly as it
-                # was: recomputing the batch's aggregate/status from a row
-                # that cannot currently be decoded is exactly as safe as
-                # recomputing it before this job's row was ever touched,
-                # and never guesses at (or overwrites) its true past
-                # outcome. Without this, one poisoned child could abort
-                # reconciliation for every other batch in the same sweep
-                # (PR3 exact-HEAD audit, third round, P1-5).
+                # it, and never guess at or overwrite the row's true
+                # request/result content). Without this branch existing at
+                # all, one poisoned child could abort reconciliation for
+                # every other batch in the same sweep (PR3 exact-HEAD
+                # audit, third round, P1-5).
+                #
+                # A narrow exception: `get_raw_status()` reads only the
+                # `status` column, with no decode of the (still-broken)
+                # payload -- if PR #397's own quarantine already flipped
+                # it to a genuine terminal outcome that needs no result
+                # data to be meaningful (`failed`/`cancelled`; never
+                # `succeeded`, which would need a real output this row
+                # cannot supply), reflecting only that one known fact
+                # converges this item -- and eventually the whole batch --
+                # to a terminal state. Without this, the item would stay
+                # stuck at its last pre-quarantine status
+                # (queued/pending) forever, even though the underlying Job
+                # has already reached a real, quarantined terminal outcome
+                # (PR3 exact-HEAD audit, fourth round, finding 2).
+                raw_status = self.job_repository.get_raw_status(item.job_id)
+                if raw_status in (JOB_STATUS_FAILED, JOB_STATUS_CANCELLED):
+                    logger.warning(
+                        "Batch %s: child job %s could not be decoded, but "
+                        "its raw status (%s) is already terminal; "
+                        "reflecting that into the batch item.",
+                        record.id,
+                        item.job_id,
+                        raw_status,
+                    )
+                    item.status = raw_status
+                    # `error_message` is a plain TEXT column, populated
+                    # once when the row reached this terminal outcome and
+                    # never touched again -- reading it directly (via
+                    # `get_raw_error_message()`, the same narrow shape as
+                    # `get_raw_status()`) recovers the real diagnostic
+                    # message even though the rest of the row cannot
+                    # currently be decoded, whether that message was
+                    # written by an ordinary failure or by PR #397's own
+                    # quarantine primitives. Only fabricate the generic
+                    # placeholder if the column was never populated at all
+                    # (`None`) -- an empty-but-recorded message (`""`, e.g.
+                    # a generator that raised a message-less exception:
+                    # `JobRunner` persists `error_message=str(exc)`, which
+                    # is `""` for `raise RuntimeError()`) is still a real,
+                    # if uninformative, recorded outcome and must not be
+                    # papered over with a fabricated placeholder (found via
+                    # adversarial review of this round's own fix: falling
+                    # back to the batch item's own possibly-stale cached
+                    # `error_message` instead of the DB's authoritative
+                    # column could permanently lose a real message that
+                    # was sitting in the DB the whole time, if this is the
+                    # very first reconcile pass to observe the row after
+                    # it became undecodable).
+                    raw_error_message = self.job_repository.get_raw_error_message(
+                        item.job_id
+                    )
+                    item.error_message = (
+                        raw_error_message
+                        if raw_error_message is not None
+                        else (
+                            f"Job row could not be decoded (quarantined); raw "
+                            f"status is {raw_status!r}."
+                        )
+                    )
+                    continue
                 logger.warning(
                     "Batch %s: child job %s could not be decoded during "
                     "reconciliation; leaving its last-known state as-is.",
@@ -743,13 +863,44 @@ class BatchService:
         exact-HEAD audit P1-6). ``scan_was_fully_reliable=False`` tells the
         caller exactly that: a transient read failure occurred, so "no
         cancellation intent found" cannot be trusted this pass.
+
+        A *malformed* batch file (deterministically invalid content, not a
+        transient read failure) is just as unsafe for this specific
+        purpose, even though `list_all_tolerant()` itself correctly keeps
+        the two kinds of failure distinct for other callers: whether the
+        file is malformed or merely unreadable right now, its
+        `cancellation_requested` value is equally unknown, so a malformed
+        file must downgrade `scan_was_fully_reliable` here too (PR3
+        exact-HEAD audit, fourth round, finding 1) -- otherwise a batch
+        whose intent was durably persisted before its file became
+        malformed would have its still-queued children silently
+        re-enqueued by `run_startup_recovery()`'s generic sweep.
         """
 
-        records, _malformed_ids, scan_was_fully_reliable = (
+        records, malformed_ids, scan_was_fully_reliable = (
             self.batch_repository.list_all_tolerant()
         )
         resumed: list[BatchRecord] = []
-        fully_reliable = scan_was_fully_reliable
+        fully_reliable = scan_was_fully_reliable and not malformed_ids
+        if malformed_ids:
+            # Observability follow-up from adversarial review of this
+            # round's own fix (PR3 exact-HEAD audit, fourth round): treating
+            # a malformed scan as unsafe is correct, but it now suppresses
+            # `run_startup_recovery()`'s entire generic queued-job sweep on
+            # *every* restart until an operator repairs or removes the file
+            # -- with no log line naming which file, that trade-off is
+            # invisible and the suppression could look like an unrelated
+            # liveness bug indefinitely.
+            logger.warning(
+                "Startup: %d batch file(s) are malformed and cannot be "
+                "read (%s) -- their cancellation state is unknown, so the "
+                "generic queued-job re-enqueue sweep is suppressed this "
+                "pass and will stay suppressed on every future restart "
+                "until these files are repaired or removed: %s",
+                len(malformed_ids),
+                "id" if len(malformed_ids) == 1 else "ids",
+                ", ".join(sorted(malformed_ids)),
+            )
         for record in records:
             if not record.cancellation_requested:
                 continue
@@ -797,14 +948,78 @@ class BatchService:
         create-or-reuse never creates a second job for an id that already
         has one), and it already refuses to materialize anything for a
         batch whose durable ``cancellation_requested`` is set.
+
+        A materialization attempt can also fail *permanently* rather than
+        transiently: if reference/model capabilities changed across the
+        restart, ``JobService.create_or_reuse_job_without_enqueue()``'s own
+        ``validate_references()`` call can raise
+        ``UnsupportedReferenceError``/``MissingReferenceAssetError``, and a
+        stable id whose existing row's content no longer matches its
+        expected request raises ``ValueError``. Neither is retryable by
+        simply calling this again -- unlike a transient storage failure,
+        re-running ``_enqueue_stage()`` for the same batch would raise the
+        exact same exception every time. Each batch's own attempt is
+        isolated here so one such permanently-broken batch can never abort
+        recovery for every other batch, nor the whole application's
+        startup, on every future restart (PR3 exact-HEAD audit, fourth
+        round, finding 3) -- the permanent failure is instead persisted
+        onto that one batch via the same ``advance_error``/
+        ``BATCH_STATUS_FAILED`` representation
+        ``_recompute_and_advance_capturing()`` already uses for an
+        identical failure class, so it stays observable rather than being
+        silently dropped, and ``_derive_status()`` keeps it ``"failed"``
+        (not reverted by a later, unrelated reconcile pass) until an
+        operator resolves the underlying mismatch.
         """
 
         resumed: list[BatchRecord] = []
         for record in self.batch_repository.list_all():
-            refreshed = self._enqueue_stage(record.id, stage_index=record.stage_index)
+            try:
+                refreshed = self._enqueue_stage(record.id, stage_index=record.stage_index)
+            except (UnsupportedReferenceError, MissingReferenceAssetError, ValueError) as exc:
+                logger.warning(
+                    "Batch %s: permanent materialization failure while "
+                    "resuming its current stage; isolating it and "
+                    "continuing with other batches: %s",
+                    record.id,
+                    exc,
+                )
+                self._persist_stage_materialization_failure(record.id, exc)
+                continue
             if refreshed is not None:
                 resumed.append(refreshed)
         return resumed
+
+    def _persist_stage_materialization_failure(
+        self, batch_id: str, exc: Exception
+    ) -> None:
+        """Durably record a stage-materialization failure onto one batch --
+        reuses the same ``advance_error``/``BATCH_STATUS_FAILED`` fields
+        ``_recompute_and_advance_capturing()`` already uses for a stage-
+        *transition* failure, never a new failure-tracking mechanism, but
+        with a distinguishing prefix (see ``_MATERIALIZATION_FAILURE_PREFIX``)
+        so ``_clear_stale_materialization_failure()`` can later clear
+        *this* class of failure specifically once a retry succeeds,
+        without ever touching (or being confused with) a genuine stage-
+        transition failure's own message. Found necessary via adversarial
+        review of this round's own initial fix: without a way to tell the
+        two apart, this failure could never be cleared at all for a
+        single-stage (or last-stage) batch, since
+        ``_try_advance_in_place()``'s own clear line is only reachable
+        when actually advancing to a *further* stage.
+
+        A batch that has already been deleted in the interim has nothing
+        left to mark.
+        """
+
+        def _mark_failed(record: BatchRecord | None) -> BatchRecord | None:
+            if record is None:
+                return None
+            record.advance_error = f"{_MATERIALIZATION_FAILURE_PREFIX}{exc}"
+            record.status = BATCH_STATUS_FAILED
+            return record
+
+        self.batch_repository.mutate(batch_id, _mark_failed)
 
     def promote(self, batch_id: str, item_id: str) -> BatchRecord | None:
         def _mark_promoted_and_recompute(record: BatchRecord | None) -> BatchRecord | None:

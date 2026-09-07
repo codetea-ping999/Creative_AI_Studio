@@ -10,7 +10,7 @@ import pytest
 
 from core.jobs import CancellationRegistry, EventBus, JobQueue, JobRunner, JobService
 from core.jobs.schemas import JobRecord
-from core.jobs.statuses import JOB_STATUSES, is_valid_transition
+from core.jobs.statuses import JOB_STATUSES, TERMINAL_JOB_STATUSES, is_valid_transition
 from core.schemas import GenerationRequest, GenerationResult
 from core.storage.repositories.job_repository import JobRecordDecodeError, JobRepository
 from generators.base import BaseGenerator
@@ -1227,3 +1227,121 @@ def test_create_or_reuse_job_still_raises_on_a_genuine_request_mismatch(tmp_path
         job_service.create_or_reuse_job(
             job_id, GenerationRequest(media_type="image", prompt="second", model_id="fake")
         )
+
+
+# --- PR3 exact-HEAD audit, fourth round, finding 4: index the completion
+# retry predicate ---------------------------------------------------------
+
+
+def _jobs_index_names(db_path) -> set:
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'jobs'"
+        ).fetchall()
+    return {row[0] for row in rows}
+
+
+def test_completion_retry_index_exists_on_a_fresh_database(tmp_path):
+    db_path = tmp_path / "jobs.db"
+    JobRepository(db_path)
+
+    assert "idx_jobs_completion_retry" in _jobs_index_names(db_path)
+
+
+def test_completion_retry_index_is_created_on_a_legacy_database_upgrade(tmp_path):
+    db_path = tmp_path / "jobs.db"
+    # A pre-PR3 database: the `jobs` table exists, but without the
+    # completion_state/completion_error columns -- and therefore without
+    # any index referencing them either -- exactly what a real legacy
+    # database looks like before `_ensure_column()`'s backfill ever runs.
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE jobs (
+                id TEXT PRIMARY KEY,
+                project_id TEXT,
+                media_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                request_json TEXT NOT NULL,
+                result_json TEXT,
+                progress REAL NOT NULL,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+    assert "idx_jobs_completion_retry" not in _jobs_index_names(db_path)
+
+    JobRepository(db_path)  # triggers _initialize()'s migration path
+
+    assert "idx_jobs_completion_retry" in _jobs_index_names(db_path)
+
+
+def test_repeated_job_repository_initialization_is_safe(tmp_path):
+    db_path = tmp_path / "jobs.db"
+    JobRepository(db_path)
+    JobRepository(db_path)  # must not raise, must not duplicate the index
+
+    # SQLite's own implicit `sqlite_autoindex_jobs_1` (for the PRIMARY KEY)
+    # is unrelated to this fix -- only assert our own named index appears
+    # exactly once (a duplicate `CREATE INDEX` with a different internal
+    # name would show up as two entries here).
+    named_indexes = [
+        name for name in _jobs_index_names(db_path) if name == "idx_jobs_completion_retry"
+    ]
+    assert named_indexes == ["idx_jobs_completion_retry"]
+
+
+def test_completion_retry_query_correctness_is_unchanged_by_the_index(tmp_path):
+    repository = JobRepository(tmp_path / "jobs.db")
+
+    def _seed_with_completion(job_id, status, completion_state, created_at):
+        return repository.create(
+            JobRecord(
+                id=job_id,
+                status=status,
+                media_type="image",
+                request=GenerationRequest(media_type="image", prompt="x", model_id="fake"),
+                completion_state=completion_state,
+                created_at=created_at,
+                updated_at=created_at,
+            )
+        )
+
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    older = _seed_with_completion("job_older", "succeeded", "pending", base)
+    newer = _seed_with_completion(
+        "job_newer", "failed", "pending", base.replace(hour=1)
+    )
+    _seed_with_completion(  # excluded: completion_state already "done"
+        "job_done", "succeeded", "done", base.replace(hour=2)
+    )
+    _seed_with_completion(  # excluded: status is not terminal
+        "job_active", "queued", "pending", base.replace(hour=3)
+    )
+
+    results = repository.list_terminal_pending_completion()
+
+    assert [job.id for job in results] == [older.id, newer.id]  # ASC by created_at
+
+
+def test_completion_retry_query_plan_uses_the_new_index(tmp_path):
+    db_path = tmp_path / "jobs.db"
+    JobRepository(db_path)
+
+    placeholders = ", ".join("?" for _ in TERMINAL_JOB_STATUSES)
+    with sqlite3.connect(db_path) as conn:
+        plan_rows = conn.execute(
+            f"""
+            EXPLAIN QUERY PLAN
+            SELECT id FROM jobs
+            WHERE completion_state = 'pending' AND status IN ({placeholders})
+            ORDER BY created_at ASC
+            """,
+            tuple(TERMINAL_JOB_STATUSES),
+        ).fetchall()
+    plan_text = " ".join(str(cell) for row in plan_rows for cell in row)
+
+    assert "idx_jobs_completion_retry" in plan_text
