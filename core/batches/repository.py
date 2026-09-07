@@ -56,19 +56,42 @@ class BatchRepository:
         """Like `get()`, but tells confirmed absence apart from unreadable.
 
         Returns `(record, uncertain)`. `uncertain=True` means the file
-        exists but could not be read right now (a transient `OSError`) --
+        exists but could not be read right now -- either a transient
+        `OSError`, or deterministically malformed content -- so
         `record is None` in that case must not be read as "this batch was
         deleted." A single-file counterpart to `list_all_tolerant()` /
         `find_by_job_id_or_diagnose()`, for a caller (`BatchService.
         reconcile_child_job()`) that already knows the exact id it cares
         about and does not need a full directory scan to find it (PR3
         exact-HEAD audit, second round, P1-2).
+
+        Malformed content is just as disqualifying as a transient read
+        failure for the specific question this method answers ("is this
+        batch confirmed gone") -- both leave the batch's true prior state
+        (its `items`, `cancellation_requested`, ...) equally unreadable
+        right now. Before this fix, `_try_load_diagnosed()`'s own
+        `(None, False)` return for malformed content was passed straight
+        through, indistinguishable from this method's *own* early
+        `(None, False)` return for a file that was confirmed to never
+        exist at all -- conflating "definitely never existed" with "exists
+        but cannot currently be parsed" (PR3 exact-HEAD audit, fifth
+        round, adversarial self-review: this is the exact same "malformed
+        != absent" bug this round's finding 1 fixed in
+        `find_by_job_id_or_diagnose()`, reproduced here in this method's
+        own logic, and reachable through four separate callers --
+        `_authorize_and_expose()`, `reconcile_child_job()`, `advance()`,
+        and `resume_pending_cancellations()` -- none of which needed any
+        change themselves, since each already correctly branches on
+        `uncertain`).
         """
 
         batch_file = self.batch_dir / f"{batch_id}.json"
         if not batch_file.exists():
             return None, False
-        return self._try_load_diagnosed(batch_file)
+        record, _transient_failure = self._try_load_diagnosed(batch_file)
+        if record is not None:
+            return record, False
+        return None, True
 
     def run_exclusive(self, fn: Callable[[], _T]) -> _T:
         """Run `fn()` while holding this repository's own lock.
@@ -304,13 +327,27 @@ class BatchRepository:
         during this scan -- the true owner of `job_id`, if any, could be
         exactly that unreadable file, so `None` here must not be read as
         "confirmed: no parent Batch."
+
+        A *malformed* batch file (deterministically invalid content, not
+        a transient read failure) is equally disqualifying: its own
+        `items` can never be inspected for `job_id`, so it remains a
+        candidate owner exactly as uncertain as an unreadable one, until
+        it is repaired (PR3 exact-HEAD audit, fifth round, finding 1) --
+        `list_all_tolerant()` itself correctly keeps the two kinds of
+        failure distinct for other callers, but for "confirmed: no
+        parent Batch exists," malformed content is just as disqualifying
+        as an `OSError` would be. Without this, a terminal child whose
+        real owning Batch happens to be malformed right now would be
+        reported as having no parent at all, marking its completion
+        `done` and permanently excluding it from every future retry --
+        even after the file is repaired.
         """
 
-        records, _malformed_ids, scan_was_fully_reliable = self.list_all_tolerant()
+        records, malformed_ids, scan_was_fully_reliable = self.list_all_tolerant()
         for record in records:
             if any(item.job_id == job_id for item in record.items):
                 return record, False
-        return None, not scan_was_fully_reliable
+        return None, bool(malformed_ids) or not scan_was_fully_reliable
 
     def delete(self, batch_id: str) -> bool:
         # Shares _lock with mutate()/mutate_by_job_id()/save() so a

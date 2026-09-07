@@ -543,6 +543,67 @@ def test_startup_resume_never_reassigns_an_id_to_a_legacy_cancelled_item(tmp_pat
     assert job_queue.dequeue() is None  # nothing new was ever enqueued
 
 
+# --- PR3 exact-HEAD audit, fifth round, finding 2: skip terminal items
+# before recreating missing job rows ------------------------------------------
+
+
+@pytest.mark.parametrize("terminal_status", ["succeeded", "failed", "cancelled"])
+def test_resume_never_recreates_a_missing_job_row_for_a_terminal_item(
+    tmp_path, terminal_status
+):
+    """A Batch item that already reached a terminal outcome, and still
+    holds the exact stable `job_id` it was assigned, must never have its
+    Job row re-materialized just because that row is later missing from
+    SQLite (a DB restore, a manual delete, ...) while the Batch JSON
+    survives.
+
+    Before this fix, `_enqueue_stage()`'s phase-two loop only skipped an
+    item lacking a `job_id` entirely (the pre-PR3 legacy-cancelled case);
+    an item that already has a stable id but whose row is now missing
+    still entered `create_or_reuse_job_without_enqueue()`, which happily
+    creates a brand-new `queued` row under that same id and goes on to
+    authorize and enqueue it -- silently resurrecting and rerunning a
+    generation that had already concluded (PR3 exact-HEAD audit, fifth
+    round, finding 2).
+    """
+
+    job_repository, job_queue, job_service, batch_repository, batch_service = _build(
+        tmp_path
+    )
+    generator = _CountingGenerator()
+    job_runner = JobRunner(
+        job_repository, job_queue, GeneratorRegistry({"image": generator}),
+        job_service=job_service,
+    )
+
+    batch = batch_service.create_batch(_spec())
+    job_id = batch.items[0].job_id
+    job_queue.dequeue()  # drain the original create_batch() enqueue
+
+    def _mark_terminal(record):
+        record.items[0].status = terminal_status
+        return record
+
+    batch_repository.mutate(batch.id, _mark_terminal)
+
+    with sqlite3.connect(tmp_path / "jobs.db") as raw:
+        raw.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+        raw.commit()
+    assert job_repository.get(job_id) is None
+
+    for _ in range(3):
+        batch_service.resume_current_stage_for_all_batches()
+
+    resumed = batch_repository.get(batch.id)
+    assert resumed.items[0].job_id == job_id  # stable id preserved as-is
+    assert resumed.items[0].status == terminal_status
+    assert job_repository.get(job_id) is None  # never recreated
+    assert job_queue.dequeue() is None  # never enqueued
+
+    _drain_queue(job_runner)
+    assert generator.calls == 0
+
+
 # --- PR3 exact-HEAD audit, third round, P1-1: re-enqueue a reused queued
 # child during runtime recovery ----------------------------------------------
 
@@ -722,6 +783,79 @@ def test_unreadable_authorize_recheck_never_enqueues_the_child(tmp_path, monkeyp
     assert generator.calls == 0
 
     monkeypatch.undo()  # storage "recovers"
+
+    batch_service._enqueue_stage(batch_id, stage_index=0)
+
+    assert job_queue.dequeue() == job_id  # now safely (re-)enqueued
+
+
+# --- PR3 exact-HEAD audit, fifth round, adversarial self-review: a
+# malformed (not merely transiently unreadable) batch file must be just as
+# "uncertain" to `get_or_diagnose()`, never "confirmed absent" -----------------
+
+
+def test_malformed_authorize_recheck_never_cancels_or_enqueues_the_child(
+    tmp_path, monkeypatch
+):
+    """`get_or_diagnose()` is the single-file lookup `_authorize_and_
+    expose()` uses to decide whether a materialized-but-not-yet-exposed
+    child may become worker-visible. Before this fix, a batch file that
+    is genuinely malformed (not merely hit by a transient `OSError`) was
+    reported identically to a *confirmed-deleted* batch -- both as
+    `(None, False)` -- so a live batch whose file happened to be
+    malformed right now would have this child's row *cancelled*
+    (`decision == "absent"`), not merely left unexposed for a later
+    retry, exactly as if the batch had genuinely been deleted (PR3
+    exact-HEAD audit, fifth round, adversarial self-review).
+    """
+
+    job_repository, job_queue, job_service, batch_repository, batch_service = _build(tmp_path)
+    generator = _CountingGenerator()
+    job_runner = JobRunner(
+        job_repository, job_queue, GeneratorRegistry({"image": generator}),
+        job_service=job_service,
+    )
+
+    def always_fail(*args, **kwargs):
+        raise RuntimeError("injected: crash before the row is ever created")
+
+    monkeypatch.setattr(job_service, "create_or_reuse_job_without_enqueue", always_fail)
+    with pytest.raises(RuntimeError, match="injected"):
+        batch_service.create_batch(_spec())
+    monkeypatch.undo()
+
+    batch_id = batch_repository.list_all()[0].id
+    job_id = batch_repository.get(batch_id).items[0].job_id
+    assert job_repository.get(job_id) is None
+
+    # Materialization itself uses the plain (non-diagnosed) `_try_load()`
+    # path (via `mutate()` -> `get()`); only the authorize step's own
+    # `get_or_diagnose()` -> `_try_load_diagnosed()` read is injected
+    # here, simulating deterministically malformed content (not an
+    # `OSError`) -- `transient_failure=False`, matching exactly what
+    # `_try_load_diagnosed()` itself returns for bad JSON/schema content.
+    original_try_load_diagnosed = batch_repository._try_load_diagnosed
+
+    def flaky_malformed(batch_file):
+        if batch_file.stem == batch_id:
+            return None, False
+        return original_try_load_diagnosed(batch_file)
+
+    monkeypatch.setattr(batch_repository, "_try_load_diagnosed", flaky_malformed)
+
+    batch_service._enqueue_stage(batch_id, stage_index=0)
+
+    materialized = job_repository.get(job_id)
+    assert materialized is not None  # materialization itself succeeded
+    # Must stay exactly as materialized -- never cancelled (the "absent"
+    # bug) and never enqueued (uncertainty is not "not cancelled").
+    assert materialized.status == "queued"
+    assert job_queue.dequeue() is None
+
+    _drain_queue(job_runner)
+    assert generator.calls == 0
+
+    monkeypatch.undo()  # the file is repaired
 
     batch_service._enqueue_stage(batch_id, stage_index=0)
 
@@ -1175,3 +1309,126 @@ def test_a_retry_that_never_reaches_the_still_broken_item_does_not_clear_its_mar
     converged = batch_service.get_batch(batch_id)
     assert converged.status == "succeeded"
     assert converged.advance_error is None
+
+
+# --- PR3 exact-HEAD audit, fifth round, finding 3: retry batches omitted
+# from the startup resume scan ------------------------------------------------
+
+
+def test_startup_retries_a_batch_transiently_omitted_from_the_resume_scan(
+    tmp_path, monkeypatch
+):
+    """A batch in the supported "stable id persisted, Job row not yet
+    created" crash window must not be permanently stuck just because the
+    very first startup scan attempt hits a transient `OSError` reading
+    its file.
+
+    Before this fix, `resume_current_stage_for_all_batches()` used the
+    failure-suppressing `list_all()`, which silently omits a file it
+    could not read this pass -- the batch was never even seen, let alone
+    resumed, and nothing distinguished that from "there is genuinely
+    nothing left to resume." With no Job row yet, no terminal event, and
+    no runtime retry trigger, such a batch would stay stuck until the
+    next restart or manual intervention (PR3 exact-HEAD audit, fifth
+    round, finding 3). The fix's bounded immediate re-scan recovers it
+    within this same call, without a new background mechanism.
+    """
+
+    job_repository, job_queue, job_service, batch_repository, batch_service = _build(
+        tmp_path
+    )
+    generator = _CountingGenerator()
+    job_runner = JobRunner(
+        job_repository, job_queue, GeneratorRegistry({"image": generator}),
+        job_service=job_service,
+    )
+
+    def always_fail(*args, **kwargs):
+        raise RuntimeError("injected: crash before the row is ever created")
+
+    monkeypatch.setattr(job_service, "create_or_reuse_job_without_enqueue", always_fail)
+    with pytest.raises(RuntimeError, match="injected"):
+        batch_service.create_batch(_spec())
+    monkeypatch.undo()
+
+    batch_a_id = batch_repository.list_all()[0].id
+    job_a_id = batch_repository.get(batch_a_id).items[0].job_id
+    assert job_repository.get(job_a_id) is None
+
+    batch_b = batch_service.create_batch(_spec())
+    job_b_id = batch_b.items[0].job_id
+    job_queue.dequeue()  # simulate a fresh restart's empty in-memory queue
+
+    original_try_load_diagnosed = batch_repository._try_load_diagnosed
+    read_attempts = {"count": 0}
+
+    def flaky_once_for_batch_a(batch_file):
+        if batch_file.stem == batch_a_id and read_attempts["count"] == 0:
+            read_attempts["count"] += 1
+            return None, True  # simulate a transient OSError, first read only
+        return original_try_load_diagnosed(batch_file)
+
+    monkeypatch.setattr(
+        batch_repository, "_try_load_diagnosed", flaky_once_for_batch_a
+    )
+
+    resumed = batch_service.resume_current_stage_for_all_batches()
+
+    # Batch A must not be silently treated as processed on the attempt
+    # that missed it -- but the bounded in-call retry recovers it within
+    # this same startup pass, alongside Batch B.
+    assert any(record.id == batch_a_id for record in resumed)
+    assert any(record.id == batch_b.id for record in resumed)
+    assert read_attempts["count"] == 1  # the injected failure fired exactly once
+    materialized = job_repository.get(job_a_id)
+    assert materialized is not None
+    assert materialized.status == "queued"
+
+    monkeypatch.undo()
+    _drain_queue(job_runner)
+    assert generator.calls == 2
+    assert job_repository.get(job_a_id).status == "succeeded"
+    assert job_repository.get(job_b_id).status == "succeeded"
+
+    # Repeated startup recovery never duplicates the row.
+    batch_service.resume_current_stage_for_all_batches()
+    assert len([job for job in job_repository.list() if job.id == job_a_id]) == 1
+
+
+def test_startup_reports_a_malformed_batch_as_unresumable_without_retrying_it(
+    tmp_path,
+):
+    """Unlike a transient read failure, a genuinely malformed batch file
+    must not be retried by the bounded in-call scan (its content will
+    not change on its own) -- it is reported and left unresumed, while
+    an unrelated healthy batch still resumes normally.
+    """
+
+    job_repository, job_queue, job_service, batch_repository, batch_service = _build(
+        tmp_path
+    )
+    generator = _CountingGenerator()
+    job_runner = JobRunner(
+        job_repository, job_queue, GeneratorRegistry({"image": generator}),
+        job_service=job_service,
+    )
+
+    batch_a = batch_service.create_batch(_spec())
+    job_a_id = batch_a.items[0].job_id
+    batch_b = batch_service.create_batch(_spec())
+    job_b_id = batch_b.items[0].job_id
+    job_queue.dequeue()
+    job_queue.dequeue()
+
+    batch_file = tmp_path / "batches" / f"{batch_a.id}.json"
+    batch_file.write_text("{not valid json", encoding="utf-8")
+
+    resumed = batch_service.resume_current_stage_for_all_batches()
+
+    assert not any(record.id == batch_a.id for record in resumed)
+    assert any(record.id == batch_b.id for record in resumed)
+
+    _drain_queue(job_runner)
+    assert generator.calls == 1
+    assert job_repository.get(job_a_id).status == "queued"  # untouched
+    assert job_repository.get(job_b_id).status == "succeeded"

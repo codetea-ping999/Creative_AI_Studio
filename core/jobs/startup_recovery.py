@@ -132,11 +132,14 @@ def run_startup_recovery(
         # leave a batch record persisted with a child id assigned but its
         # Job row never created (or never created at all) -- nothing in an
         # ordinary reconcile pass ever notices or fixes that (PR3
-        # exact-HEAD audit P1-1). Each batch's own `_enqueue_stage()` call
-        # re-reads that exact batch fresh before deciding to materialize
-        # anything, so this step needs no reliability gate of its own: a
-        # batch this pass cannot currently read is simply skipped by
-        # `list_all()`, not acted on incorrectly.
+        # exact-HEAD audit P1-1). This step needs no reliability gate of
+        # its own: `resume_current_stage_for_all_batches()` itself uses
+        # the tolerant scan with a small bounded number of immediate
+        # re-scans, so a batch transiently unreadable on the very first
+        # attempt is very often still resumed within this same call (PR3
+        # exact-HEAD audit, fifth round, finding 3) -- and one still
+        # unreadable after every attempt is left unresumed for a later
+        # pass, never silently treated as processed.
         stage_resumed = batch_service.resume_current_stage_for_all_batches()
         report.batches_resumed_current_stage = [record.id for record in stage_resumed]
 

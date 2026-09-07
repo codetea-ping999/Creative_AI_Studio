@@ -360,20 +360,39 @@ class JobRepository:
         return None if row is None else row["status"]
 
     def get_raw_error_message(self, job_id: str) -> str | None:
-        """Return `job_id`'s persisted `error_message` column as-is.
+        """Return `job_id`'s persisted `error_message` column, type-checked.
 
         Same narrow shape as `get_raw_status()` -- `error_message` is a
-        plain `TEXT` column, populated once by `JobRunner`/`JobService` at
-        the moment a job reaches a terminal outcome, never touched again
-        afterwards, and independently readable without decoding
-        `request_json`/`result_json` -- so a caller that already knows a
-        row cannot currently be decoded (`JobRecordDecodeError`) can still
-        recover its real, previously-recorded diagnostic message instead
-        of fabricating a generic placeholder in its place (PR3 exact-HEAD
-        audit, fourth round, adversarial self-review: a job that legitimately
-        failed with a real message, and only *later* became undecodable for
-        an unrelated reason, must not lose that message just because the
-        rest of its row currently cannot be reconstructed).
+        plain `TEXT`-affinity column, populated once by `JobRunner`/
+        `JobService` at the moment a job reaches a terminal outcome, never
+        touched again afterwards, and independently readable without
+        decoding `request_json`/`result_json` -- so a caller that already
+        knows a row cannot currently be decoded (`JobRecordDecodeError`)
+        can still recover its real, previously-recorded diagnostic message
+        instead of fabricating a generic placeholder in its place (PR3
+        exact-HEAD audit, fourth round, adversarial self-review: a job
+        that legitimately failed with a real message, and only *later*
+        became undecodable for an unrelated reason, must not lose that
+        message just because the rest of its row currently cannot be
+        reconstructed).
+
+        SQLite's type affinity is a hint, not an enforced constraint: a
+        `TEXT`-affinity column can still hold a `BLOB` storage class value
+        (e.g. bytes that are not valid UTF-8), which this repository's own
+        write paths never produce, but which external corruption or a
+        direct raw write could. This method's *return type* is a promise
+        callers rely on (`str | None`, matching `BatchItem.error_message`)
+        -- returning that raw value un-type-checked would let a non-`str`
+        leak into a domain model field, breaking its later JSON
+        serialization (`BatchRecord.model_dump(mode="json")`) and
+        aborting the reconciliation pass that was trying to *recover*
+        this exact row (PR3 exact-HEAD audit, fifth round, finding 4).
+        Only a genuine `str` is ever returned as the real message; `NULL`
+        (no message ever recorded) returns `None`; any other raw storage
+        class (e.g. `bytes`, `int`, `float`) is treated as unrecoverable
+        raw metadata and reported via a fixed, descriptive fallback string
+        instead -- never decoded, re-encoded, or `repr()`-ed (which could
+        embed an arbitrarily large BLOB verbatim into the Batch record).
 
         Returns `None` if the row does not exist, or if no error message
         was ever recorded for it (both indistinguishable from this single
@@ -385,7 +404,15 @@ class JobRepository:
             row = connection.execute(
                 "SELECT error_message FROM jobs WHERE id = ?", (job_id,)
             ).fetchone()
-        return None if row is None else row["error_message"]
+        if row is None:
+            return None
+        raw_value = row["error_message"]
+        if raw_value is None or isinstance(raw_value, str):
+            return raw_value
+        return (
+            "Job's error_message column contains non-text data and could "
+            "not be recovered."
+        )
 
     def peek_raw_request_params(
         self, job_id: str

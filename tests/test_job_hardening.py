@@ -1345,3 +1345,120 @@ def test_completion_retry_query_plan_uses_the_new_index(tmp_path):
     plan_text = " ".join(str(cell) for row in plan_rows for cell in row)
 
     assert "idx_jobs_completion_retry" in plan_text
+
+
+# --- PR3 exact-HEAD audit, fifth round, finding 4: validate raw error text
+# before saving the batch ---------------------------------------------------
+
+
+def _seed_bare_job_row(db_path, job_id, *, status="failed"):
+    """Insert a minimal jobs row directly, bypassing `JobRepository.create()`
+    entirely -- so `error_message` can be set to a raw value no normal
+    write path would ever produce.
+    """
+
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO jobs (
+                id, project_id, media_type, status, progress,
+                request_json, result_json, error_message,
+                created_at, updated_at, completion_state, completion_error
+            ) VALUES (?, NULL, 'image', ?, 0.0, '{}', NULL, NULL, ?, ?, 'pending', NULL)
+            """,
+            (job_id, status, now, now),
+        )
+        conn.commit()
+
+
+def test_get_raw_error_message_returns_a_valid_string_unchanged(tmp_path):
+    db_path = tmp_path / "jobs.db"
+    repository = JobRepository(db_path)
+    _seed_bare_job_row(db_path, "job_a")
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE jobs SET error_message = ? WHERE id = ?",
+            ("a perfectly normal error message", "job_a"),
+        )
+        conn.commit()
+
+    assert repository.get_raw_error_message("job_a") == "a perfectly normal error message"
+
+
+def test_get_raw_error_message_returns_none_for_a_null_column(tmp_path):
+    db_path = tmp_path / "jobs.db"
+    repository = JobRepository(db_path)
+    _seed_bare_job_row(db_path, "job_a")
+
+    assert repository.get_raw_error_message("job_a") is None
+
+
+def test_get_raw_error_message_rejects_a_non_text_blob_value(tmp_path):
+    """SQLite's TEXT affinity is a hint, not an enforced constraint -- a
+    `BLOB` storage-class value (e.g. bytes that are not valid UTF-8) can
+    still be written into a TEXT-affinity column and read back as raw
+    `bytes` with no decode error at read time. `get_raw_error_message()`'s
+    `str | None` return-type contract must actually be guaranteed, not
+    merely declared: a caller (`BatchService._recompute()`) assigns this
+    value straight into `BatchItem.error_message`, and letting a `bytes`
+    value leak through would only fail much later, at
+    `BatchRecord.model_dump(mode="json")` -- aborting the very
+    reconciliation pass that was trying to *recover* this row (PR3
+    exact-HEAD audit, fifth round, finding 4).
+    """
+
+    db_path = tmp_path / "jobs.db"
+    repository = JobRepository(db_path)
+    _seed_bare_job_row(db_path, "job_a")
+
+    invalid_utf8_blob = b"\xff\xfe\x00not valid utf-8"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE jobs SET error_message = ? WHERE id = ?",
+            (invalid_utf8_blob, "job_a"),
+        )
+        conn.commit()
+
+    # Confirm the injected value really is stored as a non-text BLOB, not
+    # silently coerced to TEXT by SQLite itself.
+    with sqlite3.connect(db_path) as conn:
+        raw_value = conn.execute(
+            "SELECT error_message FROM jobs WHERE id = ?", ("job_a",)
+        ).fetchone()[0]
+    assert isinstance(raw_value, bytes)
+
+    result = repository.get_raw_error_message("job_a")
+
+    assert isinstance(result, str)
+    assert result != invalid_utf8_blob
+    assert "non-text" in result or "could not be recovered" in result
+
+
+def test_get_raw_error_message_rejects_an_empty_blob(tmp_path):
+    """A zero-length `BLOB` is still a non-text storage class -- SQLite's
+    dynamic typing does not coerce it to an empty string, so it must be
+    rejected the same as any other non-text value, not confused with a
+    legitimately empty (but genuinely `str`) error message.
+    """
+
+    db_path = tmp_path / "jobs.db"
+    repository = JobRepository(db_path)
+    _seed_bare_job_row(db_path, "job_a")
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE jobs SET error_message = ? WHERE id = ?", (b"", "job_a")
+        )
+        conn.commit()
+    with sqlite3.connect(db_path) as conn:
+        raw_value = conn.execute(
+            "SELECT error_message FROM jobs WHERE id = ?", ("job_a",)
+        ).fetchone()[0]
+    assert isinstance(raw_value, bytes)
+
+    result = repository.get_raw_error_message("job_a")
+
+    assert isinstance(result, str)
+    assert result != ""

@@ -585,6 +585,79 @@ def test_transient_batch_read_failure_keeps_completion_pending_not_done(tmp_path
     assert job_repository.get(job_id).completion_state == "done"
 
 
+# --- PR3 exact-HEAD audit, fifth round, finding 1: treat malformed batch
+# files as uncertain owners, not confirmed-absent ones -----------------------
+
+
+def test_malformed_owning_batch_keeps_completion_pending_not_done(tmp_path):
+    """A terminal child's owning Batch file being malformed (not merely
+    transiently unreadable) must be treated exactly like a transient read
+    failure by `reconcile_child_job()` -- `RETRYABLE_FAILURE`, never the
+    confirmed-absent `NO_PARENT` outcome -- since a malformed file's
+    content (including whether it actually owns this `job_id`) is just
+    as unknown as an unreadable one's.
+
+    Without this, `find_by_job_id_or_diagnose()` discarded evidence of a
+    malformed candidate and reported `uncertain=False`, so a terminal
+    child whose real owning Batch happened to be malformed right now was
+    marked completion `done` and permanently excluded from every future
+    retry -- even once the file was repaired, leaving a multi-stage
+    Batch stuck on its old stage forever (PR3 exact-HEAD audit, fifth
+    round, finding 1).
+    """
+    from core.batches import BatchRepository, BatchService
+    from core.batches.schemas import BatchSpec
+    from core.jobs import JobQueue, JobService
+
+    job_repository = JobRepository(tmp_path / "jobs.db")
+    asset_repository = AssetRepository(tmp_path / "assets")
+    batch_repository = BatchRepository(tmp_path / "batches")
+    job_service = JobService(job_repository, JobQueue())
+    batch_service = BatchService(batch_repository, job_service, job_repository)
+    converger = CompletionConverger(job_repository, asset_repository, batch_service=batch_service)
+
+    batch = batch_service.create_batch(
+        BatchSpec(
+            name="malformed-owner", media_type="image", model_id="fake", prompt="x", limit=1,
+            stages=[{"name": "probe"}, {"name": "refine"}],
+        )
+    )
+    job_id = batch.items[0].job_id
+    job_repository.update_status(job_id, "preparing")
+    job_repository.update_status(job_id, "running")
+    job_repository.update_status(job_id, "postprocessing")
+    job_repository.update(
+        job_id, status="succeeded", progress=1.0,
+        result=GenerationResult(job_id=job_id, status="succeeded", outputs=["a.png"]),
+    )
+
+    batch_file = tmp_path / "batches" / f"{batch.id}.json"
+    good_content = batch_file.read_text(encoding="utf-8")
+    batch_file.write_text("{not valid json", encoding="utf-8")
+
+    outcome = converger.converge_job(job_id)
+
+    assert outcome == CompletionOutcome.RETRYABLE_FAILURE
+    after = job_repository.get(job_id)
+    assert after.completion_state == "pending"
+    assert after.completion_error is not None
+    assert after.status == "succeeded"  # the generation-level outcome is untouched
+
+    # Repair the file -- the next retry finds the real owner and advances
+    # its stage normally, exactly as if the file had never been malformed.
+    batch_file.write_text(good_content, encoding="utf-8")
+
+    second = converger.converge_job(job_id)
+
+    assert second == CompletionOutcome.DONE
+    assert job_repository.get(job_id).completion_state == "done"
+    refreshed = batch_repository.get(batch.id)
+    assert refreshed.stage_index == 1
+    refine_item = next(item for item in refreshed.items if item.stage_index == 1)
+    assert refine_item.job_id is not None
+    assert job_repository.get(refine_item.job_id) is not None
+
+
 def test_no_parent_batch_still_converges_to_done(tmp_path):
     from core.batches import BatchRepository, BatchService
     from core.jobs import JobQueue, JobService

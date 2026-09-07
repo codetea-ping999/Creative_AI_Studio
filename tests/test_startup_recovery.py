@@ -9,6 +9,7 @@ asserting on the resulting rows -- no threads, no timing.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 import sqlite3
 
 import pytest
@@ -1030,3 +1031,68 @@ def test_quarantine_reflection_preserves_a_legitimately_empty_error_message(tmp_
     refreshed = batch_service.get_batch(batch.id)
     assert refreshed.items[0].status == "failed"
     assert refreshed.items[0].error_message == ""
+
+
+# --- PR3 exact-HEAD audit, fifth round, finding 4: validate raw error text
+# before saving the batch -----------------------------------------------------
+
+
+def test_quarantine_reflection_survives_a_non_text_raw_error_message(tmp_path):
+    """An undecodable terminal Job whose raw `error_message` column holds
+    non-text data (e.g. an invalid-UTF-8 `BLOB`, which SQLite's TEXT
+    affinity does not reject) must not break Batch reconciliation or its
+    JSON serialization.
+
+    Before this fix, the raw value was assigned straight into
+    `BatchItem.error_message` (a `str | None` field) with no type check;
+    a non-`str` value would only fail much later, at
+    `BatchRecord.model_dump(mode="json")` -- aborting the very
+    reconciliation pass that was trying to recover this row, and (via
+    `run_startup_recovery()`'s own batch reconcile pass) capable of
+    repeating on every future restart until the row was fixed by hand
+    (PR3 exact-HEAD audit, fifth round, finding 4).
+    """
+    from core.batches.schemas import BatchSpec
+
+    services = _build_services(tmp_path)
+    batch_service = services["batch_service"]
+    job_repository = services["job_repository"]
+
+    batch = batch_service.create_batch(
+        BatchSpec(name="blob-message", media_type="image", model_id="fake", prompt="x", limit=1)
+    )
+    job_id = batch.items[0].job_id
+    services["job_queue"].dequeue()  # never actually run by JobRunner
+
+    invalid_utf8_blob = b"\xff\xfe\x00not valid utf-8"
+    with sqlite3.connect(services["db_path"]) as raw:
+        raw.execute(
+            "UPDATE jobs SET status = ?, error_message = ?, request_json = ? "
+            "WHERE id = ?",
+            ("failed", invalid_utf8_blob, "{not valid json", job_id),
+        )
+        raw.commit()
+    assert _raw_status(services["db_path"], job_id) == "failed"
+    with pytest.raises(JobRecordDecodeError):
+        job_repository.get(job_id)
+
+    # Must not raise -- neither on reconciliation nor on the JSON
+    # serialization `batch_repository.mutate()` performs to persist it.
+    refreshed = batch_service.get_batch(batch.id)
+
+    assert refreshed.items[0].status == "failed"
+    assert isinstance(refreshed.items[0].error_message, str)
+    assert refreshed.items[0].error_message != invalid_utf8_blob
+
+    # The Batch record on disk is valid JSON -- serialization genuinely
+    # succeeded, not merely avoided raising in-memory.
+    batch_file = tmp_path / "batches" / f"{batch.id}.json"
+    json.loads(batch_file.read_text(encoding="utf-8"))
+
+    # Idempotent on repeat, and startup recovery as a whole does not abort.
+    report = run_startup_recovery(
+        job_repository, services["job_service"], services["completion_converger"],
+        batch_service=batch_service,
+    )
+    assert report is not None
+    assert batch_service.get_batch(batch.id).items[0].status == "failed"

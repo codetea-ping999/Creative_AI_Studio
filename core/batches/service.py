@@ -59,6 +59,15 @@ _TERMINAL_EVENT_TYPES = frozenset(
 # without a next stage to advance into).
 _MATERIALIZATION_FAILURE_PREFIX = "Stage materialization failed (resumable): "
 
+# Bounded immediate-retry count for `resume_current_stage_for_all_batches()`'s
+# own tolerant batch scan (PR3 exact-HEAD audit, fifth round, finding 3) --
+# not a general polling interval, not a background mechanism: a transient
+# per-file `OSError` reading a batch during startup is very often already
+# gone by the very next read attempt (a concurrent atomic replace, brief
+# I/O contention), so a handful of immediate re-scans resolves the common
+# case within the same startup pass, with no new thread and no sleep.
+_STARTUP_BATCH_SCAN_MAX_ATTEMPTS = 3
+
 
 class BatchReconciliationOutcome(Enum):
     """Result of one `BatchService.reconcile_child_job()` attempt.
@@ -259,6 +268,22 @@ class BatchService:
         completed_stage_without_early_exit = True
         for item in record.items_for_stage(stage_index):
             if item.job_id is None:
+                continue
+            if is_terminal_status(item.status):
+                # This item already has its final outcome recorded --
+                # mirrors `_assign_ids()`'s own analogous check above, but
+                # here for an item that *already* has a stable `job_id`
+                # from a previous pass, not one that never got one. If
+                # its SQLite Job row is later lost while the Batch JSON
+                # survives (a DB restore, a manual delete, ...), that
+                # must never be read as "this item still needs
+                # materializing" -- `create_or_reuse_job_without_enqueue()`
+                # below would otherwise create a brand-new `queued` row
+                # under the exact same stable id and go on to authorize
+                # and enqueue it, silently resurrecting and rerunning a
+                # generation that already concluded (PR3 exact-HEAD
+                # audit, fifth round, finding 2). The stable id itself is
+                # left exactly as-is; only materialization is skipped.
                 continue
             # Cheap, lock-free pre-check -- purely an optimization to skip
             # unnecessary Job-row materialization for a batch already known
@@ -970,24 +995,93 @@ class BatchService:
         silently dropped, and ``_derive_status()`` keeps it ``"failed"``
         (not reverted by a later, unrelated reconcile pass) until an
         operator resolves the underlying mismatch.
+
+        Uses the tolerant scan (``BatchRepository.list_all_tolerant()``),
+        not ``list_all()``: the latter silently *omits* a batch file that
+        hits a transient ``OSError`` while being read -- in the exact
+        crash window this method exists to close (a stable child id
+        persisted, its Job row never created), that means the resulting
+        batch would not even be *seen* by this pass, let alone resumed,
+        with nothing here to tell "genuinely nothing left to resume"
+        apart from "one batch was simply never looked at" (PR3 exact-HEAD
+        audit, fifth round, finding 3). A malformed file (deterministically
+        invalid content) is reported, not retried -- unlike a transient
+        read hiccup, its content will not change on its own. A transient
+        read failure gets a small, fixed number of immediate re-scans
+        (not a new background mechanism, not an unbounded loop): a batch
+        already resumed on an earlier attempt this call is never
+        revisited (`_enqueue_stage()` is idempotent regardless, but there
+        is no reason to redo confirmed work), while one still unreadable
+        after every attempt is simply left unresumed -- never marked
+        processed -- for the next restart or reconcile pass to pick up,
+        exactly like every other "uncertain, not confirmed absent" case
+        in this class.
         """
 
         resumed: list[BatchRecord] = []
-        for record in self.batch_repository.list_all():
-            try:
-                refreshed = self._enqueue_stage(record.id, stage_index=record.stage_index)
-            except (UnsupportedReferenceError, MissingReferenceAssetError, ValueError) as exc:
+        processed_ids: set[str] = set()
+        for attempt in range(_STARTUP_BATCH_SCAN_MAX_ATTEMPTS):
+            records, malformed_ids, scan_was_fully_reliable = (
+                self.batch_repository.list_all_tolerant()
+            )
+            if malformed_ids:
                 logger.warning(
-                    "Batch %s: permanent materialization failure while "
-                    "resuming its current stage; isolating it and "
-                    "continuing with other batches: %s",
-                    record.id,
-                    exc,
+                    "Startup: %d batch file(s) are malformed and cannot "
+                    "be resumed (%s), and will stay unresumed until "
+                    "repaired or removed: %s",
+                    len(malformed_ids),
+                    "id" if len(malformed_ids) == 1 else "ids",
+                    ", ".join(sorted(malformed_ids)),
                 )
-                self._persist_stage_materialization_failure(record.id, exc)
-                continue
-            if refreshed is not None:
-                resumed.append(refreshed)
+            for record in records:
+                if record.id in processed_ids:
+                    continue
+                processed_ids.add(record.id)
+                try:
+                    refreshed = self._enqueue_stage(
+                        record.id, stage_index=record.stage_index
+                    )
+                except (
+                    UnsupportedReferenceError,
+                    MissingReferenceAssetError,
+                    ValueError,
+                ) as exc:
+                    logger.warning(
+                        "Batch %s: permanent materialization failure while "
+                        "resuming its current stage; isolating it and "
+                        "continuing with other batches: %s",
+                        record.id,
+                        exc,
+                    )
+                    self._persist_stage_materialization_failure(record.id, exc)
+                    continue
+                if refreshed is not None:
+                    resumed.append(refreshed)
+            if scan_was_fully_reliable:
+                break
+            if attempt + 1 < _STARTUP_BATCH_SCAN_MAX_ATTEMPTS:
+                logger.warning(
+                    "Startup: batch scan hit a transient read failure on "
+                    "attempt %d/%d; retrying immediately rather than "
+                    "treating an unseen batch as resumed.",
+                    attempt + 1,
+                    _STARTUP_BATCH_SCAN_MAX_ATTEMPTS,
+                )
+            else:
+                # No further attempt will actually run -- found via
+                # adversarial review of this round's own fix: the
+                # previous unconditional "retrying immediately" message
+                # was misleading on the final attempt, claiming a retry
+                # that never happens. A batch still unreadable after
+                # every attempt is left unresumed -- never marked
+                # processed -- for the next restart or reconcile pass.
+                logger.warning(
+                    "Startup: batch scan still unreliable after %d/%d "
+                    "attempts; leaving any still-unseen batch unresumed "
+                    "for a later pass.",
+                    attempt + 1,
+                    _STARTUP_BATCH_SCAN_MAX_ATTEMPTS,
+                )
         return resumed
 
     def _persist_stage_materialization_failure(
