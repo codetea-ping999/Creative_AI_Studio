@@ -1225,3 +1225,461 @@ def test_active_retry_tick_builds_the_candidate_index_at_most_once(tmp_path, mon
     assert convergence_calls["count"] == job_count
     for i in range(job_count):
         assert job_repository.get(f"job_{i}").completion_state == "done"
+
+
+def _seed_failed_job(repository, job_id, *, created_at=None):
+    now = created_at or datetime.now(timezone.utc)
+    return repository.create(
+        JobRecord(
+            id=job_id,
+            status="failed",
+            media_type="image",
+            request=GenerationRequest(media_type="image", prompt="fake", model_id="fake"),
+            error_message="injected: generation failed",
+            created_at=now,
+            updated_at=now,
+        )
+    )
+
+
+# --- PR3 exact-HEAD audit, eleventh round, finding 5: avoid rescanning
+# every Batch for each pending completion --------------------------------
+
+
+def _build_with_batch_service(tmp_path, *, with_story=False):
+    from core.batches import BatchRepository, BatchService
+    from core.jobs import JobQueue, JobService
+
+    job_repository = JobRepository(tmp_path / "jobs.db")
+    asset_repository = AssetRepository(tmp_path / "assets")
+    batch_repository = BatchRepository(tmp_path / "batches")
+    job_service = JobService(job_repository, JobQueue())
+    batch_service = BatchService(batch_repository, job_service, job_repository)
+    story_repository = None
+    scene_binder = None
+    if with_story:
+        story_repository = StoryRepository(tmp_path / "stories")
+        scene_binder = SceneBinder(story_repository, job_repository, asset_repository)
+    converger = CompletionConverger(
+        job_repository, asset_repository,
+        story_repository=story_repository, scene_binder=scene_binder,
+        batch_service=batch_service,
+    )
+    return job_repository, batch_repository, batch_service, job_service, converger
+
+
+def test_startup_recovery_builds_the_batch_ownership_index_at_most_once_per_pass(
+    tmp_path, monkeypatch
+):
+    """100 completion-pending standalone (non-Batch) jobs, plus 20 unrelated
+    Batch files each owning their own already-converged child, must not
+    each trigger their own full Batch-directory scan during one startup
+    recovery pass -- before this fix, `converge_job()` ->
+    `_reconcile_batch()` -> `reconcile_child_job()` re-scanned every Batch
+    file from scratch for every single pending job, an O(N x B) startup
+    cost (PR3 exact-HEAD audit, eleventh round, finding 5).
+    """
+    from core.batches.schemas import BatchSpec
+    from core.jobs.startup_recovery import run_startup_recovery
+
+    job_repository, batch_repository, batch_service, job_service, converger = (
+        _build_with_batch_service(tmp_path)
+    )
+
+    # 20 unrelated Batch files, each already fully converged -- present
+    # purely to be scanned, never the owner of any of the 100 pending jobs.
+    for i in range(20):
+        batch = batch_service.create_batch(
+            BatchSpec(
+                name=f"unrelated-{i}", media_type="image", model_id="fake", prompt="x", limit=1,
+            )
+        )
+        owner_job_id = batch.items[0].job_id
+        job_repository.update_status(owner_job_id, "preparing")
+        job_repository.update_status(owner_job_id, "running")
+        job_repository.update_status(owner_job_id, "postprocessing")
+        job_repository.update(
+            owner_job_id, status="succeeded", progress=1.0,
+            result=GenerationResult(job_id=owner_job_id, status="succeeded", outputs=["a.png"]),
+        )
+        job_repository.mark_completion_done(owner_job_id)
+
+    job_count = 100
+    for i in range(job_count):
+        _seed_succeeded_job(job_repository, f"job_standalone_{i}")
+
+    # Count calls to the index builder itself, not the lower-level
+    # `list_all_tolerant()` -- `run_startup_recovery()` legitimately calls
+    # that directly, once each, from several OTHER unrelated steps
+    # (`resume_pending_cancellations()`, `resume_current_stage_for_all_
+    # batches()`, `list_batches_tolerant()`); finding 5 only bounds step
+    # 4's own cost to one call, not the whole pass's.
+    real_build_index = batch_service.build_job_ownership_index
+    build_calls = {"count": 0}
+
+    def counting_build_index():
+        build_calls["count"] += 1
+        return real_build_index()
+
+    monkeypatch.setattr(batch_service, "build_job_ownership_index", counting_build_index)
+
+    report = run_startup_recovery(
+        job_repository, job_service, converger, batch_service=batch_service
+    )
+
+    # Built once for this whole pass -- not once per pending job.
+    assert build_calls["count"] == 1
+    assert len(report.completion_outcomes) == job_count
+    for i in range(job_count):
+        job_id = f"job_standalone_{i}"
+        assert job_repository.get(job_id).completion_state == "done"
+        assert report.completion_outcomes[job_id] == CompletionOutcome.DONE
+
+
+def test_startup_recovery_still_reconciles_an_actual_batch_child_via_the_shared_index(
+    tmp_path, monkeypatch
+):
+    """A job that *is* present in the shared ownership index must still go
+    through the real `reconcile_child_job()` call (stage advance, child
+    materialization, ...) -- the index only ever short-circuits the
+    confirmed-absent case, never substitutes for the real reconciliation
+    of a job it actually contains.
+    """
+    from core.batches.schemas import BatchSpec
+    from core.jobs.startup_recovery import run_startup_recovery
+
+    job_repository, batch_repository, batch_service, job_service, converger = (
+        _build_with_batch_service(tmp_path)
+    )
+
+    batch = batch_service.create_batch(
+        BatchSpec(
+            name="two-stage", media_type="image", model_id="fake", prompt="x", limit=1,
+            stages=[{"name": "probe"}, {"name": "refine"}],
+        )
+    )
+    job_id = batch.items[0].job_id
+    job_repository.update_status(job_id, "preparing")
+    job_repository.update_status(job_id, "running")
+    job_repository.update_status(job_id, "postprocessing")
+    job_repository.update(
+        job_id, status="succeeded", progress=1.0,
+        result=GenerationResult(job_id=job_id, status="succeeded", outputs=["a.png"]),
+    )
+
+    report = run_startup_recovery(
+        job_repository, job_service, converger, batch_service=batch_service
+    )
+
+    assert report.completion_outcomes[job_id] == CompletionOutcome.DONE
+    assert job_repository.get(job_id).completion_state == "done"
+    refreshed = batch_repository.get(batch.id)
+    assert refreshed.stage_index == 1  # the real reconciliation actually advanced the stage
+    refine_item = next(item for item in refreshed.items if item.stage_index == 1)
+    assert refine_item.job_id is not None
+    assert job_repository.get(refine_item.job_id) is not None
+
+
+def test_malformed_batch_file_keeps_the_ownership_index_unreliable(tmp_path):
+    """A malformed Batch file present when the shared index is built must
+    not let a standalone job be wrongly short-circuited to a *confirmed*
+    "no parent" -- the malformed file itself might be the real owner. The
+    index must be reported unreliable, so `_reconcile_batch()` falls back
+    to the normal, per-job `reconcile_child_job()` path exactly as if no
+    index existed -- proved here by comparing the outcome *with* the
+    unreliable index passed against the outcome with no index at all
+    (`reconcile_child_job()`'s own baseline behavior, unaffected by this
+    finding): they must be identical, never a wrongly-optimistic `DONE`.
+    """
+    job_repository, batch_repository, batch_service, job_service, converger = (
+        _build_with_batch_service(tmp_path)
+    )
+
+    (tmp_path / "batches").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "batches" / "batch_malformed.json").write_text(
+        "{not valid json", encoding="utf-8"
+    )
+
+    owned_job_ids, reliable = batch_service.build_job_ownership_index()
+    assert reliable is False
+
+    baseline_job = _seed_succeeded_job(job_repository, "job_baseline_no_index")
+    baseline_outcome = converger.converge_job(baseline_job.id)  # no index at all
+
+    job = _seed_succeeded_job(job_repository, "job_standalone")
+    assert job.id not in owned_job_ids
+    outcome = converger.converge_job(job.id, batch_ownership_index=(owned_job_ids, reliable))
+
+    # The unreliable index changed nothing: same outcome as the no-index
+    # baseline (the malformed file genuinely could be hiding this job's
+    # real owner, so both correctly stay retryable, never a guessed DONE).
+    assert outcome == baseline_outcome == CompletionOutcome.RETRYABLE_FAILURE
+    assert job_repository.get(job.id).completion_state == "pending"
+    assert job_repository.get(job.id).completion_error is not None
+
+
+def test_active_retry_tick_builds_the_batch_ownership_index_at_most_once(
+    tmp_path, monkeypatch
+):
+    """N genuinely completion-pending standalone jobs on one tick must
+    still build the shared Batch-ownership index exactly once for that
+    tick, mirroring the Story-replay index's own "shared, not per-job"
+    contract (PR3 exact-HEAD audit, eleventh round, finding 5).
+    """
+    job_repository, batch_repository, batch_service, job_service, converger = (
+        _build_with_batch_service(tmp_path)
+    )
+
+    job_count = 10
+    for i in range(job_count):
+        _seed_succeeded_job(job_repository, f"job_{i}")
+    assert len(job_repository.list_terminal_pending_completion()) == job_count
+
+    real_list_all_tolerant = batch_repository.list_all_tolerant
+    scan_calls = {"count": 0}
+
+    def counting_list_all_tolerant(*args, **kwargs):
+        scan_calls["count"] += 1
+        return real_list_all_tolerant(*args, **kwargs)
+
+    monkeypatch.setattr(batch_repository, "list_all_tolerant", counting_list_all_tolerant)
+
+    stop_event = Event()
+    convergence_calls = {"count": 0}
+    original_converge_job = converger.converge_job
+
+    def converge_job_then_maybe_stop(job_id, **kwargs):
+        result = original_converge_job(job_id, **kwargs)
+        convergence_calls["count"] += 1
+        if convergence_calls["count"] >= job_count:
+            stop_event.set()
+        return result
+
+    monkeypatch.setattr(converger, "converge_job", converge_job_then_maybe_stop)
+
+    converger.run_retry_loop(stop_event=stop_event, poll_interval_seconds=0)
+
+    assert scan_calls["count"] == 1
+    assert convergence_calls["count"] == job_count
+    for i in range(job_count):
+        assert job_repository.get(f"job_{i}").completion_state == "done"
+
+
+# --- PR3 exact-HEAD audit, eleventh round, finding 6: skip the Story index
+# when no succeeded completion is pending ----------------------------------
+
+
+def test_failed_only_retry_tick_builds_no_candidate_index(tmp_path, monkeypatch):
+    """A tick whose pending jobs are all `failed`/`cancelled` (a bursty
+    failure spell, a mass batch cancellation right before a restart) has
+    no use for the `SceneCandidateIndex` -- `_converge_story()` only ever
+    runs for a `succeeded` job -- so building it anyway is the exact same
+    wasted full-table scan+decode the idle-tick fix already ruled out for
+    "nothing pending at all" (PR3 exact-HEAD audit, eleventh round,
+    finding 6).
+    """
+    import core.story.replay_selection as replay_selection_module
+
+    job_repository, batch_repository, batch_service, job_service, converger = (
+        _build_with_batch_service(tmp_path, with_story=True)
+    )
+
+    job_count = 5
+    for i in range(job_count):
+        _seed_failed_job(job_repository, f"job_failed_{i}")
+    assert len(job_repository.list_terminal_pending_completion()) == job_count
+
+    build_calls = {"count": 0}
+    real_build = replay_selection_module.build_scene_candidate_index
+
+    def counting_build(job_repository_arg):
+        build_calls["count"] += 1
+        return real_build(job_repository_arg)
+
+    monkeypatch.setattr(replay_selection_module, "build_scene_candidate_index", counting_build)
+
+    # Stop only after every pending job this tick has actually been
+    # converged -- setting stop_event any earlier (e.g. right after
+    # listing pending jobs) would trip the loop's own graceful-shutdown
+    # check (`if stop_event.is_set(): break`) partway through this same
+    # tick's for-loop, converging none of them.
+    stop_event = Event()
+    convergence_calls = {"count": 0}
+    original_converge_job = converger.converge_job
+
+    def converge_job_then_maybe_stop(job_id, **kwargs):
+        result = original_converge_job(job_id, **kwargs)
+        convergence_calls["count"] += 1
+        if convergence_calls["count"] >= job_count:
+            stop_event.set()
+        return result
+
+    monkeypatch.setattr(converger, "converge_job", converge_job_then_maybe_stop)
+
+    converger.run_retry_loop(stop_event=stop_event, poll_interval_seconds=0)
+
+    assert build_calls["count"] == 0
+    assert convergence_calls["count"] == job_count
+    for i in range(job_count):
+        assert job_repository.get(f"job_failed_{i}").completion_state == "done"
+
+
+def test_failed_only_startup_recovery_builds_no_candidate_index(tmp_path, monkeypatch):
+    """The identical "no succeeded job pending, no Story index" contract
+    applies to `run_startup_recovery()`'s step 4 -- found and fixed via
+    this round's own required adversarial self-review, extending finding
+    6 (originally scoped only to `run_retry_loop()`) to the startup pass,
+    which has the identical unconditional-build pattern.
+    """
+    from core.jobs.startup_recovery import run_startup_recovery
+    import core.story.replay_selection as replay_selection_module
+
+    job_repository, batch_repository, batch_service, job_service, converger = (
+        _build_with_batch_service(tmp_path, with_story=True)
+    )
+
+    job_count = 5
+    for i in range(job_count):
+        _seed_failed_job(job_repository, f"job_failed_{i}")
+
+    build_calls = {"count": 0}
+    real_build = replay_selection_module.build_scene_candidate_index
+
+    def counting_build(job_repository_arg):
+        build_calls["count"] += 1
+        return real_build(job_repository_arg)
+
+    monkeypatch.setattr(replay_selection_module, "build_scene_candidate_index", counting_build)
+
+    report = run_startup_recovery(
+        job_repository, job_service, converger, batch_service=batch_service
+    )
+
+    assert build_calls["count"] == 0
+    assert len(report.completion_outcomes) == job_count
+    for i in range(job_count):
+        assert job_repository.get(f"job_failed_{i}").completion_state == "done"
+
+
+# --- PR3 exact-HEAD audit, eleventh round, finding 7: avoid rescanning
+# every Asset for each replay candidate -------------------------------------
+
+
+def test_has_usable_output_skips_the_asset_scan_for_a_normal_candidate(tmp_path, monkeypatch):
+    """A normal succeeded candidate's own `result.outputs` -- already in
+    memory, no repository access -- must settle usability on its own,
+    without ever calling `AssetRepository.get_primary_by_job()` (a full
+    Asset-directory scan+decode) at all (PR3 exact-HEAD audit, eleventh
+    round, finding 7).
+    """
+    from core.story.replay_selection import _has_usable_output
+
+    asset_repository = AssetRepository(tmp_path / "assets")
+    candidate = _job_record_for_usability_check(outputs=("out.png",))
+
+    def fail_if_called(_job_id):
+        raise AssertionError("get_primary_by_job() must not be called for a usable candidate")
+
+    monkeypatch.setattr(asset_repository, "get_primary_by_job", fail_if_called)
+
+    assert _has_usable_output(candidate, asset_repository) is True
+
+
+def test_has_usable_output_falls_back_to_the_asset_repository_for_an_outputless_legacy_job(
+    tmp_path,
+):
+    """An outputless candidate -- `result.outputs` empty, or no `result`
+    at all -- must still be recognized as usable if an Asset already
+    exists for it from an earlier sync, independent of what its current
+    `result` payload says (a legacy row, or one whose `result` was never
+    fully round-tripped). Finding 7 only reorders the two checks; it must
+    not remove this fallback.
+    """
+    from core.story.replay_selection import _has_usable_output
+
+    asset_repository = AssetRepository(tmp_path / "assets")
+    synced_job = _job_record_for_usability_check(job_id="job_legacy", outputs=("out.png",))
+    asset_repository.sync_job(synced_job)
+    assert asset_repository.get_primary_by_job("job_legacy") is not None
+
+    outputless_view = _job_record_for_usability_check(job_id="job_legacy", outputs=())
+    assert _has_usable_output(outputless_view, asset_repository) is True
+
+    no_result_view = _job_record_for_usability_check(job_id="job_legacy", outputs=None)
+    assert _has_usable_output(no_result_view, asset_repository) is True
+
+
+def test_has_usable_output_correctly_rejects_a_genuinely_outputless_candidate(tmp_path):
+    """The reordering must not accidentally make a genuinely outputless
+    candidate with no synced Asset look usable.
+    """
+    from core.story.replay_selection import _has_usable_output
+
+    asset_repository = AssetRepository(tmp_path / "assets")
+    candidate = _job_record_for_usability_check(job_id="job_never_usable", outputs=())
+
+    assert _has_usable_output(candidate, asset_repository) is False
+
+
+def test_converge_scene_binding_does_not_redundantly_scan_assets_for_a_normal_job(
+    tmp_path, monkeypatch
+):
+    """`converge_scene_binding()`'s own Asset precondition check (in
+    core/story/replay_selection.py) previously called `AssetRepository.
+    get_primary_by_job()` unconditionally for the job it is currently
+    converging, regardless of whether `result.outputs` was already
+    populated -- defeating finding 7's own reordering of
+    `_has_usable_output()` for the overwhelmingly common single-candidate
+    case (found via this round's own required adversarial self-review,
+    an adjacent gap to finding 7). A normal succeeded, scene-bound job
+    with populated `result.outputs` and no racing siblings must reach a
+    bound outcome with at most one Asset-repository lookup for its own
+    id -- `SceneBinder.replay_job_safely()`'s own unavoidable fetch to
+    actually persist the binding -- never a second, redundant one from
+    the precondition check itself.
+    """
+    job_repository, asset_repository, story_repository, scene_binder, converger = _build(
+        tmp_path
+    )
+    story = _create_bound_story(story_repository)
+    scene_id = story.scenes[0].id
+    job = _seed_succeeded_job(
+        job_repository, "job_a",
+        params=scene_binding_params(story.id, scene_id, "visual"),
+        outputs=("a.png",),
+    )
+
+    call_count = {"count": 0}
+    real_get_primary_by_job = asset_repository.get_primary_by_job
+
+    def counting_get_primary_by_job(job_id):
+        call_count["count"] += 1
+        return real_get_primary_by_job(job_id)
+
+    monkeypatch.setattr(asset_repository, "get_primary_by_job", counting_get_primary_by_job)
+
+    outcome = converger.converge_job(job.id)
+
+    assert outcome == CompletionOutcome.DONE
+    assert call_count["count"] <= 1
+    bound = story_repository.get(story.id)
+    asset = asset_repository.get_primary_by_job(job.id)
+    assert bound.scenes[0].asset_ids.get("visual") == asset.id
+
+
+def _job_record_for_usability_check(*, job_id="job_candidate", outputs=()):
+    now = datetime.now(timezone.utc)
+    result = (
+        None
+        if outputs is None
+        else GenerationResult(job_id=job_id, status="succeeded", outputs=list(outputs))
+    )
+    return JobRecord(
+        id=job_id,
+        status="succeeded",
+        media_type="image",
+        request=GenerationRequest(media_type="image", prompt="fake", model_id="fake"),
+        result=result,
+        created_at=now,
+        updated_at=now,
+    )

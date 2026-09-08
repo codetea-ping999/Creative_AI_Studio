@@ -434,7 +434,11 @@ class CompletionConverger:
         self.converge_job(job_id)
 
     def converge_job(
-        self, job_id: str, *, candidate_index: "SceneCandidateIndex | None" = None
+        self,
+        job_id: str,
+        *,
+        candidate_index: "SceneCandidateIndex | None" = None,
+        batch_ownership_index: "tuple[frozenset[str], bool] | None" = None,
     ) -> CompletionOutcome:
         """Converge one job's post-terminal side effects, idempotently.
 
@@ -453,6 +457,13 @@ class CompletionConverger:
         one job at a time -- a fresh index is built lazily inside
         `converge_scene_binding()` only if this one job's own convergence
         actually needs candidate selection.
+
+        `batch_ownership_index`: an optional pre-built `(owned_job_ids,
+        reliable)` pair (see `build_batch_ownership_index()` below),
+        identically shared across every `converge_job()` call in one pass
+        (PR3 exact-HEAD audit, eleventh round, finding 5) so N pending
+        jobs cost one Batch directory scan total, not N -- see
+        `_reconcile_batch()` for how it is used.
         """
 
         try:
@@ -483,7 +494,9 @@ class CompletionConverger:
                 story_outcome_converged, story_outcome_retryable = self._converge_story(
                     job, candidate_index=candidate_index
                 )
-            batch_reconciliation_retryable = self._reconcile_batch(job_id)
+            batch_reconciliation_retryable = self._reconcile_batch(
+                job_id, batch_ownership_index=batch_ownership_index
+            )
         except Exception as exc:
             self.job_repository.mark_completion_pending_with_error(job_id, str(exc))
             logger.exception("Completion convergence failed for job %s.", job_id)
@@ -567,7 +580,31 @@ class CompletionConverger:
 
         return build_scene_candidate_index(self.job_repository)
 
-    def _reconcile_batch(self, job_id: str) -> bool:
+    def build_batch_ownership_index(self) -> "tuple[frozenset[str], bool] | None":
+        """Build one Batch-ownership snapshot for a convergence pass.
+
+        Returns `None` if no `batch_service` is configured on this
+        converger at all -- mirroring `build_scene_candidate_index()`'s
+        own early return -- so a caller with no Batch feature enabled
+        never pays for a scan whose result would go unused. A batch
+        caller (startup recovery, `run_retry_loop()`) should call this
+        exactly once per pass and pass the result to every
+        `converge_job()` call in that same pass (PR3 exact-HEAD audit,
+        eleventh round, finding 5), exactly like `build_scene_candidate_
+        index()` already does for Story replay.
+        """
+
+        if self.batch_service is None:
+            return None
+
+        return self.batch_service.build_job_ownership_index()
+
+    def _reconcile_batch(
+        self,
+        job_id: str,
+        *,
+        batch_ownership_index: "tuple[frozenset[str], bool] | None" = None,
+    ) -> bool:
         """Reconcile `job_id`'s owning Batch, if any.
 
         Returns whether this step is retryable -- i.e. whether the caller
@@ -575,10 +612,29 @@ class CompletionConverger:
         covers both "no parent Batch" and "reconciled successfully";
         only a genuinely uncertain read (see `BatchReconciliationOutcome.
         RETRYABLE_FAILURE`) returns `True`.
+
+        `batch_ownership_index`: an optional `(owned_job_ids, reliable)`
+        pair from `build_batch_ownership_index()`. When `reliable` is
+        `True` and `job_id` is absent from `owned_job_ids`, this job is
+        confirmed to have no owning Batch *as of that one shared scan* --
+        identical to `reconcile_child_job()`'s own `NO_PARENT` outcome --
+        so the full per-job reconciliation call (its own fresh Batch
+        directory scan) is skipped entirely (PR3 exact-HEAD audit,
+        eleventh round, finding 5). Never skipped when the index is
+        `None`, unreliable, or `job_id` *is* present in it -- an
+        unreliable scan could be hiding this exact job's real owner, and
+        a job present in the index still needs the real per-job call to
+        actually reconcile (advance stage, materialize children, etc.),
+        not just confirm ownership.
         """
 
         if self.batch_service is None:
             return False
+
+        if batch_ownership_index is not None:
+            owned_job_ids, reliable = batch_ownership_index
+            if reliable and job_id not in owned_job_ids:
+                return False
 
         # Local import: mirrors _converge_story()'s core.story import
         # above -- avoids a core.jobs <-> core.batches import-order
@@ -613,7 +669,27 @@ class CompletionConverger:
         forever, with nothing to actually use it for -- silently
         defeating the whole point of `list_terminal_pending_
         completion()`'s own supporting SQLite index (PR3 exact-HEAD
-        audit, seventh round, finding 2).
+        audit, seventh round, finding 2). Narrowed further (PR3
+        exact-HEAD audit, eleventh round, finding 6): only a `succeeded`
+        job's convergence ever calls `_converge_story()` at all (see
+        `converge_job()` -- a `failed`/`cancelled` job skips Story replay
+        entirely), so a tick whose pending jobs are all `failed`/
+        `cancelled` -- a bursty failure spell, a mass batch cancellation
+        -- has no use for this index either; building it anyway would be
+        the exact same wasted full-table scan+decode this same finding's
+        predecessor (seventh round, finding 2) already ruled out for the
+        "nothing pending at all" case, just for a slightly less obvious
+        "something pending, but none of it succeeded" case instead.
+
+        Builds one Batch-ownership index (see `build_batch_ownership_
+        index()`) per tick under the same rule -- shared across every job
+        this tick converges, so N pending jobs cost one Batch directory
+        scan total, not N (PR3 exact-HEAD audit, eleventh round, finding
+        5). Unlike the Story index, this one is not narrowed by outcome:
+        `_reconcile_batch()` runs for every terminal job regardless of
+        succeeded/failed/cancelled (a Batch needs to know about a failed
+        or cancelled child too), so it is built whenever there is at
+        least one pending job at all.
 
         Also drives `_retry_poison_quarantine_candidates()` every tick,
         in its own separate `try`/`except` -- a startup-recovery poison
@@ -627,11 +703,20 @@ class CompletionConverger:
             try:
                 pending_jobs = self.job_repository.list_terminal_pending_completion()
                 if pending_jobs:
-                    candidate_index = self.build_scene_candidate_index()
+                    candidate_index = (
+                        self.build_scene_candidate_index()
+                        if any(job.status == JOB_STATUS_SUCCEEDED for job in pending_jobs)
+                        else None
+                    )
+                    batch_ownership_index = self.build_batch_ownership_index()
                     for job in pending_jobs:
                         if stop_event.is_set():
                             break
-                        self.converge_job(job.id, candidate_index=candidate_index)
+                        self.converge_job(
+                            job.id,
+                            candidate_index=candidate_index,
+                            batch_ownership_index=batch_ownership_index,
+                        )
             except Exception:
                 logger.exception("Completion retry loop iteration failed; continuing.")
             try:

@@ -21,6 +21,39 @@ from core.reference_capabilities import MissingReferenceAssetError, UnsupportedR
 router = APIRouter(prefix="/batches", tags=["batches"])
 
 
+def _detail_with_committed_batch_id(exc: Exception) -> str:
+    """Append an already-committed batch's id to a permanent-failure message.
+
+    `UnsupportedReferenceError` / `MissingReferenceAssetError` / a plain
+    `ValueError` raised from inside `create_batch()`'s stage-0
+    materialization retry loop can fire *after* the Batch record was
+    already durably committed (Codex exact-HEAD audit, eleventh round,
+    adversarial follow-up to finding 1: these three widely-reused
+    exception types otherwise carry no batch identity at all, unlike
+    `BatchStageMaterializationError`, which finding 1 itself already
+    fixed). Without this, the client sees a bare client error with no way
+    to tell the batch already exists -- and, if it blindly retries the
+    exact same create request assuming nothing happened, mints a second,
+    separate batch under a new id for the identical permanent failure.
+
+    `committed_batch_id` is only ever present when `create_batch()`'s own
+    retry loop stamped it, right before re-raising, onto an exception
+    instance it knows fired after that exact commit -- absent for every
+    other raise site of these same shared exception types (the pre-commit
+    preflight check above, `advance_batch()`, template building, ...),
+    which have no batch to report and must not be reworded.
+    """
+
+    committed_batch_id = getattr(exc, "committed_batch_id", None)
+    detail = str(exc)
+    if committed_batch_id is not None:
+        detail = (
+            f"{detail} (batch {committed_batch_id} was already created -- "
+            f"do not resubmit; use GET /batches/{committed_batch_id} instead)"
+        )
+    return detail
+
+
 class BatchItemResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -104,7 +137,30 @@ def list_batches(
     )
 
 
-@router.post("", response_model=BatchResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=BatchResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses={
+        # PR3 exact-HEAD audit, eleventh round, finding 8: round 10 added
+        # a genuine runtime 202 response (materialization exhausted, but
+        # the Batch is durably committed) without declaring it here, so
+        # the generated OpenAPI contract told clients a successful create
+        # could only ever be 201 -- documenting the runtime behavior this
+        # route actually has, not adding a new one.
+        status.HTTP_202_ACCEPTED: {
+            "model": BatchResponse,
+            "description": (
+                "The batch was created and durably committed, but its "
+                "stage-0 materialization could not be confirmed complete "
+                "right now (a transient storage failure). Continue using "
+                "the returned batch id -- poll GET /batches/{id}, or wait "
+                "for the next process restart's startup resume -- rather "
+                "than submitting a new create request."
+            ),
+        },
+    },
+)
 def create_batch(
     request: CreateBatchRequest,
     response: Response,
@@ -146,7 +202,8 @@ def create_batch(
         # order, and the broader clause would otherwise catch these first,
         # making this one unreachable and reporting 400 instead of 422.
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=_detail_with_committed_batch_id(exc),
         ) from exc
     except BatchStageMaterializationError as exc:
         # `POST /batches` is non-idempotent: unlike `advance_batch()`'s
@@ -158,20 +215,30 @@ def create_batch(
         # request, minting a second, entirely separate Batch under a new
         # id -- both eventually running -- while also skipping the
         # project-binding loop below for whatever children already got a
-        # stable id. Instead, look up the batch this exact exception
-        # names (`exc.batch_id`) and return *that* committed record, with
-        # its own real (still in-progress) status -- 202 Accepted, not
-        # 201: the request was accepted and the batch does exist, but
-        # materialization is not yet confirmed complete. The client
-        # continues using this same batch id (poll `GET /batches/{id}`,
-        # or wait for the next restart's startup resume) instead of
-        # submitting a new create request.
-        committed_record = services.batch_service.get_batch(exc.batch_id)
+        # stable id.
+        #
+        # Uses `exc.record` directly -- never a separate `get_batch()`
+        # call of its own (PR3 exact-HEAD audit, eleventh round, finding
+        # 1): a second read here would itself be fallible, and if the
+        # exact same storage failure that caused the exhaustion also
+        # broke *this* read, the route would fall back to exactly the
+        # bare 503 this fix exists to eliminate -- the committed Batch's
+        # identity would survive on disk but be unreachable from this
+        # response. `create_batch()`'s own raise site guarantees `record`
+        # is never `None` (see `BatchStageMaterializationError`'s own
+        # docstring for how). `record` being present is not a claim that
+        # materialization is complete -- only that this exact committed
+        # Batch's identity/state, as best known at the moment of raising,
+        # is returned: 202 Accepted, not 201 -- the request was accepted
+        # and the batch does exist, but materialization is not yet
+        # confirmed complete. The client continues using this same batch
+        # id (poll `GET /batches/{id}`, or wait for the next restart's
+        # startup resume) instead of submitting a new create request.
+        committed_record = exc.record
         if committed_record is None:
-            # Should not happen (the batch was just created moments ago
-            # and nothing else in this request had a chance to delete
-            # it), but never silently fabricate a response for a batch
-            # that turns out not to exist.
+            # Defensive only -- unreachable given `create_batch()`'s own
+            # guarantee, but never silently fabricate a response for a
+            # batch this exception cannot actually identify.
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
             ) from exc
@@ -185,7 +252,8 @@ def create_batch(
         # Expansion refusing an oversized sweep is a client error, and the message
         # already names the count and the cap.
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=_detail_with_committed_batch_id(exc),
         ) from exc
 
     if spec.project_id is not None:

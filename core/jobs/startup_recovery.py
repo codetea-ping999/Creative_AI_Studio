@@ -303,17 +303,42 @@ def run_startup_recovery(
     # snapshot of "which succeeded jobs exist," not "who has already won
     # a role" (that is always re-read fresh per job from the live Story),
     # so sharing it across this one pass changes no outcome, only cost.
+    #
+    # Likewise, one Batch-ownership index (PR3 exact-HEAD audit, eleventh
+    # round, finding 5) is built up front and shared across every job this
+    # loop converges: `converge_job()` -> `_reconcile_batch()` ->
+    # `reconcile_child_job()` previously re-scanned every Batch file from
+    # scratch for every single pending job, an O(N x B) startup cost on
+    # top of the O(N) Story cost finding 2 already fixed.
     pending_completion_jobs = job_repository.list_terminal_pending_completion()
     if pending_completion_jobs:
-        # Built only when there is at least one job to actually use it
-        # for -- on a fresh/already-converged database this loop has
-        # nothing to do at all, and building the index anyway would be a
-        # wasted full-table scan+decode on every single startup (PR3
-        # exact-HEAD audit, seventh round, finding 2).
-        candidate_index = completion_converger.build_scene_candidate_index()
+        # The Story index is built only when at least one pending job is
+        # `succeeded` (PR3 exact-HEAD audit, eleventh round, finding 6,
+        # extended to this pass via this round's own adversarial
+        # self-review): `_converge_story()` only ever runs for a
+        # `succeeded` job (see `converge_job()`) -- a startup pass whose
+        # entire pending backlog is `failed`/`cancelled` (e.g. a mass
+        # batch cancellation right before a restart) has no use for it,
+        # and building it anyway would be the exact same wasted
+        # full-table scan+decode finding 2 (seventh round) already ruled
+        # out for the "nothing pending at all" case. The Batch-ownership
+        # index has no such narrowing -- `_reconcile_batch()` runs for
+        # every terminal outcome alike -- so it is built whenever there
+        # is at least one job to actually use it for (on a fresh/already-
+        # converged database this loop has nothing to do at all, and
+        # building either index anyway would be a wasted scan on every
+        # single startup, PR3 exact-HEAD audit, seventh round, finding 2).
+        candidate_index = (
+            completion_converger.build_scene_candidate_index()
+            if any(job.status == JOB_STATUS_SUCCEEDED for job in pending_completion_jobs)
+            else None
+        )
+        batch_ownership_index = completion_converger.build_batch_ownership_index()
         for job in pending_completion_jobs:
             report.completion_outcomes[job.id] = completion_converger.converge_job(
-                job.id, candidate_index=candidate_index
+                job.id,
+                candidate_index=candidate_index,
+                batch_ownership_index=batch_ownership_index,
             )
 
     # 4b. Asset repair, independent of completion_state (PR3 exact-HEAD
@@ -567,21 +592,30 @@ def quarantine_or_defer_for_batch_cancellation(
     try:
         raw_status = job_repository.get_raw_status(job_id)  # decode-free peek
         if raw_status == JOB_STATUS_QUEUED and batch_service is not None:
-            cancellation_state = batch_service.diagnose_job_batch_cancellation(job_id)
-            if cancellation_state == "uncertain":
+            # PR3 exact-HEAD audit, eleventh round, finding 4: the
+            # ownership lookup, the cancellation inspection, and the raw
+            # queued-child disposition -- cancelled OR the ordinary
+            # `failed` outcome alike (adversarial follow-up to finding 4:
+            # a confirmed-owning-but-not-cancelling read is only correct
+            # for the instant it was taken, so its own CAS to `failed`
+            # must happen under the same lock too, or a `cancel()` call
+            # landing right after the read but before an unlocked CAS
+            # could still lose that race) -- all happen inside ONE call to
+            # `diagnose_and_transition_cancelled_poison_child()`, under
+            # the same `BatchRepository.run_exclusive()` lock `cancel()`'s
+            # own durable-intent mutation uses, not as separate steps a
+            # concurrent `cancel()` call could interleave with.
+            reason = f"Startup recovery: row could not be reconstructed: {exc}"
+            outcome = batch_service.diagnose_and_transition_cancelled_poison_child(
+                job_id, reason=reason
+            )
+            if outcome == "uncertain":
                 return "batch_cancellation_uncertain"
-            if cancellation_state == "cancelled":
-                reason = f"Startup recovery: row could not be reconstructed: {exc}"
-                ok = job_repository.transition_if_status(
-                    job_id,
-                    (JOB_STATUS_QUEUED,),
-                    status=JOB_STATUS_CANCELLED,
-                    progress=1.0,
-                    error_message=reason,
-                )
-                return "cancelled" if ok else "already_resolved"
-            # "not_cancelled" or "no_parent" -- proceed with the normal,
-            # unaffected quarantine classification below.
+            if outcome in ("cancelled", "failed", "already_resolved"):
+                return outcome
+            # "no_parent" -- proceed with the normal, unaffected quarantine
+            # classification below (no owning Batch means no `cancel()`
+            # call can race this row through `BatchRepository`'s lock).
     except Exception:
         logger.exception(
             "Transient failure while checking Batch cancellation "

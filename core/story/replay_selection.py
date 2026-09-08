@@ -235,14 +235,24 @@ def _has_usable_output(
     (`converge_scene_binding()`'s own rule below never revisits a lost
     race), while the winner stays `RETRYABLE` forever waiting for an Asset
     that will never arrive -- the role never gets filled by anyone.
-    Checking the Asset repository first (not just `candidate.result`)
-    also covers a candidate whose Asset already exists from an earlier
-    sync, independent of what its `result` payload currently says.
+
+    Checks `candidate.result.outputs` first -- already in memory, no
+    repository access at all -- before ever calling `AssetRepository.
+    get_primary_by_job()`, which is a full Asset-directory scan+decode
+    (PR3 exact-HEAD audit, eleventh round, finding 7): completion
+    convergence always runs Asset sync before Story replay for a
+    `succeeded` job (see `CompletionConverger.converge_job()`), so by the
+    time a candidate reaches this selection at all, a normal candidate's
+    `result.outputs` is already populated and this check alone settles
+    it -- one full Asset scan is only ever paid for the genuine edge case
+    this order still covers identically: a legacy, outputless candidate
+    whose Asset nonetheless already exists from an earlier sync,
+    independent of what its `result` payload currently says.
     """
 
-    if asset_repository.get_primary_by_job(candidate.id) is not None:
+    if candidate.result is not None and any(candidate.result.outputs):
         return True
-    return bool(candidate.result is not None and any(candidate.result.outputs))
+    return asset_repository.get_primary_by_job(candidate.id) is not None
 
 
 def _select_winner(candidates: list["JobRecord"]) -> "JobRecord":
@@ -325,11 +335,21 @@ def converge_scene_binding(
         scene_binder.replay_job_safely(job.id)
         return ReplayOutcome.CONVERGED
 
-    asset = asset_repository.get_primary_by_job(job.id)
-    if asset is None:
+    if not _has_usable_output(job, asset_repository):
         # Asset sync for this job has not produced anything (yet). Since
         # completion convergence runs Asset sync before Story replay, this
         # is normally transient (sync hasn't committed) -- retry later.
+        #
+        # Reuses `_has_usable_output()` -- checking `job.result.outputs`
+        # (in-memory) before ever calling `asset_repository.get_primary_
+        # by_job()` -- rather than a bare, unconditional repository call
+        # of its own (PR3 exact-HEAD audit, eleventh round, adversarial
+        # follow-up to finding 7): this exact precondition check ran for
+        # every succeeded, scene-bound job's *own* convergence, regardless
+        # of whether its `result.outputs` was already populated, defeating
+        # finding 7's own reordering for the overwhelmingly common case --
+        # `_has_usable_output()`'s own scan is only ever reached for the
+        # legacy, outputless case this check must still cover identically.
         return ReplayOutcome.RETRYABLE
 
     # The role is genuinely unresolved. There may be other succeeded,

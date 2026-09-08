@@ -2640,15 +2640,14 @@ def test_startup_isolates_a_transient_failure_from_the_cancellation_precedence_c
     tmp_path, monkeypatch
 ):
     """Finding 4's new Batch-cancellation-precedence check (`get_raw_
-    status()`, `diagnose_job_batch_cancellation()`, and the direct CAS
-    for a confirmed-cancelled row) was itself unguarded when first
-    written -- a transient failure from any of those calls would
-    propagate straight out of `run_startup_recovery()`'s step-1 loop,
-    aborting the entire startup pass, exactly the class of gap finding 2
-    fixed for `reconcile_child_job()` but reintroduced by finding 4's
-    own new code (found via this round's own required adversarial
-    self-review). A healthy, unrelated job's own recovery must not be
-    blocked by it.
+    status()` and the atomic `diagnose_and_transition_cancelled_poison_
+    child()`) was itself unguarded when first written -- a transient
+    failure from any of those calls would propagate straight out of
+    `run_startup_recovery()`'s step-1 loop, aborting the entire startup
+    pass, exactly the class of gap finding 2 fixed for `reconcile_
+    child_job()` but reintroduced by finding 4's own new code (found via
+    this round's own required adversarial self-review). A healthy,
+    unrelated job's own recovery must not be blocked by it.
     """
 
     from core.batches.schemas import BatchSpec
@@ -2682,14 +2681,16 @@ def test_startup_isolates_a_transient_failure_from_the_cancellation_precedence_c
 
     healthy_job = _seed(job_repository, "queued", "job_healthy_precedence")
 
-    real_diagnose = batch_service.diagnose_job_batch_cancellation
+    real_diagnose = batch_service.diagnose_and_transition_cancelled_poison_child
 
-    def flaky_diagnose(job_id_arg):
+    def flaky_diagnose(job_id_arg, *, reason):
         if job_id_arg == job_id:
             raise sqlite3.OperationalError("injected: transient Batch read failure")
-        return real_diagnose(job_id_arg)
+        return real_diagnose(job_id_arg, reason=reason)
 
-    monkeypatch.setattr(batch_service, "diagnose_job_batch_cancellation", flaky_diagnose)
+    monkeypatch.setattr(
+        batch_service, "diagnose_and_transition_cancelled_poison_child", flaky_diagnose
+    )
 
     report = run_startup_recovery(
         job_repository, services["job_service"], completion_converger,
@@ -2699,8 +2700,15 @@ def test_startup_isolates_a_transient_failure_from_the_cancellation_precedence_c
     # startup did not raise globally -- reaching this line proves it.
     assert report.poison_rows[job_id] == "transient_write_failure"
     assert job_id in completion_converger._poison_retry_candidates
-    # Never guessed a disposition on incomplete information.
-    assert _raw_status(services["db_path"], job_id) == "queued"
+    # Step 1's own precedence check never guessed a disposition -- but this
+    # same startup pass's step 2 (`resume_pending_cancellations()`) reaches
+    # this exact child through a wholly separate, unmocked path (`cancel()`'s
+    # own `_apply_cancellation_intent` closure, finding 3) and resolves it
+    # correctly on its own, independent of step 1's injected failure. This
+    # is defense in depth, not a guess: `cancel()` re-derives the same
+    # raw-status-is-QUEUED fact directly, under its own lock, rather than
+    # trusting step 1's failed attempt.
+    assert _raw_status(services["db_path"], job_id) == "cancelled"
     # The healthy, unrelated job's own recovery was not blocked.
     assert healthy_job.id in report.requeued
 
@@ -2708,6 +2716,10 @@ def test_startup_isolates_a_transient_failure_from_the_cancellation_precedence_c
 
     _one_retry_tick(job_repository, completion_converger)
 
+    # A later retry tick, now unmocked, finds the row already terminal and
+    # simply reflects that (`left_untouched_terminal`) -- it does not need
+    # to, and cannot, re-derive a disposition of its own for an already-
+    # resolved row.
     assert _raw_status(services["db_path"], job_id) == "cancelled"
     assert job_id not in completion_converger._poison_retry_candidates
 

@@ -681,6 +681,19 @@ def test_runtime_retry_safely_reenqueues_a_reused_queued_child(tmp_path, monkeyp
     a *runtime* retry, not a restart: the same `BatchService`/`JobQueue`
     instances, exactly as `reconcile_child_job()`'s own completion-retry
     path would re-drive `_enqueue_stage()`.
+
+    The injected failure now persists across every one of `create_batch()`'s
+    own bounded retry attempts (PR3 exact-HEAD audit, eleventh round,
+    finding 2 made a single transient `_enqueue_stage()` exception
+    retried, and therefore self-healing, within `create_batch()` itself --
+    a one-shot failure would no longer reach this test's own subsequent
+    `_enqueue_stage()` call at all, since `create_batch()` would now
+    silently retry past it and return a normal, fully materialized
+    batch). A persistent failure still reaches the same "materialized but
+    never enqueued" precondition this test needs, just via
+    `BatchStageMaterializationError` (finding 2's own identity-preserving
+    outcome for a raised, not merely ambiguous, materialization failure)
+    instead of the raw injected exception.
     """
 
     job_repository, job_queue, job_service, batch_repository, batch_service = _build(tmp_path)
@@ -691,18 +704,16 @@ def test_runtime_retry_safely_reenqueues_a_reused_queued_child(tmp_path, monkeyp
     )
 
     original_enqueue_job = job_service.enqueue_job
-    calls = {"count": 0}
 
     def flaky_enqueue_job(job_id):
-        calls["count"] += 1
-        if calls["count"] == 1:
-            raise RuntimeError("injected: enqueue_job fails after materialization")
-        return original_enqueue_job(job_id)
+        raise RuntimeError("injected: enqueue_job fails after materialization")
 
     monkeypatch.setattr(job_service, "enqueue_job", flaky_enqueue_job)
 
-    with pytest.raises(RuntimeError, match="injected"):
+    with pytest.raises(BatchStageMaterializationError):
         batch_service.create_batch(_spec())
+
+    monkeypatch.setattr(job_service, "enqueue_job", original_enqueue_job)
 
     batch_id = batch_repository.list_all()[0].id
     job_id = batch_repository.get(batch_id).items[0].job_id
@@ -1977,6 +1988,12 @@ def test_create_batch_raises_a_retryable_failure_when_retries_are_exhausted(
     [record] = batch_repository.list_all()
     batch_id = record.id
     assert batch_id in str(excinfo.value)
+    # The exception carries this exact committed record directly (PR3
+    # exact-HEAD audit, eleventh round, finding 1) -- a caller never
+    # needs a second, separately-fallible read to identify or use it.
+    assert excinfo.value.batch_id == batch_id
+    assert excinfo.value.record is not None
+    assert excinfo.value.record.id == batch_id
     item1_id, item2_id = (item.job_id for item in record.items)
     assert item2_id == item2_id_holder["id"]
     assert job_repository.get(item1_id).status == "queued"
@@ -2087,3 +2104,261 @@ def test_batch_status_stays_succeeded_when_cancellation_arrives_after_true_compl
     reconciled_after_cancel = batch_service.reconcile(batch.id)
     assert reconciled_after_cancel.status == "succeeded"
     assert reconciled_after_cancel.cancellation_requested is True
+
+
+# --- Codex exact-HEAD audit, eleventh round, finding 2: preserve Batch
+# identity for ALL post-commit materialization errors ----------------------
+
+
+def test_create_batch_normalizes_a_raised_materialization_exception(
+    tmp_path, monkeypatch, caplog
+):
+    """`_enqueue_stage()` can RAISE, not just return an ambiguous `None`
+    -- for example a transient `sqlite3.OperationalError` while creating
+    a child Job row. The Batch is already durably committed by this
+    point, exactly like the bounded-`None`-exhaustion case; an unguarded
+    raise here would bypass `BatchStageMaterializationError` entirely
+    and reach the API route as a bare, identity-less exception, inviting
+    the exact same non-idempotent-POST-retry duplication finding 1
+    closed for the ambiguous-`None` case (Codex exact-HEAD audit,
+    eleventh round, finding 2). Normalized to the same identity-
+    preserving `BatchStageMaterializationError`, retried within the same
+    bounded loop first -- exactly like an ambiguous `None` result
+    already is -- rather than failing immediately on the first
+    occurrence.
+    """
+
+    job_repository, job_queue, job_service, batch_repository, batch_service = _build(
+        tmp_path
+    )
+
+    def always_raises(*args, **kwargs):
+        raise sqlite3.OperationalError("injected: transient child Job row insert failure")
+
+    monkeypatch.setattr(job_service, "create_or_reuse_job_without_enqueue", always_raises)
+
+    with caplog.at_level("WARNING", logger="core.batches.service"):
+        with pytest.raises(BatchStageMaterializationError) as excinfo:
+            batch_service.create_batch(_spec())
+
+    # Committed Batch identity survives -- same contract as the
+    # bounded-`None`-exhaustion path.
+    [record] = batch_repository.list_all()
+    assert excinfo.value.batch_id == record.id
+    assert excinfo.value.record is not None
+    assert excinfo.value.record.id == record.id
+    # Retried within the bounded loop before finally giving up -- not
+    # failed immediately on the very first occurrence.
+    assert any(
+        "retrying" in log_record.getMessage() for log_record in caplog.records
+    )
+    # Never actually created any Job row (the injected failure fires
+    # before that point every attempt) -- no partial/duplicate state.
+    assert job_repository.list() == []
+    assert job_queue.size() == 0
+
+
+def test_create_batch_permanent_reference_failure_from_enqueue_stage_still_propagates(
+    tmp_path, monkeypatch
+):
+    """A genuinely PERMANENT failure (`UnsupportedReferenceError`/
+    `MissingReferenceAssetError`/`ValueError`) raised by `_enqueue_stage()`
+    itself must still propagate immediately, unretried, straight to the
+    API route's own existing 422/400 handling -- finding 2's new
+    catch-all for *unexpected* exceptions must not also start retrying
+    (or converting to `BatchStageMaterializationError`) a failure a retry
+    can never fix on its own, matching `resume_current_stage_for_all_
+    batches()`'s own identical classification of these exact three
+    exception types from the same call.
+    """
+
+    job_repository, job_queue, job_service, batch_repository, batch_service = _build(
+        tmp_path
+    )
+
+    def always_permanent(*args, **kwargs):
+        raise ValueError("injected: permanent content mismatch")
+
+    monkeypatch.setattr(job_service, "create_or_reuse_job_without_enqueue", always_permanent)
+
+    with pytest.raises(ValueError, match="injected: permanent content mismatch"):
+        batch_service.create_batch(_spec())
+
+
+# --- Codex exact-HEAD audit, eleventh round, finding 3: cancel queued
+# poison children instead of leaving them to JobRunner ----------------------
+
+
+def test_cancel_transitions_a_raw_queued_poison_child_to_cancelled(tmp_path):
+    """A malformed queued child, already sitting in the in-memory
+    `JobQueue` before it became poison, must not be left `queued` once
+    the owning Batch's cancellation intent is durable: `JobRunner`'s own
+    separate poison-quarantine path (`_quarantine_poison_job()`) can
+    dequeue and CAS it straight to `failed`, publishing `job_failed` and
+    reconciling this now-cancelling Batch as `failed` instead of
+    `cancelled` -- a live-runner code path `cancel()`'s own recovery
+    helpers never otherwise touch (Codex exact-HEAD audit, eleventh
+    round, finding 3). `cancel()` now transitions a raw QUEUED poison
+    child directly to `cancelled` in the same atomic save as persisting
+    the durable cancellation intent, so the runner finds it already
+    resolved and never overwrites it.
+    """
+
+    job_repository, job_queue, job_service, batch_repository, batch_service = _build(
+        tmp_path
+    )
+    generator = _CountingGenerator()
+    job_runner = JobRunner(
+        job_repository, job_queue, GeneratorRegistry({"image": generator}),
+        job_service=job_service,
+    )
+
+    batch = batch_service.create_batch(_spec())
+    job_id = batch.items[0].job_id
+    assert job_queue.size() == 1  # already queue-visible before it becomes poison
+
+    with sqlite3.connect(tmp_path / "jobs.db") as raw:
+        raw.execute(
+            "UPDATE jobs SET request_json = ? WHERE id = ?", ("{not valid json", job_id)
+        )
+        raw.commit()
+
+    reconciled = batch_service.cancel(batch.id)
+
+    assert reconciled is not None
+    with sqlite3.connect(tmp_path / "jobs.db") as raw:
+        status = raw.execute(
+            "SELECT status FROM jobs WHERE id = ?", (job_id,)
+        ).fetchone()[0]
+    assert status == "cancelled"
+    assert reconciled.status == "cancelled"
+
+    # The runner is now allowed to continue: it dequeues this exact id,
+    # cannot decode the row (payload is still corrupted), and its own
+    # poison-quarantine CAS -- expecting `queued` -- correctly misses
+    # (the row is already `cancelled`) and reports "already resolved"
+    # rather than overwriting anything. `run_once()` still re-raises the
+    # original decode failure (its own documented contract for a
+    # permanent pre-claim failure), so this is the proof the runner
+    # genuinely attempted and deferred, not that it silently no-opped.
+    from core.storage.repositories.job_repository import JobRecordDecodeError
+
+    with pytest.raises(JobRecordDecodeError):
+        job_runner.run_once()
+
+    with sqlite3.connect(tmp_path / "jobs.db") as raw:
+        status_after_runner = raw.execute(
+            "SELECT status FROM jobs WHERE id = ?", (job_id,)
+        ).fetchone()[0]
+    assert status_after_runner == "cancelled"  # never overwritten to "failed"
+    assert generator.calls == 0
+
+    # Idempotent repeat.
+    batch_service.cancel(batch.id)
+    with sqlite3.connect(tmp_path / "jobs.db") as raw:
+        status_again = raw.execute(
+            "SELECT status FROM jobs WHERE id = ?", (job_id,)
+        ).fetchone()[0]
+    assert status_again == "cancelled"
+
+
+# --- Codex exact-HEAD audit, eleventh round, finding 4: serialize runtime
+# poison classification with Batch cancellation ------------------------------
+
+
+def test_poison_disposition_never_overwrites_a_cancel_that_commits_first(tmp_path):
+    """Two independent poison-child dispositions for the SAME raw QUEUED
+    poison row, run as genuinely concurrent threads: the runtime poison-
+    retry loop's own `quarantine_or_defer_for_batch_cancellation()`
+    (thread A) racing a user-initiated `cancel()` (thread B) (Codex
+    exact-HEAD audit, eleventh round, finding 4).
+
+    The interleaving is fixed deterministically -- no sleep, no polling --
+    so that thread B's cancellation intent (and, per finding 3, its own
+    direct CAS of this exact raw QUEUED poison child to `cancelled`) fully
+    commits before thread A's own disposition call is even made: thread A
+    blocks on an `Event` that thread B sets only after `cancel()` returns.
+    This is the literal ordering the round's own specification names
+    ("Thread B: cancel(). cancel intent commits first."), and fixing it
+    this way is still a meaningful proof of finding 4's own fix, not just
+    finding 3's: before finding 4, thread A's read of Batch ownership/
+    cancellation (`diagnose_job_batch_cancellation()`) was lock-free, so
+    thread A's own subsequent CAS attempt ran outside any lock shared with
+    `cancel()` at all. Finding 4's atomic `diagnose_and_transition_
+    cancelled_poison_child()` makes thread A's entire read-decide-CAS
+    sequence run inside the same `BatchRepository.run_exclusive()` lock
+    `cancel()` itself uses, so thread A is guaranteed to observe the fully
+    committed post-cancel state and never attempt to CAS the row away from
+    it, no matter how the two threads are actually scheduled by the OS.
+    """
+
+    from threading import Event, Thread
+
+    from core.jobs.startup_recovery import quarantine_or_defer_for_batch_cancellation
+
+    job_repository, job_queue, job_service, batch_repository, batch_service = _build(
+        tmp_path
+    )
+
+    batch = batch_service.create_batch(_spec())
+    job_id = batch.items[0].job_id
+    assert job_queue.size() == 1  # already queue-visible before it becomes poison
+
+    with sqlite3.connect(tmp_path / "jobs.db") as raw:
+        raw.execute(
+            "UPDATE jobs SET request_json = ? WHERE id = ?", ("{not valid json", job_id)
+        )
+        raw.commit()
+
+    _records, failures = job_repository.list_tolerant()
+    decode_error = dict(failures)[job_id]
+
+    cancel_committed = Event()
+    errors: list[BaseException] = []
+    outcomes: dict[str, str] = {}
+
+    def _run_cancel():
+        try:
+            batch_service.cancel(batch.id)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+        finally:
+            cancel_committed.set()
+
+    def _run_poison_disposition():
+        assert cancel_committed.wait(timeout=5)  # fixes the interleaving; no sleep/poll
+        try:
+            outcomes["disposition"] = quarantine_or_defer_for_batch_cancellation(
+                job_repository, batch_service, job_id, decode_error
+            )
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    thread_a = Thread(target=_run_poison_disposition)
+    thread_b = Thread(target=_run_cancel)
+    thread_b.start()
+    thread_a.start()
+    thread_a.join(timeout=5)
+    thread_b.join(timeout=5)
+
+    assert not thread_a.is_alive() and not thread_b.is_alive()
+    assert errors == []
+
+    # Thread B's cancel() already fully resolved this exact child (finding
+    # 3): thread A's own disposition, running strictly after, must find it
+    # already terminal and reflect that -- never re-decide, never guess,
+    # and never (this is the invariant this test exists to prove) "failed".
+    assert outcomes["disposition"] in (
+        "cancelled",
+        "already_resolved",
+        "left_untouched_terminal",
+    )
+
+    with sqlite3.connect(tmp_path / "jobs.db") as raw:
+        status = raw.execute(
+            "SELECT status FROM jobs WHERE id = ?", (job_id,)
+        ).fetchone()[0]
+    assert status == "cancelled"  # never "failed"
+
+    reconciled = batch_repository.get(batch.id)
+    assert reconciled.cancellation_requested is True
