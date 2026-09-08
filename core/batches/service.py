@@ -261,6 +261,20 @@ class BatchService:
         # were wrong.
         enqueued = None
         last_transient_exc: Exception | None = None
+        # Refreshed after every failed attempt, not only once at the very
+        # end (PR3 exact-HEAD audit, twelfth round, finding 1): `_enqueue_
+        # stage()`'s own phase 1 (assigning stable child ids) can succeed
+        # and persist on an EARLIER attempt even though that same attempt's
+        # phase 2 (row creation) -- or a LATER attempt entirely -- is what
+        # actually fails/exhausts. Falling back to the original pre-loop
+        # `record` (still `job_id=None` on every item) in that case would
+        # silently lose the already-persisted id assignments from the
+        # final response, even though the batch's real on-disk state
+        # already has them; each attempt's own best-effort re-read keeps
+        # this snapshot as fresh as possible, so only a storage failure
+        # affecting EVERY single re-read in the whole loop (vanishingly
+        # rare) ever falls all the way back to the original record.
+        latest_known_record = record
         for attempt in range(_STARTUP_BATCH_SCAN_MAX_ATTEMPTS):
             try:
                 enqueued = self._enqueue_stage(record.id, stage_index=0)
@@ -314,9 +328,13 @@ class BatchService:
                 )
                 last_transient_exc = exc
                 enqueued = None
+                latest_known_record = (
+                    self.batch_repository.get(record.id) or latest_known_record
+                )
                 continue
             if enqueued is not None:
                 return enqueued
+            latest_known_record = self.batch_repository.get(record.id) or latest_known_record
         logger.warning(
             "Batch %s: stage materialization was still ambiguous/"
             "incomplete after %d attempt(s) during creation; reporting a "
@@ -346,14 +364,17 @@ class BatchService:
         # exact-HEAD audit, eleventh round, finding 1) -- a plain,
         # non-mutating `get()`, not `reconcile()` (which would attempt
         # yet more state changes at this already-fragile moment. Falls
-        # back to the batch's own original in-memory `record` (from the
-        # `create()` call above, never `None`) if even this best-effort
-        # re-read fails -- e.g. the exact same storage failure that
-        # exhausted materialization also breaks this read. Either way,
-        # the caller (the API route) always receives a genuine
-        # `BatchRecord` identifying this exact batch, with no need for a
-        # second, separately-fallible read of its own.
-        best_known_record = self.batch_repository.get(record.id) or record
+        # back to `latest_known_record` -- the freshest successful re-read
+        # from anywhere in the loop above, never the stale pre-
+        # materialization `record` (PR3 exact-HEAD audit, twelfth round,
+        # finding 1) -- if even this final best-effort re-read fails --
+        # e.g. the exact same storage failure that exhausted
+        # materialization also breaks this read. Either way, the caller
+        # (the API route) always receives a genuine `BatchRecord`
+        # identifying this exact batch, with no need for a second,
+        # separately-fallible read of its own, and with every child id
+        # this loop ever actually managed to observe already reflected.
+        best_known_record = self.batch_repository.get(record.id) or latest_known_record
         last_failure_description = (
             "a transient storage failure"
             if last_transient_exc is None
@@ -861,15 +882,43 @@ class BatchService:
         (silently skipped, matching `list_all_tolerant()`'s own contract)
         without making the scan itself unreliable -- only a directory- or
         read-level `OSError` does that.
+
+        `reconcile()` itself can also raise for one specific record -- a
+        transient `OSError` while saving its recomputed JSON, or a SQLite
+        error while reading one of its children -- isolated per record
+        here (PR3 exact-HEAD audit, twelfth round, finding 4): this is a
+        non-critical backstop pass (`run_startup_recovery()`'s step 5),
+        and an unguarded exception from one batch's reconciliation would
+        otherwise abort the whole startup pass, preventing every OTHER
+        batch's reconciliation -- and the rest of startup recovery after
+        it -- from ever running, purely because of one batch's own
+        transient hiccup. A record whose own reconcile attempt raised is
+        returned as-is (its last-known state, exactly like the existing
+        `reconcile() -> None` fallback just below already does for a
+        batch confirmed deleted mid-pass), and the overall scan is
+        reported unreliable -- this pass genuinely did not finish
+        reconciling everything it found, so a caller must not treat it as
+        a clean, fully successful sweep.
         """
 
         records, _malformed_ids, scan_was_fully_reliable = (
             self.batch_repository.list_all_tolerant(project_id=project_id)
         )
-        return (
-            [self.reconcile(record.id) or record for record in records],
-            scan_was_fully_reliable,
-        )
+        reconciled: list[BatchRecord] = []
+        for record in records:
+            try:
+                reconciled.append(self.reconcile(record.id) or record)
+            except Exception as exc:
+                logger.warning(
+                    "Batch %s: backstop reconcile pass raised an "
+                    "unexpected error; leaving it at its last-known state "
+                    "and continuing with other batches: %s",
+                    record.id,
+                    exc,
+                )
+                reconciled.append(record)
+                scan_was_fully_reliable = False
+        return reconciled, scan_was_fully_reliable
 
     # --------------------------------------------------------- reconciliation
 
@@ -1599,6 +1648,36 @@ class BatchService:
                     )
                     self._persist_stage_materialization_failure(record.id, exc)
                     processed_ids.add(record.id)
+                    continue
+                except Exception as exc:
+                    # `_enqueue_stage()` itself raised -- not merely
+                    # returned `None` -- for example a transient `sqlite3.
+                    # OperationalError` while inserting a missing child Job
+                    # row (PR3 exact-HEAD audit, twelfth round, finding 3:
+                    # `create_batch()`'s own retry loop already normalizes
+                    # this exact raised-failure case, this round's finding
+                    # 2, but this sibling startup-resume call had no such
+                    # guard of its own). Left completely unguarded, this
+                    # would propagate straight out of `run_startup_
+                    # recovery()`'s step 2b, aborting the ENTIRE startup
+                    # pass -- unlike `create_batch()`'s own caller (one
+                    # HTTP request), this one caller's abort prevents the
+                    # whole application from starting at all. Treated
+                    # exactly like the ambiguous `None` case just below:
+                    # left unresolved so this same bounded retry cycle
+                    # (`attempt` loop, `_STARTUP_BATCH_SCAN_MAX_ATTEMPTS`)
+                    # retries it, isolated per batch so one still-transient
+                    # failure can never block every other batch's own
+                    # resume this same pass.
+                    logger.warning(
+                        "Batch %s: stage resume raised an unexpected error "
+                        "on attempt %d/%d; retrying: %s",
+                        record.id,
+                        attempt + 1,
+                        _STARTUP_BATCH_SCAN_MAX_ATTEMPTS,
+                        exc,
+                    )
+                    unresolved_ids_this_attempt.add(record.id)
                     continue
                 if refreshed is not None:
                     resumed.append(refreshed)

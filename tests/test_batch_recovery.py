@@ -2008,6 +2008,88 @@ def test_create_batch_raises_a_retryable_failure_when_retries_are_exhausted(
     assert job_queue.size() == 2
 
 
+# --- Codex exact-HEAD audit, twelfth round, finding 1: preserve project
+# links when using the fallback record ---------------------------------------
+
+
+def test_create_batch_fallback_record_preserves_an_already_assigned_job_id(
+    tmp_path, monkeypatch
+):
+    """If EVERY re-read after the very first one fails, the fallback
+    `BatchStageMaterializationError.record` must still reflect the child
+    id `_enqueue_stage()`'s own phase 1 already assigned and persisted on
+    an earlier attempt -- never the stale, pre-materialization snapshot
+    (`job_id=None` on every item) captured before the retry loop ever ran
+    (Codex exact-HEAD audit, twelfth round, finding 1). The API route's
+    202 handler binds `Project.job_ids` from exactly this record, so a
+    stale fallback would silently omit an already-materialized child from
+    its project -- with nothing to ever repair that link later.
+    """
+
+    job_repository, job_queue, job_service, batch_repository, batch_service = _build(
+        tmp_path
+    )
+
+    # A controlled stand-in for `_enqueue_stage()`: on its first call,
+    # simulates phase 1 (id assignment) succeeding and persisting --
+    # exactly like the real two-phase implementation's own `mutate()`
+    # call -- then always returns the same ambiguous `None` phase 2
+    # never confirms, on every attempt, so `create_batch()`'s own retry
+    # loop genuinely exhausts.
+    assigned = {}
+
+    def fake_enqueue_stage(batch_id_arg, *, stage_index):
+        if "job_id" not in assigned:
+            def _assign(record):
+                record.items[0].job_id = "job_assigned_by_phase_1"
+                return record
+
+            updated = batch_repository.mutate(batch_id_arg, _assign)
+            assigned["job_id"] = updated.items[0].job_id
+        return None
+
+    monkeypatch.setattr(batch_service, "_enqueue_stage", fake_enqueue_stage)
+
+    # Allows exactly ONE successful re-read after phase 1 assigns and
+    # persists the id -- `create_batch()`'s own retry loop refresh right
+    # after that same attempt's `_enqueue_stage()` call returns, which is
+    # what should capture the id into `latest_known_record` -- then fails
+    # every read after that, including every later attempt's own refresh
+    # and the final fallback one. Tied to STATE (has phase 1 run yet, has
+    # one post-assignment read already happened), not a fragile call
+    # count: `BatchRepository.mutate()` -- used by `fake_enqueue_stage()`'s
+    # own phase-1 stand-in above -- calls `self.get()` internally as part
+    # of its own read-modify-write cycle, so a naive "fail after the Nth
+    # call overall" mock would be counting the wrong calls.
+    real_get = batch_repository.get
+    post_assignment_read_already_succeeded = {"done": False}
+    later_read_failures = {"count": 0}
+
+    def get_fails_after_first_post_assignment_read(batch_id_arg):
+        if "job_id" in assigned and post_assignment_read_already_succeeded["done"]:
+            later_read_failures["count"] += 1
+            return None
+        result = real_get(batch_id_arg)
+        if "job_id" in assigned:
+            post_assignment_read_already_succeeded["done"] = True
+        return result
+
+    monkeypatch.setattr(batch_repository, "get", get_fails_after_first_post_assignment_read)
+
+    with pytest.raises(BatchStageMaterializationError) as excinfo:
+        batch_service.create_batch(_spec())
+
+    assert "job_id" in assigned  # phase 1's stand-in actually ran
+    assert later_read_failures["count"] > 0  # the later, failing re-reads actually happened
+    assert excinfo.value.record is not None
+    # The one and only item's job id, assigned on the first attempt and
+    # captured by that attempt's own successful re-read, survived every
+    # later re-read failing -- never fell back to the stale, pre-loop
+    # snapshot (which would have `job_id=None`).
+    assert excinfo.value.record.items[0].job_id == assigned["job_id"]
+    assert job_repository.get(assigned["job_id"]) is None  # phase 2 never actually ran
+
+
 # --- PR3 exact-HEAD audit, ninth round, finding 4: report cancellation
 # when it skips a later stage ---------------------------------------------
 
@@ -2362,3 +2444,146 @@ def test_poison_disposition_never_overwrites_a_cancel_that_commits_first(tmp_pat
 
     reconciled = batch_repository.get(batch.id)
     assert reconciled.cancellation_requested is True
+
+
+# --- Codex exact-HEAD audit, twelfth round, finding 3: retry raised
+# failures during startup materialization -----------------------------------
+
+
+def test_resume_current_stage_retries_a_raised_transient_failure(tmp_path, monkeypatch):
+    """A transient exception raised by `_enqueue_stage()` during startup's
+    `resume_current_stage_for_all_batches()` (step 2b) -- for example a
+    `sqlite3.OperationalError` while inserting a missing child Job row --
+    must be retried within the same bounded loop, exactly like
+    `create_batch()`'s own retry loop already does (this round's own
+    finding 2), not propagate uncaught and abort the ENTIRE startup pass,
+    preventing the whole application from starting (Codex exact-HEAD
+    audit, twelfth round, finding 3).
+    """
+
+    job_repository, job_queue, job_service, batch_repository, batch_service = _build(
+        tmp_path
+    )
+
+    def always_fail(*args, **kwargs):
+        raise RuntimeError("injected: crash before the row is ever created")
+
+    monkeypatch.setattr(job_service, "create_or_reuse_job_without_enqueue", always_fail)
+    with pytest.raises(RuntimeError, match="injected"):
+        batch_service.create_batch(_spec())
+    monkeypatch.undo()
+
+    batch_id = batch_repository.list_all()[0].id
+    job_id = batch_repository.get(batch_id).items[0].job_id
+    assert job_repository.get(job_id) is None  # stable id persisted, row never created
+
+    real_create_or_reuse = job_service.create_or_reuse_job_without_enqueue
+    attempts = {"count": 0}
+
+    def flaky_once(*args, **kwargs):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise sqlite3.OperationalError("injected: transient child Job row insert failure")
+        return real_create_or_reuse(*args, **kwargs)
+
+    monkeypatch.setattr(job_service, "create_or_reuse_job_without_enqueue", flaky_once)
+
+    # Must not raise -- the whole point of the fix.
+    resumed = batch_service.resume_current_stage_for_all_batches()
+
+    assert attempts["count"] >= 2  # the transient failure was actually retried
+    assert any(record.id == batch_id for record in resumed)
+    assert job_repository.get(job_id) is not None
+    assert job_repository.get(job_id).status == "queued"
+
+
+def test_resume_current_stage_isolates_a_still_transient_failure_per_batch(
+    tmp_path, monkeypatch
+):
+    """A batch whose materialization keeps failing transiently on EVERY
+    attempt within the bounded retry loop must be left unresumed for a
+    later pass -- never crash startup, and never block a healthy sibling
+    batch's own resume in the same call.
+    """
+
+    job_repository, job_queue, job_service, batch_repository, batch_service = _build(
+        tmp_path
+    )
+
+    def always_fail(*args, **kwargs):
+        raise RuntimeError("injected: crash before the row is ever created")
+
+    monkeypatch.setattr(job_service, "create_or_reuse_job_without_enqueue", always_fail)
+    with pytest.raises(RuntimeError, match="injected"):
+        batch_service.create_batch(_spec())
+    monkeypatch.undo()
+
+    broken_batch_id = batch_repository.list_all()[0].id
+    broken_job_id = batch_repository.get(broken_batch_id).items[0].job_id
+
+    healthy_batch = batch_service.create_batch(_spec())
+    job_queue.dequeue()
+
+    call_count = {"count": 0}
+    real_create_or_reuse = job_service.create_or_reuse_job_without_enqueue
+
+    def transient_only_for_broken(*args, **kwargs):
+        call_count["count"] += 1
+        job_id_arg = args[0] if args else kwargs.get("job_id")
+        if job_id_arg == broken_job_id:
+            raise sqlite3.OperationalError("injected: still transient")
+        return real_create_or_reuse(*args, **kwargs)
+
+    monkeypatch.setattr(
+        job_service, "create_or_reuse_job_without_enqueue", transient_only_for_broken
+    )
+
+    # Must not raise, and must not abort the healthy batch's own resume.
+    resumed = batch_service.resume_current_stage_for_all_batches()
+
+    assert any(record.id == healthy_batch.id for record in resumed)
+    assert not any(record.id == broken_batch_id for record in resumed)
+    assert job_repository.get(broken_job_id) is None  # still not materialized
+    # The broken batch is not marked failed (unlike a genuinely permanent
+    # error) -- it stays eligible for a later pass to retry.
+    assert batch_repository.get(broken_batch_id).status != "failed"
+
+
+# --- Codex exact-HEAD audit, twelfth round, finding 4: isolate exceptions
+# in the batch backstop pass -------------------------------------------------
+
+
+def test_list_batches_tolerant_isolates_a_reconcile_exception_per_batch(
+    tmp_path, monkeypatch
+):
+    """`list_batches_tolerant()` (startup step 5's non-critical backstop
+    reconcile pass) must not let one batch's own `reconcile()` exception
+    -- a transient `OSError` while saving its recomputed JSON, or a
+    SQLite error while reading one of its children -- abort the whole
+    pass, preventing every OTHER batch's reconciliation (and the rest of
+    startup recovery after it) from ever running (Codex exact-HEAD audit,
+    twelfth round, finding 4).
+    """
+
+    job_repository, job_queue, job_service, batch_repository, batch_service = _build(
+        tmp_path
+    )
+    broken_batch = batch_service.create_batch(_spec())
+    healthy_batch = batch_service.create_batch(_spec())
+
+    real_reconcile = batch_service.reconcile
+
+    def flaky_reconcile(batch_id_arg):
+        if batch_id_arg == broken_batch.id:
+            raise OSError("injected: transient save failure")
+        return real_reconcile(batch_id_arg)
+
+    monkeypatch.setattr(batch_service, "reconcile", flaky_reconcile)
+
+    # Must not raise -- the whole point of the fix.
+    records, scan_was_fully_reliable = batch_service.list_batches_tolerant()
+
+    assert scan_was_fully_reliable is False  # this pass genuinely did not finish
+    reconciled_ids = {record.id for record in records}
+    assert broken_batch.id in reconciled_ids  # left at its last-known state, not dropped
+    assert healthy_batch.id in reconciled_ids  # unaffected by the other batch's exception
