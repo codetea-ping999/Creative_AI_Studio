@@ -1016,6 +1016,27 @@ class BatchService:
         processed -- for the next restart or reconcile pass to pick up,
         exactly like every other "uncertain, not confirmed absent" case
         in this class.
+
+        A batch is only ever marked processed once *its own* current-
+        stage resume attempt reaches a definitive outcome -- succeeded,
+        a permanent materialization failure was isolated, or the batch
+        is confirmed gone/cancelling -- never merely because the outer
+        directory scan that found it this attempt happened to succeed
+        (PR3 exact-HEAD audit, sixth round, finding 1). `_enqueue_stage()`
+        can itself return `None` for a reason entirely separate from the
+        outer scan: its own internal reread (`mutate()`'s own `get()`)
+        can hit a transient failure distinct from -- and possibly after
+        -- the outer scan's own successful read of this exact file. A
+        bare `None` there is exactly as ambiguous as `find_by_job_id_or_
+        diagnose()`'s own `(None, False)` was before earlier rounds'
+        fixes: it could mean "confirmed gone," "cancellation_requested,"
+        or "transiently unreadable right now" -- and only the first two
+        are safe to treat as "nothing left to do." `get_or_diagnose()`
+        (the same primitive `advance()` already uses for this identical
+        ambiguity) resolves it before this batch is ever marked
+        processed; a batch still uncertain (or confirmed to still exist,
+        not cancelling) stays eligible for this same bounded retry cycle
+        rather than being silently abandoned until the next restart.
         """
 
         resumed: list[BatchRecord] = []
@@ -1033,10 +1054,10 @@ class BatchService:
                     "id" if len(malformed_ids) == 1 else "ids",
                     ", ".join(sorted(malformed_ids)),
                 )
+            unresolved_ids_this_attempt: set[str] = set()
             for record in records:
                 if record.id in processed_ids:
                     continue
-                processed_ids.add(record.id)
                 try:
                     refreshed = self._enqueue_stage(
                         record.id, stage_index=record.stage_index
@@ -1054,34 +1075,81 @@ class BatchService:
                         exc,
                     )
                     self._persist_stage_materialization_failure(record.id, exc)
+                    processed_ids.add(record.id)
                     continue
                 if refreshed is not None:
                     resumed.append(refreshed)
-            if scan_was_fully_reliable:
+                    processed_ids.add(record.id)
+                    continue
+                # `_enqueue_stage()` returned `None` with no exception --
+                # ambiguous by itself (see the docstring above). Diagnose
+                # before deciding whether this batch may be marked
+                # processed.
+                still_exists, uncertain = self.batch_repository.get_or_diagnose(
+                    record.id
+                )
+                if still_exists is None and not uncertain:
+                    processed_ids.add(record.id)  # confirmed gone
+                elif still_exists is not None and still_exists.cancellation_requested:
+                    processed_ids.add(record.id)  # confirmed cancelling
+                else:
+                    # Still exists (and not cancelling), or genuinely
+                    # uncertain right now -- leave it unprocessed so a
+                    # later attempt this call retries it, exactly like a
+                    # batch the outer scan itself failed to read.
+                    unresolved_ids_this_attempt.add(record.id)
+            if scan_was_fully_reliable and not unresolved_ids_this_attempt:
                 break
             if attempt + 1 < _STARTUP_BATCH_SCAN_MAX_ATTEMPTS:
-                logger.warning(
-                    "Startup: batch scan hit a transient read failure on "
-                    "attempt %d/%d; retrying immediately rather than "
-                    "treating an unseen batch as resumed.",
-                    attempt + 1,
-                    _STARTUP_BATCH_SCAN_MAX_ATTEMPTS,
-                )
+                if unresolved_ids_this_attempt:
+                    # Named by id, mirroring the malformed-file warning
+                    # above -- found via adversarial review of this
+                    # round's own fix: a generic "something is unreliable"
+                    # message left an operator with no way to identify
+                    # which batch(es) to investigate, unlike the sibling
+                    # malformed-file case a few lines up.
+                    logger.warning(
+                        "Startup: %d batch(es) left unresolved on attempt "
+                        "%d/%d (%s); retrying immediately rather than "
+                        "treating them as resumed: %s",
+                        len(unresolved_ids_this_attempt),
+                        attempt + 1,
+                        _STARTUP_BATCH_SCAN_MAX_ATTEMPTS,
+                        "id" if len(unresolved_ids_this_attempt) == 1 else "ids",
+                        ", ".join(sorted(unresolved_ids_this_attempt)),
+                    )
+                else:
+                    logger.warning(
+                        "Startup: batch scan hit a transient read failure "
+                        "on attempt %d/%d; retrying immediately rather "
+                        "than treating an unseen batch as resumed.",
+                        attempt + 1,
+                        _STARTUP_BATCH_SCAN_MAX_ATTEMPTS,
+                    )
             else:
-                # No further attempt will actually run -- found via
-                # adversarial review of this round's own fix: the
-                # previous unconditional "retrying immediately" message
-                # was misleading on the final attempt, claiming a retry
-                # that never happens. A batch still unreadable after
-                # every attempt is left unresumed -- never marked
-                # processed -- for the next restart or reconcile pass.
-                logger.warning(
-                    "Startup: batch scan still unreliable after %d/%d "
-                    "attempts; leaving any still-unseen batch unresumed "
-                    "for a later pass.",
-                    attempt + 1,
-                    _STARTUP_BATCH_SCAN_MAX_ATTEMPTS,
-                )
+                # No further attempt will actually run -- a batch still
+                # unresolved after every attempt is left unresumed --
+                # never marked processed -- for the next restart or
+                # reconcile pass.
+                if unresolved_ids_this_attempt:
+                    logger.warning(
+                        "Startup: %d batch(es) still unresolved after "
+                        "%d/%d attempts (%s), left unresumed for a later "
+                        "pass: %s",
+                        len(unresolved_ids_this_attempt),
+                        attempt + 1,
+                        _STARTUP_BATCH_SCAN_MAX_ATTEMPTS,
+                        "id" if len(unresolved_ids_this_attempt) == 1 else "ids",
+                        ", ".join(sorted(unresolved_ids_this_attempt)),
+                    )
+                else:
+                    logger.warning(
+                        "Startup: batch scan still unreliable after "
+                        "%d/%d attempts; leaving any still-unresolved "
+                        "batch unresumed for a later pass.",
+                        attempt + 1,
+                        _STARTUP_BATCH_SCAN_MAX_ATTEMPTS,
+                    )
         return resumed
 
     def _persist_stage_materialization_failure(

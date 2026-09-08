@@ -176,8 +176,21 @@ def run_startup_recovery(
     # job whose convergence never completed. list_terminal_pending_completion()
     # already filters at the SQL level and silently skips a poison row
     # (step 1 already handled those).
+    #
+    # One SceneCandidateIndex is built up front and shared across every
+    # job this loop converges (PR3 exact-HEAD audit, sixth round, finding
+    # 2): a legacy-migration backlog can pending-backfill a large number
+    # of terminal jobs at once, and each one's Story-replay candidate
+    # lookup previously re-scanned and re-decoded every job in the table
+    # from scratch -- an effectively O(N^2) startup cost. The index is a
+    # snapshot of "which succeeded jobs exist," not "who has already won
+    # a role" (that is always re-read fresh per job from the live Story),
+    # so sharing it across this one pass changes no outcome, only cost.
+    candidate_index = completion_converger.build_scene_candidate_index()
     for job in job_repository.list_terminal_pending_completion():
-        report.completion_outcomes[job.id] = completion_converger.converge_job(job.id)
+        report.completion_outcomes[job.id] = completion_converger.converge_job(
+            job.id, candidate_index=candidate_index
+        )
 
     # 4b. Asset repair, independent of completion_state (PR3 exact-HEAD
     # audit, third round, P2-1) -- see _repair_assets_for_succeeded_jobs()'s

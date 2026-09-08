@@ -1432,3 +1432,97 @@ def test_startup_reports_a_malformed_batch_as_unresumable_without_retrying_it(
     assert generator.calls == 1
     assert job_repository.get(job_a_id).status == "queued"  # untouched
     assert job_repository.get(job_b_id).status == "succeeded"
+
+
+# --- PR3 exact-HEAD audit, sixth round, finding 1: retry batches whose
+# own enqueue reread fails -----------------------------------------------
+
+
+def test_startup_retries_a_batch_whose_own_enqueue_stage_reread_fails(
+    tmp_path, monkeypatch, caplog
+):
+    """The outer directory scan (`list_all_tolerant()`) can succeed in
+    full while `_enqueue_stage()`'s own, *separate* internal reread
+    (`mutate()`'s own `get()` -> `_try_load()`) hits a transient failure
+    for one specific batch. That batch must not be marked processed on
+    this attempt merely because `scan_was_fully_reliable` is `True` --
+    unlike the outer scan's own read failure (see the test above), the
+    previous fix only retried when the *scan itself* was unreliable,
+    unconditionally adding a batch to `processed_ids` the moment its own
+    `_enqueue_stage()` call returned (PR3 exact-HEAD audit, sixth round,
+    finding 1). In the supported "stable id persisted, Job row not yet
+    created" crash window, a batch stuck this way has no Job row, no
+    terminal event, and no runtime retry trigger to ever notice it again
+    before the next restart.
+    """
+
+    job_repository, job_queue, job_service, batch_repository, batch_service = _build(
+        tmp_path
+    )
+    generator = _CountingGenerator()
+    job_runner = JobRunner(
+        job_repository, job_queue, GeneratorRegistry({"image": generator}),
+        job_service=job_service,
+    )
+
+    def always_fail(*args, **kwargs):
+        raise RuntimeError("injected: crash before the row is ever created")
+
+    monkeypatch.setattr(job_service, "create_or_reuse_job_without_enqueue", always_fail)
+    with pytest.raises(RuntimeError, match="injected"):
+        batch_service.create_batch(_spec())
+    monkeypatch.undo()
+
+    batch_a_id = batch_repository.list_all()[0].id
+    job_a_id = batch_repository.get(batch_a_id).items[0].job_id
+    assert job_repository.get(job_a_id) is None
+
+    batch_b = batch_service.create_batch(_spec())
+    job_b_id = batch_b.items[0].job_id
+    job_queue.dequeue()  # simulate a fresh restart's empty in-memory queue
+
+    # `_try_load()` (used by `get()` -> `mutate()`), not
+    # `_try_load_diagnosed()` (used by `list_all_tolerant()`) -- the
+    # outer scan reads Batch A's file just fine this attempt; only
+    # `_enqueue_stage()`'s own phase-1 `mutate()` reread fails, and only
+    # once.
+    original_try_load = batch_repository._try_load
+    read_attempts = {"count": 0}
+
+    def flaky_once_for_batch_a(batch_file):
+        if batch_file.stem == batch_a_id and read_attempts["count"] == 0:
+            read_attempts["count"] += 1
+            return None  # what _try_load() returns after catching an OSError
+        return original_try_load(batch_file)
+
+    monkeypatch.setattr(batch_repository, "_try_load", flaky_once_for_batch_a)
+
+    with caplog.at_level("WARNING", logger="core.batches.service"):
+        resumed = batch_service.resume_current_stage_for_all_batches()
+
+    # Batch A's own materialization reread failed this attempt even
+    # though the outer scan succeeded -- it must not be silently marked
+    # processed; the bounded retry cycle recovers it within this same
+    # call, alongside Batch B.
+    assert any(record.id == batch_a_id for record in resumed)
+    assert any(record.id == batch_b.id for record in resumed)
+    assert read_attempts["count"] == 1  # the injected failure fired exactly once
+
+    # Observability follow-up (adversarial self-review): the unresolved
+    # batch's own id must be named in a warning, mirroring the sibling
+    # malformed-file warning in the same method -- not just a generic
+    # "something is unreliable" message.
+    assert any(batch_a_id in record.getMessage() for record in caplog.records)
+    materialized = job_repository.get(job_a_id)
+    assert materialized is not None
+    assert materialized.status == "queued"
+
+    monkeypatch.undo()
+    _drain_queue(job_runner)
+    assert generator.calls == 2
+    assert job_repository.get(job_a_id).status == "succeeded"
+    assert job_repository.get(job_b_id).status == "succeeded"
+
+    # Repeated startup recovery never duplicates the row.
+    batch_service.resume_current_stage_for_all_batches()
+    assert len([job for job in job_repository.list() if job.id == job_a_id]) == 1

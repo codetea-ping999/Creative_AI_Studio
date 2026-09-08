@@ -756,3 +756,254 @@ def test_transient_stage_enqueue_failure_keeps_completion_pending_not_done(
     refine_item_after = next(item for item in materialized.items if item.stage_index == 1)
     assert refine_item_after.job_id is not None
     assert job_repository.get(refine_item_after.job_id) is not None
+
+
+# --- PR3 exact-HEAD audit, sixth round, finding 2: avoid rescanning every
+# job for each replay candidate -----------------------------------------------
+
+
+def test_shared_candidate_index_preserves_newest_usable_winner_semantics(tmp_path):
+    """Passing an explicitly pre-built `SceneCandidateIndex` (the shared-
+    index path a batch caller uses) must select exactly the same winner
+    as the lazily-built-per-call path already covers elsewhere in this
+    file -- the optimization changes *cost*, never the outcome.
+    """
+    from core.story.replay_selection import build_scene_candidate_index
+
+    job_repository, asset_repository, story_repository, scene_binder, converger = _build(tmp_path)
+    story = _create_bound_story(story_repository)
+    scene_id = story.scenes[0].id
+    params = scene_binding_params(story.id, scene_id, "visual")
+
+    older_usable = _seed_succeeded_job(
+        job_repository, "job_older", created_at=datetime.now(timezone.utc) - timedelta(hours=1),
+        params=params, outputs=("older.png",),
+    )
+    newer_outputless = _seed_succeeded_job(
+        job_repository, "job_newer_outputless", created_at=datetime.now(timezone.utc),
+        params=params, outputs=(),
+    )
+    # A handful of unrelated succeeded jobs targeting different scenes --
+    # confirms the shared index does not let unrelated jobs leak into this
+    # scene/role's own candidate list.
+    for i in range(5):
+        other_story = story_repository.create(title=f"Other {i}", premise="p")
+        other_story = story_repository.save(apply_text_result(other_story, "scene_list", _SCENES))
+        _seed_succeeded_job(
+            job_repository, f"job_unrelated_{i}",
+            params=scene_binding_params(other_story.id, other_story.scenes[0].id, "visual"),
+            outputs=(f"unrelated_{i}.png",),
+        )
+
+    shared_index = build_scene_candidate_index(job_repository)
+
+    assert converger.converge_job(
+        newer_outputless.id, candidate_index=shared_index
+    ) == CompletionOutcome.RETRYABLE_FAILURE
+    assert converger.converge_job(
+        older_usable.id, candidate_index=shared_index
+    ) == CompletionOutcome.DONE
+
+    bound = story_repository.get(story.id)
+    older_asset = asset_repository.get_primary_by_job(older_usable.id)
+    assert older_asset is not None
+    assert bound.scenes[0].asset_ids.get("visual") == older_asset.id
+
+    # Re-converging the outputless one with the SAME (now slightly stale
+    # relative to the just-applied binding, but still-valid-for-candidate-
+    # enumeration) shared index must still see the role as resolved --
+    # that check reads the live Story fresh, never the cached index.
+    assert converger.converge_job(
+        newer_outputless.id, candidate_index=shared_index
+    ) == CompletionOutcome.DONE
+
+
+def test_shared_candidate_index_preserves_poison_conservatism(tmp_path):
+    """The shared-index path must preserve the exact same conservative
+    behavior as the per-call path: a relevant, undecodable succeeded
+    sibling must still block an older decodable candidate from binding,
+    never silently ignored just because candidate lookup was batched.
+    """
+    from core.story.replay_selection import build_scene_candidate_index
+
+    job_repository, asset_repository, story_repository, scene_binder, converger = _build(tmp_path)
+    story = _create_bound_story(story_repository)
+    scene_id = story.scenes[0].id
+    params = scene_binding_params(story.id, scene_id, "visual")
+
+    older = _seed_succeeded_job(
+        job_repository, "job_older", created_at=datetime.now(timezone.utc) - timedelta(hours=1),
+        params=params, outputs=("older.png",),
+    )
+    newer = _seed_succeeded_job(
+        job_repository, "job_newer", created_at=datetime.now(timezone.utc),
+        params=params, outputs=("newer.png",),
+    )
+    db_path = tmp_path / "jobs.db"
+    with sqlite3.connect(db_path) as raw:
+        raw.execute("UPDATE jobs SET created_at = ? WHERE id = ?", ("not-a-timestamp", newer.id))
+        raw.commit()
+
+    shared_index = build_scene_candidate_index(job_repository)
+
+    outcome = converger.converge_job(older.id, candidate_index=shared_index)
+
+    assert outcome == CompletionOutcome.UNRESOLVED
+    bound = story_repository.get(story.id)
+    assert bound.scenes[0].asset_ids.get("visual") is None
+
+    # Repair, rebuild the index fresh (matching how a real batch caller
+    # rebuilds it every pass), and confirm normal convergence resumes.
+    with sqlite3.connect(db_path) as raw:
+        raw.execute(
+            "UPDATE jobs SET created_at = ? WHERE id = ?",
+            (newer.created_at.isoformat(), newer.id),
+        )
+        raw.commit()
+    rebuilt_index = build_scene_candidate_index(job_repository)
+    assert converger.converge_job(newer.id, candidate_index=rebuilt_index) == CompletionOutcome.DONE
+    assert converger.converge_job(older.id, candidate_index=rebuilt_index) == CompletionOutcome.DONE
+    bound_after = story_repository.get(story.id)
+    newer_asset = asset_repository.get_primary_by_job(newer.id)
+    assert bound_after.scenes[0].asset_ids.get("visual") == newer_asset.id
+
+
+def test_shared_candidate_index_never_lets_an_unrelated_poison_row_taint_everything(
+    tmp_path,
+):
+    """An ordinary poison row belonging to a non-scene-bound job (the
+    overwhelmingly common case -- any plain image/audio/video job's
+    `params` has no `story_id`/`scene_id`/`scene_role` at all) must never
+    taint the *entire* index just because its own `params` happen to lack
+    those keys (or hold a wrong-typed value). The old per-call
+    implementation compared such a row's `(None, None, None)`-shaped
+    tuple by strict equality against the specific query's guaranteed-
+    all-`str` key -- which can never match -- so it was silently ignored
+    for every query.
+
+    Found via adversarial review of this round's own first attempt at a
+    mypy fix for a *different* concern (a poison row whose params values
+    are wrong-typed): that version conflated "keys missing/wrong-typed"
+    with "payload could not be parsed at all" and set the global
+    `has_unattributable_poison_row` flag for both -- which, applied to
+    this ubiquitous case, would have permanently blocked Story-replay
+    convergence platform-wide the moment any single unrelated job's row
+    became undecodable for any reason at all.
+    """
+    from core.story.replay_selection import build_scene_candidate_index
+
+    job_repository, asset_repository, story_repository, scene_binder, converger = _build(tmp_path)
+    story = _create_bound_story(story_repository)
+    scene_id = story.scenes[0].id
+    params = scene_binding_params(story.id, scene_id, "visual")
+
+    usable = _seed_succeeded_job(
+        job_repository, "job_usable", params=params, outputs=("out.png",),
+    )
+    # A completely unrelated, ordinary (non-scene-bound) job whose row is
+    # independently undecodable via list_tolerant() (corrupt created_at)
+    # -- its own params have no story_id/scene_id/scene_role at all,
+    # exactly like any real ad-hoc generation request.
+    unrelated = _seed_succeeded_job(
+        job_repository, "job_unrelated", params={"prompt": "a cat"}, outputs=("cat.png",),
+    )
+    db_path = tmp_path / "jobs.db"
+    with sqlite3.connect(db_path) as raw:
+        raw.execute(
+            "UPDATE jobs SET created_at = ? WHERE id = ?", ("not-a-timestamp", unrelated.id)
+        )
+        raw.commit()
+
+    index = build_scene_candidate_index(job_repository)
+
+    assert index.has_unattributable_poison_row is False
+    outcome = converger.converge_job(usable.id, candidate_index=index)
+    assert outcome == CompletionOutcome.DONE
+    bound = story_repository.get(story.id)
+    usable_asset = asset_repository.get_primary_by_job(usable.id)
+    assert bound.scenes[0].asset_ids.get("visual") == usable_asset.id
+
+
+def test_shared_candidate_index_ignores_a_poison_row_with_wrongly_typed_params(tmp_path):
+    """A poison row whose `params` decode fine but hold a non-string
+    value in `story_id`/`scene_id`/`scene_role` can never match any real
+    `(str, str, str)` query key -- same reasoning as the "missing keys"
+    case above -- so it must not taint the index either, matching the
+    old per-call implementation's own strict-equality behavior exactly.
+    """
+    from core.story.replay_selection import build_scene_candidate_index
+
+    job_repository, asset_repository, story_repository, scene_binder, converger = _build(tmp_path)
+    story = _create_bound_story(story_repository)
+    scene_id = story.scenes[0].id
+    params = scene_binding_params(story.id, scene_id, "visual")
+
+    usable = _seed_succeeded_job(
+        job_repository, "job_usable", params=params, outputs=("out.png",),
+    )
+    weird = _seed_succeeded_job(
+        job_repository, "job_weird",
+        params={"story_id": 12345, "scene_id": scene_id, "scene_role": "visual"},
+        outputs=("weird.png",),
+    )
+    db_path = tmp_path / "jobs.db"
+    with sqlite3.connect(db_path) as raw:
+        raw.execute("UPDATE jobs SET created_at = ? WHERE id = ?", ("not-a-timestamp", weird.id))
+        raw.commit()
+
+    index = build_scene_candidate_index(job_repository)
+
+    assert index.has_unattributable_poison_row is False
+    assert (story.id, scene_id, "visual") not in index.poisoned_keys
+    outcome = converger.converge_job(usable.id, candidate_index=index)
+    assert outcome == CompletionOutcome.DONE
+
+
+def test_startup_recovery_builds_the_scene_candidate_index_at_most_once_per_pass(
+    tmp_path, monkeypatch
+):
+    """N scene-bound succeeded jobs, each targeting a DIFFERENT scene (so
+    no single-key cache hit could mask the fix), must not each trigger
+    their own full Story-replay-candidate scan during one startup
+    recovery pass -- before this fix, that made a legacy-migration
+    backlog's startup cost effectively O(N^2): N pending jobs times one
+    full-table `list_tolerant()` scan+decode each (PR3 exact-HEAD audit,
+    sixth round, finding 2).
+    """
+    from core.jobs import JobQueue, JobService
+    from core.jobs.startup_recovery import run_startup_recovery
+    import core.story.replay_selection as replay_selection_module
+
+    job_repository, asset_repository, story_repository, scene_binder, converger = _build(tmp_path)
+    job_service = JobService(job_repository, JobQueue())
+
+    job_count = 20
+    expected_asset_ids = {}
+    for i in range(job_count):
+        story = story_repository.create(title=f"Story {i}", premise="p")
+        story = story_repository.save(apply_text_result(story, "scene_list", _SCENES))
+        scene_id = story.scenes[0].id
+        params = scene_binding_params(story.id, scene_id, "visual")
+        job = _seed_succeeded_job(
+            job_repository, f"job_{i}", params=params, outputs=(f"out_{i}.png",)
+        )
+        expected_asset_ids[job.id] = story.id
+
+    real_build = replay_selection_module.build_scene_candidate_index
+    call_count = {"count": 0}
+
+    def counting_build(job_repository_arg):
+        call_count["count"] += 1
+        return real_build(job_repository_arg)
+
+    monkeypatch.setattr(replay_selection_module, "build_scene_candidate_index", counting_build)
+
+    report = run_startup_recovery(job_repository, job_service, converger)
+
+    # Built once for this whole pass -- not once per job.
+    assert call_count["count"] <= 1
+    assert len(report.completion_outcomes) == job_count
+    for job_id in expected_asset_ids:
+        assert job_repository.get(job_id).completion_state == "done"
+        outcome = report.completion_outcomes[job_id]
+        assert outcome == CompletionOutcome.DONE

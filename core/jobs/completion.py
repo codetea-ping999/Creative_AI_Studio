@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from core.assets import AssetRepository
     from core.batches import BatchService
     from core.story import SceneBinder, StoryRepository
+    from core.story.replay_selection import SceneCandidateIndex
 
     from .events import JobEvent
     from core.storage.repositories.job_repository import JobRepository
@@ -108,13 +109,26 @@ class CompletionConverger:
             return
         self.converge_job(job_id)
 
-    def converge_job(self, job_id: str) -> CompletionOutcome:
+    def converge_job(
+        self, job_id: str, *, candidate_index: "SceneCandidateIndex | None" = None
+    ) -> CompletionOutcome:
         """Converge one job's post-terminal side effects, idempotently.
 
         Safe to call for a job that is not terminal yet, does not exist, or
         already converged (`SAFE_NOOP` in every case) -- callers (the event
         subscriber, startup recovery, a runtime retry loop) do not need to
         pre-filter.
+
+        `candidate_index`: an optional pre-built `SceneCandidateIndex`
+        (see `core.story.replay_selection`) a batch caller converging
+        many jobs in one pass builds once (via `build_scene_candidate_
+        index()` below) and passes to every `converge_job()` call in that
+        same pass, so N jobs cost one Story-replay-candidate scan total
+        instead of N (PR3 exact-HEAD audit, sixth round, finding 2). Left
+        unset by the live event-bus subscriber, which converges exactly
+        one job at a time -- a fresh index is built lazily inside
+        `converge_scene_binding()` only if this one job's own convergence
+        actually needs candidate selection.
         """
 
         try:
@@ -142,7 +156,9 @@ class CompletionConverger:
                 # Never re-runs the generator: this is purely a replay of
                 # the already-persisted GenerationResult.
                 self.asset_repository.sync_job(job)
-                story_outcome_converged, story_outcome_retryable = self._converge_story(job)
+                story_outcome_converged, story_outcome_retryable = self._converge_story(
+                    job, candidate_index=candidate_index
+                )
             batch_reconciliation_retryable = self._reconcile_batch(job_id)
         except Exception as exc:
             self.job_repository.mark_completion_pending_with_error(job_id, str(exc))
@@ -180,7 +196,9 @@ class CompletionConverger:
         self.job_repository.mark_completion_done(job_id)
         return CompletionOutcome.DONE
 
-    def _converge_story(self, job) -> tuple[bool, bool]:
+    def _converge_story(
+        self, job, *, candidate_index: "SceneCandidateIndex | None" = None
+    ) -> tuple[bool, bool]:
         """Return `(converged, retryable)` for `job`'s Story replay step."""
 
         if self.story_repository is None or self.scene_binder is None:
@@ -197,12 +215,33 @@ class CompletionConverger:
             story_repository=self.story_repository,
             job_repository=self.job_repository,
             asset_repository=self.asset_repository,
+            candidate_index=candidate_index,
         )
         if outcome is ReplayOutcome.CONVERGED:
             return True, False
         if outcome is ReplayOutcome.RETRYABLE:
             return False, True
         return False, False
+
+    def build_scene_candidate_index(self) -> "SceneCandidateIndex | None":
+        """Build one `SceneCandidateIndex` for a batch convergence pass.
+
+        Returns `None` if Story replay is not configured on this
+        converger at all (`story_repository`/`scene_binder` unset) --
+        mirroring `_converge_story()`'s own early return -- so a caller
+        that does not use the Story feature never pays for a scan whose
+        result would go unused. A batch caller (startup recovery, `run_
+        retry_loop()`) should call this exactly once per pass and pass
+        the result to every `converge_job()` call in that same pass (PR3
+        exact-HEAD audit, sixth round, finding 2).
+        """
+
+        if self.story_repository is None or self.scene_binder is None:
+            return None
+
+        from core.story.replay_selection import build_scene_candidate_index
+
+        return build_scene_candidate_index(self.job_repository)
 
     def _reconcile_batch(self, job_id: str) -> bool:
         """Reconcile `job_id`'s owning Batch, if any.
@@ -236,14 +275,22 @@ class CompletionConverger:
         soon as `stop_event` is set; a caller (see `apps/api/main.py`) must
         join this thread before releasing data-directory ownership, exactly
         like the main job runner thread.
+
+        Builds one `SceneCandidateIndex` (see `build_scene_candidate_
+        index()`) per tick, shared across every job this tick converges
+        -- rebuilt fresh every tick, so it is never held stale across
+        ticks, but reused within one tick so a burst of N pending jobs
+        costs one Story-replay-candidate scan total, not N (PR3
+        exact-HEAD audit, sixth round, finding 2).
         """
 
         while not stop_event.is_set():
             try:
+                candidate_index = self.build_scene_candidate_index()
                 for job in self.job_repository.list_terminal_pending_completion():
                     if stop_event.is_set():
                         break
-                    self.converge_job(job.id)
+                    self.converge_job(job.id, candidate_index=candidate_index)
             except Exception:
                 logger.exception("Completion retry loop iteration failed; continuing.")
             stop_event.wait(poll_interval_seconds)

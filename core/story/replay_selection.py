@@ -16,6 +16,7 @@ at all.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from enum import Enum
 import logging
 from typing import TYPE_CHECKING
@@ -89,8 +90,116 @@ def select_scene_bound_params(
     return None
 
 
-def _succeeded_candidates_for_role(
+@dataclass
+class SceneCandidateIndex:
+    """A single-pass snapshot of every currently succeeded job's Story-
+    binding target, keyed by ``(story_id, scene_id, role)``.
+
+    Built once via exactly one `JobRepository.list_tolerant()` scan (see
+    `build_scene_candidate_index()`) and safe to reuse across every
+    `converge_scene_binding()` call within the *same* convergence pass
+    (one startup-recovery sweep, or one `run_retry_loop()` tick): nothing
+    a convergence pass itself does can add a *new* succeeded job to the
+    repository mid-pass, so the set of candidate jobs for any given
+    scene/role cannot change while this snapshot is in use -- only *who
+    has already won* a role can change (tracked separately, by re-reading
+    the live `StoryDocument` fresh on every call, never cached here).
+    Without sharing this snapshot, a batch of N completion-pending jobs
+    triggered one independent O(N) scan+decode *per job*, an effectively
+    O(N^2) cost during startup recovery of a large legacy backlog (PR3
+    exact-HEAD audit, sixth round, finding 2). Rebuilt fresh on every
+    pass (`run_retry_loop()` builds a new one every tick), so it is never
+    held stale across passes.
+    """
+
+    candidates_by_key: dict[tuple[str, str, str], list["JobRecord"]] = field(
+        default_factory=dict
+    )
+    poisoned_keys: set[tuple[str, str, str]] = field(default_factory=set)
+    has_unattributable_poison_row: bool = False
+
+
+def build_scene_candidate_index(
     job_repository: "JobRepository",
+) -> SceneCandidateIndex:
+    """Build one `SceneCandidateIndex` via a single `list_tolerant()` scan.
+
+    Groups every decodable succeeded job by its `(story_id, scene_id,
+    role)` target -- exactly the same classification
+    `select_scene_bound_params()` already does per-job, just computed for
+    every job in one pass instead of once per query. A poison row's own
+    `failures` entry is checked too (via the same raw, payload-only peek
+    the old per-call implementation used): a succeeded job whose `status`
+    column reads fine but whose `request_json`/params cannot be confirmed
+    one way or the other must not be silently excluded from candidate
+    selection, since it could be the *newest* one for whatever scene/role
+    is later queried against this index -- committing an older decodable
+    candidate as the winner would let it bind permanently, and
+    `replay_job_safely()` correctly refuses to ever replace an
+    already-populated role afterward, even once the poison row is
+    repaired. A poison row whose `params` cannot even be extracted taints
+    *every* key in this index (`has_unattributable_poison_row=True`),
+    exactly like the old implementation's unconditional `break` did for
+    whichever single query happened to be running at the time.
+    """
+
+    records, failures = job_repository.list_tolerant()
+    candidates_by_key: dict[tuple[str, str, str], list["JobRecord"]] = {}
+    for record in records:
+        if record.status != "succeeded":
+            continue
+        params = select_scene_bound_params(record)
+        if params is not None:
+            candidates_by_key.setdefault(params, []).append(record)
+
+    poisoned_keys: set[tuple[str, str, str]] = set()
+    has_unattributable_poison_row = False
+    for job_id, _exc in failures:
+        raw_status, poison_params = job_repository.peek_raw_request_params(job_id)
+        if raw_status != "succeeded":
+            continue
+        if poison_params is None:
+            # request_json itself didn't parse (or the row vanished) --
+            # cannot rule out relevance to any scene/role at all.
+            has_unattributable_poison_row = True
+            continue
+        candidate_story_id = poison_params.get(STORY_ID_PARAM)
+        candidate_scene_id = poison_params.get(SCENE_ID_PARAM)
+        candidate_role = poison_params.get(SCENE_ROLE_PARAM)
+        if (
+            isinstance(candidate_story_id, str)
+            and isinstance(candidate_scene_id, str)
+            and isinstance(candidate_role, str)
+        ):
+            poisoned_keys.add((candidate_story_id, candidate_scene_id, candidate_role))
+        # else: missing keys entirely, or a non-string value in one of
+        # them -- exactly like the old per-call implementation's own
+        # strict tuple-equality check (`candidate == (story_id, scene_id,
+        # role)`, comparing against a guaranteed all-`str` query key),
+        # such a row can never match ANY real `(str, str, str)` query --
+        # a missing key and a wrong-typed key both compare unequal to
+        # every possible string, with no exception. This is NOT the same
+        # as `poison_params is None` above: there, the payload itself
+        # could not be parsed at all, so it is unknown whether the row is
+        # even scene-bound; here it parsed fine and simply isn't a match
+        # for any scene/role -- found via adversarial review of this
+        # round's own first attempt at the mypy fix below, which
+        # conflated the two and made a single ordinary, unrelated
+        # non-scene-bound poison row (ubiquitous: any image/audio/video
+        # job's `params` has no `story_id` at all) taint every single
+        # query in the whole index, blocking all Story-replay
+        # convergence platform-wide until that one unrelated row was
+        # repaired.
+
+    return SceneCandidateIndex(
+        candidates_by_key=candidates_by_key,
+        poisoned_keys=poisoned_keys,
+        has_unattributable_poison_row=has_unattributable_poison_row,
+    )
+
+
+def _succeeded_candidates_for_role(
+    candidate_index: SceneCandidateIndex,
     *,
     story_id: str,
     scene_id: str,
@@ -99,47 +208,17 @@ def _succeeded_candidates_for_role(
     """Decodable succeeded candidates for `(story_id, scene_id, role)`, plus
     whether an *undecodable* succeeded row might also be relevant.
 
-    Uses the decode-failure-tolerant scan (`list_tolerant`), not `list()`:
-    an unrelated poison row elsewhere in the table must never block Story
-    replay convergence for a completely different job. A poison row's own
-    `failures` entry is checked too (via a raw, payload-only peek that does
-    not require the row to fully decode): a succeeded job whose `status`
-    column reads fine but whose `request_json`/params cannot be confirmed
-    one way or the other must not be silently excluded from candidate
-    selection, since it could be the *newest* one -- committing an older
-    decodable candidate as the winner would let it bind permanently, and
-    `replay_job_safely()` correctly refuses to ever replace an
-    already-populated role afterward, even once the poison row is repaired.
+    A pure, in-memory lookup into an already-built `SceneCandidateIndex`
+    -- no repository access here at all; see `build_scene_candidate_
+    index()` for where the actual scan happens.
     """
 
-    records, failures = job_repository.list_tolerant()
-    candidates = []
-    for record in records:
-        if record.status != "succeeded":
-            continue
-        params = select_scene_bound_params(record)
-        if params == (story_id, scene_id, role):
-            candidates.append(record)
-
-    has_unresolvable_poison_sibling = False
-    for job_id, _exc in failures:
-        raw_status, poison_params = job_repository.peek_raw_request_params(job_id)
-        if raw_status != "succeeded":
-            continue
-        if poison_params is None:
-            # request_json itself didn't parse (or the row vanished) --
-            # cannot rule out relevance at all.
-            has_unresolvable_poison_sibling = True
-            break
-        candidate = (
-            poison_params.get(STORY_ID_PARAM),
-            poison_params.get(SCENE_ID_PARAM),
-            poison_params.get(SCENE_ROLE_PARAM),
-        )
-        if candidate == (story_id, scene_id, role):
-            has_unresolvable_poison_sibling = True
-            break
-
+    key = (story_id, scene_id, role)
+    candidates = candidate_index.candidates_by_key.get(key, [])
+    has_unresolvable_poison_sibling = (
+        candidate_index.has_unattributable_poison_row
+        or key in candidate_index.poisoned_keys
+    )
     return candidates, has_unresolvable_poison_sibling
 
 
@@ -189,6 +268,7 @@ def converge_scene_binding(
     story_repository: "StoryRepository",
     job_repository: "JobRepository",
     asset_repository: "AssetRepository",
+    candidate_index: SceneCandidateIndex | None = None,
 ) -> ReplayOutcome:
     """Converge `job`'s Story binding, choosing a candidate if needed.
 
@@ -196,6 +276,15 @@ def converge_scene_binding(
     lifecycle state itself (that is the caller's -- completion convergence's
     -- job). Never calls anything other than
     `scene_binder.replay_job_safely()` to mutate the story.
+
+    `candidate_index`: an optional pre-built `SceneCandidateIndex` (see
+    that class's own docstring) a batch caller (startup recovery, the
+    runtime retry loop) builds once and passes to every job it converges
+    in the same pass, so N jobs cost one scan total instead of N. Left
+    unset (the default) for a single-job caller (the live event-bus
+    subscriber) -- a fresh index is built lazily, only if candidate
+    selection actually turns out to be needed for this one job, exactly
+    matching this function's pre-fix per-call cost.
     """
 
     params = select_scene_bound_params(job)
@@ -247,8 +336,13 @@ def converge_scene_binding(
     # not-yet-converged candidates racing for it -- pick a deterministic
     # winner rather than assuming this job is the only one, and never
     # commit one while an undecodable sibling might also be relevant.
+    # Built lazily, right here, only for a caller that didn't already
+    # supply one -- a job that converged via any pre-check above never
+    # pays this scan's cost at all.
+    if candidate_index is None:
+        candidate_index = build_scene_candidate_index(job_repository)
     candidates, has_unresolvable_poison_sibling = _succeeded_candidates_for_role(
-        job_repository, story_id=story_id, scene_id=scene_id, role=role
+        candidate_index, story_id=story_id, scene_id=scene_id, role=role
     )
     if has_unresolvable_poison_sibling:
         logger.warning(
@@ -312,6 +406,8 @@ def converge_scene_binding(
 
 __all__ = [
     "ReplayOutcome",
+    "SceneCandidateIndex",
+    "build_scene_candidate_index",
     "converge_scene_binding",
     "select_scene_bound_params",
 ]
