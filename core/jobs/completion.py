@@ -140,10 +140,13 @@ class CompletionConverger:
         fresh `JobRepository.get()` distinguishes:
 
         - decodes successfully now -- no longer poison; drop the
-          candidate, and if its current status is still `queued`, hand it
-          back to the existing, safe `enqueue_job()` path (idempotent
-          against a duplicate exposure) rather than leaving it silently
-          un-enqueued forever.
+          candidate (unless the Batch-authorization step below decides
+          otherwise), and if its current status is still `queued`, hand
+          it to `_authorize_recovered_queued_job()` rather than the raw
+          `enqueue_job()` path (PR3 exact-HEAD audit, ninth round,
+          finding 1) -- see that helper's own docstring for why a
+          repaired row cannot be assumed to be an ordinary, non-Batch
+          job.
         - still raises `JobRecordDecodeError` -- genuinely still poison;
           proceed with the quarantine attempt exactly as before. A
           successful quarantine here gets the identical Batch-convergence
@@ -155,7 +158,20 @@ class CompletionConverger:
           differently than the identical outcome reached at startup, or
           a Batch whose last poison child happened to resolve here
           instead of at startup would stay stuck on its old stage for
-          the rest of the process's life.
+          the rest of the process's life. That follow-up's own outcome
+          is itself checked now (PR3 exact-HEAD audit, ninth round,
+          finding 3): a `RETRYABLE_FAILURE` (the owning Batch could not
+          be read just now) keeps this candidate scheduled rather than
+          dropping it, since the terminalized-but-still-undecodable row
+          would otherwise have no other path back to Batch convergence
+          -- it is invisible to `list_terminal_pending_completion()`
+          (still undecodable as a whole `JobRecord`) and published no
+          terminal event of its own. A later tick's revalidation will
+          hit this exact branch again; `quarantine_poison_row_safely()`
+          is itself idempotent for an already-terminal row (an
+          `"already_resolved"`/`"left_untouched_terminal"`-class
+          outcome), so re-attempting Batch reconciliation on each
+          subsequent tick is always safe.
         - row now absent (`None`) -- nothing left to quarantine or
           resume; drop the candidate.
         - any other exception (a transient repository-level read
@@ -166,6 +182,7 @@ class CompletionConverger:
 
         if not self._poison_retry_candidates:
             return
+        from core.batches.service import BatchReconciliationOutcome
         from core.jobs.startup_recovery import (
             QUARANTINE_OUTCOMES_NEEDING_BATCH_CONVERGENCE,
             quarantine_poison_row_safely,
@@ -190,7 +207,11 @@ class CompletionConverger:
                     # published no terminal event of its own.
                     # `reconcile_child_job()` never calls a generator and
                     # is itself idempotent.
-                    self.batch_service.reconcile_child_job(job_id)
+                    _record, reconcile_outcome = self.batch_service.reconcile_child_job(
+                        job_id
+                    )
+                    if reconcile_outcome is BatchReconciliationOutcome.RETRYABLE_FAILURE:
+                        still_pending[job_id] = exc
                 continue
             except Exception:
                 logger.exception(
@@ -203,9 +224,73 @@ class CompletionConverger:
             if repaired is None:
                 continue  # confirmed gone -- nothing left to do
             # Decodes cleanly now -- genuinely repaired, never quarantine.
-            if repaired.status == JOB_STATUS_QUEUED and self.job_service is not None:
-                self.job_service.enqueue_job(job_id)
+            if repaired.status == JOB_STATUS_QUEUED:
+                if self._authorize_recovered_queued_job(job_id) == "uncertain":
+                    # Batch ownership itself could not be confirmed right
+                    # now -- must not guess either "no owner" or "not
+                    # cancelled" by dropping this candidate. Keeping the
+                    # original `exc` here is purely a container detail:
+                    # the row decodes fine now, so the next tick's own
+                    # `job_repository.get()` call above will succeed
+                    # again and simply retry this exact authorization
+                    # check -- `exc` itself is never reused once the row
+                    # is no longer genuinely poison.
+                    still_pending[job_id] = exc
         self._poison_retry_candidates = still_pending
+
+    def _authorize_recovered_queued_job(self, job_id: str) -> str:
+        """Enqueue a repaired, still-`queued` job -- but only after
+        re-confirming it is not a child of a Batch that has since been
+        durably cancelled (PR3 exact-HEAD audit, ninth round, finding 1).
+
+        A poison row can be exactly the child a Batch's own startup
+        cancellation sweep (`resume_pending_cancellations()`) could not
+        safely expose or terminalize, because it was unreadable at that
+        time -- that scan only ever sees decodable rows. Handing such a
+        row straight to `JobService.enqueue_job()` once it becomes
+        readable again would bypass the durable-cancellation
+        authorization boundary entirely, making a child worker-visible
+        again after its owning Batch's cancellation already won.
+
+        Delegates to `BatchService.authorize_recovered_queued_job()`,
+        which runs the whole "who owns this job, and are they
+        cancelling" decision under the same lock `cancel()`'s own
+        durable-intent mutation uses -- no new locking/concurrency
+        design here, only a narrow, safe reuse of that existing
+        boundary. If `batch_service` is not configured on this
+        converger at all (some minimal test setups omit it), falls back
+        to the plain, safe `enqueue_job()` path -- unchanged from before
+        this round for a caller that never wires Batch support in.
+
+        Returns the underlying `authorize_recovered_queued_job()`
+        outcome (`"enqueued"`/`"not_queued"`/`"cancelled"`/
+        `"uncertain"`) so the caller can decide whether this candidate
+        needs to stay scheduled; returns `"enqueued"` for the no-
+        `batch_service` fallback and the no-`job_service` no-op alike,
+        since neither case leaves anything for a caller to retry.
+        """
+
+        if self.job_service is None:
+            return "enqueued"
+        if self.batch_service is None:
+            self.job_service.enqueue_job(job_id)
+            return "enqueued"
+
+        outcome = self.batch_service.authorize_recovered_queued_job(
+            job_id, JOB_STATUS_QUEUED
+        )
+        if outcome == "cancelled":
+            # The owning Batch's cancellation intent is durably set --
+            # this child must never become worker-visible. Terminalize it
+            # now (mirrors `_enqueue_stage()`'s own identical handling of
+            # a confirmed-cancelling batch) rather than leaving it
+            # `queued`-but-never-enqueued forever; `cancel_job()`
+            # publishes a terminal event for an already-`queued` job,
+            # which reaches the live event-bus path's own
+            # `CompletionConverger.converge_job()` -> Batch reconciliation
+            # normally -- no separate reconciliation call needed here.
+            self.job_service.cancel_job(job_id)
+        return outcome
 
     def attach_to_event_bus(self, event_bus) -> None:
         if event_bus is None:

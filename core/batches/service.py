@@ -232,15 +232,36 @@ class BatchService:
                 return enqueued
         logger.warning(
             "Batch %s: stage materialization was still ambiguous/"
-            "incomplete after %d attempt(s) during creation; returning "
-            "it as-is -- an operator or the next restart's startup "
-            "resume may be needed to finish materializing it.",
+            "incomplete after %d attempt(s) during creation; reporting a "
+            "retryable failure -- an operator retry, or the next "
+            "restart's startup resume, will finish materializing it.",
             record.id,
             _STARTUP_BATCH_SCAN_MAX_ATTEMPTS,
         )
-        reread = self.batch_repository.get(record.id)
-        assert reread is not None
-        return reread
+        # Every bounded attempt above came back ambiguous/incomplete (a
+        # transient storage failure, not a confirmed cancellation or
+        # deletion -- either of those would have made `_enqueue_stage()`
+        # return non-`None`). The Batch record itself was already
+        # persisted (`self.batch_repository.create()` above), so this is
+        # exactly `BatchStageMaterializationError`'s existing contract --
+        # a stage's materialization could not be confirmed right now, not
+        # a confirmed-gone batch -- reused here rather than silently
+        # returning a normal-looking `BatchRecord` whose stage-0
+        # children were never actually confirmed to exist (PR3 exact-HEAD
+        # audit, ninth round, finding 2). Never deletes the persisted
+        # record to feign non-existence, and never conflates this with a
+        # permanent reference-preflight failure (`UnsupportedReference
+        # Error`/`MissingReferenceAssetError`, handled separately above,
+        # before the record was ever persisted) or with a confirmed
+        # cancellation/deletion, both already excluded by construction.
+        raise BatchStageMaterializationError(
+            f"Batch {record.id}: stage 0 materialization could not be "
+            f"confirmed after {_STARTUP_BATCH_SCAN_MAX_ATTEMPTS} "
+            "attempt(s) (a transient storage failure). The batch itself "
+            "was created; retry this request, or wait for the next "
+            "process restart's startup resume, to finish materializing "
+            "its children."
+        )
 
     def _enqueue_stage(self, batch_id: str, *, stage_index: int) -> BatchRecord | None:
         """Idempotently create/reuse this stage's children and enqueue them.
@@ -535,6 +556,69 @@ class BatchService:
                 return "unreadable" if uncertain else "absent"
             if record.cancellation_requested:
                 return "cancelled"
+            if job_status != JOB_STATUS_QUEUED:
+                return "not_queued"
+            self.job_service.enqueue_job(job_id)
+            return "enqueued"
+
+        return self.batch_repository.run_exclusive(_decide)
+
+    def authorize_recovered_queued_job(self, job_id: str, job_status: str) -> str:
+        """Like `_authorize_and_expose()`, but for a caller (`Completion
+        Converger`'s poison-retry revalidation) that only has a `job_id`,
+        not an already-known owning `batch_id`.
+
+        A poison-retry candidate that turns out to be repaired (freshly
+        decodable, genuinely `queued`) is not necessarily an ordinary,
+        non-Batch job: it could be exactly the child whose owning
+        Batch's cancellation could not be safely applied at startup
+        because this row was unreadable then (`resume_pending_
+        cancellations()`'s own scan only ever sees decodable rows).
+        Handing a repaired-but-Batch-owned row straight to `JobService.
+        enqueue_job()` -- as PR3 exact-HEAD audit, eighth round, finding
+        5 originally did -- bypasses the durable-cancellation
+        authorization boundary entirely: a durable `cancellation_
+        requested=True` on the owning Batch would never be rechecked,
+        and the repaired child would become worker-visible again after
+        cancellation already won (PR3 exact-HEAD audit, ninth round,
+        finding 1) -- the same class of gap `_authorize_and_expose()`
+        itself was introduced to close for ordinary stage materialization
+        (see that method's own docstring).
+
+        Runs the *entire* ownership lookup and decision under `BatchRepository
+        .run_exclusive()` -- the same lock `cancel()`'s own durable-intent
+        mutation and `_authorize_and_expose()` both use -- so a concurrent
+        `cancel()` call can never land in a gap between "who owns this job"
+        and "is that owner cancelling." `find_by_job_id_or_diagnose()` is a
+        lock-free *read* by itself (matching every other plain repository
+        read); wrapping this call's entire decision in `run_exclusive()` is
+        what makes it race-free against a concurrent `cancel()`, exactly
+        like `_authorize_and_expose()`'s own docstring already explains for
+        the ordinary materialization path.
+
+        Returns one of:
+        - ``"enqueued"`` -- exposed to the worker queue just now, either
+          because no owning Batch exists or because the owning Batch is
+          not cancelling.
+        - ``"not_queued"`` -- `job_status` was not `queued`; nothing to do.
+        - ``"cancelled"`` -- the owning Batch's cancellation intent is
+          durably set; never enqueued.
+        - ``"uncertain"`` -- Batch ownership itself could not be confirmed
+          right now (a transient read failure); the caller must not
+          enqueue and must not assume either "no owner" or "not
+          cancelled".
+        """
+
+        def _decide() -> str:
+            owner, uncertain = self.batch_repository.find_by_job_id_or_diagnose(job_id)
+            if owner is None and uncertain:
+                return "uncertain"
+            if owner is not None and owner.cancellation_requested:
+                return "cancelled"
+            # Either no owning Batch at all (an ordinary, non-Batch job),
+            # or a Batch that owns it but is not cancelling -- both cases
+            # authorize exposure identically to `_authorize_and_expose()`'s
+            # own "not cancelled" branch.
             if job_status != JOB_STATUS_QUEUED:
                 return "not_queued"
             self.job_service.enqueue_job(job_id)
@@ -1420,6 +1504,23 @@ def _derive_status(record: BatchRecord) -> str:
         return BATCH_STATUS_RUNNING
 
     if aggregate.succeeded == aggregate.total:
+        if has_further_stage and record.cancellation_requested:
+            # A later, required stage exists but will never be created --
+            # `_try_advance_in_place()` refuses to create a new stage or
+            # new children once `cancellation_requested` is set (see its
+            # own docstring), so the multi-stage work this Batch was
+            # asked to do was never completed, even though every item in
+            # the CURRENT stage happens to have succeeded. Reporting
+            # `SUCCEEDED` here would claim the Batch finished work it
+            # never did (PR3 exact-HEAD audit, ninth round, finding 4).
+            # Only reachable once every current-stage item is itself
+            # terminal (the `not all_terminal` branch above already
+            # returned otherwise), so no non-terminal item is masked by
+            # this decision. Does not affect a Batch whose *every* stage
+            # had already genuinely completed before cancellation
+            # arrived (`has_further_stage` is `False` there) -- that
+            # `SUCCEEDED` remains legitimate and is untouched.
+            return BATCH_STATUS_CANCELLED
         return BATCH_STATUS_SUCCEEDED
     if aggregate.succeeded:
         return BATCH_STATUS_PARTIAL

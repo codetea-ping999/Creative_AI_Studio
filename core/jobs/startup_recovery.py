@@ -179,7 +179,29 @@ def run_startup_recovery(
             # idempotent -- safe even for an "already_resolved" or
             # "left_untouched_terminal" outcome that some earlier pass
             # may already have converged.
-            batch_service.reconcile_child_job(job_id)
+            #
+            # Its own outcome is checked (PR3 exact-HEAD audit, ninth
+            # round, adversarial follow-up to finding 3): a
+            # `RETRYABLE_FAILURE` here (the owning Batch could not be
+            # read just now -- a transient failure, not a confirmed "no
+            # parent") must not be silently discarded the way this exact
+            # call site used to. Registering this job_id as a poison
+            # retry candidate reuses the existing mechanism exactly:
+            # `CompletionConverger.run_retry_loop()`'s own tick re-reads
+            # the row (still undecodable -- only its `status` column was
+            # ever flipped by the quarantine CAS), hits the same
+            # `JobRecordDecodeError` branch again, and
+            # `quarantine_poison_row_safely()` is itself idempotent for
+            # an already-terminal row, so re-attempting Batch
+            # reconciliation on a later tick is always safe -- this is
+            # the exact retry path the eighth round already built for a
+            # quarantine *write* failure, reused here for a quarantine-
+            # succeeded-but-reconciliation-failed outcome instead.
+            from core.batches.service import BatchReconciliationOutcome
+
+            _record, reconcile_outcome = batch_service.reconcile_child_job(job_id)
+            if reconcile_outcome is BatchReconciliationOutcome.RETRYABLE_FAILURE:
+                completion_converger.register_poison_retry_candidate(job_id, exc)
 
     # A quarantined/repaired row's *current* state can only be known by
     # rereading it -- `records` above still reflects the pre-quarantine

@@ -1911,14 +1911,24 @@ def test_create_batch_retries_an_ambiguous_early_exit_within_the_same_call(
     assert len(job_repository.list()) == 2  # no duplicate rows
 
 
-def test_create_batch_falls_back_honestly_when_retries_are_exhausted(
+def test_create_batch_raises_a_retryable_failure_when_retries_are_exhausted(
     tmp_path, monkeypatch, caplog
 ):
     """If the ambiguous early exit never resolves within `create_batch()`'s
-    own bounded retry attempts, it must still return a valid `BatchRecord`
-    (never raise or hang) -- the already-materialized item stays exposed,
-    the still-ambiguous one is left for a later explicit resume, and the
-    situation is at least logged rather than silently swallowed.
+    own bounded retry attempts, it must report a retryable failure --
+    never return a normal-looking, apparently-successful `BatchRecord`
+    (PR3 exact-HEAD audit, ninth round, finding 2): the batch's stage-0
+    materialization was never actually confirmed complete, so returning
+    it as-is would silently claim success for work that never finished.
+    `BatchStageMaterializationError` -- the same exception `advance()`
+    already raises for the identical "stage transition persisted, but
+    materializing its children could not be confirmed" ambiguity -- is
+    reused rather than inventing a second failure shape for the same
+    underlying condition. The Batch record itself stays persisted (never
+    deleted to feign non-existence); the already-materialized item stays
+    exposed; the still-ambiguous one is left for a later explicit
+    resume; the situation is at least logged rather than silently
+    swallowed.
     """
 
     job_repository, job_queue, job_service, batch_repository, batch_service = _build(
@@ -1958,18 +1968,122 @@ def test_create_batch_falls_back_honestly_when_retries_are_exhausted(
     monkeypatch.setattr(batch_service, "_authorize_and_expose", always_unreadable_for_item2)
 
     with caplog.at_level("WARNING", logger="core.batches.service"):
-        batch = batch_service.create_batch(spec)
+        with pytest.raises(BatchStageMaterializationError) as excinfo:
+            batch_service.create_batch(spec)
 
-    assert batch is not None
-    item1_id, item2_id = (item.job_id for item in batch.items)
+    # The Batch record itself was persisted before the retry loop ever
+    # ran -- never deleted to feign non-existence -- so it is still
+    # findable, and is the only batch this isolated tmp_path has.
+    [record] = batch_repository.list_all()
+    batch_id = record.id
+    assert batch_id in str(excinfo.value)
+    item1_id, item2_id = (item.job_id for item in record.items)
     assert item2_id == item2_id_holder["id"]
     assert job_repository.get(item1_id).status == "queued"
     assert job_queue.size() == 1  # only item 1 ever got exposed
-    assert any(batch.id in record.getMessage() for record in caplog.records)
+    assert any(batch_id in log_record.getMessage() for log_record in caplog.records)
 
     monkeypatch.undo()
 
     # A later explicit resume (e.g. the next startup) still recovers it.
     resumed = batch_service.resume_current_stage_for_all_batches()
-    assert any(record.id == batch.id for record in resumed)
+    assert any(r.id == batch_id for r in resumed)
     assert job_queue.size() == 2
+
+
+# --- PR3 exact-HEAD audit, ninth round, finding 4: report cancellation
+# when it skips a later stage ---------------------------------------------
+
+
+def test_batch_status_is_not_succeeded_when_cancellation_suppresses_a_later_stage(
+    tmp_path,
+):
+    """A multi-stage Batch whose current stage fully succeeds, but whose
+    durable `cancellation_requested` then suppresses the next (required)
+    stage entirely, must never report `SUCCEEDED` -- that would claim
+    the Batch finished work it never did (PR3 exact-HEAD audit, ninth
+    round, finding 4). `_try_advance_in_place()` already refuses to
+    create a new stage or new children once cancellation is durable, so
+    the suppressed stage genuinely never gets a chance to run; the
+    aggregate-status derivation must reflect that instead of reading
+    "every current-stage item succeeded" as "the whole Batch succeeded."
+    """
+
+    job_repository, job_queue, job_service, batch_repository, batch_service = _build(
+        tmp_path
+    )
+    generator = _CountingGenerator()
+    job_runner = JobRunner(
+        job_repository, job_queue, GeneratorRegistry({"image": generator}),
+        job_service=job_service,
+    )
+
+    batch = batch_service.create_batch(
+        _spec(stages=[{"name": "probe"}, {"name": "refine"}])
+    )
+    job_id = batch.items[0].job_id
+
+    _drain_queue(job_runner)
+    assert generator.calls == 1
+    assert job_repository.get(job_id).status == "succeeded"
+
+    # Before stage "refine" is ever materialized, cancellation lands.
+    batch_service.cancel(batch.id)
+
+    reconciled = batch_service.reconcile(batch.id)
+
+    assert reconciled.status != "succeeded"
+    assert reconciled.status == "cancelled"
+    assert reconciled.stage_index == 0  # never advanced to "refine"
+    assert not any(item.stage_index == 1 for item in reconciled.items)
+
+    # The refine stage was never materialized, so nothing new was ever
+    # queued or run for it.
+    _drain_queue(job_runner)
+    assert generator.calls == 1
+    assert job_queue.size() == 0
+
+    # Idempotent repeat.
+    reconciled_again = batch_service.reconcile(batch.id)
+    assert reconciled_again.status == "cancelled"
+    assert reconciled_again.stage_index == 0
+
+
+def test_batch_status_stays_succeeded_when_cancellation_arrives_after_true_completion(
+    tmp_path,
+):
+    """Late cancellation must not rewrite a Batch's already-genuine
+    success: if every stage had already completed before
+    `cancellation_requested` was ever set, `SUCCEEDED` remains
+    legitimate (PR3 exact-HEAD audit, ninth round, finding 4's own
+    explicit "cancellation after true final completion" contrast case)
+    -- there is no *further*, required stage a late cancellation could
+    have suppressed.
+    """
+
+    job_repository, job_queue, job_service, batch_repository, batch_service = _build(
+        tmp_path
+    )
+    generator = _CountingGenerator()
+    job_runner = JobRunner(
+        job_repository, job_queue, GeneratorRegistry({"image": generator}),
+        job_service=job_service,
+    )
+
+    batch = batch_service.create_batch(_spec())  # single-stage
+    job_id = batch.items[0].job_id
+
+    _drain_queue(job_runner)
+    assert generator.calls == 1
+    assert job_repository.get(job_id).status == "succeeded"
+
+    reconciled = batch_service.reconcile(batch.id)
+    assert reconciled.status == "succeeded"
+
+    # Cancellation arrives only now, after the (single, final) stage
+    # already genuinely completed.
+    batch_service.cancel(batch.id)
+
+    reconciled_after_cancel = batch_service.reconcile(batch.id)
+    assert reconciled_after_cancel.status == "succeeded"
+    assert reconciled_after_cancel.cancellation_requested is True

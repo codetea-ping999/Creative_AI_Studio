@@ -147,6 +147,18 @@ def create_batch(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
         ) from exc
+    except BatchStageMaterializationError as exc:
+        # The batch itself was persisted, but its stage-0 children could
+        # not be confirmed materialized right now (a transient storage
+        # failure, not a permanent reference problem or a confirmed
+        # cancellation/deletion) -- distinct from the 422 case above:
+        # retrying the same request, or waiting for the next restart's
+        # startup resume, is the correct next step (PR3 exact-HEAD audit,
+        # ninth round, finding 2). Mirrors `advance_batch()`'s identical
+        # handling of the same exception below.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+        ) from exc
     except ValueError as exc:
         # Expansion refusing an oversized sweep is a client error, and the message
         # already names the count and the cap.
