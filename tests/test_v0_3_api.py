@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest import mock
 
 try:
     from fastapi.testclient import TestClient
@@ -689,6 +690,90 @@ class BatchApiTests(unittest.TestCase):
                 },
             )
             self.assertEqual(missing.status_code, 404)
+
+    def test_create_batch_returns_the_committed_batch_when_materialization_is_exhausted(
+        self,
+    ) -> None:
+        """PR3 exact-HEAD audit, tenth round, finding 1: `POST /batches`
+        is non-idempotent -- if `create_batch()`'s bounded materialization
+        retries are exhausted, the Batch itself is already durably
+        committed (and some children may already be materialized/
+        exposed) before the exception is ever raised. The API must not
+        report a bare 503 that would invite a client to retry the
+        *create* request and mint a second, entirely separate Batch. It
+        must instead return the already-committed batch (202, not 201 or
+        503) so the client continues using the same batch id, and must
+        still run project binding for whatever children already got a
+        stable id.
+        """
+
+        with TemporaryDirectory() as tmp_dir:
+            studio = _Studio(Path(tmp_dir))
+            project_id = studio.client.post(
+                "/projects", json={"name": "Exhaustion test"}
+            ).json()["id"]
+
+            real_authorize = studio.services.batch_service._authorize_and_expose
+
+            def always_unreadable_for_second_item(batch_id_arg, job_id_arg, job_status_arg):
+                current = studio.services.batch_repository.get(batch_id_arg)
+                if current is not None and len(current.items) >= 2:
+                    if job_id_arg == current.items[1].job_id:
+                        return "unreadable"
+                return real_authorize(batch_id_arg, job_id_arg, job_status_arg)
+
+            with mock.patch.object(
+                studio.services.batch_service,
+                "_authorize_and_expose",
+                side_effect=always_unreadable_for_second_item,
+            ):
+                response = studio.client.post(
+                    "/batches",
+                    json={
+                        "spec": {
+                            "name": "two-item-stuck",
+                            "media_type": "text",
+                            "task_type": "story",
+                            "model_id": "template-writer",
+                            "prompt": "premise",
+                            "project_id": project_id,
+                            "params": {"task": "logline"},
+                            "axes": [
+                                {
+                                    "name": "variant",
+                                    "values": [
+                                        {"label": "v1", "patch": {"prompt": "item one"}},
+                                        {"label": "v2", "patch": {"prompt": "item two"}},
+                                    ],
+                                }
+                            ],
+                        }
+                    },
+                )
+
+            self.assertEqual(response.status_code, 202, response.text)
+            batch = response.json()
+            item1_job_id = batch["items"][0]["job_id"]
+            self.assertIsNotNone(item1_job_id)
+
+            # No duplicate Batch was created for this one request.
+            listing = studio.client.get("/batches").json()
+            self.assertEqual(len(listing["items"]), 1)
+            self.assertEqual(listing["items"][0]["id"], batch["id"])
+
+            # The already-materialized child is still bound to the
+            # project -- the exception path must not skip this loop.
+            project_jobs = {
+                job["id"]
+                for job in studio.client.get(f"/projects/{project_id}/jobs").json()["jobs"]
+            }
+            self.assertIn(item1_job_id, project_jobs)
+
+            # The client continues using the SAME committed batch id --
+            # no need to (and no incentive to) submit a new create
+            # request for this same work.
+            reread = studio.client.get(f"/batches/{batch['id']}").json()
+            self.assertEqual(reread["id"], batch["id"])
 
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"missing dependency: {IMPORT_ERROR}")

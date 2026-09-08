@@ -31,7 +31,12 @@ from enum import Enum
 import logging
 from typing import TYPE_CHECKING
 
-from .statuses import JOB_STATUS_QUEUED, JOB_STATUS_SUCCEEDED, is_terminal_status
+from .statuses import (
+    JOB_STATUS_FAILED,
+    JOB_STATUS_QUEUED,
+    JOB_STATUS_SUCCEEDED,
+    is_terminal_status,
+)
 
 if TYPE_CHECKING:
     from core.assets import AssetRepository
@@ -185,7 +190,7 @@ class CompletionConverger:
         from core.batches.service import BatchReconciliationOutcome
         from core.jobs.startup_recovery import (
             QUARANTINE_OUTCOMES_NEEDING_BATCH_CONVERGENCE,
-            quarantine_poison_row_safely,
+            quarantine_or_defer_for_batch_cancellation,
         )
         from core.storage.repositories.job_repository import JobRecordDecodeError
 
@@ -194,8 +199,20 @@ class CompletionConverger:
             try:
                 repaired = self.job_repository.get(job_id)
             except JobRecordDecodeError:
-                outcome = quarantine_poison_row_safely(self.job_repository, job_id, exc)
-                if outcome == "transient_write_failure":
+                # `quarantine_or_defer_for_batch_cancellation()` (PR3
+                # exact-HEAD audit, tenth round, adversarial follow-up to
+                # finding 4) reuses `run_startup_recovery()`'s own
+                # Batch-cancellation-precedence check here too: this
+                # candidate could just as easily still be waiting when
+                # its owning Batch's cancellation becomes durable during
+                # ordinary runtime operation, not only at startup --
+                # blindly quarantining a raw QUEUED row to `failed` in
+                # that case would override the cancellation intent
+                # exactly like the original startup-only gap did.
+                outcome = quarantine_or_defer_for_batch_cancellation(
+                    self.job_repository, self.batch_service, job_id, exc
+                )
+                if outcome in ("transient_write_failure", "batch_cancellation_uncertain"):
                     still_pending[job_id] = exc
                 elif (
                     outcome in QUARANTINE_OUTCOMES_NEEDING_BATCH_CONVERGENCE
@@ -206,11 +223,31 @@ class CompletionConverger:
                     # terminal status reached via a raw SQL CAS that
                     # published no terminal event of its own.
                     # `reconcile_child_job()` never calls a generator and
-                    # is itself idempotent.
-                    _record, reconcile_outcome = self.batch_service.reconcile_child_job(
-                        job_id
-                    )
-                    if reconcile_outcome is BatchReconciliationOutcome.RETRYABLE_FAILURE:
+                    # is itself idempotent. Isolated per job (PR3
+                    # exact-HEAD audit, tenth round, adversarial
+                    # follow-up to finding 2): an unguarded exception
+                    # here would propagate out of this entire `for` loop,
+                    # meaning `self._poison_retry_candidates =
+                    # still_pending` below is never reached -- silently
+                    # reverting every OTHER candidate this same tick
+                    # already resolved back to "still pending," not just
+                    # failing to advance this one job.
+                    try:
+                        _record, reconcile_outcome = self.batch_service.reconcile_child_job(
+                            job_id
+                        )
+                        retryable = (
+                            reconcile_outcome is BatchReconciliationOutcome.RETRYABLE_FAILURE
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Batch convergence for quarantined job %s raised "
+                            "unexpectedly during a poison-retry tick; "
+                            "leaving it for a later retry.",
+                            job_id,
+                        )
+                        retryable = True
+                    if retryable:
                         still_pending[job_id] = exc
                 continue
             except Exception:
@@ -224,19 +261,98 @@ class CompletionConverger:
             if repaired is None:
                 continue  # confirmed gone -- nothing left to do
             # Decodes cleanly now -- genuinely repaired, never quarantine.
-            if repaired.status == JOB_STATUS_QUEUED:
-                if self._authorize_recovered_queued_job(job_id) == "uncertain":
-                    # Batch ownership itself could not be confirmed right
-                    # now -- must not guess either "no owner" or "not
-                    # cancelled" by dropping this candidate. Keeping the
-                    # original `exc` here is purely a container detail:
-                    # the row decodes fine now, so the next tick's own
-                    # `job_repository.get()` call above will succeed
-                    # again and simply retry this exact authorization
-                    # check -- `exc` itself is never reused once the row
-                    # is no longer genuinely poison.
-                    still_pending[job_id] = exc
+            # Its CURRENT status decides what happens next, not just
+            # `queued` (PR3 exact-HEAD audit, tenth round, finding 3): an
+            # operator/concurrent repair can land while the row's raw
+            # status is anything a startup-time decode failure could have
+            # frozen it at -- `preparing`/`running`/`postprocessing`
+            # (this process is not the worker that owned it; that worker
+            # is confirmed gone) or `cancel_requested`. Dropping the
+            # candidate for any of those without transitioning it first
+            # would strand it forever: no runtime owner will ever finish
+            # it, and it stays invisible to `list_terminal_pending_
+            # completion()` (only sees already-terminal rows).
+            if self._resolve_repaired_job(job_id, repaired.status):
+                still_pending[job_id] = exc
         self._poison_retry_candidates = still_pending
+
+    def _resolve_repaired_job(self, job_id: str, status: str) -> bool:
+        """Classify a poison-retry candidate that now decodes cleanly, by
+        its current `status` -- returns `True` if the candidate must stay
+        scheduled for a later attempt, `False` once it is resolved one
+        way or another (PR3 exact-HEAD audit, tenth round, finding 3).
+
+        Reuses `run_startup_recovery()` step 3's own exact classification
+        -- `INTERRUPTED_JOB_STATUSES`/`PROCESS_INTERRUPTED_REASON` -- for
+        `queued` (this candidate could not exist otherwise; see finding
+        1) or active (`preparing`/`running`/`postprocessing`; this
+        process never owned this job before whatever crash/restart left
+        it undecodable, so it is finalized `failed`, never resumed or
+        re-run) or `cancel_requested` (finalized `cancelled`). Never a
+        second, drifting copy of that contract -- the same module-level
+        constants, imported here.
+
+        Either transition uses the same CAS primitive (`transition_
+        if_status`) execution ownership itself uses. Unlike `run_
+        startup_recovery()` step 3 (provably single-threaded, running
+        strictly before the job runner/retry-loop threads ever start),
+        this method runs from the *live* runtime retry loop, where a
+        concurrent, genuinely legitimate actor can race this exact CAS
+        -- e.g. an operator's `POST /jobs/{id}/cancel` transitioning
+        `preparing` to `cancel_requested` in the gap between the
+        revalidation read above and this call's own CAS attempt (PR3
+        exact-HEAD audit, tenth round, adversarial follow-up to finding
+        3). The CAS's own boolean return is checked for exactly this
+        reason: a lost race must not be read as "already resolved,
+        nothing left to do" and silently dropped -- that would strand
+        the job at whatever status it actually raced to, with no
+        runtime owner left to ever finalize it (a raced-to `cancel_
+        requested` in particular has no active worker to observe its
+        own cooperative shutdown and call `finalize_cancellation()`).
+        Kept scheduled instead: the next tick's own revalidation read
+        picks up the row's true current status fresh and reclassifies
+        it correctly.
+
+        No Batch-convergence follow-up is issued directly on a
+        successful transition: the job is now a plain, fully decodable
+        terminal `JobRecord` with `completion_state="pending"`, so the
+        very next `run_retry_loop()` tick's own `list_terminal_pending_
+        completion()` pass -- which runs before this method, each tick
+        -- picks it up and converges it (including Batch reconciliation)
+        through the exact same path any ordinary terminal job takes;
+        nothing new needed.
+
+        A row whose status is already terminal (`succeeded`/`failed`/
+        `cancelled`) needs no transition at all -- convergence is
+        already `converge_job()`'s job via the normal pass above.
+        """
+
+        from core.jobs.startup_recovery import (
+            INTERRUPTED_JOB_STATUSES,
+            PROCESS_INTERRUPTED_REASON,
+        )
+        from core.jobs.statuses import JOB_STATUS_CANCEL_REQUESTED, JOB_STATUS_CANCELLED
+
+        if status == JOB_STATUS_QUEUED:
+            return self._authorize_recovered_queued_job(job_id) == "uncertain"
+        if status in INTERRUPTED_JOB_STATUSES:
+            ok = self.job_repository.transition_if_status(
+                job_id,
+                (status,),
+                status=JOB_STATUS_FAILED,
+                progress=1.0,
+                error_message=PROCESS_INTERRUPTED_REASON,
+            )
+            return not ok
+        if status == JOB_STATUS_CANCEL_REQUESTED:
+            ok = self.job_repository.transition_if_status(
+                job_id,
+                (JOB_STATUS_CANCEL_REQUESTED,),
+                status=JOB_STATUS_CANCELLED,
+                progress=1.0,
+            )
+            return not ok
+        return False
 
     def _authorize_recovered_queued_job(self, job_id: str) -> str:
         """Enqueue a repaired, still-`queued` job -- but only after

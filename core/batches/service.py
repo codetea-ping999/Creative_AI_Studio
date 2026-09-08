@@ -110,7 +110,23 @@ class BatchStageMaterializationError(RuntimeError):
     would silently leave the batch stuck with no Job to ever finish it and
     no runtime retry scheduled, since the triggering job may already be
     `completion_state="done"`.
+
+    Carries `batch_id` (PR3 exact-HEAD audit, tenth round, finding 1):
+    `advance()`'s own raise site is safe to blindly retry (the same
+    `batch_id` is already in the request URL, so retrying just calls
+    `advance()` again -- no duplicate risk), but `create_batch()`'s raise
+    site is not: `POST /batches` is non-idempotent, and the Batch it
+    raises for was already durably committed before the exception was
+    ever raised. A caller that only knows "retry the request" from the
+    exception type alone would mint a brand-new Batch on retry instead of
+    continuing the one that already exists -- `batch_id` lets a caller
+    (the API route) identify and return the *already-committed* Batch
+    instead of discarding that identity.
     """
+
+    def __init__(self, message: str, *, batch_id: str) -> None:
+        super().__init__(message)
+        self.batch_id = batch_id
 
 
 def resolve_max_items_limit(configured: int | None = None) -> int:
@@ -258,9 +274,12 @@ class BatchService:
             f"Batch {record.id}: stage 0 materialization could not be "
             f"confirmed after {_STARTUP_BATCH_SCAN_MAX_ATTEMPTS} "
             "attempt(s) (a transient storage failure). The batch itself "
-            "was created; retry this request, or wait for the next "
-            "process restart's startup resume, to finish materializing "
-            "its children."
+            f"was already created -- continue using this same batch id "
+            f"({record.id}), e.g. via GET /batches/{record.id}, or wait "
+            "for the next process restart's startup resume, to finish "
+            "materializing its children. Do not submit a new create "
+            "request for this same work: the batch already exists.",
+            batch_id=record.id,
         )
 
     def _enqueue_stage(self, batch_id: str, *, stage_index: int) -> BatchRecord | None:
@@ -626,6 +645,43 @@ class BatchService:
 
         return self.batch_repository.run_exclusive(_decide)
 
+    def diagnose_job_batch_cancellation(self, job_id: str) -> str:
+        """Read-only: is `job_id` owned by a Batch, and if so is that
+        Batch's cancellation durably requested (PR3 exact-HEAD audit,
+        tenth round, finding 4)?
+
+        For a caller (`run_startup_recovery()`'s step 1) that needs this
+        answer *before* the row can be treated as a normal, decodable
+        `JobRecord` at all -- unlike `authorize_recovered_queued_job()`,
+        which assumes the caller can already act on the job through
+        `JobService` (enqueue/cancel), this deliberately does neither:
+        it only reads and reports. A poison row's raw status can be
+        transitioned directly via `JobRepository.transition_if_status()`
+        (the same CAS primitive `quarantine_poison_row_safely()` itself
+        uses), which needs no decodable `JobRecord` at all.
+
+        Lock-free by design, matching `find_by_job_id_or_diagnose()`'s
+        own plain-read contract: `run_startup_recovery()` runs once,
+        strictly before the job runner and retry-loop threads start, so
+        there is no concurrent Batch mutation to race against for this
+        specific call.
+
+        Returns one of:
+        - ``"cancelled"`` -- a confirmed owning Batch has
+          `cancellation_requested=True`.
+        - ``"not_cancelled"`` -- a confirmed owning Batch exists but is
+          not cancelling.
+        - ``"no_parent"`` -- confirmed no owning Batch at all.
+        - ``"uncertain"`` -- ownership itself could not be confirmed
+          right now (a transient read failure); the caller must not
+          assume either "no owner" or "not cancelled".
+        """
+
+        owner, uncertain = self.batch_repository.find_by_job_id_or_diagnose(job_id)
+        if owner is None:
+            return "uncertain" if uncertain else "no_parent"
+        return "cancelled" if owner.cancellation_requested else "not_cancelled"
+
     # ------------------------------------------------------------------- reads
 
     def get_batch(self, batch_id: str) -> BatchRecord | None:
@@ -864,7 +920,8 @@ class BatchService:
             raise BatchStageMaterializationError(
                 f"Batch {record.id!r} advanced to stage {record.stage_index}, "
                 "but materializing its Job rows could not be confirmed "
-                "right now (a transient storage failure); retry."
+                "right now (a transient storage failure); retry.",
+                batch_id=record.id,
             )
         return self.reconcile(batch_id)
 

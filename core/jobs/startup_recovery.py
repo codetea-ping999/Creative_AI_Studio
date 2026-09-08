@@ -75,9 +75,17 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_INTERRUPTED_STATUSES = (JOB_STATUS_PREPARING, JOB_STATUS_RUNNING, JOB_STATUS_POSTPROCESSING)
+# Public (not underscore-prefixed), matching the same PR3 exact-HEAD-audit
+# convention `QUARANTINE_OUTCOMES_NEEDING_BATCH_CONVERGENCE` below already
+# established: `core.jobs.completion.CompletionConverger._retry_poison_
+# quarantine_candidates()` reuses these exact same values (PR3 exact-HEAD
+# audit, tenth round, finding 3) to apply the identical "active status ->
+# process_interrupted -> failed; cancel_requested -> cancelled"
+# classification to a poison-retry candidate that turns out to be repaired
+# but not `queued` -- never a second, drifting copy of this contract.
+INTERRUPTED_JOB_STATUSES = (JOB_STATUS_PREPARING, JOB_STATUS_RUNNING, JOB_STATUS_POSTPROCESSING)
 
-_PROCESS_INTERRUPTED_REASON = (
+PROCESS_INTERRUPTED_REASON = (
     "process_interrupted: job was still active when the process restarted; "
     "the worker that owned it is confirmed gone."
 )
@@ -139,69 +147,88 @@ def run_startup_recovery(
 ) -> StartupRecoveryReport:
     report = StartupRecoveryReport()
 
+    def _reconcile_quarantined_batch_child(job_id: str, exc: Exception) -> None:
+        """Give a poison row that just reached a genuine terminal status a
+        Batch-convergence follow-up, isolated per job (PR3 exact-HEAD
+        audit, eighth round finding 4; ninth round adversarial follow-up
+        to finding 3; tenth round finding 2).
+
+        The row reached its terminal status via a raw SQL CAS that
+        published no terminal event and ran no convergence of its own --
+        unlike an ordinary terminal transition, which always reaches
+        `CompletionConverger`/`reconcile_child_job()` (including a
+        stage-advance attempt). Without this, a Batch whose owning
+        stage's only remaining nonterminal item was this exact poisoned
+        row would stay stuck on its old stage forever: step 5 below only
+        ever calls the plain, non-advancing `reconcile()`.
+        `reconcile_child_job()` never calls a generator; it only reads/
+        reconciles Batch and Job state, and is itself idempotent -- safe
+        even for an outcome some earlier pass may already have converged.
+
+        `reconcile_child_job()`'s own outcome is checked: a
+        `RETRYABLE_FAILURE` (the owning Batch could not be read just
+        now) must not be silently discarded. It can also itself RAISE --
+        not just return `RETRYABLE_FAILURE` -- for example a transient
+        `OSError` from `BatchRepository.save()` while persisting the
+        recomputed Batch state; before the tenth round this was
+        completely unguarded and would abort the entire startup pass
+        over one already-terminal poison row's convergence follow-up.
+        Either way, this job_id is registered as a poison retry
+        candidate: `CompletionConverger.run_retry_loop()`'s own tick
+        re-reads the row (still undecodable -- only its `status` column
+        was ever flipped by a CAS), hits the same `JobRecordDecodeError`
+        branch again, and `quarantine_poison_row_safely()` is itself
+        idempotent for an already-terminal row, so re-attempting Batch
+        reconciliation on a later tick is always safe.
+        """
+
+        assert batch_service is not None
+        try:
+            from core.batches.service import BatchReconciliationOutcome
+
+            _record, reconcile_outcome = batch_service.reconcile_child_job(job_id)
+            retryable = reconcile_outcome is BatchReconciliationOutcome.RETRYABLE_FAILURE
+        except Exception:
+            logger.exception(
+                "Batch convergence for quarantined job %s raised "
+                "unexpectedly during startup recovery; leaving it for a "
+                "later retry.",
+                job_id,
+            )
+            retryable = True
+        if retryable:
+            completion_converger.register_poison_retry_candidate(job_id, exc)
+
     # 1. Row-level poison scan -- one bad row never aborts the rest.
     records, failures = job_repository.list_tolerant()
     for job_id, exc in failures:
-        outcome = quarantine_poison_row_safely(job_repository, job_id, exc)
+        outcome = quarantine_or_defer_for_batch_cancellation(
+            job_repository, batch_service, job_id, exc
+        )
         report.poison_rows[job_id] = outcome
-        if outcome == "transient_write_failure":
-            # The row is still undecodable AND the quarantine write
-            # itself just failed transiently -- its raw status stays
-            # queued/active/cancel_requested, so it is now invisible to
-            # every other existing retry mechanism: `list_tolerant()`
-            # can't decode it, `list_terminal_pending_completion()` only
-            # ever sees terminal rows, and nothing about it changes on
-            # its own. Without an explicit retry candidate, it would stay
-            # stranded for the rest of this process's lifetime, until the
-            # next full restart (PR3 exact-HEAD audit, seventh round,
-            # finding 4). Registered on the shared `CompletionConverger`
-            # so its own existing `run_retry_loop()` tick -- the one
-            # minimal background retry mechanism this PR already
-            # maintains -- picks it back up; no new scheduler.
+        if outcome in ("transient_write_failure", "batch_cancellation_uncertain"):
+            # Either the quarantine write itself failed transiently, or
+            # (PR3 exact-HEAD audit, tenth round, finding 4) a durable
+            # Batch cancellation intent could not be confirmed right now
+            # for a raw QUEUED row -- either way the row's raw status
+            # stays queued/active/cancel_requested, so it is now
+            # invisible to every other existing retry mechanism:
+            # `list_tolerant()` can't decode it, `list_terminal_pending_
+            # completion()` only ever sees terminal rows, and nothing
+            # about it changes on its own. Without an explicit retry
+            # candidate, it would stay stranded for the rest of this
+            # process's lifetime, until the next full restart (PR3
+            # exact-HEAD audit, seventh round, finding 4). Registered on
+            # the shared `CompletionConverger` so its own existing
+            # `run_retry_loop()` tick -- the one minimal background retry
+            # mechanism this PR already maintains -- picks it back up; no
+            # new scheduler.
             completion_converger.register_poison_retry_candidate(job_id, exc)
         elif (
             outcome in QUARANTINE_OUTCOMES_NEEDING_BATCH_CONVERGENCE
             and batch_service is not None
         ):
-            # This row is now (or was already) at a genuine terminal
-            # status, but reached it via a raw SQL CAS that published no
-            # terminal event and ran no convergence of its own -- unlike
-            # an ordinary terminal transition, which always reaches
-            # `CompletionConverger`/`reconcile_child_job()` (including a
-            # stage-advance attempt). Without this, a Batch whose owning
-            # stage's only remaining nonterminal item was this exact
-            # poisoned row -- with every sibling already `completion_
-            # state="done"` -- would stay stuck on its old stage forever:
-            # step 5 below only ever calls the plain, non-advancing
-            # `reconcile()` (PR3 exact-HEAD audit, eighth round, finding
-            # 4). `reconcile_child_job()` never calls a generator; it
-            # only reads/reconciles Batch and Job state, and is itself
-            # idempotent -- safe even for an "already_resolved" or
-            # "left_untouched_terminal" outcome that some earlier pass
-            # may already have converged.
-            #
-            # Its own outcome is checked (PR3 exact-HEAD audit, ninth
-            # round, adversarial follow-up to finding 3): a
-            # `RETRYABLE_FAILURE` here (the owning Batch could not be
-            # read just now -- a transient failure, not a confirmed "no
-            # parent") must not be silently discarded the way this exact
-            # call site used to. Registering this job_id as a poison
-            # retry candidate reuses the existing mechanism exactly:
-            # `CompletionConverger.run_retry_loop()`'s own tick re-reads
-            # the row (still undecodable -- only its `status` column was
-            # ever flipped by the quarantine CAS), hits the same
-            # `JobRecordDecodeError` branch again, and
-            # `quarantine_poison_row_safely()` is itself idempotent for
-            # an already-terminal row, so re-attempting Batch
-            # reconciliation on a later tick is always safe -- this is
-            # the exact retry path the eighth round already built for a
-            # quarantine *write* failure, reused here for a quarantine-
-            # succeeded-but-reconciliation-failed outcome instead.
-            from core.batches.service import BatchReconciliationOutcome
-
-            _record, reconcile_outcome = batch_service.reconcile_child_job(job_id)
-            if reconcile_outcome is BatchReconciliationOutcome.RETRYABLE_FAILURE:
-                completion_converger.register_poison_retry_candidate(job_id, exc)
+            _reconcile_quarantined_batch_child(job_id, exc)
 
     # A quarantined/repaired row's *current* state can only be known by
     # rereading it -- `records` above still reflects the pre-quarantine
@@ -243,13 +270,13 @@ def run_startup_recovery(
     # re-runs a generator: this is a pure state transition using the exact
     # same CAS primitive the execution claim itself uses.
     for job in records:
-        if job.status in _INTERRUPTED_STATUSES:
+        if job.status in INTERRUPTED_JOB_STATUSES:
             if job_repository.transition_if_status(
                 job.id,
                 (job.status,),
                 status=JOB_STATUS_FAILED,
                 progress=1.0,
-                error_message=_PROCESS_INTERRUPTED_REASON,
+                error_message=PROCESS_INTERRUPTED_REASON,
             ):
                 report.interrupted_failed.append(job.id)
         elif job.status == JOB_STATUS_CANCEL_REQUESTED:
@@ -437,7 +464,7 @@ def quarantine_poison_row_safely(
                 error_message=reason,
             )
             return "cancelled" if ok else "already_resolved"
-        if raw_status in _INTERRUPTED_STATUSES or raw_status == JOB_STATUS_QUEUED:
+        if raw_status in INTERRUPTED_JOB_STATUSES or raw_status == JOB_STATUS_QUEUED:
             ok = job_repository.transition_if_status(
                 job_id,
                 (raw_status,),
@@ -476,8 +503,103 @@ def quarantine_poison_row_safely(
         return "transient_write_failure"
 
 
+def quarantine_or_defer_for_batch_cancellation(
+    job_repository: "JobRepository",
+    batch_service: "BatchService | None",
+    job_id: str,
+    exc: Exception,
+) -> str:
+    """Like `quarantine_poison_row_safely()`, but a durable Batch
+    cancellation intent is checked first for a raw QUEUED poison row
+    (PR3 exact-HEAD audit, tenth round, finding 4).
+
+    The crash window this closes: a Batch's `cancellation_requested`
+    becomes durable, then the process crashes (or, for the runtime
+    poison-retry loop, the row simply never resolves in time) before
+    this exact child's own cancellation could be applied, with this
+    child's payload independently malformed. `quarantine_poison_row_
+    safely()` alone has no Batch context and would otherwise classify a
+    QUEUED poison row as `failed` unconditionally -- correct for an
+    ordinary (non-Batch, or non-cancelling-Batch) poison job, but wrong
+    here: a cancelled Batch whose only remaining child ends up `failed`
+    instead of `cancelled` reports an incorrect terminal Batch status,
+    overriding a cancellation intent that existed *before* this
+    decision was ever made.
+
+    Shared between `run_startup_recovery()`'s step 1 and `Completion
+    Converger._retry_poison_quarantine_candidates()`'s own "still
+    poison" branch (PR3 exact-HEAD audit, tenth round, adversarial
+    follow-up to finding 4): a poison row can just as easily still be
+    sitting in `_poison_retry_candidates` -- because its quarantine
+    *write* failed transiently, or because Batch ownership was itself
+    uncertain on an earlier attempt -- when its owning Batch's
+    cancellation becomes durable sometime later, during ordinary
+    runtime operation, not only at startup. Reusing this one function
+    for both callers closes the gap at both call sites identically,
+    rather than only at the one this round's finding 4 originally named.
+
+    Scoped to QUEUED only -- an active-status (`preparing`/`running`/
+    `postprocessing`) poison row is correctly `failed` (process_
+    interrupted) regardless of Batch cancellation, since the
+    interruption already genuinely happened, matching `run_startup_
+    recovery()` step 3's own identical unconditional rule for every
+    other interrupted job -- and a raw `cancel_requested` poison row
+    already correctly becomes `cancelled` via `quarantine_poison_row_
+    safely()`'s own existing branch, unrelated to Batch-level
+    cancellation.
+
+    Never raises: every step here (the raw-status peek, the Batch-
+    ownership diagnosis, the direct CAS transition) is wrapped exactly
+    like `quarantine_poison_row_safely()` itself already wraps its own
+    body, so one row's transient read/write failure can never abort a
+    caller's larger loop over many rows (PR3 exact-HEAD audit, tenth
+    round, adversarial follow-up to finding 2 -- the identical class of
+    gap finding 2 fixed for `reconcile_child_job()`, found here for
+    this new finding-4 code's own raw calls).
+
+    Returns the same outcome vocabulary `quarantine_poison_row_safely()`
+    already returns, plus `"batch_cancellation_uncertain"` -- the caller
+    must treat that new outcome exactly like `"transient_write_failure"`
+    (keep the row scheduled for a later attempt; never guess "not
+    cancelled").
+    """
+
+    try:
+        raw_status = job_repository.get_raw_status(job_id)  # decode-free peek
+        if raw_status == JOB_STATUS_QUEUED and batch_service is not None:
+            cancellation_state = batch_service.diagnose_job_batch_cancellation(job_id)
+            if cancellation_state == "uncertain":
+                return "batch_cancellation_uncertain"
+            if cancellation_state == "cancelled":
+                reason = f"Startup recovery: row could not be reconstructed: {exc}"
+                ok = job_repository.transition_if_status(
+                    job_id,
+                    (JOB_STATUS_QUEUED,),
+                    status=JOB_STATUS_CANCELLED,
+                    progress=1.0,
+                    error_message=reason,
+                )
+                return "cancelled" if ok else "already_resolved"
+            # "not_cancelled" or "no_parent" -- proceed with the normal,
+            # unaffected quarantine classification below.
+    except Exception:
+        logger.exception(
+            "Transient failure while checking Batch cancellation "
+            "precedence for poison job %s; leaving it for a later "
+            "retry.",
+            job_id,
+        )
+        return "transient_write_failure"
+
+    return quarantine_poison_row_safely(job_repository, job_id, exc)
+
+
 __all__ = [
+    "INTERRUPTED_JOB_STATUSES",
+    "PROCESS_INTERRUPTED_REASON",
     "QUARANTINE_OUTCOMES_NEEDING_BATCH_CONVERGENCE",
     "StartupRecoveryReport",
+    "quarantine_or_defer_for_batch_cancellation",
+    "quarantine_poison_row_safely",
     "run_startup_recovery",
 ]

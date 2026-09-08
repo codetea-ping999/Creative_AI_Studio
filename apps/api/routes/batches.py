@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from apps.api.dependencies import get_services
@@ -107,6 +107,7 @@ def list_batches(
 @router.post("", response_model=BatchResponse, status_code=status.HTTP_201_CREATED)
 def create_batch(
     request: CreateBatchRequest,
+    response: Response,
     services: ApplicationServices = Depends(get_services),
 ) -> BatchResponse:
     if (request.spec is None) == (request.template is None):
@@ -148,17 +149,38 @@ def create_batch(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
         ) from exc
     except BatchStageMaterializationError as exc:
-        # The batch itself was persisted, but its stage-0 children could
-        # not be confirmed materialized right now (a transient storage
-        # failure, not a permanent reference problem or a confirmed
-        # cancellation/deletion) -- distinct from the 422 case above:
-        # retrying the same request, or waiting for the next restart's
-        # startup resume, is the correct next step (PR3 exact-HEAD audit,
-        # ninth round, finding 2). Mirrors `advance_batch()`'s identical
-        # handling of the same exception below.
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
-        ) from exc
+        # `POST /batches` is non-idempotent: unlike `advance_batch()`'s
+        # identical exception (safe to retry -- the same batch_id is
+        # already in the URL), the Batch this raised for was already
+        # durably committed to disk *before* this exception was ever
+        # raised (PR3 exact-HEAD audit, tenth round, finding 1). Reporting
+        # a bare 503 here would invite a client to retry the *create*
+        # request, minting a second, entirely separate Batch under a new
+        # id -- both eventually running -- while also skipping the
+        # project-binding loop below for whatever children already got a
+        # stable id. Instead, look up the batch this exact exception
+        # names (`exc.batch_id`) and return *that* committed record, with
+        # its own real (still in-progress) status -- 202 Accepted, not
+        # 201: the request was accepted and the batch does exist, but
+        # materialization is not yet confirmed complete. The client
+        # continues using this same batch id (poll `GET /batches/{id}`,
+        # or wait for the next restart's startup resume) instead of
+        # submitting a new create request.
+        committed_record = services.batch_service.get_batch(exc.batch_id)
+        if committed_record is None:
+            # Should not happen (the batch was just created moments ago
+            # and nothing else in this request had a chance to delete
+            # it), but never silently fabricate a response for a batch
+            # that turns out not to exist.
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+            ) from exc
+        if spec.project_id is not None:
+            for item in committed_record.items:
+                if item.job_id:
+                    services.project_repository.add_job(spec.project_id, item.job_id)
+        response.status_code = status.HTTP_202_ACCEPTED
+        return BatchResponse.from_record(committed_record)
     except ValueError as exc:
         # Expansion refusing an oversized sweep is a client error, and the message
         # already names the count and the cap.
