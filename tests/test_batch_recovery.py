@@ -934,40 +934,49 @@ def test_malformed_authorize_recheck_never_cancels_or_enqueues_the_child(
 def test_get_or_diagnose_treats_a_stat_failure_as_uncertain_not_absent(
     tmp_path, monkeypatch
 ):
-    """`get_or_diagnose()`'s own pre-fix `Path.exists()` pre-check
-    internally resolves straight to `os.stat()` (bypassing the public
-    `Path.stat()` method entirely) and returns `False` for *any*
-    `OSError`, not only "genuinely does not exist" -- a transient stat
-    failure (a permission hiccup, a mount timeout) on a batch file that
-    fully exists would otherwise be laundered into "confirmed: this
-    batch was deleted," identically to the fifth round's malformed-
-    content bug but via a different stdlib call (PR3 exact-HEAD audit,
-    eighth round, finding 2). A live batch that merely can't be stat'd
-    *right now* must be reported as uncertain, never as confirmed absent.
+    """`get_or_diagnose()` now calls the batch file's own `.stat()`
+    directly and must distinguish a confirmed `FileNotFoundError` from
+    any other transient `OSError` (a permission hiccup, a mount
+    timeout) -- the latter must be reported as uncertain, never as
+    confirmed absence, or a live batch could be wrongly treated as
+    deleted (PR3 exact-HEAD audit, eighth round, finding 2).
+
+    Injects the failure by patching `pathlib.Path.stat` itself (the
+    exact method `get_or_diagnose()` calls), rather than the lower-level
+    `os.stat()` free function: `Path.exists()`/`Path.stat()`'s internal
+    routing to `os.stat()` is a CPython-version-specific implementation
+    detail (confirmed to differ between the local 3.14 environment and
+    CI's Python 3.10 runtime -- an `os.stat()`-level patch does not
+    reliably intercept every version's call path), while `Path.stat`
+    itself is the stable, version-portable interception point that
+    matches what the fixed production code actually calls.
 
     A direct unit test of `get_or_diagnose()` itself, not through
     `_enqueue_stage()`: that method's own earlier "cheap, lock-free
-    pre-check" (`self.batch_repository.get(batch_id)`) also resolves to
-    `Path.exists()` for the exact same file, so an `os.stat()`-level
-    injection broad enough to reach `Path.exists()` would trip that
-    unrelated call too, confounding the test.
+    pre-check" (`self.batch_repository.get(batch_id)`) also stats the
+    exact same file, so a `Path.stat`-level injection broad enough to
+    catch every batch file would trip that unrelated call too,
+    confounding the test -- guarded against below by raising only for
+    this exact target path and delegating every other path to the real
+    `Path.stat`.
     """
 
-    import os as os_module
+    from pathlib import Path
 
     _job_repository, _job_queue, _job_service, batch_repository, batch_service = _build(
         tmp_path
     )
     batch = batch_service.create_batch(_spec())
 
-    real_os_stat = os_module.stat
+    target_file = batch_repository.batch_dir / f"{batch.id}.json"
+    real_path_stat = Path.stat
 
-    def flaky_os_stat(path, *args, **kwargs):
-        if os_module.fspath(path).endswith(f"{batch.id}.json"):
+    def flaky_path_stat(self, *args, **kwargs):
+        if self == target_file:
             raise OSError("injected: transient stat failure")
-        return real_os_stat(path, *args, **kwargs)
+        return real_path_stat(self, *args, **kwargs)
 
-    monkeypatch.setattr(os_module, "stat", flaky_os_stat)
+    monkeypatch.setattr(Path, "stat", flaky_path_stat)
 
     record, uncertain = batch_repository.get_or_diagnose(batch.id)
 

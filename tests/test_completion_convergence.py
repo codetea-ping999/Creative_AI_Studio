@@ -490,37 +490,39 @@ def test_story_get_for_recovery_treats_a_read_error_as_unreadable_not_missing(
 def test_story_get_for_recovery_treats_a_stat_failure_as_unreadable_not_missing(
     tmp_path, monkeypatch
 ):
-    """`get_for_recovery()`'s own pre-fix `Path.exists()` pre-check
-    internally resolves straight to a single `os.stat()` call and
-    returns `False` for *any* `OSError`, not only "genuinely does not
-    exist" -- a transient stat failure (a permission hiccup, a mount
-    timeout) on a Story file that fully exists would otherwise be
-    laundered into "confirmed: this Story was deleted," identically to
-    the analogous Batch-side bug fixed the same round, but for a Story
-    file (PR3 exact-HEAD audit, eighth round, finding 3). This is
-    distinct from the read-failure case right above: here `.exists()`
-    itself never gets far enough to attempt `read_text()` at all.
-    """
+    """`get_for_recovery()` now calls the story file's own `.stat()`
+    directly and must distinguish a confirmed `FileNotFoundError` from
+    any other transient `OSError` (a permission hiccup, a mount
+    timeout) -- the latter must be reported as unreadable, never as
+    confirmed absence, identically to the analogous Batch-side bug
+    fixed the same round, but for a Story file (PR3 exact-HEAD audit,
+    eighth round, finding 3). This is distinct from the read-failure
+    case right above: here `.stat()` itself never gets far enough to
+    attempt `read_text()` at all.
 
-    import os as os_module
+    Injects the failure by patching `pathlib.Path.stat` itself (the
+    exact method `get_for_recovery()` calls), rather than the
+    lower-level `os.stat()` free function: `Path.stat()`'s internal
+    routing to `os.stat()` is a CPython-version-specific implementation
+    detail (confirmed to differ between the local 3.14 environment and
+    CI's Python 3.10 runtime -- an `os.stat()`-level patch does not
+    reliably intercept every version's call path), while `Path.stat`
+    itself is the stable, version-portable interception point that
+    matches what the fixed production code actually calls.
+    """
 
     story_repository = StoryRepository(tmp_path / "stories")
     story = story_repository.create(title="t")
-    story_file = tmp_path / "stories" / f"{story.id}.json"
+    target_file = tmp_path / "stories" / f"{story.id}.json"
 
-    # Injected at the `os.stat()` level, not `Path.stat()`:
-    # `Path.exists()` -- what the pre-fix code called -- resolves
-    # internally straight to `os.stat()`, bypassing the public
-    # `Path.stat()` method entirely, so patching only the latter would
-    # not actually exercise the bug this fix closes.
-    real_os_stat = os_module.stat
+    real_path_stat = Path.stat
 
-    def flaky_os_stat(path, *args, **kwargs):
-        if os_module.fspath(path) == os_module.fspath(story_file):
+    def flaky_path_stat(self, *args, **kwargs):
+        if self == target_file:
             raise OSError("injected: transient stat failure")
-        return real_os_stat(path, *args, **kwargs)
+        return real_path_stat(self, *args, **kwargs)
 
-    monkeypatch.setattr(os_module, "stat", flaky_os_stat)
+    monkeypatch.setattr(Path, "stat", flaky_path_stat)
 
     result, confirmed_absent = story_repository.get_for_recovery(story.id)
 
