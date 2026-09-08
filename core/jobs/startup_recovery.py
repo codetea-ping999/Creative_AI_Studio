@@ -82,6 +82,36 @@ _PROCESS_INTERRUPTED_REASON = (
     "the worker that owned it is confirmed gone."
 )
 
+# `quarantine_poison_row_safely()` outcomes that mean the row is now --
+# or was already, independently of this exact call -- at a genuine
+# terminal status (PR3 exact-HEAD audit, eighth round, finding 4): a
+# successful quarantine transitions the row directly via a raw SQL CAS,
+# publishing no terminal event and running no completion/Batch
+# convergence of its own. Excludes "missing" (nothing left to reconcile
+# by job id), "transient_write_failure" (not yet terminal -- handled
+# separately, see `CompletionConverger.register_poison_retry_
+# candidate()`), and "left_untouched" (dead/unreachable).
+#
+# Shared with `CompletionConverger._retry_poison_quarantine_candidates()`
+# (PR3 exact-HEAD audit, eighth round, adversarial follow-up): that
+# method calls this exact same `quarantine_poison_row_safely()` primitive
+# for a *runtime* retry of a poison row, and needs the identical
+# Batch-convergence follow-up for the identical set of outcomes -- a
+# quarantine success reached via the retry loop must not be treated any
+# differently than one reached at startup, or a Batch could stay stuck on
+# its old stage for the rest of the process's life purely because its
+# last poison child happened to resolve via the retry loop instead of
+# the startup pass.
+QUARANTINE_OUTCOMES_NEEDING_BATCH_CONVERGENCE = frozenset(
+    {
+        "cancelled",
+        "failed",
+        "already_resolved",
+        "left_untouched_terminal",
+        "quarantined_invalid_status",
+    }
+)
+
 
 @dataclass
 class StartupRecoveryReport:
@@ -96,6 +126,7 @@ class StartupRecoveryReport:
     batches_resumed_current_stage: list[str] = field(default_factory=list)
     batch_cancellation_scan_was_fully_reliable: bool = True
     queued_enqueue_skipped_due_to_unreliable_batch_scan: bool = False
+    batch_reconcile_scan_was_fully_reliable: bool = True
     assets_repaired: int = 0
 
 
@@ -128,6 +159,27 @@ def run_startup_recovery(
             # minimal background retry mechanism this PR already
             # maintains -- picks it back up; no new scheduler.
             completion_converger.register_poison_retry_candidate(job_id, exc)
+        elif (
+            outcome in QUARANTINE_OUTCOMES_NEEDING_BATCH_CONVERGENCE
+            and batch_service is not None
+        ):
+            # This row is now (or was already) at a genuine terminal
+            # status, but reached it via a raw SQL CAS that published no
+            # terminal event and ran no convergence of its own -- unlike
+            # an ordinary terminal transition, which always reaches
+            # `CompletionConverger`/`reconcile_child_job()` (including a
+            # stage-advance attempt). Without this, a Batch whose owning
+            # stage's only remaining nonterminal item was this exact
+            # poisoned row -- with every sibling already `completion_
+            # state="done"` -- would stay stuck on its old stage forever:
+            # step 5 below only ever calls the plain, non-advancing
+            # `reconcile()` (PR3 exact-HEAD audit, eighth round, finding
+            # 4). `reconcile_child_job()` never calls a generator; it
+            # only reads/reconciles Batch and Job state, and is itself
+            # idempotent -- safe even for an "already_resolved" or
+            # "left_untouched_terminal" outcome that some earlier pass
+            # may already have converged.
+            batch_service.reconcile_child_job(job_id)
 
     # A quarantined/repaired row's *current* state can only be known by
     # rereading it -- `records` above still reflects the pre-quarantine
@@ -226,8 +278,21 @@ def run_startup_recovery(
     # touched by step 4 (e.g. all its children were already "done" before
     # this restart, but the batch record itself was never re-read) still
     # reflects current child state.
+    #
+    # Uses `list_batches_tolerant()`, not `list_batches()`: the latter's
+    # `Path.glob()`-based scan silently treats a directory-level `OSError`
+    # as "zero batches" (the exact same bug fixed for step 2's
+    # cancellation scan -- PR3 exact-HEAD audit, eighth round, finding 1
+    # and its adversarial follow-up). This pass is a backstop, not a
+    # safety-critical gate like step 2's, so an unreliable scan here does
+    # not need to skip any other step -- it is simply recorded, and the
+    # next restart (or a direct `get_batch()`/`GET /batches/{id}`, which
+    # reconciles via single-file `get()`, unaffected by a directory-level
+    # failure) naturally retries it.
     if batch_service is not None:
-        batch_service.list_batches()
+        _reconciled_batches, report.batch_reconcile_scan_was_fully_reliable = (
+            batch_service.list_batches_tolerant()
+        )
 
     # 6. Re-enqueue every job that is, on a fresh read right now, still
     # queued -- under its existing id, never a new one. JobQueue is
@@ -389,4 +454,8 @@ def quarantine_poison_row_safely(
         return "transient_write_failure"
 
 
-__all__ = ["StartupRecoveryReport", "run_startup_recovery"]
+__all__ = [
+    "QUARANTINE_OUTCOMES_NEEDING_BATCH_CONVERGENCE",
+    "StartupRecoveryReport",
+    "run_startup_recovery",
+]

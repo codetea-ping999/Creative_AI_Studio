@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import json
+import os
 from pathlib import Path
 from threading import RLock
 from typing import TypeVar
@@ -86,8 +87,22 @@ class BatchRepository:
         """
 
         batch_file = self.batch_dir / f"{batch_id}.json"
-        if not batch_file.exists():
+        # `Path.exists()` is not this method's confirmed-absence check --
+        # it internally stats the path and returns `False` for *any*
+        # `OSError`, not only "genuinely does not exist" (`ENOENT`). A
+        # transient stat failure (a permission hiccup, a mount timeout)
+        # would otherwise be laundered into "confirmed: this batch was
+        # deleted" (PR3 exact-HEAD audit, eighth round, finding 2) --
+        # exactly the same "uncertain != absent" bug this class's own
+        # `list_all_tolerant()`/`find_by_job_id_or_diagnose()` already
+        # guard against for a directory scan, reproduced here via a
+        # different stdlib call for a single-file stat.
+        try:
+            batch_file.stat()
+        except FileNotFoundError:
             return None, False
+        except OSError:
+            return None, True
         record, _transient_failure = self._try_load_diagnosed(batch_file)
         if record is not None:
             return record, False
@@ -299,12 +314,36 @@ class BatchRepository:
         `BatchService.resume_pending_cancellations`) must check this flag
         first: a transient read failure must never be silently treated as
         "there is nothing left to resume."
+
+        Also unreliable -- and reported the exact same way -- if the
+        directory *enumeration* itself fails: `Path.glob()` internally
+        uses `os.scandir()`, which can itself raise a transient `OSError`
+        (a temporary permission, mount, or I/O failure) -- but `glob()`
+        silently swallows exactly that and yields zero entries instead of
+        propagating it, indistinguishable from "this directory is simply
+        empty" (PR3 exact-HEAD audit, eighth round, finding 1). Without
+        this, a durable `cancellation_requested=True` on a batch this
+        pass could not even enumerate would be invisible to
+        `resume_pending_cancellations()`, which would then trust
+        `scan_was_fully_reliable=True` and let `run_startup_recovery()`'s
+        generic queued-job sweep re-enqueue that exact batch's children.
+        Enumerates via `os.scandir()` directly instead, so a directory-
+        level failure (at the initial call, or partway through iterating)
+        is caught explicitly rather than laundered into "no entries."
         """
 
         records: list[BatchRecord] = []
         malformed_ids: list[str] = []
         scan_was_fully_reliable = True
-        for batch_file in sorted(self.batch_dir.glob("*.json")):
+        try:
+            with os.scandir(self.batch_dir) as it:
+                batch_files = sorted(
+                    Path(entry.path) for entry in it if entry.name.endswith(".json")
+                )
+        except OSError:
+            return [], [], False
+
+        for batch_file in batch_files:
             record, transient_failure = self._try_load_diagnosed(batch_file)
             if record is None:
                 if transient_failure:

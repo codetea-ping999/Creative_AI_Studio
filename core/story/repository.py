@@ -96,11 +96,32 @@ class StoryRepository:
         failure cases; when it is, ``confirmed_absent`` tells them apart —
         ``True`` only when the file is confirmed not to exist, ``False`` when
         it exists but could not be loaded.
+
+        Deliberately does not use ``Path.exists()`` for that confirmation:
+        it internally resolves to a single ``stat()`` call and returns
+        ``False`` for *any* ``OSError`` -- not only "genuinely does not
+        exist" (``FileNotFoundError``/``ENOENT``) -- so a transient stat
+        failure (a permission hiccup, a mount timeout) on a Story file
+        that fully exists would otherwise be laundered into "confirmed
+        deleted" (PR3 exact-HEAD audit, eighth round, finding 3) --
+        exactly the same "uncertain != absent" bug this class's own
+        ``core.batches.repository.BatchRepository.get_or_diagnose()``
+        already guards against for a Batch file, reproduced here for a
+        Story file. `converge_scene_binding()` treats a confirmed-absent
+        Story as a safe no-op (no resurrection) and marks completion
+        done; treating a merely-unreadable-right-now Story the same way
+        would permanently stop retrying Story replay for that job the
+        moment a transient stat error coincided with its convergence
+        attempt.
         """
 
         story_file = self.story_dir / f"{story_id}.json"
-        if not story_file.exists():
+        try:
+            story_file.stat()
+        except FileNotFoundError:
             return None, True
+        except OSError:
+            return None, False
         return self._try_load(story_file), False
 
     def save(self, story: StoryDocument) -> StoryDocument:

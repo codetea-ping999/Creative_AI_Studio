@@ -483,6 +483,58 @@ def test_story_get_for_recovery_treats_a_read_error_as_unreadable_not_missing(
     assert confirmed_absent is False
 
 
+# --- PR3 exact-HEAD audit, eighth round, finding 3: distinguish Story
+# stat failures from deletion -------------------------------------------------
+
+
+def test_story_get_for_recovery_treats_a_stat_failure_as_unreadable_not_missing(
+    tmp_path, monkeypatch
+):
+    """`get_for_recovery()`'s own pre-fix `Path.exists()` pre-check
+    internally resolves straight to a single `os.stat()` call and
+    returns `False` for *any* `OSError`, not only "genuinely does not
+    exist" -- a transient stat failure (a permission hiccup, a mount
+    timeout) on a Story file that fully exists would otherwise be
+    laundered into "confirmed: this Story was deleted," identically to
+    the analogous Batch-side bug fixed the same round, but for a Story
+    file (PR3 exact-HEAD audit, eighth round, finding 3). This is
+    distinct from the read-failure case right above: here `.exists()`
+    itself never gets far enough to attempt `read_text()` at all.
+    """
+
+    import os as os_module
+
+    story_repository = StoryRepository(tmp_path / "stories")
+    story = story_repository.create(title="t")
+    story_file = tmp_path / "stories" / f"{story.id}.json"
+
+    # Injected at the `os.stat()` level, not `Path.stat()`:
+    # `Path.exists()` -- what the pre-fix code called -- resolves
+    # internally straight to `os.stat()`, bypassing the public
+    # `Path.stat()` method entirely, so patching only the latter would
+    # not actually exercise the bug this fix closes.
+    real_os_stat = os_module.stat
+
+    def flaky_os_stat(path, *args, **kwargs):
+        if os_module.fspath(path) == os_module.fspath(story_file):
+            raise OSError("injected: transient stat failure")
+        return real_os_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os_module, "stat", flaky_os_stat)
+
+    result, confirmed_absent = story_repository.get_for_recovery(story.id)
+
+    assert result is None
+    assert confirmed_absent is False  # NOT confirmed absent -- must stay retryable
+
+    monkeypatch.undo()  # the storage hiccup clears
+
+    result_after, confirmed_absent_after = story_repository.get_for_recovery(story.id)
+    assert result_after is not None
+    assert result_after.id == story.id
+    assert confirmed_absent_after is False
+
+
 # --- PR3 exact-HEAD audit P2-2: invalid scene roles never retry forever ---
 
 

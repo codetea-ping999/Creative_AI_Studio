@@ -556,6 +556,42 @@ class BatchService:
         records = self.batch_repository.list_all(project_id=project_id, limit=limit)
         return [self.reconcile(record.id) or record for record in records]
 
+    def list_batches_tolerant(
+        self, *, project_id: str | None = None
+    ) -> tuple[list[BatchRecord], bool]:
+        """Like `list_batches()`, but for a recovery caller that must not
+        mistake a failed directory scan for "no batches exist."
+
+        `list_batches()` (and the plain `list_all()` it is built on) uses
+        `Path.glob()`, whose internal `os.scandir()` silently swallows a
+        directory-level `OSError` and yields zero entries instead of
+        propagating it -- the exact same "empty scan == failed scan" bug
+        `list_all_tolerant()` was already fixed to guard against for
+        `resume_pending_cancellations()` (PR3 exact-HEAD audit, eighth
+        round, finding 1). `run_startup_recovery()`'s own backstop batch
+        reconcile pass (step 5) has the identical exposure: on a
+        transient scan failure, silently reconciling zero batches instead
+        of reporting the scan as unreliable is indistinguishable from "no
+        batch needed reconciling this restart" -- the wrong conclusion
+        for a caller whose whole point is to catch a batch step 4 missed
+        (PR3 exact-HEAD audit, eighth round, adversarial follow-up).
+
+        Returns `(records, scan_was_fully_reliable)`. Every record found
+        is still passed through `reconcile()`, exactly like
+        `list_batches()`; a malformed individual file is tolerated
+        (silently skipped, matching `list_all_tolerant()`'s own contract)
+        without making the scan itself unreliable -- only a directory- or
+        read-level `OSError` does that.
+        """
+
+        records, _malformed_ids, scan_was_fully_reliable = (
+            self.batch_repository.list_all_tolerant(project_id=project_id)
+        )
+        return (
+            [self.reconcile(record.id) or record for record in records],
+            scan_was_fully_reliable,
+        )
+
     # --------------------------------------------------------- reconciliation
 
     def reconcile(self, batch_id: str) -> BatchRecord | None:

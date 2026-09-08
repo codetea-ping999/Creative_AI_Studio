@@ -927,6 +927,61 @@ def test_malformed_authorize_recheck_never_cancels_or_enqueues_the_child(
     assert job_queue.dequeue() == job_id  # now safely (re-)enqueued
 
 
+# --- PR3 exact-HEAD audit, eighth round, finding 2: distinguish stat
+# failures from confirmed absence ---------------------------------------------
+
+
+def test_get_or_diagnose_treats_a_stat_failure_as_uncertain_not_absent(
+    tmp_path, monkeypatch
+):
+    """`get_or_diagnose()`'s own pre-fix `Path.exists()` pre-check
+    internally resolves straight to `os.stat()` (bypassing the public
+    `Path.stat()` method entirely) and returns `False` for *any*
+    `OSError`, not only "genuinely does not exist" -- a transient stat
+    failure (a permission hiccup, a mount timeout) on a batch file that
+    fully exists would otherwise be laundered into "confirmed: this
+    batch was deleted," identically to the fifth round's malformed-
+    content bug but via a different stdlib call (PR3 exact-HEAD audit,
+    eighth round, finding 2). A live batch that merely can't be stat'd
+    *right now* must be reported as uncertain, never as confirmed absent.
+
+    A direct unit test of `get_or_diagnose()` itself, not through
+    `_enqueue_stage()`: that method's own earlier "cheap, lock-free
+    pre-check" (`self.batch_repository.get(batch_id)`) also resolves to
+    `Path.exists()` for the exact same file, so an `os.stat()`-level
+    injection broad enough to reach `Path.exists()` would trip that
+    unrelated call too, confounding the test.
+    """
+
+    import os as os_module
+
+    _job_repository, _job_queue, _job_service, batch_repository, batch_service = _build(
+        tmp_path
+    )
+    batch = batch_service.create_batch(_spec())
+
+    real_os_stat = os_module.stat
+
+    def flaky_os_stat(path, *args, **kwargs):
+        if os_module.fspath(path).endswith(f"{batch.id}.json"):
+            raise OSError("injected: transient stat failure")
+        return real_os_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os_module, "stat", flaky_os_stat)
+
+    record, uncertain = batch_repository.get_or_diagnose(batch.id)
+
+    assert record is None
+    assert uncertain is True  # NOT confirmed absent -- must stay retryable
+
+    monkeypatch.undo()  # the storage hiccup clears
+
+    record_after, uncertain_after = batch_repository.get_or_diagnose(batch.id)
+    assert record_after is not None
+    assert record_after.id == batch.id
+    assert uncertain_after is False
+
+
 # --- PR3 exact-HEAD audit, third round, P1-6: propagate manual
 # stage-enqueue failures -------------------------------------------------
 

@@ -31,7 +31,7 @@ from enum import Enum
 import logging
 from typing import TYPE_CHECKING
 
-from .statuses import JOB_STATUS_SUCCEEDED, is_terminal_status
+from .statuses import JOB_STATUS_QUEUED, JOB_STATUS_SUCCEEDED, is_terminal_status
 
 if TYPE_CHECKING:
     from core.assets import AssetRepository
@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     from core.story.replay_selection import SceneCandidateIndex
 
     from .events import JobEvent
+    from .service import JobService
     from core.storage.repositories.job_repository import JobRepository
 
 logger = logging.getLogger(__name__)
@@ -77,12 +78,22 @@ class CompletionConverger:
         story_repository: "StoryRepository | None" = None,
         scene_binder: "SceneBinder | None" = None,
         batch_service: "BatchService | None" = None,
+        job_service: "JobService | None" = None,
     ) -> None:
         self.job_repository = job_repository
         self.asset_repository = asset_repository
         self.story_repository = story_repository
         self.scene_binder = scene_binder
         self.batch_service = batch_service
+        # PR3 exact-HEAD audit, eighth round, finding 5: needed so a
+        # poison-retry candidate that turns out to be repaired (freshly
+        # decodable, still genuinely `queued`) can be handed back to the
+        # existing, safe `enqueue_job()` path -- see
+        # `_retry_poison_quarantine_candidates()`. Optional, like every
+        # other collaborator here: a caller that never registers a
+        # poison-retry candidate (e.g. a test using this class directly)
+        # need not provide one.
+        self.job_service = job_service
         # PR3 exact-HEAD audit, seventh round, finding 4: job ids whose
         # startup-recovery poison quarantine write failed transiently --
         # see `register_poison_retry_candidate()`.
@@ -116,17 +127,84 @@ class CompletionConverger:
         time, already resolved by something else, or the row is simply
         gone now) -- so this set can never grow without bound: it only
         ever holds job ids genuinely still stuck right now.
+
+        Before ever quarantining, freshly re-reads the row (PR3
+        exact-HEAD audit, eighth round, finding 5): a candidate can sit
+        here for several seconds (or, across ticks, much longer) after
+        the ORIGINAL decode exception was captured at startup -- if an
+        operator or a concurrent process repairs the payload/timestamp
+        in that window while the row's raw status is still genuinely
+        `queued`, blindly reusing the stale original exception and
+        quarantining anyway would incorrectly fail a now-perfectly-valid
+        job that was never actually still poison. Revalidating with a
+        fresh `JobRepository.get()` distinguishes:
+
+        - decodes successfully now -- no longer poison; drop the
+          candidate, and if its current status is still `queued`, hand it
+          back to the existing, safe `enqueue_job()` path (idempotent
+          against a duplicate exposure) rather than leaving it silently
+          un-enqueued forever.
+        - still raises `JobRecordDecodeError` -- genuinely still poison;
+          proceed with the quarantine attempt exactly as before. A
+          successful quarantine here gets the identical Batch-convergence
+          follow-up `run_startup_recovery()` gives its own quarantine
+          attempts (PR3 exact-HEAD audit, eighth round, adversarial
+          follow-up to finding 4): this method calls the exact same
+          `quarantine_poison_row_safely()` primitive, so an outcome
+          reached via a runtime retry tick must not be treated any
+          differently than the identical outcome reached at startup, or
+          a Batch whose last poison child happened to resolve here
+          instead of at startup would stay stuck on its old stage for
+          the rest of the process's life.
+        - row now absent (`None`) -- nothing left to quarantine or
+          resume; drop the candidate.
+        - any other exception (a transient repository-level read
+          failure, not a decode failure) -- cannot tell which of the
+          above applies right now; keep the candidate scheduled for a
+          later tick rather than guessing either way.
         """
 
         if not self._poison_retry_candidates:
             return
-        from core.jobs.startup_recovery import quarantine_poison_row_safely
+        from core.jobs.startup_recovery import (
+            QUARANTINE_OUTCOMES_NEEDING_BATCH_CONVERGENCE,
+            quarantine_poison_row_safely,
+        )
+        from core.storage.repositories.job_repository import JobRecordDecodeError
 
         still_pending: dict[str, Exception] = {}
         for job_id, exc in self._poison_retry_candidates.items():
-            outcome = quarantine_poison_row_safely(self.job_repository, job_id, exc)
-            if outcome == "transient_write_failure":
+            try:
+                repaired = self.job_repository.get(job_id)
+            except JobRecordDecodeError:
+                outcome = quarantine_poison_row_safely(self.job_repository, job_id, exc)
+                if outcome == "transient_write_failure":
+                    still_pending[job_id] = exc
+                elif (
+                    outcome in QUARANTINE_OUTCOMES_NEEDING_BATCH_CONVERGENCE
+                    and self.batch_service is not None
+                ):
+                    # Mirrors `run_startup_recovery()`'s own follow-up:
+                    # this row is now (or was already) at a genuine
+                    # terminal status reached via a raw SQL CAS that
+                    # published no terminal event of its own.
+                    # `reconcile_child_job()` never calls a generator and
+                    # is itself idempotent.
+                    self.batch_service.reconcile_child_job(job_id)
+                continue
+            except Exception:
+                logger.exception(
+                    "Poison-retry revalidation read failed for job %s; "
+                    "keeping it scheduled for a later attempt.",
+                    job_id,
+                )
                 still_pending[job_id] = exc
+                continue
+            if repaired is None:
+                continue  # confirmed gone -- nothing left to do
+            # Decodes cleanly now -- genuinely repaired, never quarantine.
+            if repaired.status == JOB_STATUS_QUEUED and self.job_service is not None:
+                self.job_service.enqueue_job(job_id)
         self._poison_retry_candidates = still_pending
 
     def attach_to_event_bus(self, event_bus) -> None:

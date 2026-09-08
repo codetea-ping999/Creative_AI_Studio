@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+import os
 import sqlite3
 
 import pytest
@@ -94,7 +95,8 @@ def _build_services(tmp_path, generator=None):
         batch_repository, job_service, job_repository, event_bus=event_bus
     )
     completion_converger = CompletionConverger(
-        job_repository, asset_repository, batch_service=batch_service
+        job_repository, asset_repository, batch_service=batch_service,
+        job_service=job_service,
     )
     return {
         "db_path": db_path,
@@ -825,6 +827,101 @@ def test_startup_treats_a_malformed_batch_scan_as_unsafe_for_generic_requeue(
     assert job_repository.get(poison_job_id).status in ("cancel_requested", "cancelled")
 
 
+# --- PR3 exact-HEAD audit, eighth round, finding 1: treat directory scan
+# errors as unreliable ---------------------------------------------------
+
+
+def test_startup_treats_a_batch_directory_enumeration_failure_as_unreliable(
+    tmp_path, monkeypatch
+):
+    """`Path.glob()` internally uses `os.scandir()`, which can itself
+    raise a transient `OSError` while enumerating the batch directory (a
+    temporary permission, mount, or I/O failure) -- but `glob()` silently
+    swallows exactly that and yields zero entries, indistinguishable from
+    "this directory is simply empty."
+
+    A batch whose durable `cancellation_requested=True` was persisted
+    before the batch DIRECTORY itself (not just one file in it) becomes
+    transiently unreadable must not have that intent silently missed --
+    the generic queued-job sweep must stay suppressed until the directory
+    is readable again (PR3 exact-HEAD audit, eighth round, finding 1).
+    """
+
+    from core.batches.schemas import BatchSpec
+
+    services = _build_services(tmp_path)
+    batch_service = services["batch_service"]
+    job_repository = services["job_repository"]
+
+    batch_a = batch_service.create_batch(
+        BatchSpec(name="hidden-by-scan-failure", media_type="image", model_id="fake",
+                   prompt="x", limit=1)
+    )
+    poison_job_id = batch_a.items[0].job_id
+    batch_b = batch_service.create_batch(
+        BatchSpec(name="healthy", media_type="image", model_id="fake", prompt="x", limit=1)
+    )
+    healthy_job_id = batch_b.items[0].job_id
+
+    def _mark_cancellation_requested_only(record):
+        record.cancellation_requested = True
+        return record
+
+    services["batch_repository"].mutate(batch_a.id, _mark_cancellation_requested_only)
+    assert job_repository.get(poison_job_id).status == "queued"
+
+    # Simulate a fresh restart: the in-memory queue starts empty.
+    services["job_queue"].dequeue()
+    services["job_queue"].dequeue()
+
+    # Persists for the entire pass -- both `resume_pending_cancellations()`
+    # and `resume_current_stage_for_all_batches()` (its own separate
+    # bounded-retry scan) call `list_all_tolerant()` independently, so a
+    # failure that only fired once could be "used up" by whichever of the
+    # two happens to scan first, letting the other see a healthy
+    # directory. A real directory-level outage (a mount hiccup, a
+    # permission change) does not clear itself mid-attempt.
+    batch_dir = tmp_path / "batches"
+    real_scandir = os.scandir
+
+    def flaky_scandir(path="."):
+        if os.fspath(path) == os.fspath(batch_dir):
+            raise OSError("injected: transient directory enumeration failure")
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", flaky_scandir)
+
+    report = run_startup_recovery(
+        job_repository, services["job_service"], services["completion_converger"],
+        batch_service=batch_service,
+    )
+
+    assert report.batch_cancellation_scan_was_fully_reliable is False
+    assert report.queued_enqueue_skipped_due_to_unreliable_batch_scan is True
+    assert poison_job_id not in report.requeued
+
+    # Neither batch's child becomes worker-visible this pass -- the
+    # entire directory was invisible to this scan, not just batch_a's
+    # own file, so batch_b's own per-batch resume path never even saw
+    # batch_b either.
+    _drain_queue(services)
+    assert services["generator"].calls == 0
+    assert job_repository.get(poison_job_id).status == "queued"  # untouched
+    assert job_repository.get(healthy_job_id).status == "queued"  # untouched
+
+    monkeypatch.undo()  # the directory becomes readable again
+
+    second = run_startup_recovery(
+        job_repository, services["job_service"], services["completion_converger"],
+        batch_service=batch_service,
+    )
+
+    assert second.batch_cancellation_scan_was_fully_reliable is True
+    assert job_repository.get(poison_job_id).status in ("cancel_requested", "cancelled")
+    _drain_queue(services)
+    assert job_repository.get(healthy_job_id).status == "succeeded"
+
+
 # --- PR3 exact-HEAD audit, fourth round, finding 2: reflect quarantined
 # child status in its batch ---------------------------------------------
 
@@ -871,6 +968,102 @@ def test_startup_reflects_a_quarantined_terminal_status_into_its_batch_item(tmp_
     refreshed_again = batch_service.get_batch(batch.id)
     assert refreshed_again.items[0].status == "failed"
     assert refreshed_again.status == "failed"
+
+
+# --- PR3 exact-HEAD audit, eighth round, finding 4: reconcile batches
+# after poison quarantine -------------------------------------------------
+
+
+def test_startup_advances_a_batch_stage_after_a_successful_poison_quarantine(
+    tmp_path,
+):
+    """A successful poison quarantine transitions a row directly via a
+    raw SQL CAS -- it publishes no terminal event and runs no completion/
+    Batch reconciliation of its own. If that row was the LAST nonterminal
+    item in its stage, and a sibling item in the same stage already
+    reached `completion_state="done"`, the owning Batch must still get
+    the same convergence opportunity (including a stage-advance attempt)
+    an ordinary terminal transition receives -- not just the plain,
+    non-advancing `reconcile()` startup's own step 5 already applies to
+    every batch (PR3 exact-HEAD audit, eighth round, finding 4).
+    """
+
+    from core.batches.schemas import Axis, AxisValue, BatchSpec
+
+    services = _build_services(tmp_path)
+    batch_service = services["batch_service"]
+    job_repository = services["job_repository"]
+
+    batch = batch_service.create_batch(
+        BatchSpec(
+            name="poison-advance", media_type="image", model_id="fake", prompt="x",
+            axes=[
+                Axis(
+                    name="variant",
+                    values=[
+                        AxisValue(label="v1", patch={"prompt": "winner"}),
+                        AxisValue(label="v2", patch={"prompt": "poisoned"}),
+                    ],
+                )
+            ],
+            stages=[{"name": "probe"}, {"name": "refine"}],
+        )
+    )
+    winner_job_id, poison_job_id = (item.job_id for item in batch.items)
+    services["job_queue"].dequeue()
+    services["job_queue"].dequeue()
+
+    # Sibling winner: drive directly to a genuine succeeded outcome, then
+    # let it fully converge (completion_state="done") -- exactly the
+    # "sibling winner already completion-done" the finding describes.
+    job_repository.update_status(winner_job_id, "preparing")
+    job_repository.update_status(winner_job_id, "running")
+    job_repository.update_status(winner_job_id, "postprocessing")
+    job_repository.update(
+        winner_job_id, status="succeeded", progress=1.0,
+        result=GenerationResult(job_id=winner_job_id, status="succeeded", outputs=["a.png"]),
+    )
+    services["completion_converger"].converge_job(winner_job_id)
+    assert job_repository.get(winner_job_id).completion_state == "done"
+
+    # Poison child: still genuinely "queued" -- the last nonterminal item
+    # in this stage. Corrupt its payload so list_tolerant() can no
+    # longer decode it, exactly the crash window startup's own poison
+    # scan exists to close.
+    with sqlite3.connect(services["db_path"]) as raw:
+        raw.execute(
+            "UPDATE jobs SET request_json = ? WHERE id = ?",
+            ("{not valid json", poison_job_id),
+        )
+        raw.commit()
+
+    report = run_startup_recovery(
+        job_repository, services["job_service"], services["completion_converger"],
+        batch_service=batch_service,
+    )
+
+    assert report.poison_rows[poison_job_id] == "failed"
+    assert _raw_status(services["db_path"], poison_job_id) == "failed"
+
+    # The Batch must have advanced past its old "probe" stage -- not
+    # stuck "running" on it forever -- and materialized its "refine"
+    # stage from the winning sibling.
+    advanced = batch_service.get_batch(batch.id)
+    assert advanced.stage_index == 1
+    refine_items = [item for item in advanced.items if item.stage_index == 1]
+    assert len(refine_items) == 1
+    assert refine_items[0].job_id is not None
+    assert job_repository.get(refine_items[0].job_id) is not None
+
+    # Repeated startup recovery is idempotent -- does not re-advance or
+    # duplicate the refine stage's own child.
+    run_startup_recovery(
+        job_repository, services["job_service"], services["completion_converger"],
+        batch_service=batch_service,
+    )
+    settled = batch_service.get_batch(batch.id)
+    assert settled.stage_index == 1
+    assert len([item for item in settled.items if item.stage_index == 1]) == 1
 
 
 def test_quarantine_reflection_preserves_a_real_pre_existing_error_message(tmp_path):
@@ -1288,3 +1481,351 @@ def test_poison_retry_never_blocks_healthy_completion_retry_in_the_same_tick(
     assert job_repository.get(healthy_job.id).completion_state == "done"
     # The poison candidate is unaffected either way -- still scheduled.
     assert poison_job.id in completion_converger._poison_retry_candidates
+
+
+# --- PR3 exact-HEAD audit, eighth round, finding 5: revalidate poison rows
+# before retrying quarantine ---------------------------------------------
+
+
+def _one_retry_tick(job_repository, completion_converger):
+    """Run exactly one `run_retry_loop()` tick, deterministically -- the
+    stop_event is set as a side effect of this tick's own
+    `list_terminal_pending_completion()` call, so `Event.wait()` returns
+    immediately with no real sleep.
+    """
+
+    from threading import Event
+
+    stop_event = Event()
+    original_list_pending = job_repository.list_terminal_pending_completion
+
+    def list_pending_then_stop():
+        result = original_list_pending()
+        stop_event.set()
+        return result
+
+    original_attr = job_repository.list_terminal_pending_completion
+    job_repository.list_terminal_pending_completion = list_pending_then_stop
+    try:
+        completion_converger.run_retry_loop(stop_event=stop_event, poll_interval_seconds=0)
+    finally:
+        job_repository.list_terminal_pending_completion = original_attr
+
+
+def test_poison_retry_revalidates_and_resumes_normal_processing_for_a_repaired_row(
+    tmp_path, monkeypatch
+):
+    """A poison-retry candidate that turns out to have been repaired (an
+    operator or concurrent process fixed the payload) while its raw
+    status is still genuinely `queued` must NOT be quarantined -- the
+    stale original decode exception must not be blindly reused against a
+    now-perfectly-valid row. It must instead be dropped as a candidate
+    and handed back to the existing, safe `enqueue_job()` path so it
+    resumes ordinary queued processing (PR3 exact-HEAD audit, eighth
+    round, finding 5).
+    """
+
+    services = _build_services(tmp_path)
+    job_repository = services["job_repository"]
+    completion_converger = services["completion_converger"]
+
+    job = _seed(job_repository, "queued", "job_repaired")
+    good_created_at = job.created_at
+    with sqlite3.connect(services["db_path"]) as raw:
+        raw.execute(
+            "UPDATE jobs SET created_at = ? WHERE id = ?", ("not-a-timestamp", job.id)
+        )
+        raw.commit()
+    with pytest.raises(JobRecordDecodeError):
+        job_repository.get(job.id)
+
+    def always_transient(*args, **kwargs):
+        raise sqlite3.OperationalError("injected: transient write failure")
+
+    monkeypatch.setattr(job_repository, "transition_if_status", always_transient)
+
+    report = run_startup_recovery(
+        job_repository, services["job_service"], completion_converger,
+    )
+    assert report.poison_rows[job.id] == "transient_write_failure"
+    assert job.id in completion_converger._poison_retry_candidates
+    monkeypatch.undo()
+
+    # An operator repairs the payload while status remains queued --
+    # simulating a concurrent fix landing before this candidate's own
+    # retry tick runs.
+    with sqlite3.connect(services["db_path"]) as raw:
+        raw.execute(
+            "UPDATE jobs SET created_at = ? WHERE id = ?",
+            (good_created_at.isoformat(), job.id),
+        )
+        raw.commit()
+    assert job_repository.get(job.id).status == "queued"
+
+    _one_retry_tick(job_repository, completion_converger)
+
+    # NOT quarantined -- still genuinely queued, never touched.
+    assert job_repository.get(job.id).status == "queued"
+    assert job.id not in completion_converger._poison_retry_candidates
+
+    # Handed back to normal queue processing, not left un-enqueued forever
+    # -- proven by actually draining the queue and watching it run, not
+    # just peeking (JobQueue exposes no non-destructive peek), matching
+    # `_drain_queue()`'s own "prove it via the real runner" convention.
+    _drain_queue(services)
+    assert services["generator"].calls == 1
+    assert job_repository.get(job.id).status == "succeeded"
+
+
+def test_poison_retry_still_quarantines_a_row_that_remains_genuinely_poison(
+    tmp_path, monkeypatch
+):
+    """The revalidation step must not accidentally block a genuinely
+    still-poison row from being quarantined -- it only ever short-circuits
+    for a row that decodes cleanly right now.
+    """
+
+    services = _build_services(tmp_path)
+    job_repository = services["job_repository"]
+    completion_converger = services["completion_converger"]
+
+    job = _seed(job_repository, "queued", "job_still_poison")
+    with sqlite3.connect(services["db_path"]) as raw:
+        raw.execute(
+            "UPDATE jobs SET created_at = ? WHERE id = ?", ("not-a-timestamp", job.id)
+        )
+        raw.commit()
+
+    def always_transient(*args, **kwargs):
+        raise sqlite3.OperationalError("injected: transient write failure")
+
+    monkeypatch.setattr(job_repository, "transition_if_status", always_transient)
+    run_startup_recovery(job_repository, services["job_service"], completion_converger)
+    assert job.id in completion_converger._poison_retry_candidates
+    monkeypatch.undo()  # only the write mechanism recovers -- the payload stays corrupt
+
+    _one_retry_tick(job_repository, completion_converger)
+
+    assert job.id not in completion_converger._poison_retry_candidates
+    assert _raw_status(services["db_path"], job.id) == "failed"
+    _drain_queue(services)
+    assert services["generator"].calls == 0
+
+
+def test_poison_retry_keeps_the_candidate_scheduled_on_a_transient_revalidation_read(
+    tmp_path, monkeypatch
+):
+    """A transient repository-level read failure *during revalidation
+    itself* (distinct from a decode failure) must not be misread as
+    either "repaired" or "still poison" -- the candidate must simply
+    stay scheduled for a later attempt.
+    """
+
+    services = _build_services(tmp_path)
+    job_repository = services["job_repository"]
+    completion_converger = services["completion_converger"]
+
+    job = _seed(job_repository, "queued", "job_flaky_revalidate")
+    with sqlite3.connect(services["db_path"]) as raw:
+        raw.execute(
+            "UPDATE jobs SET created_at = ? WHERE id = ?", ("not-a-timestamp", job.id)
+        )
+        raw.commit()
+
+    def always_transient_write(*args, **kwargs):
+        raise sqlite3.OperationalError("injected: transient write failure")
+
+    monkeypatch.setattr(job_repository, "transition_if_status", always_transient_write)
+    run_startup_recovery(job_repository, services["job_service"], completion_converger)
+    assert job.id in completion_converger._poison_retry_candidates
+    monkeypatch.undo()
+
+    # This tick's own revalidation read (job_repository.get()) hits a
+    # transient repository-level failure -- not a decode failure.
+    real_get = job_repository.get
+
+    def flaky_get(job_id_arg):
+        if job_id_arg == job.id:
+            raise sqlite3.OperationalError("injected: transient revalidation read failure")
+        return real_get(job_id_arg)
+
+    monkeypatch.setattr(job_repository, "get", flaky_get)
+
+    _one_retry_tick(job_repository, completion_converger)
+
+    # Neither quarantined nor resumed -- genuinely uncertain this tick,
+    # so it stays scheduled rather than guessing either way.
+    assert job.id in completion_converger._poison_retry_candidates
+    assert _raw_status(services["db_path"], job.id) == "queued"
+
+    monkeypatch.undo()  # the revalidation read recovers too
+
+    _one_retry_tick(job_repository, completion_converger)
+
+    assert job.id not in completion_converger._poison_retry_candidates
+    assert _raw_status(services["db_path"], job.id) == "failed"
+
+
+# --- PR3 exact-HEAD audit, eighth round, adversarial follow-up to findings
+# 1 and 4 --------------------------------------------------------------
+
+
+def test_poison_retry_advances_a_batch_stage_after_a_successful_quarantine_via_retry_loop(
+    tmp_path, monkeypatch
+):
+    """A poison quarantine that succeeds via the *runtime retry loop*
+    (`_retry_poison_quarantine_candidates()`), not the startup pass, must
+    give its owning Batch the identical stage-advance opportunity
+    `run_startup_recovery()`'s own quarantine attempts already get
+    (finding 4). Without this, a Batch whose last poison child happened
+    to resolve here instead of at startup would stay stuck on its old
+    stage for the rest of the process's life -- exactly the gap an
+    adversarial self-review of this round's own finding-4 fix surfaced,
+    since finding 4's `QUARANTINE_OUTCOMES_NEEDING_BATCH_CONVERGENCE`
+    follow-up was originally wired only into `run_startup_recovery()`'s
+    step 1, not into this sibling call site of the exact same
+    `quarantine_poison_row_safely()` primitive.
+    """
+
+    from core.batches.schemas import Axis, AxisValue, BatchSpec
+
+    services = _build_services(tmp_path)
+    batch_service = services["batch_service"]
+    job_repository = services["job_repository"]
+    completion_converger = services["completion_converger"]
+
+    batch = batch_service.create_batch(
+        BatchSpec(
+            name="poison-advance-via-retry-loop",
+            media_type="image",
+            model_id="fake",
+            prompt="x",
+            axes=[
+                Axis(
+                    name="variant",
+                    values=[
+                        AxisValue(label="v1", patch={"prompt": "winner"}),
+                        AxisValue(label="v2", patch={"prompt": "poisoned"}),
+                    ],
+                )
+            ],
+            stages=[{"name": "probe"}, {"name": "refine"}],
+        )
+    )
+    winner_job_id, poison_job_id = (item.job_id for item in batch.items)
+    services["job_queue"].dequeue()
+    services["job_queue"].dequeue()
+
+    job_repository.update_status(winner_job_id, "preparing")
+    job_repository.update_status(winner_job_id, "running")
+    job_repository.update_status(winner_job_id, "postprocessing")
+    job_repository.update(
+        winner_job_id,
+        status="succeeded",
+        progress=1.0,
+        result=GenerationResult(job_id=winner_job_id, status="succeeded", outputs=["a.png"]),
+    )
+    completion_converger.converge_job(winner_job_id)
+    assert job_repository.get(winner_job_id).completion_state == "done"
+
+    with sqlite3.connect(services["db_path"]) as raw:
+        raw.execute(
+            "UPDATE jobs SET request_json = ? WHERE id = ?",
+            ("{not valid json", poison_job_id),
+        )
+        raw.commit()
+
+    def always_transient(*args, **kwargs):
+        raise sqlite3.OperationalError("injected: transient write failure")
+
+    monkeypatch.setattr(job_repository, "transition_if_status", always_transient)
+
+    report = run_startup_recovery(
+        job_repository, services["job_service"], completion_converger,
+        batch_service=batch_service,
+    )
+    assert report.poison_rows[poison_job_id] == "transient_write_failure"
+    assert poison_job_id in completion_converger._poison_retry_candidates
+    # Quarantine has not actually succeeded yet -- the Batch must not
+    # have advanced.
+    assert batch_service.get_batch(batch.id).stage_index == 0
+    monkeypatch.undo()
+
+    _one_retry_tick(job_repository, completion_converger)
+
+    assert _raw_status(services["db_path"], poison_job_id) == "failed"
+    assert poison_job_id not in completion_converger._poison_retry_candidates
+
+    advanced = batch_service.get_batch(batch.id)
+    assert advanced.stage_index == 1
+    refine_items = [item for item in advanced.items if item.stage_index == 1]
+    assert len(refine_items) == 1
+    assert refine_items[0].job_id is not None
+    assert job_repository.get(refine_items[0].job_id) is not None
+
+
+def test_startup_step_5_batch_reconcile_pass_reports_a_directory_scan_failure_as_unreliable(
+    tmp_path, monkeypatch
+):
+    """`run_startup_recovery()` step 5's own backstop reconcile pass --
+    covering a Batch whose children were already fully converged by an
+    earlier pass but whose own on-disk record was never re-read since --
+    used `BatchService.list_batches()`, which is built on `list_all()`'s
+    plain `Path.glob()` scan. That scan's internal `os.scandir()`
+    silently swallows a directory-level `OSError` and yields zero
+    entries, indistinguishable from "no batches exist" -- the same
+    finding-1 bug, on a second call site (PR3 exact-HEAD audit, eighth
+    round, adversarial follow-up). Fixed by switching step 5 to
+    `list_batches_tolerant()` and recording the outcome on
+    `report.batch_reconcile_scan_was_fully_reliable` rather than treating
+    an unreliable scan as "nothing needed reconciling."
+    """
+
+    from core.batches.schemas import BatchSpec
+
+    services = _build_services(tmp_path)
+    batch_service = services["batch_service"]
+    job_repository = services["job_repository"]
+
+    batch = batch_service.create_batch(
+        BatchSpec(name="missed-by-step-4", media_type="image", model_id="fake", prompt="x", limit=1)
+    )
+    job_id = batch.items[0].job_id
+    services["job_queue"].dequeue()
+
+    job_repository.update_status(job_id, "preparing")
+    job_repository.update_status(job_id, "running")
+    job_repository.update_status(job_id, "postprocessing")
+    job_repository.update(
+        job_id,
+        status="succeeded",
+        progress=1.0,
+        result=GenerationResult(job_id=job_id, status="succeeded", outputs=["a.png"]),
+    )
+    services["completion_converger"].converge_job(job_id)
+    assert job_repository.get(job_id).completion_state == "done"
+
+    batch_dir = tmp_path / "batches"
+    real_scandir = os.scandir
+
+    def flaky_scandir(path="."):
+        if os.fspath(path) == os.fspath(batch_dir):
+            raise OSError("injected: transient directory enumeration failure")
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", flaky_scandir)
+
+    report = run_startup_recovery(
+        job_repository, services["job_service"], services["completion_converger"],
+        batch_service=batch_service,
+    )
+
+    assert report.batch_reconcile_scan_was_fully_reliable is False
+
+    monkeypatch.undo()
+
+    second = run_startup_recovery(
+        job_repository, services["job_service"], services["completion_converger"],
+        batch_service=batch_service,
+    )
+    assert second.batch_reconcile_scan_was_fully_reliable is True

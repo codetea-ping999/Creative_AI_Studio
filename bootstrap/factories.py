@@ -443,6 +443,7 @@ def create_application_services(
         story_repository=story_repository,
         scene_binder=scene_binder,
         batch_service=batch_service,
+        job_service=job_service,
     )
     # Subscribing means "succeeded Job != completion fully applied" gets
     # resolved live, the moment a job finishes, via the exact same
