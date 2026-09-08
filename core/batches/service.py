@@ -201,11 +201,46 @@ class BatchService:
             updated_at=now,
         )
         record = self.batch_repository.create(record)
-        enqueued = self._enqueue_stage(record.id, stage_index=0)
-        # The batch was just created above; nothing else has had a chance
-        # to delete it before this line runs.
-        assert enqueued is not None
-        return enqueued
+        # `_enqueue_stage()` can now return `None` for a transient,
+        # ambiguous early exit during stage materialization, not only for
+        # a confirmed-gone batch (PR3 exact-HEAD audit, seventh round,
+        # finding 1). Unlike every OTHER caller of `_enqueue_stage()`
+        # (`reconcile_child_job()`, `advance()`,
+        # `resume_current_stage_for_all_batches()`), this one has no
+        # later pass of its own that will ever revisit a batch stuck this
+        # way during normal runtime: an ordinary `reconcile()` (used by
+        # every `GET /batches/{id}` poll) only re-reads *existing* job
+        # rows, it never calls `_enqueue_stage()`, and
+        # `resume_current_stage_for_all_batches()` only ever runs once,
+        # at process startup -- found via adversarial review of this
+        # round's own first attempt at this fix, whose comment claimed a
+        # "later reconcile/resume pass" would cover this, which is not
+        # actually true for a batch created during normal runtime. A
+        # small, bounded number of immediate retries here (the same
+        # count `resume_current_stage_for_all_batches()`'s own bounded
+        # rescan uses) resolves the common transient case within this
+        # same call; a batch still not `None`-free after every attempt
+        # falls back to a direct re-read (never `None`: the batch was
+        # just created above and nothing else has had a chance to
+        # *delete* it), logged so the incomplete materialization is at
+        # least observable rather than silently returned as if nothing
+        # were wrong.
+        enqueued = None
+        for attempt in range(_STARTUP_BATCH_SCAN_MAX_ATTEMPTS):
+            enqueued = self._enqueue_stage(record.id, stage_index=0)
+            if enqueued is not None:
+                return enqueued
+        logger.warning(
+            "Batch %s: stage materialization was still ambiguous/"
+            "incomplete after %d attempt(s) during creation; returning "
+            "it as-is -- an operator or the next restart's startup "
+            "resume may be needed to finish materializing it.",
+            record.id,
+            _STARTUP_BATCH_SCAN_MAX_ATTEMPTS,
+        )
+        reread = self.batch_repository.get(record.id)
+        assert reread is not None
+        return reread
 
     def _enqueue_stage(self, batch_id: str, *, stage_index: int) -> BatchRecord | None:
         """Idempotently create/reuse this stage's children and enqueue them.
@@ -255,6 +290,28 @@ class BatchService:
         if record is None or record.cancellation_requested:
             return record
 
+        # Whether an early exit this pass was merely *ambiguous* (a
+        # transient read, not a confirmed outcome) rather than a settled
+        # one (confirmed cancelling, confirmed gone) -- if so, this
+        # method must not let its final `reconcile()` call's own,
+        # entirely separate read stand in for "this stage's
+        # materialization actually completed." A `reconcile()` read can
+        # easily succeed moments after an earlier item's read failed
+        # only transiently, producing what looks like a perfectly normal
+        # `BatchRecord` even though a *later* item in this exact stage
+        # was never even attempted this pass (PR3 exact-HEAD audit,
+        # seventh round, finding 1) -- silently reported as full success
+        # to every caller (`reconcile_child_job()` -> `RECONCILED` ->
+        # completion marked done; `resume_current_stage_for_all_
+        # batches()` -> marked processed), permanently losing track of
+        # the unmaterialized item with no Job row, no terminal event, and
+        # no retry trigger of its own. Forcing a bare `None` return
+        # instead reuses the exact "ambiguous, diagnose before deciding"
+        # machinery every one of those callers already has for a `None`
+        # return (via `get_or_diagnose()`) -- no new caller-side logic,
+        # no return-type change.
+        stage_materialization_confirmed_incomplete = False
+
         # Tracks whether this loop ran every item in the stage to
         # completion without an early `break` -- a materialization
         # failure was, by construction, persisted from an item this loop
@@ -293,7 +350,24 @@ class BatchService:
             # materialization is skipped one pass early, which is always
             # safe to retry later.
             current = self.batch_repository.get(batch_id)
-            if current is None or current.cancellation_requested:
+            if current is None:
+                # Ambiguous per this specific cheap, lock-free read (its
+                # own docstring above: not the safety boundary) --
+                # confirmed-gone and a transient read glitch both surface
+                # identically here. Do not let this stand in for
+                # "confirmed nothing left to materialize."
+                completed_stage_without_early_exit = False
+                stage_materialization_confirmed_incomplete = True
+                break
+            if current.cancellation_requested:
+                # `cancellation_requested` only ever transitions False ->
+                # True and never back, so reading `True` here -- unlike
+                # reading `None` above -- is fully trustworthy even
+                # without the lock: the batch really is cancelling, and
+                # every remaining item in this stage is correctly left
+                # unmaterialized (nothing further to expose for a
+                # cancelling batch). A settled, complete outcome for this
+                # attempt, not a retryable one.
                 completed_stage_without_early_exit = False
                 break
             # Materialize the row *without* enqueuing it yet (PR3 exact-HEAD
@@ -356,8 +430,12 @@ class BatchService:
                 # cancelled" (PR3 exact-HEAD audit, third round, P1-3).
                 # Leave the row exactly as-is (materialized, unexposed) for
                 # a later retry once storage recovers; do not guess either
-                # way by cancelling or enqueuing it.
+                # way by cancelling or enqueuing it. Unlike "cancelled"/
+                # "absent" above (both confirmed via the same authoritative
+                # lock this decision comes from), this is genuinely
+                # unresolved -- not a settled outcome for this attempt.
                 completed_stage_without_early_exit = False
+                stage_materialization_confirmed_incomplete = True
                 break
             # decision in ("enqueued", "not_queued") -- proceed to the next
             # item in this stage.
@@ -376,7 +454,21 @@ class BatchService:
             # clear line is unreachable without a next stage to advance
             # into).
             self._clear_stale_materialization_failure(batch_id)
-        return self.reconcile(batch_id)
+        reconciled = self.reconcile(batch_id)
+        if stage_materialization_confirmed_incomplete:
+            # Never let a `reconcile()` read that happens to succeed right
+            # now (a wholly separate read, moments after the ambiguous one
+            # above) stand in for "this stage's materialization is
+            # confirmed complete" -- every caller already treats a bare
+            # `None` here as "ambiguous, diagnose before deciding" (via
+            # `get_or_diagnose()`), so reusing that exact signal, rather
+            # than introducing a new return shape, is enough to make this
+            # retryable everywhere: `reconcile_child_job()` ->
+            # `RETRYABLE_FAILURE`, `advance()` -> `BatchStageMaterialization
+            # Error`, `resume_current_stage_for_all_batches()` -> retried
+            # within its own bounded cycle.
+            return None
+        return reconciled
 
     def _clear_stale_materialization_failure(self, batch_id: str) -> None:
         """Clear a previously-persisted materialization-failure marker (see
@@ -802,6 +894,19 @@ class BatchService:
                 # itself returns None for a missing row, so nothing would
                 # ever terminalize it without this check -- it would stay
                 # "pending" forever, and so would the batch.
+                #
+                # A missing row is only ever this specific "never
+                # materialized" case for a NON-terminal item -- an item
+                # already `succeeded`/`failed` whose row is *later* lost
+                # (a DB restore, a manual delete, ...) must keep that real
+                # outcome; overwriting it with "cancelled" here would
+                # destroy a genuine, already-concluded result the surviving
+                # Batch JSON is the only remaining record of (PR3
+                # exact-HEAD audit, seventh round, finding 3). Cancelling
+                # already-terminal work is always a no-op, never a
+                # rewrite.
+                if is_terminal_status(item.status):
+                    continue
                 try:
                     row_exists = self.job_repository.get(item.job_id) is not None
                 except JobRecordDecodeError:

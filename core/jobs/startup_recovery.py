@@ -111,7 +111,23 @@ def run_startup_recovery(
     # 1. Row-level poison scan -- one bad row never aborts the rest.
     records, failures = job_repository.list_tolerant()
     for job_id, exc in failures:
-        report.poison_rows[job_id] = _quarantine_poison_row_safely(job_repository, job_id, exc)
+        outcome = quarantine_poison_row_safely(job_repository, job_id, exc)
+        report.poison_rows[job_id] = outcome
+        if outcome == "transient_write_failure":
+            # The row is still undecodable AND the quarantine write
+            # itself just failed transiently -- its raw status stays
+            # queued/active/cancel_requested, so it is now invisible to
+            # every other existing retry mechanism: `list_tolerant()`
+            # can't decode it, `list_terminal_pending_completion()` only
+            # ever sees terminal rows, and nothing about it changes on
+            # its own. Without an explicit retry candidate, it would stay
+            # stranded for the rest of this process's lifetime, until the
+            # next full restart (PR3 exact-HEAD audit, seventh round,
+            # finding 4). Registered on the shared `CompletionConverger`
+            # so its own existing `run_retry_loop()` tick -- the one
+            # minimal background retry mechanism this PR already
+            # maintains -- picks it back up; no new scheduler.
+            completion_converger.register_poison_retry_candidate(job_id, exc)
 
     # A quarantined/repaired row's *current* state can only be known by
     # rereading it -- `records` above still reflects the pre-quarantine
@@ -186,11 +202,18 @@ def run_startup_recovery(
     # snapshot of "which succeeded jobs exist," not "who has already won
     # a role" (that is always re-read fresh per job from the live Story),
     # so sharing it across this one pass changes no outcome, only cost.
-    candidate_index = completion_converger.build_scene_candidate_index()
-    for job in job_repository.list_terminal_pending_completion():
-        report.completion_outcomes[job.id] = completion_converger.converge_job(
-            job.id, candidate_index=candidate_index
-        )
+    pending_completion_jobs = job_repository.list_terminal_pending_completion()
+    if pending_completion_jobs:
+        # Built only when there is at least one job to actually use it
+        # for -- on a fresh/already-converged database this loop has
+        # nothing to do at all, and building the index anyway would be a
+        # wasted full-table scan+decode on every single startup (PR3
+        # exact-HEAD audit, seventh round, finding 2).
+        candidate_index = completion_converger.build_scene_candidate_index()
+        for job in pending_completion_jobs:
+            report.completion_outcomes[job.id] = completion_converger.converge_job(
+                job.id, candidate_index=candidate_index
+            )
 
     # 4b. Asset repair, independent of completion_state (PR3 exact-HEAD
     # audit, third round, P2-1) -- see _repair_assets_for_succeeded_jobs()'s
@@ -296,7 +319,7 @@ def _repair_assets_for_succeeded_jobs(
     return repaired
 
 
-def _quarantine_poison_row_safely(
+def quarantine_poison_row_safely(
     job_repository: "JobRepository", job_id: str, exc: Exception
 ) -> str:
     """Best-effort resolution for one row `list_tolerant()` could not decode.
@@ -306,6 +329,11 @@ def _quarantine_poison_row_safely(
     treated as resolved -- the row is left exactly as it was for a later
     retry (a runtime retry pass, or the next full restart) rather than
     aborting the rest of this scan.
+
+    Exposed (not module-private) so `CompletionConverger`'s own poison
+    quarantine retry (see `register_poison_retry_candidate()`) can reuse
+    this exact primitive on a later `run_retry_loop()` tick, rather than
+    reimplementing any of PR #397's quarantine semantics.
     """
 
     reason = f"Startup recovery: row could not be reconstructed: {exc}"

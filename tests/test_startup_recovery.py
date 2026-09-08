@@ -1096,3 +1096,195 @@ def test_quarantine_reflection_survives_a_non_text_raw_error_message(tmp_path):
     )
     assert report is not None
     assert batch_service.get_batch(batch.id).items[0].status == "failed"
+
+
+# --- PR3 exact-HEAD audit, seventh round, finding 4: keep failed poison
+# quarantines scheduled for retry ---------------------------------------------
+
+
+def test_transient_quarantine_failure_is_retried_and_resolved_in_process(
+    tmp_path, monkeypatch
+):
+    """A poison row whose startup quarantine *write* itself fails
+    transiently must not be stranded for the rest of this process's
+    lifetime -- its raw status stays `queued`, invisible to every other
+    retry mechanism (`list_tolerant()` can't decode it, `list_terminal_
+    pending_completion()` only sees terminal rows). It must be retained
+    as a retry candidate and resolved by a later `run_retry_loop()` tick,
+    reusing the exact same `quarantine_poison_row_safely()` primitive
+    startup recovery itself uses (PR3 exact-HEAD audit, seventh round,
+    finding 4).
+    """
+
+    services = _build_services(tmp_path)
+    job_repository = services["job_repository"]
+    completion_converger = services["completion_converger"]
+
+    job = _seed(job_repository, "queued", "job_poison")
+    with sqlite3.connect(services["db_path"]) as raw:
+        raw.execute(
+            "UPDATE jobs SET created_at = ? WHERE id = ?", ("not-a-timestamp", job.id)
+        )
+        raw.commit()
+    with pytest.raises(JobRecordDecodeError):
+        job_repository.get(job.id)
+
+    # The quarantine *write* itself (not the read) fails transiently, on
+    # this first attempt only.
+    real_transition = job_repository.transition_if_status
+    attempts = {"count": 0}
+
+    def flaky_transition(*args, **kwargs):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise sqlite3.OperationalError("injected: transient write failure")
+        return real_transition(*args, **kwargs)
+
+    monkeypatch.setattr(job_repository, "transition_if_status", flaky_transition)
+
+    report = run_startup_recovery(
+        job_repository, services["job_service"], completion_converger,
+    )
+
+    assert report.poison_rows[job.id] == "transient_write_failure"
+    assert job.id in completion_converger._poison_retry_candidates
+    assert _raw_status(services["db_path"], job.id) == "queued"  # unresolved so far
+
+    monkeypatch.undo()  # storage recovers
+
+    # One retry-loop tick, deterministically: stop_event is set as a side
+    # effect of this tick's own list_terminal_pending_completion() call
+    # (there is nothing pending -- this job's raw status is still
+    # "queued", not terminal -- so the poison-retry block below still
+    # runs this same tick regardless), so Event.wait() returns
+    # immediately with no real sleep.
+    from threading import Event
+    stop_event = Event()
+    original_list_pending = job_repository.list_terminal_pending_completion
+
+    def list_pending_then_stop():
+        result = original_list_pending()
+        stop_event.set()
+        return result
+
+    monkeypatch.setattr(
+        job_repository, "list_terminal_pending_completion", list_pending_then_stop
+    )
+
+    completion_converger.run_retry_loop(stop_event=stop_event, poll_interval_seconds=0)
+
+    assert job.id not in completion_converger._poison_retry_candidates
+    assert _raw_status(services["db_path"], job.id) == "failed"
+
+    _drain_queue(services)
+    assert services["generator"].calls == 0  # never re-run
+
+
+def test_poison_retry_candidate_stays_scheduled_while_still_transient(
+    tmp_path, monkeypatch
+):
+    """A retry attempt that *also* fails transiently must leave the job id
+    scheduled for yet another attempt, not silently drop it.
+    """
+
+    services = _build_services(tmp_path)
+    job_repository = services["job_repository"]
+    completion_converger = services["completion_converger"]
+
+    job = _seed(job_repository, "queued", "job_poison")
+    with sqlite3.connect(services["db_path"]) as raw:
+        raw.execute(
+            "UPDATE jobs SET created_at = ? WHERE id = ?", ("not-a-timestamp", job.id)
+        )
+        raw.commit()
+
+    def always_transient(*args, **kwargs):
+        raise sqlite3.OperationalError("injected: still transient")
+
+    monkeypatch.setattr(job_repository, "transition_if_status", always_transient)
+
+    run_startup_recovery(job_repository, services["job_service"], completion_converger)
+    assert job.id in completion_converger._poison_retry_candidates
+
+    from threading import Event
+    stop_event = Event()
+    original_list_pending = job_repository.list_terminal_pending_completion
+
+    def list_pending_then_stop():
+        result = original_list_pending()
+        stop_event.set()
+        return result
+
+    monkeypatch.setattr(
+        job_repository, "list_terminal_pending_completion", list_pending_then_stop
+    )
+
+    completion_converger.run_retry_loop(stop_event=stop_event, poll_interval_seconds=0)
+
+    # Still transient -- still scheduled, not dropped.
+    assert job.id in completion_converger._poison_retry_candidates
+    assert _raw_status(services["db_path"], job.id) == "queued"
+
+
+def test_poison_retry_never_blocks_healthy_completion_retry_in_the_same_tick(
+    tmp_path, monkeypatch
+):
+    """A permanently-stuck poison retry candidate must not prevent an
+    unrelated, genuinely healthy completion-pending job from converging
+    in the same `run_retry_loop()` tick.
+    """
+
+    services = _build_services(tmp_path)
+    job_repository = services["job_repository"]
+    completion_converger = services["completion_converger"]
+
+    poison_job = _seed(job_repository, "queued", "job_poison")
+    with sqlite3.connect(services["db_path"]) as raw:
+        raw.execute(
+            "UPDATE jobs SET created_at = ? WHERE id = ?",
+            ("not-a-timestamp", poison_job.id),
+        )
+        raw.commit()
+
+    def always_transient(*args, **kwargs):
+        raise sqlite3.OperationalError("injected: still transient")
+
+    monkeypatch.setattr(job_repository, "transition_if_status", always_transient)
+    run_startup_recovery(job_repository, services["job_service"], completion_converger)
+    assert poison_job.id in completion_converger._poison_retry_candidates
+    monkeypatch.undo()
+
+    # A healthy, unrelated job that genuinely needs completion convergence.
+    healthy_job = _seed(
+        job_repository, "succeeded",
+        "job_healthy",
+        result=GenerationResult(job_id="job_healthy", status="succeeded", outputs=["a.png"]),
+    )
+    assert job_repository.get(healthy_job.id).completion_state == "pending"
+
+    from threading import Event
+    stop_event = Event()
+    convergence_calls = {"count": 0}
+    original_converge_job = completion_converger.converge_job
+
+    def converge_job_then_stop(job_id, **kwargs):
+        result = original_converge_job(job_id, **kwargs)
+        convergence_calls["count"] += 1
+        stop_event.set()
+        return result
+
+    monkeypatch.setattr(completion_converger, "converge_job", converge_job_then_stop)
+
+    # Re-inject the transient failure so the poison retry in this tick
+    # fails again too -- proving it does not block the healthy job.
+    def always_transient_again(*args, **kwargs):
+        raise sqlite3.OperationalError("injected: still transient")
+
+    monkeypatch.setattr(job_repository, "transition_if_status", always_transient_again)
+
+    completion_converger.run_retry_loop(stop_event=stop_event, poll_interval_seconds=0)
+
+    assert convergence_calls["count"] == 1
+    assert job_repository.get(healthy_job.id).completion_state == "done"
+    # The poison candidate is unaffected either way -- still scheduled.
+    assert poison_job.id in completion_converger._poison_retry_candidates

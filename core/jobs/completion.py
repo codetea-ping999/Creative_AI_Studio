@@ -83,6 +83,51 @@ class CompletionConverger:
         self.story_repository = story_repository
         self.scene_binder = scene_binder
         self.batch_service = batch_service
+        # PR3 exact-HEAD audit, seventh round, finding 4: job ids whose
+        # startup-recovery poison quarantine write failed transiently --
+        # see `register_poison_retry_candidate()`.
+        self._poison_retry_candidates: dict[str, Exception] = {}
+
+    def register_poison_retry_candidate(self, job_id: str, exc: Exception) -> None:
+        """Record `job_id` as needing another quarantine attempt later.
+
+        Called by `run_startup_recovery()` when its own attempt to
+        quarantine an undecodable row (`quarantine_poison_row_safely()`)
+        fails transiently -- such a row's raw status stays queued/active/
+        `cancel_requested`, invisible to every other existing retry
+        mechanism (`list_tolerant()` can't decode it to begin with,
+        `list_terminal_pending_completion()` only ever sees terminal
+        rows), so without an explicit candidate like this it would stay
+        stranded for this entire process's lifetime, until the next full
+        restart. `run_retry_loop()`'s own tick (see `_retry_poison_
+        quarantine_candidates()`) is what actually re-attempts it -- no
+        new background mechanism.
+        """
+
+        self._poison_retry_candidates[job_id] = exc
+
+    def _retry_poison_quarantine_candidates(self) -> None:
+        """Re-attempt quarantine for every still-pending poison retry
+        candidate, reusing the exact same `quarantine_poison_row_safely()`
+        primitive startup recovery itself uses -- never reimplementing
+        any of PR #397's quarantine semantics. A candidate is dropped the
+        moment its own attempt no longer reports "transient_write_failure"
+        -- resolved one way or another (successfully quarantined this
+        time, already resolved by something else, or the row is simply
+        gone now) -- so this set can never grow without bound: it only
+        ever holds job ids genuinely still stuck right now.
+        """
+
+        if not self._poison_retry_candidates:
+            return
+        from core.jobs.startup_recovery import quarantine_poison_row_safely
+
+        still_pending: dict[str, Exception] = {}
+        for job_id, exc in self._poison_retry_candidates.items():
+            outcome = quarantine_poison_row_safely(self.job_repository, job_id, exc)
+            if outcome == "transient_write_failure":
+                still_pending[job_id] = exc
+        self._poison_retry_candidates = still_pending
 
     def attach_to_event_bus(self, event_bus) -> None:
         if event_bus is None:
@@ -281,18 +326,41 @@ class CompletionConverger:
         -- rebuilt fresh every tick, so it is never held stale across
         ticks, but reused within one tick so a burst of N pending jobs
         costs one Story-replay-candidate scan total, not N (PR3
-        exact-HEAD audit, sixth round, finding 2).
+        exact-HEAD audit, sixth round, finding 2). Only built at all when
+        there is at least one completion-pending job this tick: on an
+        otherwise-idle system with a large job history, building the
+        index unconditionally every tick would itself be a full-table
+        `list_tolerant()` scan+decode every `poll_interval_seconds`
+        forever, with nothing to actually use it for -- silently
+        defeating the whole point of `list_terminal_pending_
+        completion()`'s own supporting SQLite index (PR3 exact-HEAD
+        audit, seventh round, finding 2).
+
+        Also drives `_retry_poison_quarantine_candidates()` every tick,
+        in its own separate `try`/`except` -- a startup-recovery poison
+        quarantine write that failed transiently gets retried here too
+        (PR3 exact-HEAD audit, seventh round, finding 4), and neither
+        this nor the completion-retry work above can block the other:
+        an unexpected failure in one still lets the other run every tick.
         """
 
         while not stop_event.is_set():
             try:
-                candidate_index = self.build_scene_candidate_index()
-                for job in self.job_repository.list_terminal_pending_completion():
-                    if stop_event.is_set():
-                        break
-                    self.converge_job(job.id, candidate_index=candidate_index)
+                pending_jobs = self.job_repository.list_terminal_pending_completion()
+                if pending_jobs:
+                    candidate_index = self.build_scene_candidate_index()
+                    for job in pending_jobs:
+                        if stop_event.is_set():
+                            break
+                        self.converge_job(job.id, candidate_index=candidate_index)
             except Exception:
                 logger.exception("Completion retry loop iteration failed; continuing.")
+            try:
+                self._retry_poison_quarantine_candidates()
+            except Exception:
+                logger.exception(
+                    "Poison quarantine retry failed this tick; continuing."
+                )
             stop_event.wait(poll_interval_seconds)
 
 

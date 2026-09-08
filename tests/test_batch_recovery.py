@@ -334,6 +334,71 @@ def test_cancel_terminalizes_a_stable_child_id_whose_job_row_was_never_created(
     assert refreshed_again.status == "cancelled"
 
 
+# --- PR3 exact-HEAD audit, seventh round, finding 3: preserve terminal
+# items when their Job row is missing -----------------------------------------
+
+
+@pytest.mark.parametrize("terminal_status", ["succeeded", "failed", "cancelled"])
+def test_cancel_never_rewrites_a_terminal_items_outcome_when_its_job_row_is_missing(
+    tmp_path, terminal_status
+):
+    """A Batch item that already reached a terminal outcome, and still
+    holds the exact stable `job_id` it was assigned, must never have that
+    real outcome overwritten to "cancelled" just because its Job row is
+    later missing from SQLite (a DB restore, a manual delete, ...) while
+    the Batch JSON survives.
+
+    The branch this guards was added for a *nonterminal* item ("stable id
+    persisted, Job row never created" -- see the previous test) and is
+    unconditional on the item's own status: before this fix, calling
+    `cancel()` on a batch with an already-`succeeded`/`failed` item whose
+    row happened to be missing would silently destroy that real,
+    already-concluded result, which the surviving Batch JSON is the only
+    remaining record of (PR3 exact-HEAD audit, seventh round, finding 3).
+    Cancelling already-terminal work must always be a no-op.
+    """
+
+    job_repository, job_queue, job_service, batch_repository, batch_service = _build(
+        tmp_path
+    )
+    generator = _CountingGenerator()
+    job_runner = JobRunner(
+        job_repository, job_queue, GeneratorRegistry({"image": generator}),
+        job_service=job_service,
+    )
+
+    batch = batch_service.create_batch(_spec())
+    job_id = batch.items[0].job_id
+    job_queue.dequeue()  # drain the original create_batch() enqueue
+
+    def _mark_terminal(record):
+        record.items[0].status = terminal_status
+        return record
+
+    batch_repository.mutate(batch.id, _mark_terminal)
+
+    with sqlite3.connect(tmp_path / "jobs.db") as raw:
+        raw.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+        raw.commit()
+    assert job_repository.get(job_id) is None
+
+    refreshed = batch_service.cancel(batch.id)
+
+    assert refreshed.items[0].job_id == job_id  # stable id preserved as-is
+    assert refreshed.items[0].status == terminal_status  # never rewritten
+    assert refreshed.status == terminal_status  # aggregate follows suit
+    assert job_repository.get(job_id) is None  # never recreated
+    assert job_queue.dequeue() is None  # never enqueued
+
+    _drain_queue(job_runner)
+    assert generator.calls == 0
+
+    # Idempotent on repeat.
+    refreshed_again = batch_service.cancel(batch.id)
+    assert refreshed_again.items[0].status == terminal_status
+    assert refreshed_again.status == terminal_status
+
+
 # --- PR3 exact-HEAD audit P1-2: cancellation is rechecked per child -------
 
 
@@ -1285,7 +1350,17 @@ def test_a_retry_that_never_reaches_the_still_broken_item_does_not_clear_its_mar
 
     monkeypatch.setattr(batch_service, "_authorize_and_expose", force_unreadable_for_item1)
     resumed_early_break = batch_service.resume_current_stage_for_all_batches()
-    assert any(record.id == batch_id for record in resumed_early_break)
+    # This batch must NOT be reported as resumed: `_authorize_and_expose()`
+    # returning "unreadable" for item 1 is a genuinely ambiguous, retryable
+    # outcome, not a confirmed one -- exactly the case PR3 exact-HEAD
+    # audit, seventh round, finding 1 fixed (`_enqueue_stage()` used to
+    # let its own separate, later `reconcile()` read stand in for "this
+    # stage's materialization is confirmed complete" even after an
+    # ambiguous early exit). The monkeypatch here is permanent (not a
+    # fires-once counter), so every one of this call's bounded retry
+    # attempts hits the same "unreadable" outcome and the batch ends this
+    # call still unresolved.
+    assert not any(record.id == batch_id for record in resumed_early_break)
     monkeypatch.undo()
 
     # The marker must survive: item 2's actual problem was never
@@ -1526,3 +1601,311 @@ def test_startup_retries_a_batch_whose_own_enqueue_stage_reread_fails(
     # Repeated startup recovery never duplicates the row.
     batch_service.resume_current_stage_for_all_batches()
     assert len([job for job in job_repository.list() if job.id == job_a_id]) == 1
+
+
+# --- PR3 exact-HEAD audit, seventh round, finding 1: propagate early exits
+# from stage materialization --------------------------------------------------
+
+
+def test_enqueue_stage_does_not_report_success_after_an_unreadable_early_exit(
+    tmp_path, monkeypatch
+):
+    """`_enqueue_stage()` must not let its own final `reconcile()` read --
+    a wholly separate read, taken moments after an earlier item's
+    ambiguous ("unreadable") outcome -- stand in for "this stage's
+    materialization is confirmed complete."
+
+    2-item single stage: item 1 materializes and is exposed to the queue
+    successfully; item 2's own `_authorize_and_expose()` call reports
+    "unreadable" (a transient pre-exposure Batch reread failure, not a
+    confirmed cancellation or deletion). Before this fix, the loop simply
+    broke and the function still returned whatever the final
+    `reconcile()` call happened to read -- often a perfectly normal
+    `BatchRecord`, silently reported as full success to every caller
+    (`reconcile_child_job()` -> `RECONCILED` -> completion marked done;
+    `resume_current_stage_for_all_batches()` -> marked processed) even
+    though item 2 was never actually exposed to a worker (PR3 exact-HEAD
+    audit, seventh round, finding 1).
+    """
+
+    job_repository, job_queue, job_service, batch_repository, batch_service = _build(
+        tmp_path
+    )
+    generator = _CountingGenerator()
+    job_runner = JobRunner(
+        job_repository, job_queue, GeneratorRegistry({"image": generator}),
+        job_service=job_service,
+    )
+
+    spec = BatchSpec(
+        name="two-item", media_type="image", model_id="fake", prompt="x",
+        axes=[
+            Axis(
+                name="variant",
+                values=[
+                    AxisValue(label="v1", patch={"prompt": "item one"}),
+                    AxisValue(label="v2", patch={"prompt": "item two"}),
+                ],
+            )
+        ],
+    )
+
+    def always_fail(*args, **kwargs):
+        raise RuntimeError("injected: crash before any row is ever created")
+
+    monkeypatch.setattr(job_service, "create_or_reuse_job_without_enqueue", always_fail)
+    with pytest.raises(RuntimeError, match="injected"):
+        batch_service.create_batch(spec)
+    monkeypatch.undo()
+
+    batch_id = batch_repository.list_all()[0].id
+    item1_id, item2_id = (item.job_id for item in batch_repository.get(batch_id).items)
+    for job_id in (item1_id, item2_id):
+        assert job_repository.get(job_id) is None
+
+    real_authorize = batch_service._authorize_and_expose
+
+    def force_unreadable_for_item2(batch_id_arg, job_id_arg, job_status_arg):
+        if job_id_arg == item2_id:
+            return "unreadable"
+        return real_authorize(batch_id_arg, job_id_arg, job_status_arg)
+
+    monkeypatch.setattr(batch_service, "_authorize_and_expose", force_unreadable_for_item2)
+
+    result = batch_service._enqueue_stage(batch_id, stage_index=0)
+
+    assert result is None  # not reported as normal success
+    assert job_repository.get(item1_id) is not None
+    assert job_repository.get(item1_id).status == "queued"
+    assert job_repository.get(item2_id) is not None  # materialized...
+    assert job_queue.size() == 1  # ...but never exposed to a worker
+
+    monkeypatch.undo()  # storage/authorize "recovers"
+
+    # A caller (startup resume) treating the prior `None` as "ambiguous,
+    # diagnose" -- never as confirmed complete -- retries within the same
+    # bounded cycle, exposing item 2 exactly once without re-materializing
+    # or re-exposing item 1 as a duplicate (JobQueue.enqueue()'s own
+    # idempotency for an id already pending in its lane).
+    resumed = batch_service.resume_current_stage_for_all_batches()
+    assert any(record.id == batch_id for record in resumed)
+    assert job_queue.size() == 2
+
+    _drain_queue(job_runner)
+    assert generator.calls == 2
+    assert job_repository.get(item1_id).status == "succeeded"
+    assert job_repository.get(item2_id).status == "succeeded"
+    assert len(job_repository.list()) == 2  # no duplicate rows
+
+
+def test_reconcile_child_job_treats_an_unreadable_early_exit_as_retryable(
+    tmp_path, monkeypatch
+):
+    """The same ambiguous early exit, observed through `reconcile_child_
+    job()` (the completion-convergence caller) instead of a direct
+    `_enqueue_stage()` call: completion must stay retryable, never be
+    reported as `RECONCILED` (which `CompletionConverger` would otherwise
+    mark `completion_state="done"`, permanently excluding the batch's
+    still-unexposed item from every future retry).
+    """
+
+    from core.batches import BatchReconciliationOutcome
+
+    job_repository, job_queue, job_service, batch_repository, batch_service = _build(
+        tmp_path
+    )
+    generator = _CountingGenerator()
+    job_runner = JobRunner(
+        job_repository, job_queue, GeneratorRegistry({"image": generator}),
+        job_service=job_service,
+    )
+
+    spec = BatchSpec(
+        name="two-stage-single-item", media_type="image", model_id="fake", prompt="x",
+        limit=1, stages=[{"name": "probe"}, {"name": "refine"}],
+    )
+    batch = batch_service.create_batch(spec)
+    probe_job_id = batch.items[0].job_id
+    job_queue.dequeue()  # drain the original create_batch() enqueue of the probe job
+    job_repository.update_status(probe_job_id, "preparing")
+    job_repository.update_status(probe_job_id, "running")
+    job_repository.update_status(probe_job_id, "postprocessing")
+    job_repository.update(
+        probe_job_id, status="succeeded", progress=1.0,
+        result=GenerationResult(job_id=probe_job_id, status="succeeded", outputs=["a.png"]),
+    )
+
+    # The stage-advance mutation itself persists normally; only the
+    # *following* `_enqueue_stage()` call for the new "refine" stage hits
+    # the ambiguous "unreadable" outcome for its own single item.
+    def force_unreadable(batch_id_arg, job_id_arg, job_status_arg):
+        return "unreadable"
+
+    monkeypatch.setattr(batch_service, "_authorize_and_expose", force_unreadable)
+
+    _record, outcome = batch_service.reconcile_child_job(probe_job_id)
+
+    assert outcome == BatchReconciliationOutcome.RETRYABLE_FAILURE
+    advanced = batch_repository.get(batch.id)
+    assert advanced.stage_index == 1  # the advance itself did persist
+    refine_item = next(item for item in advanced.items if item.stage_index == 1)
+    assert refine_item.job_id is not None  # materialized...
+    assert job_queue.size() == 0  # ...but never exposed
+
+    monkeypatch.undo()
+
+    _record2, outcome2 = batch_service.reconcile_child_job(probe_job_id)
+    assert outcome2 == BatchReconciliationOutcome.RECONCILED
+    assert job_queue.size() == 1
+
+    _drain_queue(job_runner)
+    assert generator.calls == 1
+    assert job_repository.get(refine_item.job_id).status == "succeeded"
+
+
+def test_create_batch_retries_an_ambiguous_early_exit_within_the_same_call(
+    tmp_path, monkeypatch
+):
+    """`create_batch()` has no later runtime pass of its own that will
+    ever revisit a batch stuck by an ambiguous early exit during its
+    initial materialization (an ordinary `reconcile()` poll never calls
+    `_enqueue_stage()`; `resume_current_stage_for_all_batches()` only
+    ever runs once, at startup) -- found via adversarial review of this
+    round's own finding-1 fix, whose first version silently returned an
+    apparently-normal-looking, but actually incompletely-materialized,
+    batch straight to the API caller with no error and no retry signal.
+
+    2-item single stage: item 2's own `_authorize_and_expose()` call
+    reports "unreadable" on the FIRST attempt only. `create_batch()`'s
+    own small, bounded immediate retry resolves this within the same
+    call -- both items end up materialized and exposed, without ever
+    needing a restart or an external caller to notice anything was
+    wrong.
+    """
+
+    job_repository, job_queue, job_service, batch_repository, batch_service = _build(
+        tmp_path
+    )
+    generator = _CountingGenerator()
+    job_runner = JobRunner(
+        job_repository, job_queue, GeneratorRegistry({"image": generator}),
+        job_service=job_service,
+    )
+
+    spec = BatchSpec(
+        name="two-item", media_type="image", model_id="fake", prompt="x",
+        axes=[
+            Axis(
+                name="variant",
+                values=[
+                    AxisValue(label="v1", patch={"prompt": "item one"}),
+                    AxisValue(label="v2", patch={"prompt": "item two"}),
+                ],
+            )
+        ],
+    )
+
+    # item2's stable id isn't known until phase 1 assigns it inside
+    # create_batch() itself -- capture it via the request content
+    # (unique prompt) at the point create_or_reuse_job_without_enqueue()
+    # is called for it, which always happens strictly before
+    # _authorize_and_expose() for that same item in the same iteration.
+    item2_id_holder: dict = {}
+    real_create_or_reuse = job_service.create_or_reuse_job_without_enqueue
+
+    def capture_item2_id(job_id_arg, request_arg, **kwargs):
+        if request_arg.prompt == "item two":
+            item2_id_holder["id"] = job_id_arg
+        return real_create_or_reuse(job_id_arg, request_arg, **kwargs)
+
+    monkeypatch.setattr(job_service, "create_or_reuse_job_without_enqueue", capture_item2_id)
+
+    real_authorize = batch_service._authorize_and_expose
+    attempts = {"count": 0}
+
+    def flaky_once_for_item2(batch_id_arg, job_id_arg, job_status_arg):
+        if job_id_arg == item2_id_holder.get("id") and attempts["count"] == 0:
+            attempts["count"] += 1
+            return "unreadable"
+        return real_authorize(batch_id_arg, job_id_arg, job_status_arg)
+
+    monkeypatch.setattr(batch_service, "_authorize_and_expose", flaky_once_for_item2)
+
+    batch = batch_service.create_batch(spec)
+
+    assert attempts["count"] == 1  # the injected failure fired exactly once
+    item1_id, item2_id = (item.job_id for item in batch.items)
+    assert item2_id == item2_id_holder["id"]
+    assert job_repository.get(item1_id).status == "queued"
+    assert job_repository.get(item2_id).status == "queued"
+    assert job_queue.size() == 2  # both ended up exposed within this one call
+
+    _drain_queue(job_runner)
+    assert generator.calls == 2
+    assert job_repository.get(item1_id).status == "succeeded"
+    assert job_repository.get(item2_id).status == "succeeded"
+    assert len(job_repository.list()) == 2  # no duplicate rows
+
+
+def test_create_batch_falls_back_honestly_when_retries_are_exhausted(
+    tmp_path, monkeypatch, caplog
+):
+    """If the ambiguous early exit never resolves within `create_batch()`'s
+    own bounded retry attempts, it must still return a valid `BatchRecord`
+    (never raise or hang) -- the already-materialized item stays exposed,
+    the still-ambiguous one is left for a later explicit resume, and the
+    situation is at least logged rather than silently swallowed.
+    """
+
+    job_repository, job_queue, job_service, batch_repository, batch_service = _build(
+        tmp_path
+    )
+
+    spec = BatchSpec(
+        name="two-item-stuck", media_type="image", model_id="fake", prompt="x",
+        axes=[
+            Axis(
+                name="variant",
+                values=[
+                    AxisValue(label="v1", patch={"prompt": "item one"}),
+                    AxisValue(label="v2", patch={"prompt": "item two"}),
+                ],
+            )
+        ],
+    )
+
+    item2_id_holder: dict = {}
+    real_create_or_reuse = job_service.create_or_reuse_job_without_enqueue
+
+    def capture_item2_id(job_id_arg, request_arg, **kwargs):
+        if request_arg.prompt == "item two":
+            item2_id_holder["id"] = job_id_arg
+        return real_create_or_reuse(job_id_arg, request_arg, **kwargs)
+
+    monkeypatch.setattr(job_service, "create_or_reuse_job_without_enqueue", capture_item2_id)
+
+    real_authorize = batch_service._authorize_and_expose
+
+    def always_unreadable_for_item2(batch_id_arg, job_id_arg, job_status_arg):
+        if job_id_arg == item2_id_holder.get("id"):
+            return "unreadable"
+        return real_authorize(batch_id_arg, job_id_arg, job_status_arg)
+
+    monkeypatch.setattr(batch_service, "_authorize_and_expose", always_unreadable_for_item2)
+
+    with caplog.at_level("WARNING", logger="core.batches.service"):
+        batch = batch_service.create_batch(spec)
+
+    assert batch is not None
+    item1_id, item2_id = (item.job_id for item in batch.items)
+    assert item2_id == item2_id_holder["id"]
+    assert job_repository.get(item1_id).status == "queued"
+    assert job_queue.size() == 1  # only item 1 ever got exposed
+    assert any(batch.id in record.getMessage() for record in caplog.records)
+
+    monkeypatch.undo()
+
+    # A later explicit resume (e.g. the next startup) still recovers it.
+    resumed = batch_service.resume_current_stage_for_all_batches()
+    assert any(record.id == batch.id for record in resumed)
+    assert job_queue.size() == 2

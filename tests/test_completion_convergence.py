@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sqlite3
+from threading import Event
 
 from core.assets import AssetRepository
 from core.jobs import EventBus
@@ -959,6 +960,41 @@ def test_shared_candidate_index_ignores_a_poison_row_with_wrongly_typed_params(t
     assert outcome == CompletionOutcome.DONE
 
 
+def test_idle_startup_recovery_builds_no_candidate_index(tmp_path, monkeypatch):
+    """The same "no completion work, no candidate index" contract applies
+    to `run_startup_recovery()`'s step 4, not just the runtime retry
+    loop: a fresh/already-converged database has nothing for step 4's
+    loop to do at all, and must not pay for a full-table scan anyway.
+    """
+    from core.jobs import JobQueue, JobService
+    from core.jobs.startup_recovery import run_startup_recovery
+    import core.story.replay_selection as replay_selection_module
+
+    job_repository, asset_repository, story_repository, scene_binder, converger = _build(
+        tmp_path
+    )
+    job_service = JobService(job_repository, JobQueue())
+
+    for i in range(20):
+        job = _seed_succeeded_job(job_repository, f"job_done_{i}")
+        job_repository.mark_completion_done(job.id)
+    assert job_repository.list_terminal_pending_completion() == []
+
+    build_calls = {"count": 0}
+    real_build = replay_selection_module.build_scene_candidate_index
+
+    def counting_build(job_repository_arg):
+        build_calls["count"] += 1
+        return real_build(job_repository_arg)
+
+    monkeypatch.setattr(replay_selection_module, "build_scene_candidate_index", counting_build)
+
+    report = run_startup_recovery(job_repository, job_service, converger)
+
+    assert build_calls["count"] == 0
+    assert report.completion_outcomes == {}
+
+
 def test_startup_recovery_builds_the_scene_candidate_index_at_most_once_per_pass(
     tmp_path, monkeypatch
 ):
@@ -1007,3 +1043,131 @@ def test_startup_recovery_builds_the_scene_candidate_index_at_most_once_per_pass
         assert job_repository.get(job_id).completion_state == "done"
         outcome = report.completion_outcomes[job_id]
         assert outcome == CompletionOutcome.DONE
+
+
+# --- PR3 exact-HEAD audit, seventh round, finding 2: skip candidate scans
+# when no completion work exists ----------------------------------------------
+
+
+def test_idle_retry_tick_builds_no_candidate_index_and_scans_nothing(
+    tmp_path, monkeypatch
+):
+    """An idle system (a large already-converged job history, nothing
+    currently completion-pending) must not build a `SceneCandidateIndex`
+    -- and therefore must not perform its full-table `list_tolerant()`
+    scan -- on any given `run_retry_loop()` tick.
+
+    Before this fix, the index was built unconditionally every tick
+    regardless of whether there was any completion work to do at all --
+    on an otherwise-idle system with a large job history, that is a full
+    O(N) scan+decode every `poll_interval_seconds` forever, silently
+    defeating the whole point of `list_terminal_pending_completion()`'s
+    own supporting SQLite index (PR3 exact-HEAD audit, seventh round,
+    finding 2).
+    """
+    import core.story.replay_selection as replay_selection_module
+
+    job_repository, asset_repository, story_repository, scene_binder, converger = _build(
+        tmp_path
+    )
+
+    # A "large" job history, all already fully converged.
+    for i in range(20):
+        job = _seed_succeeded_job(job_repository, f"job_done_{i}")
+        job_repository.mark_completion_done(job.id)
+    assert job_repository.list_terminal_pending_completion() == []
+
+    build_calls = {"count": 0}
+    real_build = replay_selection_module.build_scene_candidate_index
+
+    def counting_build(job_repository_arg):
+        build_calls["count"] += 1
+        return real_build(job_repository_arg)
+
+    monkeypatch.setattr(replay_selection_module, "build_scene_candidate_index", counting_build)
+
+    scan_calls = {"count": 0}
+    original_list_tolerant = job_repository.list_tolerant
+
+    def counting_list_tolerant():
+        scan_calls["count"] += 1
+        return original_list_tolerant()
+
+    monkeypatch.setattr(job_repository, "list_tolerant", counting_list_tolerant)
+
+    # Run exactly one tick, deterministically: the stop_event is set as a
+    # side effect of this tick's own list_terminal_pending_completion()
+    # call, so Event.wait() below returns immediately with no real sleep,
+    # and the loop's own `while not stop_event.is_set()` check then exits
+    # before a second tick ever starts.
+    stop_event = Event()
+    original_list_pending = job_repository.list_terminal_pending_completion
+
+    def list_pending_then_stop():
+        result = original_list_pending()
+        stop_event.set()
+        return result
+
+    monkeypatch.setattr(
+        job_repository, "list_terminal_pending_completion", list_pending_then_stop
+    )
+
+    converger.run_retry_loop(stop_event=stop_event, poll_interval_seconds=0)
+
+    assert build_calls["count"] == 0
+    assert scan_calls["count"] == 0
+
+
+def test_active_retry_tick_builds_the_candidate_index_at_most_once(tmp_path, monkeypatch):
+    """N genuinely completion-pending jobs on one tick must still build
+    the shared `SceneCandidateIndex` exactly once for that tick -- the
+    "skip when idle" fix (see the test above) must not regress the
+    "shared, not per-job" fix from the prior round.
+    """
+    import core.story.replay_selection as replay_selection_module
+
+    job_repository, asset_repository, story_repository, scene_binder, converger = _build(
+        tmp_path
+    )
+
+    job_count = 10
+    for i in range(job_count):
+        story = story_repository.create(title=f"Story {i}", premise="p")
+        story = story_repository.save(apply_text_result(story, "scene_list", _SCENES))
+        params = scene_binding_params(story.id, story.scenes[0].id, "visual")
+        _seed_succeeded_job(job_repository, f"job_{i}", params=params, outputs=(f"out_{i}.png",))
+    assert len(job_repository.list_terminal_pending_completion()) == job_count
+
+    build_calls = {"count": 0}
+    real_build = replay_selection_module.build_scene_candidate_index
+
+    def counting_build(job_repository_arg):
+        build_calls["count"] += 1
+        return real_build(job_repository_arg)
+
+    monkeypatch.setattr(replay_selection_module, "build_scene_candidate_index", counting_build)
+
+    # Stop only after every pending job this tick has actually been
+    # converged -- unlike the idle test above, setting stop_event any
+    # earlier (e.g. right after listing pending jobs) would trip the
+    # loop's own graceful-shutdown check (`if stop_event.is_set(): break`)
+    # partway through this same tick's for-loop, converging none of them.
+    stop_event = Event()
+    convergence_calls = {"count": 0}
+    original_converge_job = converger.converge_job
+
+    def converge_job_then_maybe_stop(job_id, **kwargs):
+        result = original_converge_job(job_id, **kwargs)
+        convergence_calls["count"] += 1
+        if convergence_calls["count"] >= job_count:
+            stop_event.set()
+        return result
+
+    monkeypatch.setattr(converger, "converge_job", converge_job_then_maybe_stop)
+
+    converger.run_retry_loop(stop_event=stop_event, poll_interval_seconds=0)
+
+    assert build_calls["count"] == 1
+    assert convergence_calls["count"] == job_count
+    for i in range(job_count):
+        assert job_repository.get(f"job_{i}").completion_state == "done"
