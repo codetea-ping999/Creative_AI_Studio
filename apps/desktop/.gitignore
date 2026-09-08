@@ -1,6 +1,6 @@
 # Rust / Cargo build outputs
-/target/
-/gen/schemas/
+/src-tauri/target/
+/src-tauri/gen/
 
 # Local build artifacts
 dist/

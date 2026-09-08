@@ -39,6 +39,23 @@ def _local_web_origins() -> list[str]:
     ]
 
 
+def _tauri_webview_origins() -> list[str]:
+    """Return the packaged Tauri WebView origins supported by this project.
+
+    The WebView origin is a product of the Tauri asset protocol, not the
+    loopback backend port. macOS/Linux use the ``tauri://`` scheme, while the
+    Windows bundle uses ``http://tauri.localhost``. ``https://tauri.localhost``
+    applies only when the Windows bundle opts into an HTTPS scheme, so it is
+    intentionally excluded until such a configuration exists. Per the desktop
+    ADR, CORS stays an exact allowlist (no wildcards).
+    """
+
+    return [
+        "tauri://localhost",
+        "http://tauri.localhost",
+    ]
+
+
 def create_app(
     services: ApplicationServices | None = None,
     *,
@@ -87,7 +104,7 @@ def create_app(
 
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=_local_web_origins(),
+        allow_origins=[*_local_web_origins(), *_tauri_webview_origins()],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],

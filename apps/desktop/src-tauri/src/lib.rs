@@ -18,6 +18,27 @@ use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 /// Label of the single Studio WebView window.
 pub const MAIN_WINDOW_LABEL: &str = "main";
 
+/// Loopback endpoint used when no runtime configuration is present.
+const FALLBACK_BACKEND_ENDPOINT: &str = "http://127.0.0.1:8000";
+
+/// Resolve the backend endpoint from Tauri-managed runtime configuration.
+///
+/// The desktop bundle must not depend solely on build-time `VITE_API_BASE_URL`
+/// (ADR ¶3). A runtime override is read first so a supported non-default port
+/// stays usable without rebuilding the bundle; the loopback default is only an
+/// explicit fallback when no override exists.
+fn resolve_backend_endpoint(override_value: Option<String>) -> String {
+    override_value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| FALLBACK_BACKEND_ENDPOINT.to_string())
+}
+
+#[tauri::command]
+fn get_backend_endpoint() -> String {
+    resolve_backend_endpoint(std::env::var("STUDIO_BACKEND_URL").ok())
+}
+
 /// Set the OS autostart state for the Studio application.
 ///
 /// Autostart defaults to disabled and is only changed by explicit user
@@ -100,8 +121,35 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             set_autostart,
-            is_autostart_enabled
+            is_autostart_enabled,
+            get_backend_endpoint
         ])
         .run(tauri::generate_context!())
         .expect("error while running Creative AI Studio desktop shell");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_backend_endpoint, FALLBACK_BACKEND_ENDPOINT};
+
+    #[test]
+    fn falls_back_to_loopback_default_without_override() {
+        assert_eq!(resolve_backend_endpoint(None), FALLBACK_BACKEND_ENDPOINT);
+    }
+
+    #[test]
+    fn empty_override_falls_back() {
+        assert_eq!(
+            resolve_backend_endpoint(Some(String::from("  "))),
+            FALLBACK_BACKEND_ENDPOINT
+        );
+    }
+
+    #[test]
+    fn trims_and_uses_non_default_override() {
+        assert_eq!(
+            resolve_backend_endpoint(Some(String::from("  http://127.0.0.1:8123  "))),
+            "http://127.0.0.1:8123"
+        );
+    }
 }
