@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from threading import Event, Lock, Thread
+from threading import Barrier, Event, Lock, Thread
 import unittest
 
 from bootstrap.factories import create_default_model_service
@@ -990,6 +990,17 @@ class RuntimeSafetyCoreTests(unittest.TestCase):
             runtime_cache=ModelRuntimeCache(max_entries=1),
         )
 
+        # Codex re-review: the primary, scheduling-independent proof --
+        # both instances hold the exact same controller object. (The
+        # concurrency proof below is a secondary, *behavioral* check that
+        # sharing actually blocks concurrent access in practice; on its
+        # own, if the scheduler happened to run worker_b only after A had
+        # already released, the old independent-semaphore bug would also
+        # have recorded state["max"] == 1, since neither semaphore would
+        # ever have been contended -- this identity assertion has no such
+        # gap.)
+        self.assertIs(service_a._admission, service_b._admission)
+
         errors: list[BaseException] = []
 
         def worker_a():
@@ -1537,6 +1548,150 @@ class RuntimeSafetyCoreTests(unittest.TestCase):
         finally:
             handle.release()
         self.assertEqual(loader.load_calls, 1)
+
+    # ------------------------- bonus 5: overflow eviction evicts only the excess
+    def test_legacy_put_overflow_evicts_only_the_excess_not_every_eligible_entry(self):
+        # Found by a further Codex re-review pass on the RETIRING-visibility
+        # fix (bonus 2) above: marking a victim RETIRING (rather than
+        # popping it) leaves it counted in the bucket's raw membership on
+        # the loop's next iteration, so the budget check must subtract
+        # this call's own already-decided victims back out, or it keeps
+        # finding "still over budget" and evicts every remaining eligible
+        # entry -- not just the genuine excess.
+        cleanup = _RecordingCleanup()
+        cache = ModelRuntimeCache(max_entries=2, on_evict=cleanup)
+        cache.put("model-a", {"id": "model-a"})
+        cache.put("model-b", {"id": "model-b"})
+        self.assertEqual(set(cache.loaded_ids()), {"model-a", "model-b"})
+
+        cache.put("model-c", {"id": "model-c"})  # overflow by exactly 1
+
+        # Only the LRU entry (model-a) is evicted -- not both.
+        self.assertEqual(cleanup.calls, ["model-a"])
+        self.assertEqual(set(cache.loaded_ids()), {"model-b", "model-c"})
+
+    # ------------------------- bonus 6: E released when revalidation is interrupted
+    def test_acquire_execution_lock_releases_e_when_revalidation_is_interrupted(self):
+        # Found by the same re-review pass: an async BaseException landing
+        # during is_current_and_ready() (after E was already won) used to
+        # leave _acquire_execution_lock() exiting without releasing E --
+        # the caller's own exception handling only releases the lease and
+        # G, never E, permanently deadlocking every future caller of this
+        # exact entry.
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service({"model-a": manifest_a}, {"fake": loader})
+
+        original_is_current_and_ready = cache.is_current_and_ready
+
+        def interrupted_check(canonical_id, entry):
+            raise _FakeCancellation("injected: interrupted during revalidation")
+
+        cache.is_current_and_ready = interrupted_check
+
+        with self.assertRaises(_FakeCancellation):
+            service.acquire_runtime("model-a", "image")
+
+        entry = cache._entries["model-a"]
+        # E must not be leaked -- a non-blocking acquire proves it's free.
+        self.assertTrue(entry.execution_lock.acquire(blocking=False))
+        entry.execution_lock.release()
+        # The lease is released too (acquire_runtime()'s own cleanup).
+        self.assertEqual(entry.lease_count, 0)
+
+        cache.is_current_and_ready = original_is_current_and_ready
+        # G was released too -- a fresh, immediate acquire succeeds.
+        handle = service.acquire_runtime("model-a", "image", wait_timeout=0)
+        try:
+            self.assertIsNotNone(handle.runtime)
+        finally:
+            handle.release()
+
+    # ------------------------- bonus 7: publish interrupted before state flips
+    def test_acquire_or_load_entry_aborts_reservation_when_publish_is_interrupted(self):
+        # Found by the same re-review pass: if an async BaseException lands
+        # during publish_ready_and_pin() *before* it actually flips
+        # entry.state to READY (e.g. between assigning .runtime and
+        # assigning .state), the old fix's state-only check took the
+        # "dispose the runtime" branch correctly, but never called
+        # abort_reservation() -- leaving the entry stuck at LOADING
+        # forever, exactly like an un-aborted load failure would.
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        cleanup = _RecordingCleanup()
+        service, cache = _build_service(
+            {"model-a": manifest_a}, {"fake": loader}, on_evict=cleanup,
+        )
+
+        original_publish = cache.publish_ready_and_pin
+
+        def interrupted_before_ready(canonical_id, reserved_entry, runtime_obj):
+            # Simulates an interruption strictly before publication -- the
+            # entry is never mutated at all (the strictest sub-case of
+            # "still LOADING when the exception arrives").
+            raise _FakeCancellation("injected: interrupted before publish")
+
+        cache.publish_ready_and_pin = interrupted_before_ready
+
+        with self.assertRaises(_FakeCancellation):
+            service.acquire_runtime("model-a", "image")
+
+        # The reservation is fully unwound -- not stuck at LOADING -- and
+        # the never-published runtime was disposed exactly once.
+        self.assertNotIn("model-a", cache._entries)
+        self.assertEqual(cleanup.calls, ["model-a"])
+
+        cache.publish_ready_and_pin = original_publish
+
+        # A subsequent attempt succeeds normally.
+        handle = service.acquire_runtime("model-a", "image")
+        try:
+            self.assertIsNotNone(handle.runtime)
+        finally:
+            handle.release()
+        self.assertEqual(loader.load_calls, 2)
+
+    # ------------------------- bonus 8: concurrent handle releases never double-release G
+    def test_concurrent_handle_releases_never_double_release_admission(self):
+        # Found by the same re-review pass: RuntimeHandle.release()'s own
+        # `if self._released: return; self._released = True` was not
+        # atomic -- two threads calling release() on the exact same handle
+        # at once could both observe `_released is False` before either
+        # set it `True`, both entering the unwind path. The second
+        # execution_lock.release() would raise, but its own nested
+        # `finally` chain would still reach `self._admission.release()` a
+        # second time, permanently inflating the process-wide admission
+        # capacity by one.
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service({"model-a": manifest_a}, {"fake": loader})
+
+        handle = service.acquire_runtime("model-a", "image")
+        # capacity=1, one slot taken -- semaphore's internal counter is 0.
+        self.assertEqual(service._admission._semaphore._value, 0)
+
+        barrier = Barrier(2)
+        errors: list[BaseException] = []
+
+        def release_racer():
+            barrier.wait(timeout=5)
+            try:
+                handle.release()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        t1 = Thread(target=release_racer)
+        t2 = Thread(target=release_racer)
+        t1.start()
+        t2.start()
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+
+        # release() itself must never raise, even racing itself.
+        self.assertEqual(errors, [])
+        # Exactly one net release -- the semaphore's counter is back to
+        # its full capacity (1), never 2 (which a double-release causes).
+        self.assertEqual(service._admission._semaphore._value, 1)
 
 
 if __name__ == "__main__":

@@ -142,6 +142,7 @@ class RuntimeHandle:
         "_entry",
         "_admission",
         "_released",
+        "_release_guard",
     )
 
     def __init__(
@@ -161,6 +162,7 @@ class RuntimeHandle:
         self._entry = entry
         self._admission = admission
         self._released = False
+        self._release_guard = Lock()
 
     def __enter__(self) -> "RuntimeHandle":
         return self
@@ -207,11 +209,27 @@ class RuntimeHandle:
         see `ModelService._acquire_execution_lock()`, which revalidates the
         entry immediately after winning E, precisely to catch this window
         from a waiter's perspective too.
+
+        Codex re-review (found on this round's own fix commits): the
+        `_released` check-and-set below is guarded by `_release_guard`
+        (a private, per-handle `Lock`) because it is not otherwise atomic
+        -- two threads calling `release()` on the exact same handle at once
+        (e.g. the `with` block's own `__exit__` racing a separate
+        cancellation/cleanup path that also holds a reference to this
+        handle) could both observe `_released is False` before either sets
+        it `True`, both proceed into the unwind below, and the second
+        `execution_lock.release()` would raise (releasing an unlocked
+        `Lock`) -- whose `finally` chain would still reach
+        `self._admission.release()` a *second* time, permanently inflating
+        the process-wide admission capacity by one. Only the flag
+        transition itself needs the lock; at most one caller can ever pass
+        it, so the actual release work below never needs it too.
         """
 
-        if self._released:
-            return
-        self._released = True
+        with self._release_guard:
+            if self._released:
+                return
+            self._released = True
         try:
             if had_exception:
                 self._cache.mark_invalid(self._canonical_id, self._entry)
@@ -539,34 +557,38 @@ class ModelService:
                     )
                 except BaseException:
                     # Found during this round's adversarial self-review,
-                    # then refined after Codex's own round-1-of-round-1
-                    # re-review caught a real gap in the first version of
-                    # this fix: `publish_ready_and_pin()` mutates `entry`
-                    # in place (sets `.runtime`, `.state = READY`,
-                    # `.lease_count = 1`) *before* it can raise its own
-                    # defensive backstop (see that method's docstring) --
-                    # believed unreachable in practice given this method
-                    # holds L for its entire duration, but an async
-                    # `BaseException` (KeyboardInterrupt, ...) could in
-                    # principle land between that mutation and this
-                    # method's own return. `entry` is the exact same object
+                    # then refined twice more after Codex's own re-reviews
+                    # of each fix in turn: `publish_ready_and_pin()`
+                    # mutates `entry` in place (sets `.runtime`,
+                    # `.state = READY`, `.lease_count = 1`) *before* it can
+                    # raise its own defensive backstop (see that method's
+                    # docstring) -- believed unreachable in practice given
+                    # this method holds L for its entire duration, but an
+                    # async `BaseException` (KeyboardInterrupt, ...) could
+                    # in principle land at any point during that mutation,
+                    # including between the `.runtime`/`.state` assignments
+                    # themselves. `entry` is the exact same object
                     # `publish_ready_and_pin()` mutates, so checking its
                     # `.state` here tells us, unambiguously, whether
-                    # publication actually happened before the exception
+                    # publication actually completed before the exception
                     # arrived:
-                    #   - still LOADING: never published -- runtime_obj is
-                    #     ours alone; dispose it (Finding 4's own primitive).
                     #   - READY: already published and pinned -- disposing
-                    #     it here would corrupt a runtime other callers can
-                    #     now see as cached. Instead release the lease this
-                    #     call just took, since no RuntimeHandle will ever
-                    #     be returned to release it otherwise -- leaving it
-                    #     pinned forever would be worse than either option
-                    #     above.
+                    #     the runtime here would corrupt one other callers
+                    #     can now see as cached. Instead release the lease
+                    #     this call just took, since no RuntimeHandle will
+                    #     ever be returned to release it otherwise.
+                    #   - still LOADING (never published, or interrupted
+                    #     mid-mutation before `.state` itself flipped):
+                    #     `runtime_obj` is ours alone to dispose, AND the
+                    #     reservation itself must be aborted -- left
+                    #     LOADING otherwise, it would block every future
+                    #     acquisition for this id forever, exactly like an
+                    #     un-aborted load failure would.
                     if entry.state is RuntimeState.READY:
                         self.runtime_cache.release_lease(manifest.id, entry)
                     else:
                         self.runtime_cache.dispose_unpublished(manifest.id, runtime_obj)
+                        self.runtime_cache.abort_reservation(manifest.id, entry)
                     raise
             return entry
         finally:
@@ -589,18 +611,32 @@ class ModelService:
         this caller during the wait, and E is released again before raising
         `RuntimeBusyError` -- this method only ever cleans up what it itself
         acquired (E); the caller's own lease is the caller's own cleanup.
+
+        Codex re-review (found on this round's own fix commit): everything
+        after winning E is wrapped in `try`/`except BaseException` below,
+        not just the explicit `RuntimeBusyError` this method itself raises
+        -- an async `BaseException` (`KeyboardInterrupt`, a cancellation
+        signal, ...) landing during `is_current_and_ready()` used to leave
+        this method exiting without ever releasing E, and the caller's own
+        exception handling only releases the lease and G, never E -- a
+        permanent, unrecoverable deadlock on this exact entry for every
+        future caller. This method now guarantees E is released on any
+        exception it does not itself successfully return past.
         """
 
         if not _acquire_with_deadline(entry.execution_lock, deadline):
             raise RuntimeBusyError(
                 f"Timed out waiting for exclusive execution access to {canonical_id!r}."
             )
-        if not self.runtime_cache.is_current_and_ready(canonical_id, entry):
+        try:
+            if not self.runtime_cache.is_current_and_ready(canonical_id, entry):
+                raise RuntimeBusyError(
+                    f"{canonical_id!r} became invalid while waiting for exclusive "
+                    "execution access; retry."
+                )
+        except BaseException:
             entry.execution_lock.release()
-            raise RuntimeBusyError(
-                f"{canonical_id!r} became invalid while waiting for exclusive "
-                "execution access; retry."
-            )
+            raise
 
     # ------------------------------------------------------- canonical unload
 

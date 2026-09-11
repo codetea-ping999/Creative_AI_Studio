@@ -717,16 +717,32 @@ class ModelRuntimeCache:
         destructively cleaned up (`torch.cuda.empty_cache()`, a pipeline's
         own `.to("cpu")`, ...) -- the same "old and new coexist" hazard
         `RETIRING` exists everywhere else in this class to prevent.
+
+        Marking a victim `RETIRING` rather than popping it means it is
+        still counted in the bucket's raw membership on the *next* loop
+        iteration (see `bucket_ids` below) -- a caller-visible fact this
+        method's own budget check must account for, or it would keep
+        finding "still over budget" and evict every remaining eligible
+        entry, not just the actual excess. `retired_this_call` tracks how
+        many victims *this call* has already committed to evicting, so the
+        loop's own effective-occupancy check subtracts them back out
+        (while a RETIRING entry some *other*, concurrent caller marked is
+        still correctly counted against budget, since only this call's own
+        already-decided victims are known to be leaving). Codex's
+        round-1-of-round-1-of-round-1 re-review caught this: without the
+        subtraction, evicting into a budget-2 bucket already at `{a, b}`
+        retired both `a` and `b` instead of just the LRU one.
         """
 
         budget = self.media_limits.get(bucket, self.max_entries)
         victims: list[tuple[str, RuntimeEntry]] = []
+        retired_this_call = 0
         while True:
             bucket_ids = [
                 entry_id for entry_id, entry in self._entries.items()
                 if entry.media_bucket == bucket
             ]
-            if len(bucket_ids) <= budget:
+            if len(bucket_ids) - retired_this_call <= budget:
                 break
             evictable = [
                 entry_id for entry_id in bucket_ids
@@ -739,6 +755,7 @@ class ModelRuntimeCache:
             victim_id = evictable[0]
             victim_entry = self._entries[victim_id]
             victim_entry.state = RuntimeState.RETIRING
+            retired_this_call += 1
             victims.append((victim_id, victim_entry))
         return victims
 
