@@ -281,7 +281,22 @@ class ModelRuntimeCache:
                     existing.media_bucket = bucket
                     self._entries.move_to_end(model_id)
                     same_object_reinsertion = True
-                else:
+            if not same_object_reinsertion:
+                # Codex re-review, found on this round's own fix commits
+                # (P2): the replacement `RuntimeEntry` is now constructed
+                # *before* the old one (if any) is removed from
+                # `_entries`. Building it used to happen after the old
+                # entry was already deleted -- if construction itself
+                # raised (a hypothetical `Lock()` allocation failure, an
+                # async `BaseException`), the old entry vanished from the
+                # cache with its `on_evict` cleanup never scheduled, and
+                # no replacement was ever installed in its place.
+                new_entry = RuntimeEntry(
+                    model_id, bucket, RuntimeState.READY,
+                    generation=self._next_generation_locked(model_id),
+                    runtime=runtime_obj,
+                )
+                if existing is not None:
                     # A replaced entry must run the same cleanup as
                     # unload()/unload_all() -- on_evict is what actually
                     # returns GPU/MPS memory (torch.mps.empty_cache() etc.
@@ -290,13 +305,7 @@ class ModelRuntimeCache:
                     del self._entries[model_id]
                     if existing.runtime is not None:
                         replaced_victim = (model_id, existing.runtime)
-
-            if not same_object_reinsertion:
-                self._entries[model_id] = RuntimeEntry(
-                    model_id, bucket, RuntimeState.READY,
-                    generation=self._next_generation_locked(model_id),
-                    runtime=runtime_obj,
-                )
+                self._entries[model_id] = new_entry
             # Enforced for BOTH a fresh insert and a same-object bucket move
             # (Finding 5) -- the destination bucket's budget must never be
             # silently exceeded either way.

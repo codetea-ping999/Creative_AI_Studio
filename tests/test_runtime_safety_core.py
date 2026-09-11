@@ -22,6 +22,7 @@ import unittest
 
 from bootstrap.factories import create_default_model_service
 from core.models.cache import ModelRuntimeCache
+import core.models.cache as cache_module
 from core.models.loader import LoaderRegistry
 from core.models.registry import ModelRegistry
 from core.models.resolver import ModelResolver
@@ -2092,6 +2093,124 @@ class RuntimeSafetyCoreTests(unittest.TestCase):
         self.assertEqual(errors, [])
 
         self.assertEqual(entry.state, RuntimeState.INVALID)
+
+    # ------------------------- bonus 18: admission ownership survives thread-id recycling
+    def test_admission_controller_tracks_ownership_by_thread_object_not_recyclable_id(self):
+        # Found by a further Codex re-review pass: threading.get_ident()
+        # values ARE recycled by the OS/interpreter once a thread exits.
+        # Keying ownership by that raw integer could misattribute a still-
+        # open handle's slot to an unrelated, later-started thread that
+        # happens to reuse the same numeric id -- wrongly rejecting its
+        # own, perfectly legitimate acquisition as "recursive". Keying by
+        # the `Thread` object itself (never recycled, unlike its `.ident`)
+        # avoids this regardless of what the OS does with the underlying
+        # thread id.
+        controller = RuntimeAdmissionController(capacity=1)
+
+        acquired: dict[str, object] = {}
+
+        def worker():
+            acquired["ok"] = controller.acquire(None)
+            # Exits WITHOUT releasing -- a separate "cleanup" thread below
+            # releases on this worker's behalf, exactly like a supported
+            # cross-thread release.
+
+        worker_thread = Thread(target=worker)
+        worker_thread.start()
+        worker_thread.join(timeout=5)
+        self.assertTrue(acquired.get("ok"))
+
+        # Ownership is keyed by the actual Thread object, not an int --
+        # still a valid, distinct dict key even after the worker thread has
+        # fully exited.
+        self.assertEqual(len(controller._held_by_thread), 1)
+        self.assertIsInstance(next(iter(controller._held_by_thread)), Thread)
+
+        cleanup_errors: list[BaseException] = []
+
+        def cleanup():
+            try:
+                controller.release(worker_thread)
+            except BaseException as exc:  # noqa: BLE001
+                cleanup_errors.append(exc)
+
+        cleanup_thread = Thread(target=cleanup)
+        cleanup_thread.start()
+        cleanup_thread.join(timeout=5)
+        self.assertEqual(cleanup_errors, [])
+        self.assertEqual(controller._held_by_thread, {})
+
+        # A brand-new thread's acquisition succeeds normally -- never
+        # confused with the exited worker's, whatever the OS did with its
+        # numeric thread id.
+        new_thread_result: dict[str, object] = {}
+
+        def new_worker():
+            new_thread_result["ok"] = controller.acquire(None)
+
+        new_thread = Thread(target=new_worker)
+        new_thread.start()
+        new_thread.join(timeout=5)
+        self.assertTrue(new_thread_result.get("ok"))
+        controller.release(new_thread)
+
+    # ------------------------- bonus 19: replacement built before old entry is deleted
+    def test_put_leaves_the_old_entry_untouched_when_replacement_construction_fails(self):
+        # Found by the same re-review pass: the old entry used to be
+        # deleted from `_entries` *before* its replacement `RuntimeEntry`
+        # was constructed. If construction itself raised (a hypothetical
+        # `Lock()` allocation failure, an async BaseException), the old
+        # entry vanished with its cleanup never scheduled, and no
+        # replacement was ever installed -- model_id ends up completely
+        # absent, as if it had never been cached at all.
+        cleanup = _RecordingCleanup()
+        cache = ModelRuntimeCache(max_entries=1, on_evict=cleanup)
+        original_runtime = {"id": "model-a", "instance": object()}
+        cache.put("model-a", original_runtime)
+        original_entry = cache._entries["model-a"]
+
+        original_runtime_entry_cls = cache_module.RuntimeEntry
+
+        def failing_runtime_entry(*args, **kwargs):
+            raise _FakeCancellation("injected: entry construction interrupted")
+
+        cache_module.RuntimeEntry = failing_runtime_entry
+        try:
+            with self.assertRaises(_FakeCancellation):
+                cache.put("model-a", {"id": "model-a", "instance": object()})
+        finally:
+            cache_module.RuntimeEntry = original_runtime_entry_cls
+
+        # The old entry survives completely untouched -- never deleted, no
+        # spurious cleanup call.
+        self.assertIs(cache._entries["model-a"], original_entry)
+        self.assertIs(cache._entries["model-a"].runtime, original_runtime)
+        self.assertEqual(cleanup.calls, [])
+
+    # ------------------------- bonus 20: reject handle re-entry and nesting
+    def test_runtime_handle_rejects_reentry_and_nested_with_blocks(self):
+        # Found by the same re-review pass: __enter__() used to return
+        # `self` unconditionally, so a released handle could be re-entered
+        # (its E/lease/G already returned, with the next __exit__ then a
+        # silent no-op), and the same handle could be entered again inside
+        # its own `with` block (the inner block's __exit__ would release
+        # everything while the outer block kept using the runtime
+        # unprotected).
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service({"model-a": manifest_a}, {"fake": loader})
+
+        handle = service.acquire_runtime("model-a", "image")
+        with handle:
+            with self.assertRaises(RuntimeError):
+                with handle:  # nested -- rejected
+                    pass
+        # The outer `with` block's own exit still released normally.
+        self.assertEqual(cache._entries["model-a"].lease_count, 0)
+
+        with self.assertRaises(RuntimeError):
+            with handle:  # re-entry after release -- rejected
+                pass
 
 
 if __name__ == "__main__":

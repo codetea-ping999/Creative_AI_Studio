@@ -121,19 +121,28 @@ class RuntimeEntry:
         # hold a lease on it (a cache hit does not imply execution access).
         self.execution_lock = Lock()
         # Codex re-review, found on this round's own fix commits: the
-        # thread id currently holding `execution_lock`, or `None` when it
-        # is free. `threading.Lock` has no owner-thread concept of its own
-        # (unlike `threading.RLock`), so with `admission_capacity > 1` a
-        # thread already holding this exact entry's E could pin it again
-        # (the lease-hit path doesn't know about E at all) and then block
-        # forever trying to acquire its own already-held, non-reentrant
-        # lock. `ModelService._acquire_execution_lock()` checks this
-        # *before* attempting to acquire E, to fail fast instead of
-        # deadlocking; not synchronized by a separate lock of its own --
-        # only the thread that already owns `execution_lock` could ever
-        # legitimately match here, so a stale read only ever matters to
-        # the one thread it is actually about.
-        self.execution_lock_owner: int | None = None
+        # `threading.Thread` object currently holding `execution_lock`, or
+        # `None` when it is free. `threading.Lock` has no owner-thread
+        # concept of its own (unlike `threading.RLock`), so with
+        # `admission_capacity > 1` a thread already holding this exact
+        # entry's E could pin it again (the lease-hit path doesn't know
+        # about E at all) and then block forever trying to acquire its own
+        # already-held, non-reentrant lock.
+        # `ModelService._acquire_execution_lock()` checks this *before*
+        # attempting to acquire E, to fail fast instead of deadlocking; not
+        # synchronized by a separate lock of its own -- only the thread
+        # that already owns `execution_lock` could ever legitimately match
+        # here, so a stale read only ever matters to the one thread it is
+        # actually about. Keyed by the `Thread` object itself
+        # (`threading.current_thread()`), not `threading.get_ident()`'s
+        # raw integer -- a second Codex re-review caught that OS-level
+        # thread ids are recycled once a thread exits, which could
+        # misattribute E ownership to an unrelated, later-started thread
+        # that happens to reuse the same numeric id (see
+        # `RuntimeAdmissionController`'s own docstring in
+        # `core/models/service.py` for the identical reasoning on the G
+        # side).
+        self.execution_lock_owner: Any | None = None
         # PR4a always classifies every runtime as "heavy" -- the one
         # process-wide admission slot (see ModelService._admission) applies
         # uniformly. This field exists so a future, explicitly audited

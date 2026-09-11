@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from threading import Lock, Semaphore, get_ident
+from threading import Lock, Semaphore, Thread, current_thread
 from typing import Any
 
 from .cache import ModelRuntimeCache
@@ -107,28 +107,40 @@ class RuntimeAdmissionController:
         # thread could ever release one of its own slots to free room for
         # itself, and it cannot do that while parked here.
         #
-        # Ownership is tracked by *acquiring* thread id in a plain dict
-        # guarded by `_held_lock`, deliberately NOT `threading.local()`:
-        # this codebase explicitly supports releasing a `RuntimeHandle`
-        # from a different thread than the one that acquired it (a
-        # cancellation/cleanup thread finishing up after a worker thread --
-        # see `RuntimeHandle`'s own `_owner_thread_id`, captured at
-        # acquisition time and threaded through to this class's `release()`
-        # so the *original* acquirer's count is what gets decremented, not
+        # Ownership is tracked by *acquiring* thread in a plain dict guarded
+        # by `_held_lock`, deliberately NOT `threading.local()`: this
+        # codebase explicitly supports releasing a `RuntimeHandle` from a
+        # different thread than the one that acquired it (a cancellation/
+        # cleanup thread finishing up after a worker thread -- see
+        # `RuntimeHandle`'s own `_owner_thread`, captured at acquisition
+        # time and threaded through to this class's `release()` so the
+        # *original* acquirer's count is what gets decremented, not
         # whichever thread happens to call `release()`). A first version of
         # this used `threading.local()`, which cannot be updated for
-        # another thread at all -- a cross-thread release left the
-        # original acquiring thread's local counter permanently stuck,
-        # rejecting its next, perfectly legitimate acquisition (Codex
-        # re-review caught this too).
+        # another thread at all -- a cross-thread release left the original
+        # acquiring thread's local counter permanently stuck, rejecting its
+        # next, perfectly legitimate acquisition (Codex re-review caught
+        # this too).
+        #
+        # Keyed by the `threading.Thread` object itself (`current_thread()`),
+        # not `get_ident()`'s raw integer: a second Codex re-review caught
+        # that OS-level thread ids *are* recycled once a thread exits -- a
+        # worker that acquires a handle and then exits before a supported
+        # cleanup thread releases it could have its numeric id reassigned
+        # to an unrelated, later-started thread, which would then inherit
+        # its held-count (and, via `RuntimeEntry.execution_lock_owner`, its
+        # E ownership too) and be wrongly rejected as "recursive". A
+        # `Thread` object's identity is not recycled this way: a new OS
+        # thread always gets a new Python `Thread` object, never the
+        # exited one's.
         self._held_lock = Lock()
-        self._held_by_thread: dict[int, int] = {}
+        self._held_by_thread: dict[Thread, int] = {}
 
     def acquire(self, deadline: float | None) -> bool:
-        thread_id = get_ident()
+        owner_thread = current_thread()
         would_block = deadline is None or deadline - time.monotonic() > 0
         with self._held_lock:
-            held = self._held_by_thread.get(thread_id, 0)
+            held = self._held_by_thread.get(owner_thread, 0)
         if would_block and held >= self.capacity:
             raise RuntimeError(
                 "Recursive acquire_runtime() call detected: this thread "
@@ -141,11 +153,11 @@ class RuntimeAdmissionController:
         acquired = _acquire_with_deadline(self._semaphore, deadline)
         if acquired:
             with self._held_lock:
-                self._held_by_thread[thread_id] = self._held_by_thread.get(thread_id, 0) + 1
+                self._held_by_thread[owner_thread] = self._held_by_thread.get(owner_thread, 0) + 1
         return acquired
 
-    def release(self, owner_thread_id: int) -> None:
-        """Release one slot previously credited to `owner_thread_id`.
+    def release(self, owner_thread: Thread) -> None:
+        """Release one slot previously credited to `owner_thread`.
 
         Known, accepted limitation (Codex re-review, this round): if a
         `BaseException` lands after the `with self._held_lock:` block
@@ -163,11 +175,11 @@ class RuntimeAdmissionController:
         """
 
         with self._held_lock:
-            current = self._held_by_thread.get(owner_thread_id, 0)
+            current = self._held_by_thread.get(owner_thread, 0)
             if current > 1:
-                self._held_by_thread[owner_thread_id] = current - 1
+                self._held_by_thread[owner_thread] = current - 1
             else:
-                self._held_by_thread.pop(owner_thread_id, None)
+                self._held_by_thread.pop(owner_thread, None)
         self._semaphore.release()
 
 
@@ -223,9 +235,10 @@ class RuntimeHandle:
         "_canonical_id",
         "_entry",
         "_admission",
-        "_owner_thread_id",
+        "_owner_thread",
         "_released",
         "_release_guard",
+        "_entered",
     )
 
     def __init__(
@@ -237,7 +250,7 @@ class RuntimeHandle:
         canonical_id: str,
         entry: RuntimeEntry,
         admission: RuntimeAdmissionController,
-        owner_thread_id: int,
+        owner_thread: Thread,
     ) -> None:
         self.manifest = manifest
         self.runtime = runtime
@@ -251,11 +264,33 @@ class RuntimeHandle:
         # acquired). `RuntimeAdmissionController.release()` needs this
         # exact id to credit the release back to its true owner; see that
         # class's own docstring for why `threading.local()` cannot do this.
-        self._owner_thread_id = owner_thread_id
+        self._owner_thread = owner_thread
         self._released = False
         self._release_guard = Lock()
+        self._entered = False
 
     def __enter__(self) -> "RuntimeHandle":
+        # Codex re-review, found on this round's own fix commits: this
+        # used to return `self` unconditionally, so a handle could be
+        # entered again after `release()` (its E/lease/G already returned,
+        # with the next `__exit__` then a silent no-op) or nested inside
+        # its own `with` block (the inner block's `__exit__` would release
+        # everything while the outer block kept using the runtime
+        # unprotected). This class is the advertised safe-use unit for
+        # PR4a; both are now rejected immediately instead of silently
+        # exposing an unprotected runtime.
+        if self._released:
+            raise RuntimeError(
+                f"Cannot re-enter a RuntimeHandle for {self._canonical_id!r} "
+                "as a context manager after it has already been released."
+            )
+        if self._entered:
+            raise RuntimeError(
+                f"Cannot nest `with` blocks on the same RuntimeHandle for "
+                f"{self._canonical_id!r} -- the inner block's __exit__ would "
+                "release E/lease/G while the outer block is still using them."
+            )
+        self._entered = True
         return self
 
     def __exit__(
@@ -372,7 +407,7 @@ class RuntimeHandle:
             try:
                 self._cache.release_lease(self._canonical_id, self._entry)
             finally:
-                self._admission.release(self._owner_thread_id)
+                self._admission.release(self._owner_thread)
 
 
 class ModelService:
@@ -672,7 +707,7 @@ class ModelService:
             ensure_cloud_provider_enabled(manifest.id)
 
         deadline = None if wait_timeout is None else time.monotonic() + wait_timeout
-        owner_thread_id = get_ident()
+        owner_thread = current_thread()
 
         if not self._admission.acquire(deadline):
             raise RuntimeBusyError(
@@ -683,7 +718,7 @@ class ModelService:
         try:
             entry = self._acquire_or_load_entry(manifest, media_type, deadline)
             try:
-                self._acquire_execution_lock(manifest.id, entry, deadline, owner_thread_id)
+                self._acquire_execution_lock(manifest.id, entry, deadline, owner_thread)
                 try:
                     return RuntimeHandle(
                         manifest=manifest,
@@ -692,7 +727,7 @@ class ModelService:
                         canonical_id=manifest.id,
                         entry=entry,
                         admission=self._admission,
-                        owner_thread_id=owner_thread_id,
+                        owner_thread=owner_thread,
                     )
                 except BaseException:
                     # Codex re-review, found on this round's own fix
@@ -715,10 +750,10 @@ class ModelService:
         except BaseException:
             # This unwind always runs on the same thread that just called
             # `self._admission.acquire()` above (no handle has been handed
-            # to any other thread yet), so `owner_thread_id` is trivially
+            # to any other thread yet), so `owner_thread` is trivially
             # this call's own -- unlike `RuntimeHandle.release()`, which
             # may run on a different thread than the one that acquired.
-            self._admission.release(owner_thread_id)
+            self._admission.release(owner_thread)
             raise
 
     def _acquire_or_load_entry(
@@ -807,7 +842,7 @@ class ModelService:
         canonical_id: str,
         entry: RuntimeEntry,
         deadline: float | None,
-        owner_thread_id: int,
+        owner_thread: Thread,
     ) -> None:
         """Acquire `entry.execution_lock` ("E") and revalidate it afterward.
 
@@ -854,7 +889,7 @@ class ModelService:
         """
 
         would_block = deadline is None or deadline - time.monotonic() > 0
-        if would_block and entry.execution_lock_owner == owner_thread_id:
+        if would_block and entry.execution_lock_owner == owner_thread:
             raise RuntimeError(
                 f"Recursive acquire_runtime() call detected for {canonical_id!r}: "
                 "this thread already holds exclusive execution access to this "
@@ -877,7 +912,7 @@ class ModelService:
         except BaseException:
             entry.execution_lock.release()
             raise
-        entry.execution_lock_owner = owner_thread_id
+        entry.execution_lock_owner = owner_thread
 
     # ------------------------------------------------------- canonical unload
 
