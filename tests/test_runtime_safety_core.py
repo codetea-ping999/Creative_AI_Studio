@@ -22,6 +22,7 @@ import unittest
 
 from bootstrap.factories import create_default_model_service
 from core.models.cache import ModelRuntimeCache
+from core.models.loader import LoaderRegistry
 from core.models.registry import ModelRegistry
 from core.models.resolver import ModelResolver
 from core.models.runtime_lease import RuntimeBusyError, RuntimeState
@@ -1322,6 +1323,84 @@ class RuntimeSafetyCoreTests(unittest.TestCase):
         finally:
             handle.release()
         self.assertEqual(loader_a.load_calls, 1)
+
+    # ------------------------- bonus 3: legacy put() same-object busy-state ordering
+    def test_put_rejects_same_object_reinsertion_of_a_retiring_entry(self):
+        # Also found by Codex's round-1-of-round-1 re-review: the
+        # same-object fast path ran *before* the busy-state check, so a
+        # caller retaining a reference to a RETIRING entry's runtime (an
+        # unload() already in flight, cleanup mid-run outside M) could
+        # still pass that same object back into put(), moving it to a
+        # different bucket and triggering eviction there -- all while
+        # _finish_retirement() was concurrently tearing the exact same
+        # object down and about to remove the entry regardless.
+        cleanup_started = Event()
+        cleanup_release = Event()
+
+        def blocking_cleanup(model_id, runtime_obj):
+            cleanup_started.set()
+            assert cleanup_release.wait(timeout=5)
+
+        cache = ModelRuntimeCache(
+            max_entries=1, media_limits={"image": 1, "text": 1}, on_evict=blocking_cleanup,
+        )
+        runtime_a = {"id": "model-a", "instance": object()}
+        cache.put("model-a", runtime_a, media_type="image")
+
+        errors: list[BaseException] = []
+
+        def unloader():
+            try:
+                cache.unload("model-a")
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        t = Thread(target=unloader)
+        t.start()
+        self.assertTrue(cleanup_started.wait(timeout=5))
+        self.assertEqual(cache._entries["model-a"].state, RuntimeState.RETIRING)
+
+        # A caller still holding the old runtime object must not be able to
+        # move/revive it into another bucket while it is RETIRING.
+        with self.assertRaises(RuntimeBusyError):
+            cache.put("model-a", runtime_a, media_type="text")
+
+        cleanup_release.set()
+        t.join(timeout=5)
+        self.assertEqual(errors, [])
+        self.assertNotIn("model-a", cache._entries)
+
+    # ------------------------- bonus 4: loader-lookup-failure reservation unwind
+    def test_acquire_runtime_aborts_reservation_when_loader_lookup_fails(self):
+        # Also found by Codex's round-1-of-round-1 re-review (P1):
+        # `loader_registry.get()` used to run *before* the try block that
+        # aborts the reservation on failure, so a manifest naming an
+        # unregistered loader left the fresh LOADING reservation stuck
+        # forever -- permanently denying every future acquisition for that
+        # id, and (with a single-entry bucket) blocking every other model
+        # sharing it too. Uses the real `LoaderRegistry`, not the fake one,
+        # so this exercises its actual `LookupError`.
+        manifest_a = _FakeManifest("model-a", loader="unregistered-loader")
+        service, cache = _build_service(
+            {"model-a": manifest_a}, {}, max_entries=1,
+        )
+        service.loader_registry = LoaderRegistry()  # empty -- no loaders registered
+
+        with self.assertRaises(LookupError):
+            service.acquire_runtime("model-a", "image")
+
+        # The reservation is fully unwound -- not stuck at LOADING.
+        self.assertNotIn("model-a", cache._entries)
+
+        # A subsequent, correctly-configured attempt succeeds normally.
+        real_loader = _ImmediateLoader()
+        service.loader_registry.register("unregistered-loader", real_loader)
+        handle = service.acquire_runtime("model-a", "image")
+        try:
+            self.assertIsNotNone(handle.runtime)
+        finally:
+            handle.release()
+        self.assertEqual(real_loader.load_calls, 1)
 
     # ---------------------------------------------------- Finding 5 (P2)
     def test_same_object_bucket_move_enforces_the_destination_budget(self):

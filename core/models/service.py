@@ -518,8 +518,17 @@ class ModelService:
         try:
             entry = self.runtime_cache.acquire_or_reserve(manifest.id, media_type)
             if entry.state is RuntimeState.LOADING:
-                loader = self.loader_registry.get(manifest.loader)
                 try:
+                    # Codex re-review, found on the round-1 fix commit
+                    # (P1): `loader_registry.get()` -- e.g. a manifest
+                    # naming an unregistered loader -- must abort the
+                    # reservation exactly like `loader.load()` itself
+                    # raising. It used to run *before* this try block, so
+                    # a bad `manifest.loader` value left the reservation
+                    # stuck at LOADING forever, permanently denying every
+                    # future acquisition for this id (and, in a
+                    # single-entry bucket, every other id sharing it too).
+                    loader = self.loader_registry.get(manifest.loader)
                     runtime_obj = loader.load(manifest)
                 except BaseException:
                     self.runtime_cache.abort_reservation(manifest.id, entry)

@@ -234,6 +234,23 @@ class ModelRuntimeCache:
         with self._metadata_lock:
             existing = self._entries.get(model_id)
             if existing is not None:
+                # Codex re-review, found on the round-1 fix commit (P2):
+                # the busy check must gate the same-object path too, not
+                # only the different-object (replace) path -- checked
+                # first here, unconditionally, rather than nested inside
+                # an `elif` a caller could route around by simply passing
+                # back the runtime object it already holds a reference to.
+                # Without this, a caller retaining a reference to a
+                # RETIRING entry's runtime (unload() already in flight,
+                # cleanup mid-run outside M) could still move it to
+                # another bucket and trigger eviction there, even though
+                # `_finish_retirement()` is concurrently tearing it down
+                # and about to remove it regardless.
+                if existing.is_pinned() or existing.state in _BUSY_FOR_UNLOAD_STATES:
+                    raise RuntimeBusyError(
+                        f"Cannot replace {model_id!r}: state={existing.state.value}, "
+                        f"lease_count={existing.lease_count}."
+                    )
                 if existing.runtime is runtime_obj:
                     # A caller reinserting the *same* runtime instance under
                     # its own model_id (e.g. to refresh LRU position or
@@ -243,11 +260,6 @@ class ModelRuntimeCache:
                     existing.media_bucket = bucket
                     self._entries.move_to_end(model_id)
                     same_object_reinsertion = True
-                elif existing.is_pinned() or existing.state in _BUSY_FOR_UNLOAD_STATES:
-                    raise RuntimeBusyError(
-                        f"Cannot replace {model_id!r}: state={existing.state.value}, "
-                        f"lease_count={existing.lease_count}."
-                    )
                 else:
                     # A replaced entry must run the same cleanup as
                     # unload()/unload_all() -- on_evict is what actually
