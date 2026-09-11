@@ -2212,6 +2212,56 @@ class RuntimeSafetyCoreTests(unittest.TestCase):
             with handle:  # re-entry after release -- rejected
                 pass
 
+    # ------------------------- bonus 21: overflow accounts for concurrent retirements
+    def test_legacy_put_overflow_accounts_for_concurrently_retiring_entries(self):
+        # Found by a further Codex re-review pass on the earlier
+        # within-call over-eviction fix (bonus 5): that fix only
+        # discounted victims *this call itself* selected, not entries
+        # already marked RETIRING by a *different*, concurrent put() call
+        # whose own cleanup was still in flight. Budget=2, bucket at
+        # {a, b}: a blocked put(c) retires "a" (mid-cleanup, not yet
+        # removed); a concurrent put(d), unaware "a" is already doomed,
+        # used to retire *two* more (b and c) to "compensate", leaving
+        # only {d} instead of the correct {c, d}.
+        cleanup_started = Event()
+        cleanup_release = Event()
+        cleanup_calls: list[str] = []
+
+        def cleanup(model_id, runtime_obj):
+            cleanup_calls.append(model_id)
+            if model_id == "model-a":
+                cleanup_started.set()
+                assert cleanup_release.wait(timeout=5)
+
+        cache = ModelRuntimeCache(max_entries=2, on_evict=cleanup)
+        cache.put("model-a", {"id": "model-a"})
+        cache.put("model-b", {"id": "model-b"})
+
+        errors: list[BaseException] = []
+
+        def put_c():
+            try:
+                cache.put("model-c", {"id": "model-c"})
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        tc = Thread(target=put_c)
+        tc.start()
+        self.assertTrue(cleanup_started.wait(timeout=5))
+        self.assertEqual(cache._entries["model-a"].state, RuntimeState.RETIRING)
+
+        # A second, concurrent put() while model-a is still RETIRING
+        # (cleanup not yet finished) must not "double-compensate" by
+        # evicting two more entries -- only one more is actually needed.
+        cache.put("model-d", {"id": "model-d"})
+
+        cleanup_release.set()
+        tc.join(timeout=5)
+        self.assertEqual(errors, [])
+
+        self.assertEqual(sorted(cleanup_calls), ["model-a", "model-b"])
+        self.assertEqual(set(cache.loaded_ids()), {"model-c", "model-d"})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -819,26 +819,35 @@ class ModelRuntimeCache:
         iteration (see `bucket_ids` below) -- a caller-visible fact this
         method's own budget check must account for, or it would keep
         finding "still over budget" and evict every remaining eligible
-        entry, not just the actual excess. `retired_this_call` tracks how
-        many victims *this call* has already committed to evicting, so the
-        loop's own effective-occupancy check subtracts them back out
-        (while a RETIRING entry some *other*, concurrent caller marked is
-        still correctly counted against budget, since only this call's own
-        already-decided victims are known to be leaving). Codex's
-        round-1-of-round-1-of-round-1 re-review caught this: without the
-        subtraction, evicting into a budget-2 bucket already at `{a, b}`
-        retired both `a` and `b` instead of just the LRU one.
+        entry, not just the actual excess. The loop's own
+        effective-occupancy check therefore subtracts *every* currently
+        `RETIRING` entry in the bucket, not only ones this specific call
+        selected -- a further Codex re-review caught that the first
+        version of this fix counted only its own selections
+        (`retired_this_call`), so a *second*, concurrent `put()` call
+        landing while an *earlier* call's victim was still mid-cleanup
+        (already `RETIRING`, not yet removed) would not credit that
+        already-doomed entry against its own budget math, and would evict
+        one extra healthy entry to "compensate" for capacity that was
+        already being freed. Counting live `RETIRING` state directly (it
+        naturally includes both this call's own selections, since marking
+        a victim mutates the same shared entry object, and any other
+        concurrent caller's) needs no separate counter and stays correct
+        across calls, not just within one.
         """
 
         budget = self.media_limits.get(bucket, self.max_entries)
         victims: list[tuple[str, RuntimeEntry]] = []
-        retired_this_call = 0
         while True:
             bucket_ids = [
                 entry_id for entry_id, entry in self._entries.items()
                 if entry.media_bucket == bucket
             ]
-            if len(bucket_ids) - retired_this_call <= budget:
+            retiring_count = sum(
+                1 for entry_id in bucket_ids
+                if self._entries[entry_id].state is RuntimeState.RETIRING
+            )
+            if len(bucket_ids) - retiring_count <= budget:
                 break
             evictable = [
                 entry_id for entry_id in bucket_ids
@@ -851,7 +860,6 @@ class ModelRuntimeCache:
             victim_id = evictable[0]
             victim_entry = self._entries[victim_id]
             victim_entry.state = RuntimeState.RETIRING
-            retired_this_call += 1
             victims.append((victim_id, victim_entry))
         return victims
 
