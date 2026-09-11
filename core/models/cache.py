@@ -273,8 +273,8 @@ class ModelRuntimeCache:
 
         if replaced_victim is not None:
             self._run_cleanup(*replaced_victim)
-        for victim_id, victim_runtime in overflow_victims:
-            self._run_cleanup(victim_id, victim_runtime)
+        for victim_id, victim_entry in overflow_victims:
+            self._finish_retirement(victim_id, victim_entry)
 
     def unload(self, canonical_id: str) -> None:
         """Retire `canonical_id`'s entry if idle; safe no-op if not cached.
@@ -673,8 +673,8 @@ class ModelRuntimeCache:
 
     def _evict_bucket_overflow_locked(
         self, bucket: str, *, exclude_id: str | None = None
-    ) -> list[tuple[str, Any]]:
-        """Legacy `put()`'s own overflow eviction (short M; caller cleans up).
+    ) -> list[tuple[str, RuntimeEntry]]:
+        """Legacy `put()`'s own overflow eviction (short M; caller finalizes).
 
         Unlike `_select_capacity_victim_locked()` (which raises when no
         victim is available), this is lenient: `put()` has always been a
@@ -689,10 +689,26 @@ class ModelRuntimeCache:
         pinned would "evict" the very entry the caller just asked to
         insert (the sole remaining unleased, thus "evictable", id), making
         `put()` a silent no-op instead of leaving the bucket over budget.
+
+        Each victim is marked `RETIRING` here (short M) and left in
+        `self._entries` -- never popped immediately -- returned to the
+        caller to finalize via `_finish_retirement()` outside M, exactly
+        like every other eviction/retirement path in this class. A second
+        finding from Codex's round-1 review of this same round's fixes: the
+        previous behavior (`self._entries.pop(victim_id)` right here, under
+        M, with cleanup running only afterward in `put()`'s own caller code)
+        made the victim's id appear fully absent -- a normal cache miss --
+        for the entire window between this method returning and that
+        cleanup actually finishing. A concurrent `acquire_runtime()` for
+        that exact id could reach that window, see nothing there, and start
+        loading a fresh replacement while the old runtime was still being
+        destructively cleaned up (`torch.cuda.empty_cache()`, a pipeline's
+        own `.to("cpu")`, ...) -- the same "old and new coexist" hazard
+        `RETIRING` exists everywhere else in this class to prevent.
         """
 
         budget = self.media_limits.get(bucket, self.max_entries)
-        victims: list[tuple[str, Any]] = []
+        victims: list[tuple[str, RuntimeEntry]] = []
         while True:
             bucket_ids = [
                 entry_id for entry_id, entry in self._entries.items()
@@ -709,9 +725,9 @@ class ModelRuntimeCache:
             if not evictable:
                 break
             victim_id = evictable[0]
-            victim_entry = self._entries.pop(victim_id)
-            if victim_entry.runtime is not None:
-                victims.append((victim_id, victim_entry.runtime))
+            victim_entry = self._entries[victim_id]
+            victim_entry.state = RuntimeState.RETIRING
+            victims.append((victim_id, victim_entry))
         return victims
 
     def _finish_retirement(self, canonical_id: str, entry: RuntimeEntry) -> None:

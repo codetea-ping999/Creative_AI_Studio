@@ -1211,6 +1211,118 @@ class RuntimeSafetyCoreTests(unittest.TestCase):
         self.assertEqual(loader.load_calls, 1)  # the load itself succeeded...
         self.assertEqual(cleanup.calls, ["model-a"])  # ...but was disposed exactly once
 
+    def test_acquire_runtime_releases_the_orphaned_lease_when_publish_mutates_then_raises(self):
+        # Codex's own review of the fix above (round 1-of-round-1) found a
+        # real gap: publish_ready_and_pin() mutates `entry` in place (READY,
+        # lease_count=1, runtime set) *before* it can raise -- an async
+        # BaseException landing right after that mutation but before the
+        # call returns (believed rare, but KeyboardInterrupt/SystemExit can
+        # land between any two bytecode instructions in CPython) would have
+        # made the old fix wrongly dispose an already-published, now-live
+        # cached runtime, corrupting it out from under any other caller,
+        # while also leaking the lease this call took (no RuntimeHandle is
+        # ever returned to release it). Simulated here by actually
+        # performing the publish, then raising.
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        cleanup = _RecordingCleanup()
+        service, cache = _build_service(
+            {"model-a": manifest_a}, {"fake": loader}, on_evict=cleanup,
+        )
+
+        original_publish = cache.publish_ready_and_pin
+
+        def publish_then_raise(canonical_id, reserved_entry, runtime_obj):
+            original_publish(canonical_id, reserved_entry, runtime_obj)
+            raise _FakeCancellation("injected: interrupted right after publish")
+
+        cache.publish_ready_and_pin = publish_then_raise
+
+        with self.assertRaises(_FakeCancellation):
+            service.acquire_runtime("model-a", "image")
+
+        entry = cache._entries["model-a"]
+        # Published successfully -- must NOT have been disposed (that would
+        # corrupt a runtime other callers can now see as cached).
+        self.assertEqual(cleanup.calls, [])
+        self.assertEqual(entry.state, RuntimeState.READY)
+        # The lease this call took is released, not orphaned.
+        self.assertEqual(entry.lease_count, 0)
+
+        # The entry is fully usable afterward -- never disposed, never
+        # reloaded.
+        handle = service.acquire_runtime("model-a", "image")
+        try:
+            self.assertIs(handle.runtime, entry.runtime)
+        finally:
+            handle.release()
+        self.assertEqual(loader.load_calls, 1)
+
+    # ------------------------- bonus 2: legacy put() overflow-victim visibility
+    def test_legacy_put_overflow_victim_stays_visible_until_cleanup_finishes(self):
+        # Also found by Codex's round-1-of-round-1 re-review: the old
+        # `_evict_bucket_overflow_locked()` popped its victim from
+        # `_entries` immediately, under M, well before that victim's
+        # cleanup (run afterward, outside M, by put()'s own caller code)
+        # ever ran. In the window between M being released and cleanup
+        # actually finishing, the victim's id looked like a plain cache
+        # miss to any concurrent caller -- unlike every other
+        # eviction/retirement path in this class, which marks RETIRING and
+        # keeps the entry visible (busy) until cleanup completes.
+        manifest_a = _FakeManifest("model-a")
+        loader_a = _ImmediateLoader()
+        cleanup_started = Event()
+        cleanup_release = Event()
+
+        def blocking_cleanup(model_id, runtime_obj):
+            cleanup_started.set()
+            assert cleanup_release.wait(timeout=5)
+
+        cache = ModelRuntimeCache(max_entries=1, on_evict=blocking_cleanup)
+        service = ModelService(
+            registry=None,
+            resolver=_FakeResolver({"model-a": manifest_a}),
+            loader_registry=_FakeLoaderRegistry({"fake": loader_a}),
+            runtime_cache=cache,
+        )
+
+        cache.put("model-a", {"id": "model-a", "instance": object()})  # occupies the sole slot
+
+        errors: list[BaseException] = []
+
+        def evictor():
+            try:
+                # A second legacy put() for a different id overflows
+                # model-a out of the (budget=1) default bucket.
+                cache.put("model-b", {"id": "model-b", "instance": object()})
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        t = Thread(target=evictor)
+        t.start()
+        self.assertTrue(cleanup_started.wait(timeout=5))
+
+        # model-a's cleanup is mid-flight (blocked) -- it must still be
+        # visible as RETIRING (busy), never silently absent.
+        self.assertEqual(cache._entries["model-a"].state, RuntimeState.RETIRING)
+        with self.assertRaises(RuntimeBusyError):
+            service.acquire_runtime("model-a", "image", wait_timeout=0)
+        self.assertEqual(loader_a.load_calls, 0)  # no competing load started
+
+        cleanup_release.set()
+        t.join(timeout=5)
+        self.assertEqual(errors, [])
+        self.assertNotIn("model-a", cache._entries)
+        self.assertTrue(cache.has("model-b"))
+
+        # Now a fresh acquire for model-a succeeds and genuinely reloads.
+        handle = service.acquire_runtime("model-a", "image")
+        try:
+            self.assertIsNotNone(handle.runtime)
+        finally:
+            handle.release()
+        self.assertEqual(loader_a.load_calls, 1)
+
     # ---------------------------------------------------- Finding 5 (P2)
     def test_same_object_bucket_move_enforces_the_destination_budget(self):
         cleanup = _RecordingCleanup()

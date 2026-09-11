@@ -529,17 +529,35 @@ class ModelService:
                         manifest.id, entry, runtime_obj
                     )
                 except BaseException:
-                    # Found during this round's adversarial self-review:
-                    # `publish_ready_and_pin()` only raises its own
-                    # defensive backstop (see that method's docstring) if
-                    # this reservation was somehow lost before publish --
-                    # believed unreachable given this method holds L for
-                    # its entire duration, but if it ever did happen, the
-                    # freshly-loaded `runtime_obj` was never published
-                    # anywhere and would otherwise leak. Dispose it via the
-                    # same primitive Finding 4 uses for the analogous gap
-                    # in the legacy `resolve_runtime()` path.
-                    self.runtime_cache.dispose_unpublished(manifest.id, runtime_obj)
+                    # Found during this round's adversarial self-review,
+                    # then refined after Codex's own round-1-of-round-1
+                    # re-review caught a real gap in the first version of
+                    # this fix: `publish_ready_and_pin()` mutates `entry`
+                    # in place (sets `.runtime`, `.state = READY`,
+                    # `.lease_count = 1`) *before* it can raise its own
+                    # defensive backstop (see that method's docstring) --
+                    # believed unreachable in practice given this method
+                    # holds L for its entire duration, but an async
+                    # `BaseException` (KeyboardInterrupt, ...) could in
+                    # principle land between that mutation and this
+                    # method's own return. `entry` is the exact same object
+                    # `publish_ready_and_pin()` mutates, so checking its
+                    # `.state` here tells us, unambiguously, whether
+                    # publication actually happened before the exception
+                    # arrived:
+                    #   - still LOADING: never published -- runtime_obj is
+                    #     ours alone; dispose it (Finding 4's own primitive).
+                    #   - READY: already published and pinned -- disposing
+                    #     it here would corrupt a runtime other callers can
+                    #     now see as cached. Instead release the lease this
+                    #     call just took, since no RuntimeHandle will ever
+                    #     be returned to release it otherwise -- leaving it
+                    #     pinned forever would be worse than either option
+                    #     above.
+                    if entry.state is RuntimeState.READY:
+                        self.runtime_cache.release_lease(manifest.id, entry)
+                    else:
+                        self.runtime_cache.dispose_unpublished(manifest.id, runtime_obj)
                     raise
             return entry
         finally:
