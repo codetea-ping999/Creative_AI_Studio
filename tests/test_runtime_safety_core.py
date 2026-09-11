@@ -2262,6 +2262,80 @@ class RuntimeSafetyCoreTests(unittest.TestCase):
         self.assertEqual(sorted(cleanup_calls), ["model-a", "model-b"])
         self.assertEqual(set(cache.loaded_ids()), {"model-c", "model-d"})
 
+    # ------------------------- bonus 22: __enter__ serialized with release()
+    def test_enter_blocks_on_release_guard_then_observes_the_committed_state(self):
+        # Found by a further Codex re-review pass on the re-entry guard
+        # (bonus 20): that fix checked `_released` without sharing
+        # `release()`'s own `_release_guard`, so `__enter__()` could read a
+        # stale `False` while a concurrent, cross-thread `release()` call
+        # (an explicitly supported pattern) was itself mid-transition,
+        # returning a handle whose E/lease/G had already been -- or were
+        # about to be -- returned. Sharing `_release_guard` between the two
+        # makes them mutually exclusive: `__enter__()` can only ever run
+        # entirely before or entirely after any given `release()` call's
+        # own transition, never overlapping it.
+        #
+        # Proven here by pausing `release()` *while it still holds*
+        # `_release_guard` (via a stand-in for `mark_invalid()`, called
+        # from inside that exact critical section) and confirming
+        # `__enter__()`, attempted concurrently, always ends up correctly
+        # rejecting -- it cannot even attempt its own check until the
+        # guard is free, by which point `_released` is already durably
+        # `True`.
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service({"model-a": manifest_a}, {"fake": loader})
+
+        handle = service.acquire_runtime("model-a", "image")
+
+        release_paused = Event()
+        let_release_continue = Event()
+        original_mark_invalid = cache.mark_invalid
+
+        def pausing_mark_invalid(canonical_id, entry_arg):
+            release_paused.set()
+            assert let_release_continue.wait(timeout=5)
+            original_mark_invalid(canonical_id, entry_arg)
+
+        cache.mark_invalid = pausing_mark_invalid
+
+        errors: list[BaseException] = []
+
+        def release_worker():
+            try:
+                handle.release(had_exception=True)  # takes the mark_invalid path
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        t = Thread(target=release_worker)
+        t.start()
+        # release() is now paused *inside* its own `_release_guard`
+        # critical section -- `_released` is already `True`, and the
+        # guard itself is still held.
+        self.assertTrue(release_paused.wait(timeout=5))
+
+        enter_result: dict[str, object] = {}
+
+        def enter_worker():
+            try:
+                handle.__enter__()
+                enter_result["entered"] = True
+            except RuntimeError as exc:
+                enter_result["error"] = exc
+
+        te = Thread(target=enter_worker)
+        te.start()
+
+        # Unblock release() -- only once its guard section actually exits
+        # can __enter__()'s own blocked attempt proceed, at which point
+        # `_released` is unconditionally `True`.
+        let_release_continue.set()
+        t.join(timeout=5)
+        te.join(timeout=5)
+
+        self.assertEqual(errors, [])
+        self.assertIsInstance(enter_result.get("error"), RuntimeError)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -279,18 +279,33 @@ class RuntimeHandle:
         # unprotected). This class is the advertised safe-use unit for
         # PR4a; both are now rejected immediately instead of silently
         # exposing an unprotected runtime.
-        if self._released:
-            raise RuntimeError(
-                f"Cannot re-enter a RuntimeHandle for {self._canonical_id!r} "
-                "as a context manager after it has already been released."
-            )
-        if self._entered:
-            raise RuntimeError(
-                f"Cannot nest `with` blocks on the same RuntimeHandle for "
-                f"{self._canonical_id!r} -- the inner block's __exit__ would "
-                "release E/lease/G while the outer block is still using them."
-            )
-        self._entered = True
+        #
+        # Codex re-review (found on this fix in turn): the check above
+        # must share `_release_guard` with `release()`'s own check-and-set
+        # -- reading `_released` unguarded here could observe a stale
+        # `False` while a concurrent cross-thread `release()` call (an
+        # explicitly supported pattern: a supervisor/cleanup thread
+        # reclaiming a handle a worker thread acquired) is *in the middle
+        # of* its own guarded transition, letting this method return a
+        # handle whose E/lease/G have already been (or are about to be)
+        # returned. Using the same lock makes the two checks mutually
+        # exclusive: this method can never observe `_released` mid-flight,
+        # only fully before or fully after any given `release()` call's
+        # own transition.
+        with self._release_guard:
+            if self._released:
+                raise RuntimeError(
+                    f"Cannot re-enter a RuntimeHandle for {self._canonical_id!r} "
+                    "as a context manager after it has already been released."
+                )
+            if self._entered:
+                raise RuntimeError(
+                    f"Cannot nest `with` blocks on the same RuntimeHandle for "
+                    f"{self._canonical_id!r} -- the inner block's __exit__ "
+                    "would release E/lease/G while the outer block is still "
+                    "using them."
+                )
+            self._entered = True
         return self
 
     def __exit__(
