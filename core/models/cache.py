@@ -252,6 +252,27 @@ class ModelRuntimeCache:
                         f"lease_count={existing.lease_count}."
                     )
                 if existing.runtime is runtime_obj:
+                    # Codex re-review, found on this round's own fix
+                    # commits (P2): an unpinned INVALID entry passes the
+                    # busy check above (INVALID is not in
+                    # `_BUSY_FOR_UNLOAD_STATES`), so without this,
+                    # reinserting its own runtime object here would take
+                    # this same-object path -- moving/refreshing it -- but
+                    # leave `.state` at INVALID. `get()`/`has()` would keep
+                    # treating it as absent (they require READY), so this
+                    # "reinsertion" fixes nothing while still being able to
+                    # evict a healthy entry in the destination bucket for
+                    # no benefit. There is no legitimate reason to pass the
+                    # same, already-invalidated object back in -- a legacy
+                    # caller "fixing" an INVALID entry loads a genuinely
+                    # new runtime and passes *that* instead, which the
+                    # different-object branch below already handles.
+                    if existing.state is RuntimeState.INVALID:
+                        raise RuntimeBusyError(
+                            f"Cannot reinsert {model_id!r}: the existing "
+                            "entry is invalid; load a fresh runtime instead "
+                            "of reusing the same object."
+                        )
                     # A caller reinserting the *same* runtime instance under
                     # its own model_id (e.g. to refresh LRU position or
                     # change its media bucket) is not a replacement --
@@ -283,10 +304,31 @@ class ModelRuntimeCache:
                 bucket, exclude_id=model_id
             )
 
+        # Codex re-review, found on this round's own fix commits (P2):
+        # `replaced_victim`'s cleanup and every `overflow_victims` entry's
+        # finalization must all be attempted, even if an earlier one raises
+        # `BaseException` -- otherwise an interrupted `replaced_victim`
+        # cleanup (which uses `_run_cleanup()` directly, not
+        # `_finish_retirement()`, since it was already removed from
+        # `_entries` atomically above) skips the overflow-victim loop
+        # entirely, stranding those already-`RETIRING` entries forever,
+        # exactly the same failure mode `unload_all()` already guards
+        # against. The first exception encountered is re-raised once every
+        # target has been attempted.
+        first_exception: BaseException | None = None
         if replaced_victim is not None:
-            self._run_cleanup(*replaced_victim)
+            try:
+                self._run_cleanup(*replaced_victim)
+            except BaseException as exc:  # noqa: BLE001 - every target must still be attempted; see above
+                first_exception = exc
         for victim_id, victim_entry in overflow_victims:
-            self._finish_retirement(victim_id, victim_entry)
+            try:
+                self._finish_retirement(victim_id, victim_entry)
+            except BaseException as exc:  # noqa: BLE001 - every target must still be attempted; see above
+                if first_exception is None:
+                    first_exception = exc
+        if first_exception is not None:
+            raise first_exception
 
     def unload(self, canonical_id: str) -> None:
         """Retire `canonical_id`'s entry if idle; safe no-op if not cached.
@@ -496,10 +538,25 @@ class ModelRuntimeCache:
         # --- cleanup + removal outside M ---
         self._finish_retirement(victim_id, victim_entry)  # type: ignore[arg-type]
 
-        # --- short M: recheck capacity, then establish the reservation
-        #     (Finding 3, victim case: never assume the slot cleanup just
-        #     freed is still free) ---
+        # --- short M: recheck the target AND capacity, then establish the
+        #     reservation (Finding 3, victim case: never assume the slot
+        #     cleanup just freed is still free) ---
         with self._metadata_lock:
+            # Codex re-review, found on this round's own fix commits: a
+            # legacy `put(canonical_id, ...)` call does not participate in
+            # `L` (the per-canonical-id load lock this method's own caller
+            # holds), so nothing stops it from republishing a fresh READY
+            # entry under this exact id while `_finish_retirement()` above
+            # was running outside M. Only rechecking bucket *capacity*
+            # (below) would miss that -- if capacity happened to look fine,
+            # this would blindly overwrite the concurrently published
+            # entry, leaking its runtime with zero cleanup while a legacy
+            # caller might already be using it.
+            if self._entries.get(canonical_id) is not None:
+                raise RuntimeBusyError(
+                    f"{canonical_id!r} was concurrently republished while a "
+                    "previous occupant was being retired; retry."
+                )
             retry_victim_id, retry_victim_entry = self._select_capacity_victim_locked(
                 bucket, budget_for=canonical_id
             )
@@ -581,13 +638,30 @@ class ModelRuntimeCache:
         transaction as the lease decrement; splitting them is what lets the
         INVALID transition become visible to an E-waiter *before* this
         decrement -- and before E itself is released -- rather than after).
+
+        Codex re-review, found on this round's own fix commits: legacy
+        `put()` deliberately leaves a bucket over its budget when every
+        over-budget entry is pinned (pin supremacy is absolute -- see
+        `_evict_bucket_overflow_locked()`'s own docstring). Without this,
+        nothing ever revisits that bucket once the last such pin releases
+        -- the overage could persist indefinitely, until some unrelated
+        future `put()` into the *same* bucket happened to trigger its own
+        overflow eviction. So the moment a lease drops to zero, this
+        re-runs the same lenient overflow eviction for `entry`'s own
+        bucket (outside `M`, once cleanup is actually needed) -- a no-op
+        if the bucket is not (or no longer) over budget.
         """
 
+        deferred_victims: list[tuple[str, RuntimeEntry]] = []
         with self._metadata_lock:
             current = self._entries.get(canonical_id)
             if current is not entry:
                 return
             entry.lease_count = max(0, entry.lease_count - 1)
+            if entry.lease_count == 0:
+                deferred_victims = self._evict_bucket_overflow_locked(entry.media_bucket)
+        for victim_id, victim_entry in deferred_victims:
+            self._finish_retirement(victim_id, victim_entry)
 
     def mark_invalid(self, canonical_id: str, entry: RuntimeEntry) -> None:
         """Mark `entry` INVALID if it is still current and `READY` (short M).

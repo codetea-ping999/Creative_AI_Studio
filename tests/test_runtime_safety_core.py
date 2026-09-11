@@ -1764,6 +1764,157 @@ class RuntimeSafetyCoreTests(unittest.TestCase):
         finally:
             handle2.release()
 
+    # ------------------------- bonus 11: put() finalizes every victim under BaseException
+    def test_put_finalizes_all_victims_even_after_a_base_exception(self):
+        # Found by a further Codex re-review pass: put()'s own
+        # replace-then-overflow cleanup sequence had no equivalent of
+        # unload_all()'s "finalize everyone before re-raising" guarantee --
+        # an interrupted replaced-victim cleanup skipped the overflow-victim
+        # loop entirely, stranding those already-RETIRING entries forever.
+        cleanup_calls: list[str] = []
+
+        def mixed_cleanup(model_id, runtime_obj):
+            cleanup_calls.append(model_id)
+            if model_id == "model-a":
+                raise _FakeCancellation("injected: model-a's replaced runtime cleanup interrupted")
+
+        cache = ModelRuntimeCache(
+            max_entries=1, media_limits={"image": 1, "text": 2}, on_evict=mixed_cleanup,
+        )
+        cache.put("model-a", {"id": "model-a", "instance": object()}, media_type="image")
+        cache.put("model-b", {"id": "model-b", "instance": object()}, media_type="text")
+        cache.put("model-c", {"id": "model-c", "instance": object()}, media_type="text")
+        self.assertEqual(set(cache.loaded_ids()), {"model-a", "model-b", "model-c"})
+
+        # Replace model-a's runtime AND move it into "text" -- already at
+        # budget=2 -- forcing both a replace-cleanup and an overflow-
+        # cleanup (evicting the LRU "text" occupant, model-b) in one call.
+        with self.assertRaises(_FakeCancellation):
+            cache.put("model-a", {"id": "model-a", "instance": object()}, media_type="text")
+
+        # Both targets were finalized -- model-b's overflow cleanup ran
+        # too, not skipped just because model-a's raised first.
+        self.assertEqual(cleanup_calls, ["model-a", "model-b"])
+        self.assertNotIn("model-b", cache._entries)
+        self.assertEqual(set(cache.loaded_ids()), {"model-a", "model-c"})
+
+    # ------------------------- bonus 12: reject same-object reinsertion of an INVALID entry
+    def test_put_rejects_same_object_reinsertion_of_an_invalid_entry(self):
+        # Found by the same re-review pass: INVALID is not in
+        # _BUSY_FOR_UNLOAD_STATES, so an unpinned INVALID entry passed the
+        # busy check and reached the same-object fast path -- which
+        # refreshes bucket/LRU position but never restores .state to
+        # READY, so get()/has() kept treating it as absent while it could
+        # still evict a healthy destination-bucket entry for no benefit.
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service({"model-a": manifest_a}, {"fake": loader})
+
+        handle = service.acquire_runtime("model-a", "image")
+        runtime_obj = handle.runtime
+        handle.release(had_exception=True)  # marks INVALID, lease_count back to 0
+        entry = cache._entries["model-a"]
+        self.assertEqual(entry.state, RuntimeState.INVALID)
+        self.assertEqual(entry.lease_count, 0)
+
+        with self.assertRaises(RuntimeBusyError):
+            cache.put("model-a", runtime_obj)  # same object, still INVALID
+
+        self.assertEqual(cache._entries["model-a"].state, RuntimeState.INVALID)
+
+    # ------------------------- bonus 13: acquire_or_reserve never overwrites a concurrent put()
+    def test_acquire_or_reserve_never_overwrites_a_concurrently_republished_target(self):
+        # Found by the same re-review pass: a legacy put() does not
+        # participate in L, so it could republish the exact id
+        # acquire_or_reserve() is trying to reserve while that call's own
+        # victim cleanup was running outside M. The post-cleanup recheck
+        # only checked bucket *capacity* -- if that happened to look fine,
+        # it would blindly overwrite the concurrently published entry,
+        # leaking its runtime with zero cleanup.
+        cleanup_started = Event()
+        cleanup_release = Event()
+
+        def blocking_cleanup(model_id, runtime_obj):
+            cleanup_started.set()
+            assert cleanup_release.wait(timeout=5)
+
+        # budget=1 for "image"; a generous budget=5 for "text" -- the
+        # concurrent put() below republishes "model-b" into "text", a
+        # *different* bucket than the one acquire_or_reserve() is
+        # reserving into ("image"). This is what actually distinguishes
+        # the fix from the old code: if the concurrent put() landed in the
+        # *same* bucket, removing one victim and adding one entry back
+        # nets to exactly the same occupancy either way, so the old
+        # bucket-capacity-only recheck would coincidentally still see (and
+        # reject) the occupied slot -- masking the bug. Publishing into an
+        # unrelated bucket makes the *target id itself* the only thing
+        # that would have caught the collision.
+        cache = ModelRuntimeCache(
+            max_entries=1, media_limits={"image": 1, "text": 5}, on_evict=blocking_cleanup,
+        )
+        cache.put("model-a", {"id": "model-a", "instance": object()}, media_type="image")
+
+        errors: list[BaseException] = []
+        result: dict[str, object] = {}
+
+        def reserver():
+            try:
+                result["entry"] = cache.acquire_or_reserve("model-b", "image")
+            except RuntimeBusyError as exc:
+                result["busy"] = exc
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        t = Thread(target=reserver)
+        t.start()
+        self.assertTrue(cleanup_started.wait(timeout=5))  # model-a's victim cleanup is mid-flight
+
+        # A concurrent legacy put() republishes "model-b" -- the exact id
+        # acquire_or_reserve() is trying to reserve -- while it's outside M,
+        # into a different (spacious) bucket.
+        republished_runtime = {"id": "model-b", "instance": object()}
+        cache.put("model-b", republished_runtime, media_type="text")
+
+        cleanup_release.set()
+        t.join(timeout=5)
+
+        self.assertEqual(errors, [])
+        self.assertNotIn("entry", result)  # never silently overwritten
+        self.assertIsInstance(result.get("busy"), RuntimeBusyError)
+
+        # The concurrently published entry survives, fully intact.
+        self.assertIs(cache._entries["model-b"].runtime, republished_runtime)
+        self.assertEqual(cache._entries["model-b"].state, RuntimeState.READY)
+
+    # ------------------------- bonus 14: deferred overflow eviction on final unpin
+    def test_release_lease_evicts_deferred_overflow_once_the_last_pin_drains(self):
+        # Found by the same re-review pass: legacy put() intentionally
+        # leaves a bucket over budget while every over-budget member is
+        # pinned (pin supremacy). Nothing previously re-triggered eviction
+        # once the last such pin released -- the overage could persist
+        # indefinitely.
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        cleanup = _RecordingCleanup()
+        service, cache = _build_service(
+            {"model-a": manifest_a}, {"fake": loader}, on_evict=cleanup, max_entries=1,
+        )
+
+        handle = service.acquire_runtime("model-a", "image")  # pins model-a
+
+        # A legacy put() overflows the (budget=1) bucket while model-a is
+        # pinned -- pin supremacy leaves the bucket over budget, as designed.
+        cache.put("model-b", {"id": "model-b", "instance": object()})
+        self.assertEqual(set(cache.loaded_ids()), {"model-a", "model-b"})
+        self.assertEqual(cleanup.calls, [])
+
+        # Releasing the last pin on model-a must now retire the deferred
+        # overflow -- model-a itself, being the LRU entry.
+        handle.release()
+
+        self.assertEqual(cleanup.calls, ["model-a"])
+        self.assertEqual(cache.loaded_ids(), ["model-b"])
+
 
 if __name__ == "__main__":
     unittest.main()

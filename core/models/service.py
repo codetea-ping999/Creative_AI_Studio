@@ -658,8 +658,20 @@ class ModelService:
                     if entry.state is RuntimeState.READY:
                         self.runtime_cache.release_lease(manifest.id, entry)
                     else:
-                        self.runtime_cache.dispose_unpublished(manifest.id, runtime_obj)
-                        self.runtime_cache.abort_reservation(manifest.id, entry)
+                        # Codex re-review, found on this round's own fix
+                        # commits: `dispose_unpublished()` -> `_run_cleanup()`
+                        # only swallows `Exception`; a `BaseException`
+                        # escaping the `on_evict` hook itself used to skip
+                        # `abort_reservation()` entirely, leaving this
+                        # entry stuck at `LOADING` forever -- the exact
+                        # failure this branch exists to prevent. The
+                        # `finally` guarantees the reservation is always
+                        # aborted once disposal has been attempted,
+                        # whatever it raised.
+                        try:
+                            self.runtime_cache.dispose_unpublished(manifest.id, runtime_obj)
+                        finally:
+                            self.runtime_cache.abort_reservation(manifest.id, entry)
                     raise
             return entry
         finally:
