@@ -1693,6 +1693,77 @@ class RuntimeSafetyCoreTests(unittest.TestCase):
         # its full capacity (1), never 2 (which a double-release causes).
         self.assertEqual(service._admission._semaphore._value, 1)
 
+    # ------------------------- bonus 9: handle-construction-interrupted unwind
+    def test_acquire_runtime_unwinds_g_lease_and_e_when_handle_construction_fails(self):
+        # Found by a further Codex re-review pass: by the time
+        # `RuntimeHandle(...)` is constructed, G, the lease, and E have all
+        # already been acquired -- but that construction call used to sit
+        # outside every protective try/except. An exception during
+        # `__init__` itself (an async BaseException, a hypothetical
+        # allocation failure, ...) left all three held with no handle ever
+        # created to release them.
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service({"model-a": manifest_a}, {"fake": loader})
+
+        original_init = service_module.RuntimeHandle.__init__
+
+        def failing_init(self, **kwargs):
+            raise _FakeCancellation("injected: interrupted during handle construction")
+
+        service_module.RuntimeHandle.__init__ = failing_init
+        try:
+            with self.assertRaises(_FakeCancellation):
+                service.acquire_runtime("model-a", "image")
+        finally:
+            service_module.RuntimeHandle.__init__ = original_init
+
+        entry = cache._entries["model-a"]
+        self.assertEqual(entry.lease_count, 0)
+        self.assertTrue(entry.execution_lock.acquire(blocking=False))
+        entry.execution_lock.release()
+
+        # G was released too -- a fresh, immediate acquire succeeds.
+        handle = service.acquire_runtime("model-a", "image", wait_timeout=0)
+        try:
+            self.assertIsNotNone(handle.runtime)
+        finally:
+            handle.release()
+
+    # ------------------------- bonus 10: reject same-thread recursive acquisition
+    def test_acquire_runtime_rejects_recursive_acquisition_on_the_same_thread(self):
+        # Found by the same re-review pass: a thread calling
+        # acquire_runtime() again while it already holds a handle from an
+        # earlier, still-open call would otherwise block on G forever --
+        # only that same (now blocked) thread could ever release the slot
+        # it is waiting for -- even for a completely different model_id,
+        # since G is process-wide, not per-canonical-id.
+        manifest_a = _FakeManifest("model-a", loader="fake-a")
+        manifest_b = _FakeManifest("model-b", loader="fake-b")
+        loader_a = _ImmediateLoader()
+        loader_b = _ImmediateLoader()
+        service, cache = _build_service(
+            {"model-a": manifest_a, "model-b": manifest_b},
+            {"fake-a": loader_a, "fake-b": loader_b},
+        )
+
+        handle = service.acquire_runtime("model-a", "image")
+        try:
+            with self.assertRaises(RuntimeError) as cm:
+                service.acquire_runtime("model-b", "image")
+            self.assertNotIsInstance(cm.exception, RuntimeBusyError)
+        finally:
+            handle.release()
+
+        # Once released, a fresh acquisition on this same thread succeeds
+        # normally -- the "held" flag was correctly cleared, not stuck
+        # permanently rejecting this thread.
+        handle2 = service.acquire_runtime("model-b", "image")
+        try:
+            self.assertIsNotNone(handle2.runtime)
+        finally:
+            handle2.release()
+
 
 if __name__ == "__main__":
     unittest.main()

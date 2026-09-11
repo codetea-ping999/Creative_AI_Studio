@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from threading import Lock, Semaphore
+from threading import Lock, Semaphore, local
 from typing import Any
 
 from .cache import ModelRuntimeCache
@@ -81,11 +81,50 @@ class RuntimeAdmissionController:
             raise ValueError(f"admission capacity must be at least 1, got {capacity!r}.")
         self.capacity = capacity
         self._semaphore = Semaphore(capacity)
+        # Codex re-review, found on this round's own fix commits: a thread
+        # that already holds every one of this controller's slots by
+        # itself (its own earlier, still-open `acquire_runtime()` calls
+        # account for all of `capacity`) and then tries to *block* waiting
+        # for one more would deadlock unconditionally -- only that same
+        # thread could ever call `release()` on one of its own handles to
+        # free a slot for itself, and it cannot do that while parked here.
+        # `threading.local()` gives each thread its own, independent
+        # held-slot counter with no extra locking needed (it is inherently
+        # thread-isolated), so this can be checked *before* ever touching
+        # `self._semaphore` and fail fast with a clear error instead of
+        # deadlocking silently. Deliberately narrow: holding *fewer* than
+        # `capacity` slots and acquiring one more is ordinary, legitimate
+        # usage (e.g. a job step that needs two different models loaded at
+        # once, with capacity raised to allow it) -- see
+        # `tests/test_runtime_safety_core.py`'s own `admission_capacity=10`
+        # tests, several of which hold multiple handles from one thread by
+        # design. A non-blocking attempt (`wait_timeout=0`, or any deadline
+        # already in the past) is never rejected here either: it can never
+        # deadlock in the first place, since it fails fast on its own via
+        # `self._semaphore` and returns a plain, retryable busy result.
+        self._held_by_this_thread = local()
+
+    def _held_count(self) -> int:
+        return getattr(self._held_by_this_thread, "count", 0)
 
     def acquire(self, deadline: float | None) -> bool:
-        return _acquire_with_deadline(self._semaphore, deadline)
+        would_block = deadline is None or deadline - time.monotonic() > 0
+        if would_block and self._held_count() >= self.capacity:
+            raise RuntimeError(
+                "Recursive acquire_runtime() call detected: this thread "
+                f"already holds all {self.capacity} process-wide admission "
+                "slot(s) from earlier, still-open acquire_runtime() "
+                "call(s). Release at least one RuntimeHandle before "
+                "acquiring another -- waiting here could never be "
+                "resolved by any other thread."
+            )
+        acquired = _acquire_with_deadline(self._semaphore, deadline)
+        if acquired:
+            self._held_by_this_thread.count = self._held_count() + 1
+        return acquired
 
     def release(self) -> None:
+        self._held_by_this_thread.count = max(0, self._held_count() - 1)
         self._semaphore.release()
 
 
@@ -466,6 +505,28 @@ class ModelService:
         resolve raises `RuntimeBusyError` immediately instead of waiting --
         see `ModelRuntimeCache.acquire_or_reserve()`'s own docstring.
 
+        Do not call this method again, on the same thread, once it already
+        holds every one of G's slots by itself (its own earlier, still-open
+        `acquire_runtime()` calls -- production defaults to
+        `admission_capacity=1`, so ordinarily this means holding even one
+        handle at all) -- release at least one handle first. A *blocking*
+        attempt in that state is rejected immediately with a plain
+        `RuntimeError` (Codex re-review, found on this round's own fix
+        commits): only this same thread could ever release one of its own
+        slots to free room for itself, so waiting here would deadlock it
+        against itself forever. Holding *fewer* than `capacity` slots and
+        acquiring one more is ordinary, legitimate usage (e.g. a job step
+        that needs two different models loaded at once, with capacity
+        raised to allow it), and a non-blocking attempt (`wait_timeout=0`,
+        or any deadline already past) is never rejected this way either --
+        it cannot deadlock, since it already fails fast with an ordinary,
+        retryable `RuntimeBusyError` on its own. Recursing onto the exact
+        same canonical entry's E is not separately detected --
+        `entry.execution_lock` is a plain, non-reentrant `threading.Lock`
+        with no owner-thread bookkeeping of its own -- and will hang the
+        same way acquiring any non-reentrant lock twice on one thread
+        always does; avoid it the same way.
+
         `wait_timeout`, if given, is a *single* overall deadline bounding
         ONLY how long this call waits on contended G/L/E synchronization --
         never reset per lock (a caller cannot wait `wait_timeout` seconds
@@ -505,6 +566,25 @@ class ModelService:
             entry = self._acquire_or_load_entry(manifest, media_type, deadline)
             try:
                 self._acquire_execution_lock(manifest.id, entry, deadline)
+                try:
+                    return RuntimeHandle(
+                        manifest=manifest,
+                        runtime=entry.runtime,
+                        cache=self.runtime_cache,
+                        canonical_id=manifest.id,
+                        entry=entry,
+                        admission=self._admission,
+                    )
+                except BaseException:
+                    # Codex re-review, found on this round's own fix
+                    # commits: G, the lease, and E were all already
+                    # acquired above by the time construction reaches
+                    # here -- an exception during `RuntimeHandle.__init__`
+                    # itself (an async BaseException, a hypothetical
+                    # allocation failure, ...) must not leave any of them
+                    # held with no handle ever created to release them.
+                    entry.execution_lock.release()
+                    raise
             except BaseException:
                 # We hold a lease (a pin) but will never use it -- release it
                 # rather than leaking a lease with no corresponding handle,
@@ -515,15 +595,6 @@ class ModelService:
         except BaseException:
             self._admission.release()
             raise
-
-        return RuntimeHandle(
-            manifest=manifest,
-            runtime=entry.runtime,
-            cache=self.runtime_cache,
-            canonical_id=manifest.id,
-            entry=entry,
-            admission=self._admission,
-        )
 
     def _acquire_or_load_entry(
         self, manifest: ModelManifest, media_type: str, deadline: float | None
