@@ -291,6 +291,11 @@ class RuntimeHandle:
                 self._cache.mark_invalid(self._canonical_id, self._entry)
         finally:
             try:
+                # Cleared before the actual release so no window exists
+                # where E is free but a stale owner id could still match a
+                # same-thread recursive-acquisition check (see
+                # `RuntimeEntry.execution_lock_owner`'s own docstring).
+                self._entry.execution_lock_owner = None
                 self._entry.execution_lock.release()
             finally:
                 try:
@@ -538,11 +543,14 @@ class ModelService:
         or any deadline already past) is never rejected this way either --
         it cannot deadlock, since it already fails fast with an ordinary,
         retryable `RuntimeBusyError` on its own. Recursing onto the exact
-        same canonical entry's E is not separately detected --
-        `entry.execution_lock` is a plain, non-reentrant `threading.Lock`
-        with no owner-thread bookkeeping of its own -- and will hang the
-        same way acquiring any non-reentrant lock twice on one thread
-        always does; avoid it the same way.
+        same canonical entry's E -- reachable with `admission_capacity > 1`,
+        where G alone would not have rejected the attempt -- is also
+        rejected immediately with a plain `RuntimeError`, via
+        `RuntimeEntry.execution_lock_owner` (see `_acquire_execution_lock()`'s
+        own docstring); `entry.execution_lock` is otherwise a plain,
+        non-reentrant `threading.Lock` with no owner-thread bookkeeping of
+        its own, and would hang the same way acquiring any non-reentrant
+        lock twice on one thread always does.
 
         `wait_timeout`, if given, is a *single* overall deadline bounding
         ONLY how long this call waits on contended G/L/E synchronization --
@@ -583,7 +591,7 @@ class ModelService:
         try:
             entry = self._acquire_or_load_entry(manifest, media_type, deadline)
             try:
-                self._acquire_execution_lock(manifest.id, entry, deadline)
+                self._acquire_execution_lock(manifest.id, entry, deadline, owner_thread_id)
                 try:
                     return RuntimeHandle(
                         manifest=manifest,
@@ -602,6 +610,7 @@ class ModelService:
                     # itself (an async BaseException, a hypothetical
                     # allocation failure, ...) must not leave any of them
                     # held with no handle ever created to release them.
+                    entry.execution_lock_owner = None
                     entry.execution_lock.release()
                     raise
             except BaseException:
@@ -702,7 +711,11 @@ class ModelService:
             load_lock.release()
 
     def _acquire_execution_lock(
-        self, canonical_id: str, entry: RuntimeEntry, deadline: float | None
+        self,
+        canonical_id: str,
+        entry: RuntimeEntry,
+        deadline: float | None,
+        owner_thread_id: int,
     ) -> None:
         """Acquire `entry.execution_lock` ("E") and revalidate it afterward.
 
@@ -729,8 +742,36 @@ class ModelService:
         permanent, unrecoverable deadlock on this exact entry for every
         future caller. This method now guarantees E is released on any
         exception it does not itself successfully return past.
+
+        Codex re-review (found on this round's own fix commit, again):
+        with `admission_capacity > 1`, a thread already holding a handle
+        on this exact canonical entry could reach this method a second
+        time (the lease-hit path in `acquire_or_reserve()` has no
+        knowledge of E at all) and then block forever trying to acquire
+        its own already-held, non-reentrant `execution_lock`. Checking
+        `entry.execution_lock_owner` before attempting acquisition fails
+        fast with a clear error instead of deadlocking; see that field's
+        own docstring on `RuntimeEntry` for why this check needs no
+        separate lock of its own. Like the analogous G-level check in
+        `RuntimeAdmissionController.acquire()`, this only fires for a
+        genuinely *blocking* attempt -- a non-blocking one (`deadline`
+        already past) is left to `_acquire_with_deadline()`'s own
+        non-blocking `acquire(blocking=False)`, which fails fast with an
+        ordinary, retryable `RuntimeBusyError` and cannot deadlock either
+        way.
         """
 
+        would_block = deadline is None or deadline - time.monotonic() > 0
+        if would_block and entry.execution_lock_owner == owner_thread_id:
+            raise RuntimeError(
+                f"Recursive acquire_runtime() call detected for {canonical_id!r}: "
+                "this thread already holds exclusive execution access to this "
+                "exact canonical entry from an earlier, still-open "
+                "acquire_runtime() call. Release that RuntimeHandle before "
+                "acquiring it again -- entry.execution_lock is a plain, "
+                "non-reentrant lock, and waiting here would deadlock this "
+                "thread against itself."
+            )
         if not _acquire_with_deadline(entry.execution_lock, deadline):
             raise RuntimeBusyError(
                 f"Timed out waiting for exclusive execution access to {canonical_id!r}."
@@ -744,6 +785,7 @@ class ModelService:
         except BaseException:
             entry.execution_lock.release()
             raise
+        entry.execution_lock_owner = owner_thread_id
 
     # ------------------------------------------------------- canonical unload
 

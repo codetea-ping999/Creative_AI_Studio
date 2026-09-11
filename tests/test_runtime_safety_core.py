@@ -25,7 +25,7 @@ from core.models.cache import ModelRuntimeCache
 from core.models.loader import LoaderRegistry
 from core.models.registry import ModelRegistry
 from core.models.resolver import ModelResolver
-from core.models.runtime_lease import RuntimeBusyError, RuntimeState
+from core.models.runtime_lease import RuntimeBusyError, RuntimeEntry, RuntimeState
 from core.models.service import ModelService, RuntimeAdmissionController
 import core.models.service as service_module
 from core.models.cloud_guard import CloudProviderDisabledError
@@ -1957,6 +1957,76 @@ class RuntimeSafetyCoreTests(unittest.TestCase):
 
         self.assertEqual(cleanup.calls, ["model-a"])
         self.assertEqual(cache.loaded_ids(), ["model-b"])
+
+    # ------------------------- bonus 15: reject recursive acquisition of the same entry
+    def test_acquire_runtime_rejects_recursive_acquisition_of_the_same_entry(self):
+        # Found by a further Codex re-review pass: with
+        # admission_capacity > 1, G alone would not reject a same-thread
+        # second acquisition of the *same* canonical entry -- the
+        # lease-hit path in acquire_or_reserve() has no knowledge of E at
+        # all, so the thread would proceed to block forever trying to
+        # acquire its own already-held, non-reentrant execution_lock.
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service(
+            {"model-a": manifest_a}, {"fake": loader}, admission_capacity=2,
+        )
+
+        handle = service.acquire_runtime("model-a", "image")
+        try:
+            with self.assertRaises(RuntimeError) as cm:
+                service.acquire_runtime("model-a", "image")  # same id, same thread
+            self.assertNotIsInstance(cm.exception, RuntimeBusyError)
+        finally:
+            handle.release()
+
+        # Once released, a fresh acquisition on this same thread succeeds
+        # normally -- the owner marker was correctly cleared, not stuck.
+        handle2 = service.acquire_runtime("model-a", "image")
+        try:
+            self.assertIsNotNone(handle2.runtime)
+        finally:
+            handle2.release()
+
+    # ------------------------- bonus 16: deferred eviction finalizes every victim
+    def test_release_lease_finalizes_every_deferred_victim_even_after_a_base_exception(self):
+        # Found by the same re-review pass: the deferred-overflow-eviction
+        # fix (bonus 14) had no equivalent of put()/unload_all()'s
+        # "finalize everyone before re-raising" guarantee -- an
+        # interrupted first victim's cleanup would strand every later
+        # victim (already marked RETIRING under M) permanently.
+        cleanup_calls: list[str] = []
+
+        def mixed_cleanup(model_id, runtime_obj):
+            cleanup_calls.append(model_id)
+            if model_id == "model-a":
+                raise _FakeCancellation("injected: model-a's deferred cleanup interrupted")
+
+        cache = ModelRuntimeCache(max_entries=1, media_limits={"shared": 1}, on_evict=mixed_cleanup)
+        # Directly construct 3 READY entries sharing one budget=1 bucket --
+        # model-a starts pinned, so put()'s own incremental eviction never
+        # gets a chance to catch up as each one is added. Releasing
+        # model-a's lease must then discover *two* deferred victims
+        # (model-a itself and model-b) in the same pass.
+        entries = {}
+        for model_id in ("model-a", "model-b", "model-c"):
+            entry = RuntimeEntry(
+                model_id, "shared", RuntimeState.READY,
+                generation=0, runtime={"id": model_id},
+            )
+            cache._entries[model_id] = entry
+            entries[model_id] = entry
+        entries["model-a"].lease_count = 1
+
+        with self.assertRaises(_FakeCancellation):
+            cache.release_lease("model-a", entries["model-a"])
+
+        # Both deferred victims were finalized -- model-b's cleanup ran
+        # too, not skipped just because model-a's raised first.
+        self.assertEqual(cleanup_calls, ["model-a", "model-b"])
+        self.assertNotIn("model-a", cache._entries)
+        self.assertNotIn("model-b", cache._entries)
+        self.assertIn("model-c", cache._entries)
 
 
 if __name__ == "__main__":

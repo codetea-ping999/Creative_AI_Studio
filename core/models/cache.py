@@ -660,8 +660,21 @@ class ModelRuntimeCache:
             entry.lease_count = max(0, entry.lease_count - 1)
             if entry.lease_count == 0:
                 deferred_victims = self._evict_bucket_overflow_locked(entry.media_bucket)
+        # Codex re-review, found on this round's own fix commits: every
+        # selected victim must be finalized regardless of an earlier one
+        # raising `BaseException`, exactly like `put()` and `unload_all()`
+        # already guarantee -- otherwise an interrupted first victim's
+        # cleanup would strand every later one (already marked `RETIRING`
+        # above) permanently.
+        first_exception: BaseException | None = None
         for victim_id, victim_entry in deferred_victims:
-            self._finish_retirement(victim_id, victim_entry)
+            try:
+                self._finish_retirement(victim_id, victim_entry)
+            except BaseException as exc:  # noqa: BLE001 - every target must still be attempted; see above
+                if first_exception is None:
+                    first_exception = exc
+        if first_exception is not None:
+            raise first_exception
 
     def mark_invalid(self, canonical_id: str, entry: RuntimeEntry) -> None:
         """Mark `entry` INVALID if it is still current and `READY` (short M).
