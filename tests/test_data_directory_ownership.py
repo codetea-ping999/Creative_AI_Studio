@@ -146,9 +146,20 @@ def test_independent_directories_and_explicit_release(tmp_path):
 
 
 def test_api_owns_directory_before_startup_sync_and_does_not_recover(tmp_path, monkeypatch):
+    # PR3 note: startup recovery (core.jobs.startup_recovery.run_startup_recovery)
+    # now *does* mutate/enqueue jobs on the actual owner's startup -- this
+    # test's own name predates that (classify_job's pre-PR3 docstring: "the
+    # caller must first establish exclusive process ownership ... (a later
+    # PR)"). Its real contract -- ownership exclusivity, and startup work
+    # running exactly once per successful acquire, never for a failed
+    # contender -- is unchanged, so the injection point moves from the old
+    # asset-sync hook to the new startup-recovery hook rather than actually
+    # running recovery here (which would make "nothing changed" no longer
+    # true by design).
     from fastapi.testclient import TestClient
-    from apps.api.main import create_app
+    from apps.api import main as main_module
     from bootstrap import create_application_services
+    from core.jobs.startup_recovery import StartupRecoveryReport
     from core.storage.ownership import DataDirectoryInUseError
     from core.jobs.statuses import JOB_STATUSES
     from tests.test_job_hardening import seed_job
@@ -159,9 +170,14 @@ def test_api_owns_directory_before_startup_sync_and_does_not_recover(tmp_path, m
     jobs = [seed_job(services.job_repository, status, "job_" + status)
             for status in JOB_STATUSES]
     sync_calls = []
-    monkeypatch.setattr(services.asset_repository, "sync_jobs", lambda jobs: sync_calls.append(1))
-    first = create_app(services, start_job_runner=False)
-    second = create_app(services, start_job_runner=False)
+
+    def fake_recovery(*args, **kwargs):
+        sync_calls.append(1)
+        return StartupRecoveryReport()
+
+    monkeypatch.setattr(main_module, "run_startup_recovery", fake_recovery)
+    first = main_module.create_app(services, start_job_runner=False)
+    second = main_module.create_app(services, start_job_runner=False)
     with TestClient(first):
         with pytest.raises(DataDirectoryInUseError), TestClient(second):
             pass
@@ -174,7 +190,7 @@ def test_api_owns_directory_before_startup_sync_and_does_not_recover(tmp_path, m
 
 def test_startup_sync_failure_releases_ownership(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
-    from apps.api.main import create_app
+    from apps.api import main as main_module
     from bootstrap import create_application_services
     from core.storage.ownership import DataDirectoryOwnership
 
@@ -182,12 +198,12 @@ def test_startup_sync_failure_releases_ownership(tmp_path, monkeypatch):
         db_path=tmp_path / "jobs.db", output_dir=tmp_path / "outputs" / "images",
     )
 
-    def fail_sync(jobs):
+    def fail_recovery(*args, **kwargs):
         raise OSError("injected startup failure")
 
-    monkeypatch.setattr(services.asset_repository, "sync_jobs", fail_sync)
+    monkeypatch.setattr(main_module, "run_startup_recovery", fail_recovery)
     with pytest.raises(OSError, match="injected startup failure"):
-        with TestClient(create_app(services, start_job_runner=False)):
+        with TestClient(main_module.create_app(services, start_job_runner=False)):
             pass
     successor = DataDirectoryOwnership(tmp_path)
     successor.acquire()

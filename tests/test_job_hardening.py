@@ -10,7 +10,7 @@ import pytest
 
 from core.jobs import CancellationRegistry, EventBus, JobQueue, JobRunner, JobService
 from core.jobs.schemas import JobRecord
-from core.jobs.statuses import JOB_STATUSES, is_valid_transition
+from core.jobs.statuses import JOB_STATUSES, TERMINAL_JOB_STATUSES, is_valid_transition
 from core.schemas import GenerationRequest, GenerationResult
 from core.storage.repositories.job_repository import JobRecordDecodeError, JobRepository
 from generators.base import BaseGenerator
@@ -1166,3 +1166,299 @@ def test_quarantine_persists_the_original_error_message_when_the_row_becomes_rea
     assert after.progress == 1.0
     assert after.error_message is not None
     assert "progress" in after.error_message
+
+
+# --- PR3 exact-HEAD audit finding P2-3: create-or-reuse under a race ------
+
+
+def test_concurrent_create_or_reuse_job_converges_on_exactly_one_row(tmp_path):
+    """Two callers racing to materialize the same stable child job id (a
+    terminal event handler racing a completion-retry pass over the same
+    Batch item, for instance) must both observe success and leave exactly
+    one persisted row -- not one 500 from an unhandled
+    `sqlite3.IntegrityError` and not two Job rows under one id.
+    """
+
+    job_repository = JobRepository(tmp_path / "jobs.db")
+    job_queue = JobQueue()
+    event_bus = EventBus()
+    job_service = JobService(job_repository, job_queue, event_bus)
+
+    request = GenerationRequest(media_type="image", prompt="shared", model_id="fake")
+    job_id = "job_shared_child"
+    barrier = Barrier(2)
+    results: list[JobRecord] = []
+    errors: list[BaseException] = []
+
+    def _create_or_reuse():
+        try:
+            barrier.wait(timeout=5)
+            results.append(job_service.create_or_reuse_job(job_id, request))
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(_create_or_reuse) for _ in range(2)]
+        for future in futures:
+            future.result(timeout=5)
+
+    assert errors == []
+    assert len(results) == 2
+    assert results[0].id == job_id
+    assert results[1].id == job_id
+    matching_rows = [job for job in job_repository.list() if job.id == job_id]
+    assert len(matching_rows) == 1
+
+
+def test_create_or_reuse_job_still_raises_on_a_genuine_request_mismatch(tmp_path):
+    """The race-safe path (`create_if_absent`) must not silently paper over
+    a real content mismatch -- only a losing caller whose request matches
+    the winner's exactly may reuse the row.
+    """
+
+    job_repository = JobRepository(tmp_path / "jobs.db")
+    job_service = JobService(job_repository, JobQueue(), EventBus())
+    job_id = "job_mismatch"
+    job_service.create_or_reuse_job(
+        job_id, GenerationRequest(media_type="image", prompt="first", model_id="fake")
+    )
+
+    with pytest.raises(ValueError, match="different request"):
+        job_service.create_or_reuse_job(
+            job_id, GenerationRequest(media_type="image", prompt="second", model_id="fake")
+        )
+
+
+# --- PR3 exact-HEAD audit, fourth round, finding 4: index the completion
+# retry predicate ---------------------------------------------------------
+
+
+def _jobs_index_names(db_path) -> set:
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'jobs'"
+        ).fetchall()
+    return {row[0] for row in rows}
+
+
+def test_completion_retry_index_exists_on_a_fresh_database(tmp_path):
+    db_path = tmp_path / "jobs.db"
+    JobRepository(db_path)
+
+    assert "idx_jobs_completion_retry" in _jobs_index_names(db_path)
+
+
+def test_completion_retry_index_is_created_on_a_legacy_database_upgrade(tmp_path):
+    db_path = tmp_path / "jobs.db"
+    # A pre-PR3 database: the `jobs` table exists, but without the
+    # completion_state/completion_error columns -- and therefore without
+    # any index referencing them either -- exactly what a real legacy
+    # database looks like before `_ensure_column()`'s backfill ever runs.
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE jobs (
+                id TEXT PRIMARY KEY,
+                project_id TEXT,
+                media_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                request_json TEXT NOT NULL,
+                result_json TEXT,
+                progress REAL NOT NULL,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+    assert "idx_jobs_completion_retry" not in _jobs_index_names(db_path)
+
+    JobRepository(db_path)  # triggers _initialize()'s migration path
+
+    assert "idx_jobs_completion_retry" in _jobs_index_names(db_path)
+
+
+def test_repeated_job_repository_initialization_is_safe(tmp_path):
+    db_path = tmp_path / "jobs.db"
+    JobRepository(db_path)
+    JobRepository(db_path)  # must not raise, must not duplicate the index
+
+    # SQLite's own implicit `sqlite_autoindex_jobs_1` (for the PRIMARY KEY)
+    # is unrelated to this fix -- only assert our own named index appears
+    # exactly once (a duplicate `CREATE INDEX` with a different internal
+    # name would show up as two entries here).
+    named_indexes = [
+        name for name in _jobs_index_names(db_path) if name == "idx_jobs_completion_retry"
+    ]
+    assert named_indexes == ["idx_jobs_completion_retry"]
+
+
+def test_completion_retry_query_correctness_is_unchanged_by_the_index(tmp_path):
+    repository = JobRepository(tmp_path / "jobs.db")
+
+    def _seed_with_completion(job_id, status, completion_state, created_at):
+        return repository.create(
+            JobRecord(
+                id=job_id,
+                status=status,
+                media_type="image",
+                request=GenerationRequest(media_type="image", prompt="x", model_id="fake"),
+                completion_state=completion_state,
+                created_at=created_at,
+                updated_at=created_at,
+            )
+        )
+
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    older = _seed_with_completion("job_older", "succeeded", "pending", base)
+    newer = _seed_with_completion(
+        "job_newer", "failed", "pending", base.replace(hour=1)
+    )
+    _seed_with_completion(  # excluded: completion_state already "done"
+        "job_done", "succeeded", "done", base.replace(hour=2)
+    )
+    _seed_with_completion(  # excluded: status is not terminal
+        "job_active", "queued", "pending", base.replace(hour=3)
+    )
+
+    results = repository.list_terminal_pending_completion()
+
+    assert [job.id for job in results] == [older.id, newer.id]  # ASC by created_at
+
+
+def test_completion_retry_query_plan_uses_the_new_index(tmp_path):
+    db_path = tmp_path / "jobs.db"
+    JobRepository(db_path)
+
+    placeholders = ", ".join("?" for _ in TERMINAL_JOB_STATUSES)
+    with sqlite3.connect(db_path) as conn:
+        plan_rows = conn.execute(
+            f"""
+            EXPLAIN QUERY PLAN
+            SELECT id FROM jobs
+            WHERE completion_state = 'pending' AND status IN ({placeholders})
+            ORDER BY created_at ASC
+            """,
+            tuple(TERMINAL_JOB_STATUSES),
+        ).fetchall()
+    plan_text = " ".join(str(cell) for row in plan_rows for cell in row)
+
+    assert "idx_jobs_completion_retry" in plan_text
+
+
+# --- PR3 exact-HEAD audit, fifth round, finding 4: validate raw error text
+# before saving the batch ---------------------------------------------------
+
+
+def _seed_bare_job_row(db_path, job_id, *, status="failed"):
+    """Insert a minimal jobs row directly, bypassing `JobRepository.create()`
+    entirely -- so `error_message` can be set to a raw value no normal
+    write path would ever produce.
+    """
+
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO jobs (
+                id, project_id, media_type, status, progress,
+                request_json, result_json, error_message,
+                created_at, updated_at, completion_state, completion_error
+            ) VALUES (?, NULL, 'image', ?, 0.0, '{}', NULL, NULL, ?, ?, 'pending', NULL)
+            """,
+            (job_id, status, now, now),
+        )
+        conn.commit()
+
+
+def test_get_raw_error_message_returns_a_valid_string_unchanged(tmp_path):
+    db_path = tmp_path / "jobs.db"
+    repository = JobRepository(db_path)
+    _seed_bare_job_row(db_path, "job_a")
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE jobs SET error_message = ? WHERE id = ?",
+            ("a perfectly normal error message", "job_a"),
+        )
+        conn.commit()
+
+    assert repository.get_raw_error_message("job_a") == "a perfectly normal error message"
+
+
+def test_get_raw_error_message_returns_none_for_a_null_column(tmp_path):
+    db_path = tmp_path / "jobs.db"
+    repository = JobRepository(db_path)
+    _seed_bare_job_row(db_path, "job_a")
+
+    assert repository.get_raw_error_message("job_a") is None
+
+
+def test_get_raw_error_message_rejects_a_non_text_blob_value(tmp_path):
+    """SQLite's TEXT affinity is a hint, not an enforced constraint -- a
+    `BLOB` storage-class value (e.g. bytes that are not valid UTF-8) can
+    still be written into a TEXT-affinity column and read back as raw
+    `bytes` with no decode error at read time. `get_raw_error_message()`'s
+    `str | None` return-type contract must actually be guaranteed, not
+    merely declared: a caller (`BatchService._recompute()`) assigns this
+    value straight into `BatchItem.error_message`, and letting a `bytes`
+    value leak through would only fail much later, at
+    `BatchRecord.model_dump(mode="json")` -- aborting the very
+    reconciliation pass that was trying to *recover* this row (PR3
+    exact-HEAD audit, fifth round, finding 4).
+    """
+
+    db_path = tmp_path / "jobs.db"
+    repository = JobRepository(db_path)
+    _seed_bare_job_row(db_path, "job_a")
+
+    invalid_utf8_blob = b"\xff\xfe\x00not valid utf-8"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE jobs SET error_message = ? WHERE id = ?",
+            (invalid_utf8_blob, "job_a"),
+        )
+        conn.commit()
+
+    # Confirm the injected value really is stored as a non-text BLOB, not
+    # silently coerced to TEXT by SQLite itself.
+    with sqlite3.connect(db_path) as conn:
+        raw_value = conn.execute(
+            "SELECT error_message FROM jobs WHERE id = ?", ("job_a",)
+        ).fetchone()[0]
+    assert isinstance(raw_value, bytes)
+
+    result = repository.get_raw_error_message("job_a")
+
+    assert isinstance(result, str)
+    assert result != invalid_utf8_blob
+    assert "non-text" in result or "could not be recovered" in result
+
+
+def test_get_raw_error_message_rejects_an_empty_blob(tmp_path):
+    """A zero-length `BLOB` is still a non-text storage class -- SQLite's
+    dynamic typing does not coerce it to an empty string, so it must be
+    rejected the same as any other non-text value, not confused with a
+    legitimately empty (but genuinely `str`) error message.
+    """
+
+    db_path = tmp_path / "jobs.db"
+    repository = JobRepository(db_path)
+    _seed_bare_job_row(db_path, "job_a")
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE jobs SET error_message = ? WHERE id = ?", (b"", "job_a")
+        )
+        conn.commit()
+    with sqlite3.connect(db_path) as conn:
+        raw_value = conn.execute(
+            "SELECT error_message FROM jobs WHERE id = ?", ("job_a",)
+        ).fetchone()[0]
+    assert isinstance(raw_value, bytes)
+
+    result = repository.get_raw_error_message("job_a")
+
+    assert isinstance(result, str)
+    assert result != ""

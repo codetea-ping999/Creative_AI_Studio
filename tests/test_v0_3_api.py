@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest import mock
 
 try:
     from fastapi.testclient import TestClient
@@ -689,6 +690,249 @@ class BatchApiTests(unittest.TestCase):
                 },
             )
             self.assertEqual(missing.status_code, 404)
+
+    def test_create_batch_returns_the_committed_batch_when_materialization_is_exhausted(
+        self,
+    ) -> None:
+        """PR3 exact-HEAD audit, tenth round, finding 1: `POST /batches`
+        is non-idempotent -- if `create_batch()`'s bounded materialization
+        retries are exhausted, the Batch itself is already durably
+        committed (and some children may already be materialized/
+        exposed) before the exception is ever raised. The API must not
+        report a bare 503 that would invite a client to retry the
+        *create* request and mint a second, entirely separate Batch. It
+        must instead return the already-committed batch (202, not 201 or
+        503) so the client continues using the same batch id, and must
+        still run project binding for whatever children already got a
+        stable id.
+        """
+
+        with TemporaryDirectory() as tmp_dir:
+            studio = _Studio(Path(tmp_dir))
+            project_id = studio.client.post(
+                "/projects", json={"name": "Exhaustion test"}
+            ).json()["id"]
+
+            real_authorize = studio.services.batch_service._authorize_and_expose
+
+            def always_unreadable_for_second_item(batch_id_arg, job_id_arg, job_status_arg):
+                current = studio.services.batch_repository.get(batch_id_arg)
+                if current is not None and len(current.items) >= 2:
+                    if job_id_arg == current.items[1].job_id:
+                        return "unreadable"
+                return real_authorize(batch_id_arg, job_id_arg, job_status_arg)
+
+            with mock.patch.object(
+                studio.services.batch_service,
+                "_authorize_and_expose",
+                side_effect=always_unreadable_for_second_item,
+            ):
+                response = studio.client.post(
+                    "/batches",
+                    json={
+                        "spec": {
+                            "name": "two-item-stuck",
+                            "media_type": "text",
+                            "task_type": "story",
+                            "model_id": "template-writer",
+                            "prompt": "premise",
+                            "project_id": project_id,
+                            "params": {"task": "logline"},
+                            "axes": [
+                                {
+                                    "name": "variant",
+                                    "values": [
+                                        {"label": "v1", "patch": {"prompt": "item one"}},
+                                        {"label": "v2", "patch": {"prompt": "item two"}},
+                                    ],
+                                }
+                            ],
+                        }
+                    },
+                )
+
+            self.assertEqual(response.status_code, 202, response.text)
+            batch = response.json()
+            item1_job_id = batch["items"][0]["job_id"]
+            self.assertIsNotNone(item1_job_id)
+
+            # No duplicate Batch was created for this one request.
+            listing = studio.client.get("/batches").json()
+            self.assertEqual(len(listing["items"]), 1)
+            self.assertEqual(listing["items"][0]["id"], batch["id"])
+
+            # The already-materialized child is still bound to the
+            # project -- the exception path must not skip this loop.
+            project_jobs = {
+                job["id"]
+                for job in studio.client.get(f"/projects/{project_id}/jobs").json()["jobs"]
+            }
+            self.assertIn(item1_job_id, project_jobs)
+
+            # The client continues using the SAME committed batch id --
+            # no need to (and no incentive to) submit a new create
+            # request for this same work.
+            reread = studio.client.get(f"/batches/{batch['id']}").json()
+            self.assertEqual(reread["id"], batch["id"])
+
+    def test_create_batch_returns_the_committed_batch_even_when_its_own_reread_fails(
+        self,
+    ) -> None:
+        """PR3 exact-HEAD audit, eleventh round, finding 1: if the exact
+        same storage failure that exhausted materialization ALSO makes
+        `create_batch()`'s own best-effort re-read (used to embed the
+        freshest record into `BatchStageMaterializationError`) return
+        `None`, the route must still return the committed batch's
+        identity -- never fall back to a bare 503 that would invite a
+        duplicate-creating retry. The route itself performs no read of
+        its own anymore (it uses `exc.record` directly), so this is
+        really proving `create_batch()`'s own guarantee that `record` is
+        never `None` even in this worst case.
+        """
+
+        with TemporaryDirectory() as tmp_dir:
+            studio = _Studio(Path(tmp_dir))
+
+            def always_unreadable(batch_id_arg, job_id_arg, job_status_arg):
+                return "unreadable"
+
+            def always_none(batch_id_arg):
+                return None
+
+            with mock.patch.object(
+                studio.services.batch_service,
+                "_authorize_and_expose",
+                side_effect=always_unreadable,
+            ), mock.patch.object(
+                studio.services.batch_repository, "get", side_effect=always_none
+            ):
+                response = studio.client.post(
+                    "/batches",
+                    json={
+                        "spec": {
+                            "name": "single",
+                            "media_type": "text",
+                            "task_type": "story",
+                            "model_id": "template-writer",
+                            "prompt": "premise",
+                            "params": {"task": "logline"},
+                        }
+                    },
+                )
+
+            self.assertEqual(response.status_code, 202, response.text)
+            batch = response.json()
+            self.assertTrue(batch["id"].startswith("batch_"))
+
+            # No duplicate Batch, and the client's own batch id from the
+            # 202 response is the one and only committed record.
+            listing = studio.client.get("/batches").json()
+            self.assertEqual(len(listing["items"]), 1)
+            self.assertEqual(listing["items"][0]["id"], batch["id"])
+
+    def test_create_batch_permanent_failure_still_names_the_committed_batch_id(
+        self,
+    ) -> None:
+        """Codex exact-HEAD audit, eleventh round, adversarial follow-up
+        to finding 1: `UnsupportedReferenceError`/`MissingReferenceAssetError`
+        /a plain `ValueError` raised from inside stage-0 materialization
+        (not the ambiguous-retry-exhausted case finding 1 itself covers)
+        can ALSO fire after the Batch was already durably committed --
+        these shared, widely-reused exception types otherwise carry no
+        batch identity at all, so a client retrying blindly after a bare
+        422/400 could mint a second, separate batch for the identical
+        permanent failure. The route must name the already-committed
+        batch id in the error detail so the client knows not to resubmit.
+        """
+
+        with TemporaryDirectory() as tmp_dir:
+            studio = _Studio(Path(tmp_dir))
+
+            def always_permanent(*args, **kwargs):
+                raise ValueError("injected: permanent content mismatch")
+
+            with mock.patch.object(
+                studio.services.job_service,
+                "create_or_reuse_job_without_enqueue",
+                side_effect=always_permanent,
+            ):
+                response = studio.client.post(
+                    "/batches",
+                    json={
+                        "spec": {
+                            "name": "single",
+                            "media_type": "text",
+                            "task_type": "story",
+                            "model_id": "template-writer",
+                            "prompt": "premise",
+                            "params": {"task": "logline"},
+                        }
+                    },
+                )
+
+            self.assertEqual(response.status_code, 400, response.text)
+            detail = response.json()["detail"]
+            self.assertIn("injected: permanent content mismatch", detail)
+            self.assertIn("was already created", detail)
+
+            # The batch really was committed -- named in the error, and
+            # independently confirmed via the listing.
+            listing = studio.client.get("/batches").json()
+            self.assertEqual(len(listing["items"]), 1)
+            self.assertIn(listing["items"][0]["id"], detail)
+
+    def test_create_batch_pre_commit_reference_failure_names_no_batch_id(
+        self,
+    ) -> None:
+        """The preflight reference check runs BEFORE the Batch record is
+        ever committed -- its own `UnsupportedReferenceError`/
+        `MissingReferenceAssetError` must never be mistaken for the
+        post-commit case above and must never claim a batch id that does
+        not exist.
+        """
+
+        with TemporaryDirectory() as tmp_dir:
+            studio = _Studio(Path(tmp_dir))
+
+            response = studio.client.post(
+                "/batches",
+                json={
+                    "spec": {
+                        "name": "single",
+                        "media_type": "image",
+                        "model_id": "template-diffusion",
+                        "prompt": "x",
+                        "references": [
+                            {"kind": "image", "asset_id": "asset_does_not_exist"}
+                        ],
+                    }
+                },
+            )
+
+            self.assertEqual(response.status_code, 422, response.text)
+            detail = response.json()["detail"]
+            self.assertNotIn("was already created", detail)
+            listing = studio.client.get("/batches").json()
+            self.assertEqual(len(listing["items"]), 0)
+
+    def test_openapi_schema_documents_the_runtime_202_response(self) -> None:
+        """PR3 exact-HEAD audit, eleventh round, finding 8: round 10
+        added a genuine runtime 202 response for `POST /batches`
+        (materialization exhausted but the Batch is durably committed)
+        without declaring it in the route's OpenAPI metadata -- a
+        generated client or response validator would be told a
+        successful create can only ever be 201, even though 202 is a
+        real, documented-by-code-comment-only runtime outcome.
+        """
+
+        with TemporaryDirectory() as tmp_dir:
+            studio = _Studio(Path(tmp_dir))
+            schema = studio.client.get("/openapi.json").json()
+            responses = schema["paths"]["/batches"]["post"]["responses"]
+            self.assertIn("201", responses)
+            self.assertIn("202", responses)
+            ref = responses["202"]["content"]["application/json"]["schema"]["$ref"]
+            self.assertTrue(ref.endswith("/BatchResponse"), ref)
 
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"missing dependency: {IMPORT_ERROR}")

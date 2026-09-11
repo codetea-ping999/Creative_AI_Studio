@@ -214,6 +214,14 @@ class BatchRecord(BaseModel):
     # reverting a batch that was explicitly marked failed back to
     # `running` on the very next `GET`.
     advance_error: str | None = None
+    # PR3: durable cancellation intent, set the instant `cancel()` is
+    # called -- *before* any child job is actually told to cancel. A
+    # process restart (or a crash mid-cancel) must be able to tell "this
+    # batch was asked to stop" apart from "this batch just hasn't advanced
+    # yet" without relying on any child having already reached
+    # cancel_requested/cancelled: this flag is the source of truth for
+    # "suppress new stage/child creation", independent of child state.
+    cancellation_requested: bool = False
     created_at: datetime
     updated_at: datetime
 
