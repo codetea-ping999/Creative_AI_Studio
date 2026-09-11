@@ -148,6 +148,97 @@ cache = ModelRuntimeCache(
 設定手順・推奨メモリバジェットは `docs/configuration.md` の
 「per-media runtime cache（#182）」節を参照してください。
 
+## Runtime Safety Core（Issue #414, PR4a）
+
+`ModelRuntimeCache` は canonical id（`manifest.id`）ごとに `RuntimeEntry` を
+1 つ持ちます。`runtime` オブジェクトそのものと、状態・pin 数・実行排他 lock
+を分離したことで、「同じ runtime を 2 箇所が同時に使っている」「pin 中の
+runtime が evict される」といった race を型として塞いでいます。
+
+### RuntimeEntry の state
+
+| state | 意味 |
+| --- | --- |
+| `LOADING` | slot は予約済みだが `runtime` は未公開。取得不可 |
+| `READY` | 通常の cached runtime。pin 済みでのみ handle として公開される |
+| `INVALID` | 新規 caller へは公開しない。既存 lease の unwind 待ち |
+| `RETIRING` | cleanup owner が確定済み。新規 acquire/load/replace 不可 |
+
+### 2 系統の API
+
+- 既存の `get()` / `put()` / `unload()` / `unload_all()` / `resolve_runtime()`
+  / `get_runtime()` は外部からの挙動を変えていません（PR4a はキャッシュの
+  内部表現を `RuntimeEntry` に統一しただけ）。ただし **lease を取らない**
+  ため concurrency-safe ではなく、legacy / transitional API です。PR4b で
+  generator 側をすべて `acquire_runtime()` へ移行するまでの互換維持用と
+  位置づけます。新規呼び出しをここへ追加しないでください
+- 新しい `ModelService.acquire_runtime(model_id, media_type, task_type=None,
+  *, timeout=None) -> RuntimeHandle` が安全な取得経路です
+
+```python
+with model_service.acquire_runtime(model_id, media_type, task_type) as handle:
+    manifest = handle.manifest
+    runtime = handle.runtime
+    ...  # generate
+```
+
+`RuntimeHandle` は「取得している間、この canonical entry を排他的に使える」
+ことを保証します。同じ entry を 2 つの caller が同時に取得しても、実行は
+必ず直列化されます（fake runtime を使った決定的 concurrency test は
+`tests/test_runtime_safety_core.py` を参照）。
+
+### lock / admission の順序
+
+- `G`：processごとに1つだけのadmission semaphore（既定capacity=1）。
+  「重いruntimeのload」と「実行」はPR4aでは同じ1枠を共有します
+- `L`：canonical idごとのload lock（`ModelRuntimeCache.lock_for()`。
+  PR4a以前から存在するlockをそのまま再利用）
+- `E`：`RuntimeEntry.execution_lock`。1entryにつき1つ、排他実行を保証
+- `M`：`ModelRuntimeCache._metadata_lock`。entryのstate・lease数・
+  LRU順序だけを守る、短命なlock
+
+取得順は常に`G -> L -> E`。`M`は単独の短いprobeとしてのみ使い、
+G/L/Eを待っている間は絶対に保持しません（loader.load()やcleanup
+callbackをM保持中に呼ぶことも禁止）。解放順は`E -> M`（lease減算・
+state更新）`-> G`です。この順序が崩れない限り、この4資源の組み合わせで
+自己deadlockは起きません。
+
+### capacityはloadの前に確保する
+
+cache miss時、`loader.load()`を呼ぶ前に:
+
+1. 既存READY entryがあればpinして終了（hit）
+2. なければbudgetを確認し、unleasedなvictimを1つ選ぶ
+3. victimが無くcapacityが必要なら即座に`RuntimeBusyError`
+   （`loader.load()`は0回、victim cleanupも0回、無期限waitはしない）
+4. victimを`RETIRING`にしてMを解放し、cleanupをMの外で実行
+5. LOADINGの予約を作ってから`loader.load()`を呼ぶ
+6. 成功したらREADY化と最初のpinを同じM区間で行う。失敗したら
+   予約を破棄し、G/L/leaseを一切残さない
+
+新旧runtimeが同時にメモリ上へ存在する時間を作らないための設計です。
+
+### unloadのcontract
+
+- `ModelService.unload_model(model_id)`はpublic id・alias・manifest id
+  のどれを渡してもresolverを経由し、同じcanonical entryを対象にします
+  （PR4a以前はaliasを渡すとcache keyが一致せず無言でno-opしていた
+  bugの修正でもあります）
+- 対象がleased・loading・retiringなら`RuntimeBusyError`。runtimeは
+  一切変更されません。未loadなら安全なno-op
+- `unload_all()`はatomic preflight：1つでもbusyなentryがあれば
+  全体を`RuntimeBusyError`とし、状態変更もcleanup呼び出しも0件。
+  全entryがidleと確認できてはじめて、Mの同じ区間内で一括
+  `RETIRING`化し、M解放後にcleanupします（cleanup自体はbest-effort
+  のままで、rollback保証ではありません）
+
+### 未解決のscope（PR4b）
+
+productionの5generator移行、semantic classifier、legacy raw-runtime
+APIの利用制限、generator側のcancellation/error統合、PR3との
+end-to-end回帰確認はPR4bのscopeです。PR4a完了時点でも
+production WorkerPoolと`JOB_LANES`のproduction活用は無効のままです。
+
 ## Image Provider Credentials（Issue #257）
 
 `generators/image/providers.py` はクラウド image provider の credential を、
