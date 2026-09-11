@@ -324,6 +324,25 @@ class RuntimeHandle:
         # `__init__`) and `release()`'s docstring for why a concurrent
         # `release()` waits on this rather than racing ahead the instant
         # it observes `_entered` already `True`.
+        #
+        # Known, accepted limitation (Codex re-review, this round): a
+        # concurrent `release()` woken by this exact `.set()` call can
+        # still race ahead of this method's own, immediately-following
+        # `return self` -- there is no operation this method can perform
+        # that is simultaneously "signal a waiter it may proceed" and
+        # "this thread has fully returned control to its caller", since
+        # those are necessarily two separate statements. Moving the
+        # signal even later (there is nowhere later to move it -- this is
+        # already the last statement before the return) cannot close this;
+        # it is the same structural class as the other instruction-
+        # boundary windows documented on `_acquire_with_deadline()` and
+        # `release()` itself, just reachable via ordinary GIL scheduling
+        # rather than an async exception. Closing it completely would
+        # need either OS-level scheduling control over this exact handoff
+        # or the `with`-body itself acknowledging activation back to
+        # `release()` -- a fundamentally different, caller-cooperating
+        # design, not a fix to this method -- so it is documented here
+        # rather than chased further.
         self._enter_committed.set()
         return self
 
@@ -442,6 +461,16 @@ class RuntimeHandle:
         vanishingly-rare async-interruption class documented above, and
         this method still proceeds (rather than hanging forever) if it is
         ever actually hit.
+
+        Known, accepted limitation (Codex re-review, this round): waking
+        from `_enter_committed.wait()` only proves `__enter__()` has
+        called `.set()`, not that it has finished its own, immediately
+        following `return self` -- this thread can still race ahead of
+        that final statement and complete its own unwind before the
+        entering thread's caller actually regains control. See
+        `__enter__()`'s own docstring, at its `_enter_committed.set()`
+        call, for why this specific residual gap cannot be closed by
+        moving the signal, and is documented rather than chased further.
         """
 
         with self._release_guard:
