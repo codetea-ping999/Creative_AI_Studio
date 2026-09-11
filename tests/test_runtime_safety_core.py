@@ -2336,6 +2336,137 @@ class RuntimeSafetyCoreTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertIsInstance(enter_result.get("error"), RuntimeError)
 
+    # ------------------------- bonus 23: avoid evicting behind an in-flight retirement
+    def test_acquire_or_reserve_denies_rather_than_evicting_behind_a_retirement(self):
+        # Found by a further Codex re-review pass: _select_capacity_victim_locked()
+        # denied a request only when *every* candidate was pinned/mid-
+        # transition -- but if a healthy, evictable entry was ALSO present
+        # alongside an unrelated in-flight retirement (someone else's
+        # unload(), cleanup still running), it evicted that healthy entry
+        # instead of recognizing the in-flight retirement was already
+        # about to free the needed capacity on its own.
+        cleanup_started = Event()
+        cleanup_release = Event()
+        cleanup_calls: list[str] = []
+
+        def cleanup(model_id, runtime_obj):
+            cleanup_calls.append(model_id)
+            if model_id == "model-a":
+                cleanup_started.set()
+                assert cleanup_release.wait(timeout=5)
+
+        cache = ModelRuntimeCache(max_entries=2, on_evict=cleanup)
+        cache.put("model-a", {"id": "model-a"})
+        cache.put("model-b", {"id": "model-b"})
+
+        errors: list[BaseException] = []
+
+        def unload_a():
+            try:
+                cache.unload("model-a")
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        t = Thread(target=unload_a)
+        t.start()
+        self.assertTrue(cleanup_started.wait(timeout=5))
+        self.assertEqual(cache._entries["model-a"].state, RuntimeState.RETIRING)
+
+        # A concurrent reservation for a NEW id must not evict the healthy
+        # "model-b" just to compensate for capacity "model-a"'s own
+        # in-flight retirement is already freeing.
+        with self.assertRaises(RuntimeBusyError):
+            cache.acquire_or_reserve("model-c", None)
+        self.assertTrue(cache.has("model-b"))  # survives, untouched
+
+        cleanup_release.set()
+        t.join(timeout=5)
+        self.assertEqual(errors, [])
+
+        # Once model-a's retirement has actually finished, capacity is
+        # genuinely available and the same request succeeds cleanly.
+        entry = cache.acquire_or_reserve("model-c", None)
+        self.assertEqual(entry.state, RuntimeState.LOADING)
+        self.assertEqual(sorted(cache._entries.keys()), ["model-b", "model-c"])
+
+    # ------------------------- bonus 24: __enter__ hands off before release() proceeds
+    def test_enter_hands_off_before_release_can_tear_down_resources(self):
+        # Found by a further Codex re-review pass on the __enter__/release()
+        # guard sharing (bonus 22): sharing _release_guard closes the
+        # check-and-set race on _released/_entered themselves, but
+        # __enter__() still exits that guard *before* returning `self` to
+        # its caller. An ordinary thread switch in that last, tiny gap
+        # (routine scheduling, no exception needed) could let a concurrent
+        # cross-thread release() run to completion first, so the entering
+        # thread would resume and hand its caller a handle whose E/lease/G
+        # are already gone.
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service({"model-a": manifest_a}, {"fake": loader})
+
+        handle = service.acquire_runtime("model-a", "image")
+        entry = handle._entry
+
+        enter_paused = Event()
+        let_enter_continue = Event()
+        original_set = handle._enter_committed.set
+
+        def pausing_set():
+            enter_paused.set()
+            assert let_enter_continue.wait(timeout=5)
+            original_set()
+
+        handle._enter_committed.set = pausing_set
+
+        release_waiting = Event()
+        original_wait = handle._enter_committed.wait
+
+        def signaling_wait(timeout=None):
+            release_waiting.set()
+            return original_wait(timeout=timeout)
+
+        handle._enter_committed.wait = signaling_wait
+
+        enter_result: dict[str, object] = {}
+
+        def enter_worker():
+            try:
+                handle.__enter__()
+                enter_result["entered"] = True
+            except RuntimeError as exc:
+                enter_result["error"] = exc
+
+        te = Thread(target=enter_worker)
+        te.start()
+        # __enter__() has already committed _entered=True (exited its half
+        # of the shared guard) and is now paused right before signaling
+        # completion.
+        self.assertTrue(enter_paused.wait(timeout=5))
+
+        errors: list[BaseException] = []
+
+        def release_worker():
+            try:
+                handle.release()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        tr = Thread(target=release_worker)
+        tr.start()
+        # release() has reached (and is now blocked in) its own wait on
+        # _enter_committed -- a genuine synchronization point, not a
+        # timing guess -- so it cannot have torn down any resource yet.
+        self.assertTrue(release_waiting.wait(timeout=5))
+        self.assertEqual(entry.lease_count, 1)
+
+        let_enter_continue.set()
+        te.join(timeout=5)
+        tr.join(timeout=5)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(enter_result.get("entered"), True)
+        self.assertEqual(entry.lease_count, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

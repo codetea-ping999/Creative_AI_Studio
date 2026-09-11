@@ -748,6 +748,16 @@ class ModelRuntimeCache:
         the exact same "never wait" rule: nothing here can wait for that
         cleanup to finish without violating it. The caller may simply
         retry.
+
+        Codex re-review, found on this round's own fix commits: denying
+        is not the same as evicting a *further*, unrelated healthy entry
+        to compensate for capacity an in-flight retirement is already in
+        the process of freeing on its own. If the bucket would already be
+        within budget once every currently-`RETIRING` entry finishes,
+        this raises `RuntimeBusyError` (retry once they finish) instead of
+        falling through to the eviction search below and sacrificing a
+        second, perfectly healthy entry that was never actually short on
+        room.
         """
 
         budget = self.media_limits.get(bucket, self.max_entries)
@@ -757,6 +767,18 @@ class ModelRuntimeCache:
         ]
         if len(bucket_ids) < budget:
             return None, None
+
+        retiring_count = sum(
+            1 for entry_id in bucket_ids
+            if self._entries[entry_id].state is RuntimeState.RETIRING
+        )
+        if len(bucket_ids) - retiring_count < budget:
+            raise RuntimeBusyError(
+                f"Capacity for {budget_for!r} in bucket {bucket!r} is "
+                f"already being freed by {retiring_count} in-flight "
+                "retirement(s); retry shortly rather than evicting an "
+                "unrelated entry."
+            )
 
         evictable = [
             entry_id for entry_id in bucket_ids

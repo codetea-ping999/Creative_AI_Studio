@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from threading import Lock, Semaphore, Thread, current_thread
+from threading import Event, Lock, Semaphore, Thread, current_thread
 from typing import Any
 
 from .cache import ModelRuntimeCache
@@ -239,6 +239,7 @@ class RuntimeHandle:
         "_released",
         "_release_guard",
         "_entered",
+        "_enter_committed",
     )
 
     def __init__(
@@ -268,6 +269,18 @@ class RuntimeHandle:
         self._released = False
         self._release_guard = Lock()
         self._entered = False
+        # Codex re-review, found on this round's own fix commits: sharing
+        # `_release_guard` between `__enter__()` and `release()` closes the
+        # check-and-set race, but `__enter__()` still exits that guard
+        # *before* returning `self` to its caller -- an ordinary thread
+        # switch in that last, tiny gap could let a concurrent cross-thread
+        # `release()` (an explicitly supported pattern) run to completion,
+        # after which `__enter__()` resumes and hands back a handle whose
+        # E/lease/G are already gone. `release()` waits on this `Event`
+        # before tearing anything down whenever it observes `_entered` is
+        # already `True` -- see `release()`'s own docstring for why this
+        # wait is bounded and does not reintroduce an unbounded wait.
+        self._enter_committed = Event()
 
     def __enter__(self) -> "RuntimeHandle":
         # Codex re-review, found on this round's own fix commits: this
@@ -306,6 +319,12 @@ class RuntimeHandle:
                     "using them."
                 )
             self._entered = True
+        # Signaled *after* releasing the guard, immediately before
+        # returning -- see `_enter_committed`'s own docstring (on
+        # `__init__`) and `release()`'s docstring for why a concurrent
+        # `release()` waits on this rather than racing ahead the instant
+        # it observes `_entered` already `True`.
+        self._enter_committed.set()
         return self
 
     def __exit__(
@@ -402,15 +421,39 @@ class RuntimeHandle:
         acquire-then-own transition, which is outside PR4a's scope (see
         `_acquire_with_deadline()`'s own docstring for the same
         conclusion on the acquiring side of this exact class of window).
+
+        Codex re-review (found on this round's own fix commits, once
+        more): sharing `_release_guard` with `__enter__()` closes the
+        check-and-set race on `_released`/`_entered` themselves, but
+        `__enter__()` still exits that guard *before* returning `self` to
+        its caller -- an ordinary thread switch in that last, tiny gap
+        (no exception needed this time, just routine scheduling) could
+        let this method run to completion first, so the entering thread
+        would resume and hand its caller a handle whose E/lease/G are
+        already gone. So immediately after this method's own guard
+        section observes `self._entered` is already `True`, it waits on
+        `_enter_committed` -- the `Event` `__enter__()` sets as its own
+        very last step -- before touching any resource. This is bounded,
+        not a new "wait indefinitely" hazard: once `_entered` reads
+        `True`, `__enter__()` has already exited its half of the shared
+        guard and has nothing left to do but signal and return, so the
+        wait is satisfied within a handful of instructions in every
+        realistic case; the timeout is a pure safety net against the same
+        vanishingly-rare async-interruption class documented above, and
+        this method still proceeds (rather than hanging forever) if it is
+        ever actually hit.
         """
 
         with self._release_guard:
             already_released = self._released
             self._released = True
+            entered = self._entered
             if had_exception:
                 self._cache.mark_invalid(self._canonical_id, self._entry)
         if already_released:
             return
+        if entered:
+            self._enter_committed.wait(timeout=5.0)
         try:
             # Cleared before the actual release so no window exists
             # where E is free but a stale owner id could still match a
