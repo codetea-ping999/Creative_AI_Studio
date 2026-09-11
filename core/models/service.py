@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from threading import Lock, Semaphore, local
+from threading import Lock, Semaphore, get_ident
 from typing import Any
 
 from .cache import ModelRuntimeCache
@@ -86,30 +86,32 @@ class RuntimeAdmissionController:
         # itself (its own earlier, still-open `acquire_runtime()` calls
         # account for all of `capacity`) and then tries to *block* waiting
         # for one more would deadlock unconditionally -- only that same
-        # thread could ever call `release()` on one of its own handles to
-        # free a slot for itself, and it cannot do that while parked here.
-        # `threading.local()` gives each thread its own, independent
-        # held-slot counter with no extra locking needed (it is inherently
-        # thread-isolated), so this can be checked *before* ever touching
-        # `self._semaphore` and fail fast with a clear error instead of
-        # deadlocking silently. Deliberately narrow: holding *fewer* than
-        # `capacity` slots and acquiring one more is ordinary, legitimate
-        # usage (e.g. a job step that needs two different models loaded at
-        # once, with capacity raised to allow it) -- see
-        # `tests/test_runtime_safety_core.py`'s own `admission_capacity=10`
-        # tests, several of which hold multiple handles from one thread by
-        # design. A non-blocking attempt (`wait_timeout=0`, or any deadline
-        # already in the past) is never rejected here either: it can never
-        # deadlock in the first place, since it fails fast on its own via
-        # `self._semaphore` and returns a plain, retryable busy result.
-        self._held_by_this_thread = local()
-
-    def _held_count(self) -> int:
-        return getattr(self._held_by_this_thread, "count", 0)
+        # thread could ever release one of its own slots to free room for
+        # itself, and it cannot do that while parked here.
+        #
+        # Ownership is tracked by *acquiring* thread id in a plain dict
+        # guarded by `_held_lock`, deliberately NOT `threading.local()`:
+        # this codebase explicitly supports releasing a `RuntimeHandle`
+        # from a different thread than the one that acquired it (a
+        # cancellation/cleanup thread finishing up after a worker thread --
+        # see `RuntimeHandle`'s own `_owner_thread_id`, captured at
+        # acquisition time and threaded through to this class's `release()`
+        # so the *original* acquirer's count is what gets decremented, not
+        # whichever thread happens to call `release()`). A first version of
+        # this used `threading.local()`, which cannot be updated for
+        # another thread at all -- a cross-thread release left the
+        # original acquiring thread's local counter permanently stuck,
+        # rejecting its next, perfectly legitimate acquisition (Codex
+        # re-review caught this too).
+        self._held_lock = Lock()
+        self._held_by_thread: dict[int, int] = {}
 
     def acquire(self, deadline: float | None) -> bool:
+        thread_id = get_ident()
         would_block = deadline is None or deadline - time.monotonic() > 0
-        if would_block and self._held_count() >= self.capacity:
+        with self._held_lock:
+            held = self._held_by_thread.get(thread_id, 0)
+        if would_block and held >= self.capacity:
             raise RuntimeError(
                 "Recursive acquire_runtime() call detected: this thread "
                 f"already holds all {self.capacity} process-wide admission "
@@ -120,11 +122,17 @@ class RuntimeAdmissionController:
             )
         acquired = _acquire_with_deadline(self._semaphore, deadline)
         if acquired:
-            self._held_by_this_thread.count = self._held_count() + 1
+            with self._held_lock:
+                self._held_by_thread[thread_id] = self._held_by_thread.get(thread_id, 0) + 1
         return acquired
 
-    def release(self) -> None:
-        self._held_by_this_thread.count = max(0, self._held_count() - 1)
+    def release(self, owner_thread_id: int) -> None:
+        with self._held_lock:
+            current = self._held_by_thread.get(owner_thread_id, 0)
+            if current > 1:
+                self._held_by_thread[owner_thread_id] = current - 1
+            else:
+                self._held_by_thread.pop(owner_thread_id, None)
         self._semaphore.release()
 
 
@@ -180,6 +188,7 @@ class RuntimeHandle:
         "_canonical_id",
         "_entry",
         "_admission",
+        "_owner_thread_id",
         "_released",
         "_release_guard",
     )
@@ -193,6 +202,7 @@ class RuntimeHandle:
         canonical_id: str,
         entry: RuntimeEntry,
         admission: RuntimeAdmissionController,
+        owner_thread_id: int,
     ) -> None:
         self.manifest = manifest
         self.runtime = runtime
@@ -200,6 +210,13 @@ class RuntimeHandle:
         self._canonical_id = canonical_id
         self._entry = entry
         self._admission = admission
+        # The thread that originally acquired G for this handle -- not
+        # necessarily whichever thread calls `release()` (a cancellation/
+        # cleanup thread may release a handle a different worker thread
+        # acquired). `RuntimeAdmissionController.release()` needs this
+        # exact id to credit the release back to its true owner; see that
+        # class's own docstring for why `threading.local()` cannot do this.
+        self._owner_thread_id = owner_thread_id
         self._released = False
         self._release_guard = Lock()
 
@@ -279,7 +296,7 @@ class RuntimeHandle:
                 try:
                     self._cache.release_lease(self._canonical_id, self._entry)
                 finally:
-                    self._admission.release()
+                    self._admission.release(self._owner_thread_id)
 
 
 class ModelService:
@@ -555,6 +572,7 @@ class ModelService:
             ensure_cloud_provider_enabled(manifest.id)
 
         deadline = None if wait_timeout is None else time.monotonic() + wait_timeout
+        owner_thread_id = get_ident()
 
         if not self._admission.acquire(deadline):
             raise RuntimeBusyError(
@@ -574,6 +592,7 @@ class ModelService:
                         canonical_id=manifest.id,
                         entry=entry,
                         admission=self._admission,
+                        owner_thread_id=owner_thread_id,
                     )
                 except BaseException:
                     # Codex re-review, found on this round's own fix
@@ -593,7 +612,12 @@ class ModelService:
                 self.runtime_cache.release_lease(manifest.id, entry)
                 raise
         except BaseException:
-            self._admission.release()
+            # This unwind always runs on the same thread that just called
+            # `self._admission.acquire()` above (no handle has been handed
+            # to any other thread yet), so `owner_thread_id` is trivially
+            # this call's own -- unlike `RuntimeHandle.release()`, which
+            # may run on a different thread than the one that acquired.
+            self._admission.release(owner_thread_id)
             raise
 
     def _acquire_or_load_entry(

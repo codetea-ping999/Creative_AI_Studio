@@ -1764,6 +1764,49 @@ class RuntimeSafetyCoreTests(unittest.TestCase):
         finally:
             handle2.release()
 
+    # ------------------------- bonus 10b: cross-thread release credits the true owner
+    def test_admission_release_credits_the_original_acquiring_thread_not_the_releaser(self):
+        # Found by Codex's re-review of bonus 10 above: a first version of
+        # the recursion guard tracked "does this thread hold a slot" via
+        # threading.local(), which cannot be updated for another thread at
+        # all. Releasing a handle from a different thread than the one
+        # that acquired it (a supported, already-tested pattern -- see the
+        # concurrent-release test) left the *original* acquiring thread's
+        # local counter permanently stuck at "holding", so its next,
+        # perfectly legitimate acquisition was wrongly rejected as
+        # recursive.
+        manifest_a = _FakeManifest("model-a", loader="fake-a")
+        manifest_b = _FakeManifest("model-b", loader="fake-b")
+        loader_a = _ImmediateLoader()
+        loader_b = _ImmediateLoader()
+        service, cache = _build_service(
+            {"model-a": manifest_a, "model-b": manifest_b},
+            {"fake-a": loader_a, "fake-b": loader_b},
+        )
+
+        handle = service.acquire_runtime("model-a", "image")  # acquired on THIS (main) thread
+
+        errors: list[BaseException] = []
+
+        def releaser():
+            try:
+                handle.release()  # released on a DIFFERENT thread
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        t = Thread(target=releaser)
+        t.start()
+        t.join(timeout=5)
+        self.assertEqual(errors, [])
+
+        # A fresh acquisition on the ORIGINAL (main) thread must succeed
+        # normally -- not be wrongly rejected as a recursive acquisition.
+        handle2 = service.acquire_runtime("model-b", "image")
+        try:
+            self.assertIsNotNone(handle2.runtime)
+        finally:
+            handle2.release()
+
     # ------------------------- bonus 11: put() finalizes every victim under BaseException
     def test_put_finalizes_all_victims_even_after_a_base_exception(self):
         # Found by a further Codex re-review pass: put()'s own
