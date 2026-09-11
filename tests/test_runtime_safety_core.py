@@ -2028,6 +2028,71 @@ class RuntimeSafetyCoreTests(unittest.TestCase):
         self.assertNotIn("model-b", cache._entries)
         self.assertIn("model-c", cache._entries)
 
+    # ------------------------- bonus 17: preserve invalidation across racing releases
+    def test_release_preserves_invalidation_from_a_racing_concurrent_caller(self):
+        # Found by the same re-review pass: RuntimeHandle.release()'s
+        # guard used to let whichever caller won it decide the outcome
+        # unilaterally -- a `release(had_exception=False)` (a clean
+        # context-manager exit) that won the race against a concurrent
+        # `release(had_exception=True)` (e.g. a supervisor/cancellation
+        # thread) silently discarded the second call's invalidation
+        # request entirely, leaving a runtime that one caller explicitly
+        # flagged as failed sitting at READY, available to the next
+        # acquirer.
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service({"model-a": manifest_a}, {"fake": loader})
+
+        handle = service.acquire_runtime("model-a", "image")
+        entry = handle._entry
+
+        class _InterceptingLock:
+            """Wraps `entry.execution_lock` to pause release() mid-unwind,
+            deterministically landing a second, racing release() call
+            while the first (winning) call is still in flight."""
+
+            def __init__(self, real_lock, on_release):
+                self._real = real_lock
+                self._on_release = on_release
+
+            def acquire(self, *args, **kwargs):
+                return self._real.acquire(*args, **kwargs)
+
+            def release(self):
+                self._on_release()
+                self._real.release()
+
+        y_in_unwind = Event()
+        let_y_continue = Event()
+        entry.execution_lock = _InterceptingLock(
+            entry.execution_lock,
+            on_release=lambda: (y_in_unwind.set(), let_y_continue.wait(timeout=5)),
+        )
+
+        errors: list[BaseException] = []
+
+        def clean_exit():
+            try:
+                handle.release(had_exception=False)  # the "winning" caller
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        ty = Thread(target=clean_exit)
+        ty.start()
+        # Y has already set _released=True (won the guard) and is now
+        # paused just before actually releasing E.
+        self.assertTrue(y_in_unwind.wait(timeout=5))
+
+        # X: a racing caller with had_exception=True, arriving while Y's
+        # own unwind is still genuinely in flight.
+        handle.release(had_exception=True)
+
+        let_y_continue.set()
+        ty.join(timeout=5)
+        self.assertEqual(errors, [])
+
+        self.assertEqual(entry.state, RuntimeState.INVALID)
+
 
 if __name__ == "__main__":
     unittest.main()
