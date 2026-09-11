@@ -173,7 +173,7 @@ runtime が evict される」といった race を型として塞いでいま�
   generator 側をすべて `acquire_runtime()` へ移行するまでの互換維持用と
   位置づけます。新規呼び出しをここへ追加しないでください
 - 新しい `ModelService.acquire_runtime(model_id, media_type, task_type=None,
-  *, timeout=None) -> RuntimeHandle` が安全な取得経路です
+  *, wait_timeout=None) -> RuntimeHandle` が安全な取得経路です
 
 ```python
 with model_service.acquire_runtime(model_id, media_type, task_type) as handle:
@@ -189,8 +189,9 @@ with model_service.acquire_runtime(model_id, media_type, task_type) as handle:
 
 ### lock / admission の順序
 
-- `G`：processごとに1つだけのadmission semaphore（既定capacity=1）。
-  「重いruntimeのload」と「実行」はPR4aでは同じ1枠を共有します
+- `G`：process全体で共有される、`RuntimeAdmissionController`が保持する
+  admission semaphore（既定capacity=1）。「重いruntimeのload」と「実行」は
+  PR4aでは同じ1枠を共有します
 - `L`：canonical idごとのload lock（`ModelRuntimeCache.lock_for()`。
   PR4a以前から存在するlockをそのまま再利用）
 - `E`：`RuntimeEntry.execution_lock`。1entryにつき1つ、排他実行を保証
@@ -199,9 +200,33 @@ with model_service.acquire_runtime(model_id, media_type, task_type) as handle:
 
 取得順は常に`G -> L -> E`。`M`は単独の短いprobeとしてのみ使い、
 G/L/Eを待っている間は絶対に保持しません（loader.load()やcleanup
-callbackをM保持中に呼ぶことも禁止）。解放順は`E -> M`（lease減算・
-state更新）`-> G`です。この順序が崩れない限り、この4資源の組み合わせで
-自己deadlockは起きません。
+callbackをM保持中に呼ぶことも禁止）。解放順は`E`を解放する前に、
+Eをまだ保持したまま短いM区間で`RuntimeEntry`をINVALID化し
+（**「Eを保持したまま短いMを取る」のは許可**、逆に「Mを保持した
+ままEを待つ」のは引き続き絶対禁止）、そのうえで`E -> M`
+（lease減算）`-> G`の順に解放します。Eを待っていた別callerが
+Eを獲得した直後には、対象entryがまだcurrentかつREADYかを
+再検証します（`ModelRuntimeCache.is_current_and_ready()`）。
+INVALID化・削除・差し替えのいずれかが起きていた場合はEを
+即座に解放し直し、handleをuser codeへは絶対に渡さず
+`RuntimeBusyError`を送出します。この順序が崩れない限り、
+この4資源の組み合わせで自己deadlockは起きません。
+
+**admissionの共有範囲**（Codex round 1 review, Finding 1）：
+`ModelService.__init__`が`admission`/`admission_capacity`を
+どちらも受け取らない場合、`core.models.service.get_default_admission_controller()`
+が遅延生成する、process全体でただ1つの`RuntimeAdmissionController`
+instanceを共有します。`bootstrap/factories.py`の
+`create_default_model_service()`は呼び出し側ごとに独立した
+`ModelService`を構築しうる（standalone generator factoryが複数
+存在するため）ため、この共有がなければ「processごとに1枠」が
+実際にはinstanceごとに1枠になってしまいます。テストコードのみ、
+`admission_capacity=`（独立したcapacity値の専用controllerを生成）
+または`admission=`（任意のcontrollerを直接注入）でこの既定を
+明示的に上書きできます。`RuntimeAdmissionController.__init__`は
+`capacity < 1`を`ValueError`で拒否します（Finding 7；
+`threading.Semaphore(0)`が誰も通れない恒久的に閉じたgateに
+なってしまう不備の修正）。
 
 ### capacityはloadの前に確保する
 
@@ -211,12 +236,32 @@ cache miss時、`loader.load()`を呼ぶ前に:
 2. なければbudgetを確認し、unleasedなvictimを1つ選ぶ
 3. victimが無くcapacityが必要なら即座に`RuntimeBusyError`
    （`loader.load()`は0回、victim cleanupも0回、無期限waitはしない）
-4. victimを`RETIRING`にしてMを解放し、cleanupをMの外で実行
-5. LOADINGの予約を作ってから`loader.load()`を呼ぶ
+4. victim不要（すでにbudget内）ならLOADINGの予約は最初のM区間内で
+   原子的に作成します（Codex round 1 review, Finding 3；victimを
+   選ぶ側とLOADING予約を作る側が別々のM区間だと、その間隙へ
+   別callerが同じ枠を先取りできてしまう余地がありました）
+5. victimがある場合はvictimを`RETIRING`にしてMを解放し、
+   cleanupをMの外で実行したうえで、あらためてMを取り直して
+   capacityを再確認してからLOADINGの予約を作成します
+   （cleanupの間にMは解放されているため、他callerがその枠を
+   先取りしている可能性を必ず再チェックします。再チェックで
+   枠が埋まっていた場合は、連鎖的に次のvictimへ波及させず
+   `RuntimeBusyError`を返します）
 6. 成功したらREADY化と最初のpinを同じM区間で行う。失敗したら
    予約を破棄し、G/L/leaseを一切残さない
 
 新旧runtimeが同時にメモリ上へ存在する時間を作らないための設計です。
+
+legacy `put()`にも2点、同じ原則を適用しています（Codex round 1
+review）：同一runtime objectをbucket間で移動させる高速経路
+（`existing.runtime is runtime_obj`）でも、移動先bucketのbudgetは
+必ず強制します（Finding 5；以前は`media_bucket`とLRU位置の更新
+だけで、budget超過を許してしまっていました）。また
+`resolve_runtime()`が`loader.load()`成功後に`put()`を呼んで
+`RuntimeBusyError`で拒否された場合（対象entryが別callerに
+先取りされていた等）、load済みだが一度もpublishされなかった
+runtimeは`ModelRuntimeCache.dispose_unpublished()`で必ず1回
+cleanupされ、leakしません（Finding 4）。
 
 ### unloadのcontract
 
@@ -231,6 +276,19 @@ cache miss時、`loader.load()`を呼ぶ前に:
   全entryがidleと確認できてはじめて、Mの同じ区間内で一括
   `RETIRING`化し、M解放後にcleanupします（cleanup自体はbest-effort
   のままで、rollback保証ではありません）
+- `_finish_retirement()`はcleanup呼び出しをtry/finallyで囲み、
+  cleanupが（`KeyboardInterrupt`等の）`BaseException`で中断しても
+  entryは必ず`_entries`から除去されます。`unload_all()`も同様に、
+  ある対象のcleanupが`BaseException`で中断しても残り全対象への
+  `_finish_retirement()`呼び出しを継続し、最初に発生した例外だけを
+  全対象の後始末が終わってから再送出します（Codex round 1 review,
+  Finding 6）。「一部の対象だけpre-RETIRING状態へ戻す」contractは
+  採用していません — cleanupが一度も走っていないentryを安全な
+  READYへ戻せる保証がないためで、常に「全対象を必ずfinalizeしてから
+  再送出」という1つのcontractに統一しています。これにより、entryが
+  永久に`RETIRING`のまま取り残される（以降そのcanonical idへの
+  `acquire_or_reserve()`/`unload()`/`unload_all()`が恒久的に
+  `RuntimeBusyError`になる）ことはありません。
 
 ### 未解決のscope（PR4b）
 

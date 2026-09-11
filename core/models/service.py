@@ -34,10 +34,10 @@ def _acquire_with_deadline(lockable: Lock | Semaphore, deadline: float | None) -
     whoever holds it finishing their own, already-bounded work, which is not
     the "wait indefinitely for a condition only another, unrelated caller
     resolves" pattern issue #414 forbids (see `RuntimeBusyError`'s own
-    docstring) -- a caller that wants a hard wall-clock cap passes `timeout`.
-    A `deadline` already in the past acquires non-blockingly (`timeout=0`
-    semantics): still race-free (never silently skips a lock), just never
-    parks the calling thread.
+    docstring) -- a caller that wants a hard wall-clock cap passes
+    `wait_timeout`. A `deadline` already in the past acquires
+    non-blockingly (`wait_timeout=0` semantics): still race-free (never
+    silently skips a lock), just never parks the calling thread.
     """
 
     if deadline is None:
@@ -47,6 +47,72 @@ def _acquire_with_deadline(lockable: Lock | Semaphore, deadline: float | None) -
     if remaining <= 0:
         return lockable.acquire(blocking=False)
     return lockable.acquire(timeout=remaining)
+
+
+class RuntimeAdmissionController:
+    """The process-wide "G" gate: how many heavy load/execute sections may
+    be in flight across the *entire process* at once, not per `ModelService`
+    instance.
+
+    PR4a's own Codex-review Finding 1 (round 1): `ModelService.__init__`
+    used to construct its own private `threading.Semaphore` -- correct for a
+    single `ModelService`, but the application graph is not guaranteed to
+    have only one. `bootstrap/factories.py`'s `create_default_model_service()`
+    is called once per standalone generator factory whenever that factory's
+    caller passes `model_service=None` (see e.g. `create_default_image_generator()`);
+    each such call used to get its own independent admission slot, so two
+    generators built this way could each load/execute a "heavy" runtime at
+    the same time -- exactly the unbounded-concurrent-heavy-work outcome G
+    exists to prevent.
+
+    Wrapping the semaphore in its own class, with a single process-wide
+    default instance (`get_default_admission_controller()`) that every
+    `ModelService` constructed *without* an explicit `admission`/
+    `admission_capacity` argument shares, makes "at most `capacity` heavy
+    sections in flight" a true process-wide invariant by default, while
+    still letting test code construct and inject an independent controller
+    to isolate the mechanism it is actually testing (see
+    `tests/test_runtime_safety_core.py`'s `_build_service()` helper, which
+    always passes an explicit `admission_capacity` for exactly this reason).
+    """
+
+    def __init__(self, capacity: int = DEFAULT_ADMISSION_CAPACITY) -> None:
+        if capacity < 1:
+            raise ValueError(f"admission capacity must be at least 1, got {capacity!r}.")
+        self.capacity = capacity
+        self._semaphore = Semaphore(capacity)
+
+    def acquire(self, deadline: float | None) -> bool:
+        return _acquire_with_deadline(self._semaphore, deadline)
+
+    def release(self) -> None:
+        self._semaphore.release()
+
+
+_default_admission_controller: RuntimeAdmissionController | None = None
+_default_admission_controller_lock = Lock()
+
+
+def get_default_admission_controller() -> RuntimeAdmissionController:
+    """Return the process-wide default `RuntimeAdmissionController`, creating
+    it once, lazily, on first use.
+
+    Every `ModelService` constructed without an explicit `admission` or
+    `admission_capacity` argument -- which includes every call to
+    `bootstrap/factories.py`'s `create_default_model_service()`, no matter
+    how many separate call sites make that call -- shares this exact
+    instance. This is what makes "one process-wide admission domain" true by
+    default even though nothing forces the application graph to construct
+    only one `ModelService`.
+    """
+
+    global _default_admission_controller
+    with _default_admission_controller_lock:
+        if _default_admission_controller is None:
+            _default_admission_controller = RuntimeAdmissionController(
+                DEFAULT_ADMISSION_CAPACITY
+            )
+        return _default_admission_controller
 
 
 class RuntimeHandle:
@@ -62,9 +128,10 @@ class RuntimeHandle:
             runtime = handle.runtime
             ...  # generate
 
-    Release order mirrors acquisition in reverse (E, then a short metadata
-    transaction, then G) -- see `ModelService.acquire_runtime()`'s own
-    docstring for the full G/L/E/M ordering this is one half of.
+    Release order mirrors acquisition in reverse, but with one deliberate
+    twist over a naive E -> M -> G reversal -- see `release()`'s own
+    docstring for why INVALID-marking happens *before* E is released, not
+    folded into the same short metadata transaction as the lease decrement.
     """
 
     __slots__ = (
@@ -85,7 +152,7 @@ class RuntimeHandle:
         cache: ModelRuntimeCache,
         canonical_id: str,
         entry: RuntimeEntry,
-        admission: Semaphore,
+        admission: RuntimeAdmissionController,
     ) -> None:
         self.manifest = manifest
         self.runtime = runtime
@@ -107,7 +174,8 @@ class RuntimeHandle:
         self.release(had_exception=exc_type is not None)
 
     def release(self, *, had_exception: bool = False) -> None:
-        """Release E, then the lease (M), then G -- idempotent.
+        """Mark INVALID (if needed) while E is still held, then release
+        E -> lease -> G, in that order. Idempotent.
 
         `had_exception=True` (always true when released via `__exit__` for
         an exception that propagated out of the `with` block) marks the
@@ -120,20 +188,41 @@ class RuntimeHandle:
         generator boundaries are migrated onto this API, is where that
         policy can be narrowed with real evidence about which exception
         classes are actually safe to shrug off.
+
+        PR4a's own Codex-review Finding 2 (round 1): the INVALID transition
+        must become visible *before* E is released, not after -- otherwise a
+        second caller already parked waiting on E (it pinned the same entry
+        while this caller was still using it) can acquire E and start using
+        a runtime this caller has already deemed unsafe, in the gap between
+        "E released" and "lease decremented + marked INVALID" that a naive
+        single combined step would leave open. So this method does the
+        INVALID transition as its own short metadata transaction *first*,
+        while E is still owned; only then releases E; only then, separately,
+        decrements the lease (a runtime otherwise reused instantly by that
+        same second caller, with its lease not yet decremented, would look
+        briefly over-leased -- harmless, since the count is only ever a
+        lower bound on "do not evict", but decrementing before the INVALID
+        transition is even visible is the actual hazard, not this ordering).
+        The corresponding other half of this fix is on the *acquiring* side:
+        see `ModelService._acquire_execution_lock()`, which revalidates the
+        entry immediately after winning E, precisely to catch this window
+        from a waiter's perspective too.
         """
 
         if self._released:
             return
         self._released = True
         try:
-            self._entry.execution_lock.release()
+            if had_exception:
+                self._cache.mark_invalid(self._canonical_id, self._entry)
         finally:
             try:
-                self._cache.release_lease(
-                    self._canonical_id, self._entry, mark_invalid=had_exception
-                )
+                self._entry.execution_lock.release()
             finally:
-                self._admission.release()
+                try:
+                    self._cache.release_lease(self._canonical_id, self._entry)
+                finally:
+                    self._admission.release()
 
 
 class ModelService:
@@ -146,20 +235,40 @@ class ModelService:
         loader_registry: LoaderRegistry,
         runtime_cache: ModelRuntimeCache,
         *,
-        admission_capacity: int = DEFAULT_ADMISSION_CAPACITY,
+        admission: RuntimeAdmissionController | None = None,
+        admission_capacity: int | None = None,
     ) -> None:
         self.registry = registry
         self.resolver = resolver
         self.loader_registry = loader_registry
         self.runtime_cache = runtime_cache
-        # PR4a (issue #414): ONE process-wide semaphore, constructed once
-        # here and shared by every caller of `acquire_runtime()` through
-        # this exact `ModelService` instance -- not one per generator, not
-        # one per media type. `bootstrap/factories.py` constructs exactly
-        # one `ModelService` for the whole application graph, so this is
-        # already process-wide in practice; it is never re-created per
-        # request or per generator instantiation.
-        self._admission = Semaphore(admission_capacity)
+        if admission is not None and admission_capacity is not None:
+            raise ValueError(
+                "Pass at most one of `admission` or `admission_capacity`, not both."
+            )
+        if admission is not None:
+            # Caller-supplied controller (tests wanting an independent
+            # admission domain; a future caller that legitimately needs a
+            # second, separate process-wide-equivalent domain).
+            self._admission = admission
+        elif admission_capacity is not None:
+            # A private, non-shared controller at an explicit capacity --
+            # used by tests that need to isolate the cache-level mechanism
+            # under test from G contention (see `_build_service()` in
+            # `tests/test_runtime_safety_core.py`). Not process-wide by
+            # design: two `ModelService` instances each passing their own
+            # `admission_capacity` do NOT share a domain.
+            self._admission = RuntimeAdmissionController(admission_capacity)
+        else:
+            # PR4a (issue #414), Codex-review Finding 1 (round 1): the
+            # default, production path shares ONE process-wide controller
+            # across every `ModelService` instance that does not opt out of
+            # it -- see `get_default_admission_controller()`'s own
+            # docstring. `bootstrap/factories.py` relies on exactly this: it
+            # never passes `admission`/`admission_capacity`, so every
+            # `create_default_model_service()` call (there can be more than
+            # one -- see that function's own callers) still shares one gate.
+            self._admission = get_default_admission_controller()
 
     def list_models(
         self,
@@ -253,7 +362,28 @@ class ModelService:
             # this media family stay resident independently of others;
             # absent one, it falls back to the cache's single shared budget
             # unchanged.
-            self.runtime_cache.put(manifest.id, runtime_obj, media_type=media_type)
+            try:
+                self.runtime_cache.put(manifest.id, runtime_obj, media_type=media_type)
+            except RuntimeBusyError:
+                # PR4a Codex-review Finding 4 (round 1): `put()` can refuse
+                # to publish (the entry it would replace became leased,
+                # loading, or retiring between our cache-miss check above and
+                # this call -- e.g. a concurrent `acquire_runtime()` reserved
+                # it first). `runtime_obj` was already fully loaded and never
+                # published anywhere, so nothing else in the process can ever
+                # reach it once this call unwinds -- without disposal it just
+                # leaks (accelerator memory included). `dispose_unpublished()`
+                # runs the exact same cleanup an eviction would, on this
+                # object only, never touching whatever `put()` actually left
+                # cached under `manifest.id` (put() raised *before* mutating
+                # `_entries` in this case -- see its own docstring). Runs
+                # with M already released (put()'s own `with` block exited
+                # before this exception reached here) and while this call
+                # still holds L, so it is serialized against a concurrent
+                # `resolve_runtime()` for the same id the same way loading
+                # already was.
+                self.runtime_cache.dispose_unpublished(manifest.id, runtime_obj)
+                raise
             return manifest, runtime_obj
 
     # -------------------------------------------------- PR4a safe-use API
@@ -264,7 +394,7 @@ class ModelService:
         media_type: str,
         task_type: str | None = None,
         *,
-        timeout: float | None = None,
+        wait_timeout: float | None = None,
     ) -> RuntimeHandle:
         """Acquire a leased, execution-locked runtime as a context manager.
 
@@ -280,7 +410,10 @@ class ModelService:
 
         with `M` (the cache's own metadata lock) used only as short,
         standalone probes inside `ModelRuntimeCache` methods -- never held
-        while this method waits for G, L, or E. Concretely, this method:
+        while this method waits for G, L, or E. "E held, then a short M
+        probe" (marking INVALID before releasing E -- see
+        `RuntimeHandle.release()`) is explicitly permitted; "M held, then
+        wait on E" remains absolutely forbidden. Concretely, this method:
 
         1. Resolves `model_id` to a manifest and checks the cloud-provider
            opt-in guard *before* any admission/pin side effect (so a
@@ -296,12 +429,17 @@ class ModelService:
            method holds other than G/L, then
            `runtime_cache.publish_ready_and_pin()`.
         5. Releases L.
-        6. Acquires E (`entry.execution_lock`).
+        6. Acquires E (`entry.execution_lock`), then revalidates the entry
+           is still current and `READY` (see `_acquire_execution_lock()`) --
+           the entry this caller pinned in step 4 may have been marked
+           `INVALID` by another lease-holder's exception-unwind while this
+           caller was still waiting on E (Codex-review Finding 2, round 1);
+           a caller that loses that race never receives a handle at all.
         7. Returns a `RuntimeHandle` owning G's slot, the lease, and E; the
-           handle's own `release()`/`__exit__` reverses this in the order
-           E -> short M transaction (decrement lease, mark INVALID on
-           exception) -> G, exactly matching this module's own top-level
-           lock-ordering contract.
+           handle's own `release()`/`__exit__` reverses this -- see that
+           method's own docstring for the exact order (INVALID-marking
+           happens *before* E is released, not folded into the same
+           transaction as the lease decrement).
 
         No two blocking resources are ever acquired in the reverse of this
         order, and M is never held while waiting for G, L, or E, so this
@@ -310,23 +448,36 @@ class ModelService:
         resolve raises `RuntimeBusyError` immediately instead of waiting --
         see `ModelRuntimeCache.acquire_or_reserve()`'s own docstring.
 
-        `timeout`, if given, is a *single* overall deadline covering G, L,
-        and E acquisition combined -- never reset per lock (a caller cannot
-        wait `timeout` seconds for G and then another `timeout` seconds for
-        E). `timeout=0` is non-blocking: returns immediately with
-        `RuntimeBusyError` unless every acquisition succeeds without
-        waiting. `timeout=None` (the default) blocks the ordinary way on
-        G/L/E -- see `_acquire_with_deadline()`'s own docstring for why that
-        is not the "indefinite wait" issue #414 forbids.
+        `wait_timeout`, if given, is a *single* overall deadline bounding
+        ONLY how long this call waits on contended G/L/E synchronization --
+        never reset per lock (a caller cannot wait `wait_timeout` seconds
+        for G and then another `wait_timeout` seconds for E).
+        `wait_timeout=0` means "do not wait for a contended synchronization
+        resource", not "do not perform synchronous work": it does NOT bound,
+        preempt, or cancel `loader.load()` itself, which this method always
+        calls synchronously and to completion once it actually starts (on a
+        genuine cache miss, after G/L are both already held) -- there is no
+        general loader-preemption/cancellation mechanism in PR4a, and this
+        parameter makes no promise about total wall-clock time for a call
+        that ends up loading. `wait_timeout=None` (the default) blocks the
+        ordinary way on G/L/E -- see `_acquire_with_deadline()`'s own
+        docstring for why that is not the "indefinite wait" issue #414
+        forbids. (Codex-review Finding 8, round 1: this parameter was
+        previously named `timeout` and its docstring claimed to be "a single
+        overall deadline covering the entire `acquire_runtime()` call",
+        which was never true once a cache miss reached `loader.load()` --
+        renamed, since PR4a has not shipped/stabilized yet, rather than kept
+        under a name that promised more than the implementation -- deliberately
+        not turned into a general preemption framework -- delivers.)
         """
 
         manifest = self.get_manifest(model_id, media_type, task_type)
         if manifest.provider == "cloud":
             ensure_cloud_provider_enabled(manifest.id)
 
-        deadline = None if timeout is None else time.monotonic() + timeout
+        deadline = None if wait_timeout is None else time.monotonic() + wait_timeout
 
-        if not _acquire_with_deadline(self._admission, deadline):
+        if not self._admission.acquire(deadline):
             raise RuntimeBusyError(
                 f"No process-wide runtime admission slot available for "
                 f"{manifest.id!r} within the given timeout."
@@ -335,17 +486,13 @@ class ModelService:
         try:
             entry = self._acquire_or_load_entry(manifest, media_type, deadline)
             try:
-                if not _acquire_with_deadline(entry.execution_lock, deadline):
-                    raise RuntimeBusyError(
-                        "Timed out waiting for exclusive execution access to "
-                        f"{manifest.id!r}."
-                    )
+                self._acquire_execution_lock(manifest.id, entry, deadline)
             except BaseException:
                 # We hold a lease (a pin) but will never use it -- release it
                 # rather than leaking a lease with no corresponding handle,
                 # which would otherwise make this entry permanently
                 # un-evictable/un-unloadable ("pinned runtime" is absolute).
-                self.runtime_cache.release_lease(manifest.id, entry, mark_invalid=False)
+                self.runtime_cache.release_lease(manifest.id, entry)
                 raise
         except BaseException:
             self._admission.release()
@@ -377,12 +524,56 @@ class ModelService:
                 except BaseException:
                     self.runtime_cache.abort_reservation(manifest.id, entry)
                     raise
-                entry = self.runtime_cache.publish_ready_and_pin(
-                    manifest.id, entry, runtime_obj
-                )
+                try:
+                    entry = self.runtime_cache.publish_ready_and_pin(
+                        manifest.id, entry, runtime_obj
+                    )
+                except BaseException:
+                    # Found during this round's adversarial self-review:
+                    # `publish_ready_and_pin()` only raises its own
+                    # defensive backstop (see that method's docstring) if
+                    # this reservation was somehow lost before publish --
+                    # believed unreachable given this method holds L for
+                    # its entire duration, but if it ever did happen, the
+                    # freshly-loaded `runtime_obj` was never published
+                    # anywhere and would otherwise leak. Dispose it via the
+                    # same primitive Finding 4 uses for the analogous gap
+                    # in the legacy `resolve_runtime()` path.
+                    self.runtime_cache.dispose_unpublished(manifest.id, runtime_obj)
+                    raise
             return entry
         finally:
             load_lock.release()
+
+    def _acquire_execution_lock(
+        self, canonical_id: str, entry: RuntimeEntry, deadline: float | None
+    ) -> None:
+        """Acquire `entry.execution_lock` ("E") and revalidate it afterward.
+
+        PR4a Codex-review Finding 2 (round 1): winning E is not, by itself,
+        proof that `entry` is still safe to hand to user code -- this
+        caller's own lease (taken in `_acquire_or_load_entry()`, before this
+        method runs) may have been sitting on an entry another lease-holder
+        marked `INVALID` while this caller was still parked waiting on E
+        (see `RuntimeHandle.release()`'s own docstring for the other half of
+        this fix). So immediately after acquiring E, this checks
+        `runtime_cache.is_current_and_ready()`; a `False` result means this
+        entry was invalidated (or, in principle, replaced) out from under
+        this caller during the wait, and E is released again before raising
+        `RuntimeBusyError` -- this method only ever cleans up what it itself
+        acquired (E); the caller's own lease is the caller's own cleanup.
+        """
+
+        if not _acquire_with_deadline(entry.execution_lock, deadline):
+            raise RuntimeBusyError(
+                f"Timed out waiting for exclusive execution access to {canonical_id!r}."
+            )
+        if not self.runtime_cache.is_current_and_ready(canonical_id, entry):
+            entry.execution_lock.release()
+            raise RuntimeBusyError(
+                f"{canonical_id!r} became invalid while waiting for exclusive "
+                "execution access; retry."
+            )
 
     # ------------------------------------------------------- canonical unload
 
@@ -408,4 +599,4 @@ class ModelService:
         self.runtime_cache.unload_all()
 
 
-__all__ = ["ModelService", "RuntimeHandle"]
+__all__ = ["ModelService", "RuntimeAdmissionController", "RuntimeHandle"]

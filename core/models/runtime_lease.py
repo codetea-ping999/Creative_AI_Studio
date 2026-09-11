@@ -59,7 +59,7 @@ class RuntimeBusyError(RuntimeError):
     and when to retry. This is distinct from ordinary lock contention (the
     process-wide admission slot, the per-canonical-id load lock, a runtime's
     own execution lock), which may legitimately block a bounded
-    ``timeout`` -- see ``ModelService.acquire_runtime()``.
+    ``wait_timeout`` -- see ``ModelService.acquire_runtime()``.
     """
 
 

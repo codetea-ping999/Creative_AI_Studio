@@ -216,12 +216,20 @@ class ModelRuntimeCache:
         loading, or retiring entry (created via `acquire_or_reserve()`) --
         a legacy caller replacing a runtime the new API is actively using
         would otherwise silently corrupt that lease.
+
+        PR4a Codex-review Finding 5 (round 1): the *destination* bucket's
+        budget is enforced even on a same-object reinsertion (a caller
+        moving an already-cached runtime into a different `media_type`'s
+        bucket) -- previously this fast path only updated `media_bucket`/LRU
+        position and skipped eviction entirely, so moving a runtime into an
+        already-full bucket could push it silently over budget. The moved
+        object itself is always excluded from its own eviction candidacy
+        (`exclude_id=model_id` below), exactly like a fresh insert.
         """
 
         bucket = media_type if media_type in self.media_limits else _DEFAULT_BUCKET
         same_object_reinsertion = False
         replaced_victim: tuple[str, Any] | None = None
-        overflow_victims: list[tuple[str, Any]] = []
 
         with self._metadata_lock:
             existing = self._entries.get(model_id)
@@ -256,9 +264,12 @@ class ModelRuntimeCache:
                     generation=self._next_generation_locked(model_id),
                     runtime=runtime_obj,
                 )
-                overflow_victims = self._evict_bucket_overflow_locked(
-                    bucket, exclude_id=model_id
-                )
+            # Enforced for BOTH a fresh insert and a same-object bucket move
+            # (Finding 5) -- the destination bucket's budget must never be
+            # silently exceeded either way.
+            overflow_victims = self._evict_bucket_overflow_locked(
+                bucket, exclude_id=model_id
+            )
 
         if replaced_victim is not None:
             self._run_cleanup(*replaced_victim)
@@ -299,6 +310,25 @@ class ModelRuntimeCache:
         time, using the same best-effort `on_evict` contract `unload()`
         already has -- "atomic" describes the preflight decision, not a
         rollback guarantee over cleanup, which was never transactional.
+
+        PR4a Codex-review Finding 6 (round 1): once a target has been marked
+        `RETIRING` here, it is *always* finalized (cleanup attempted, then
+        removed from `self._entries` -- see `_finish_retirement()`'s own
+        `try`/`finally`), even if an earlier target's cleanup raised a
+        `BaseException` (a custom cancellation signal, `KeyboardInterrupt`,
+        ...). The chosen contract is "finalize every target before
+        re-raising", not "revert untouched targets to their pre-RETIRING
+        state": reverting would mean guessing that an entry whose cleanup
+        never got a chance to run is still safe to hand out as `READY`
+        again, which this method has no way to know; finalizing it instead
+        (removing it, so the next `acquire_or_reserve()` simply reloads it
+        fresh) is always safe. The *first* exception encountered across all
+        targets is re-raised once every target has been finalized, so a
+        `KeyboardInterrupt`/`SystemExit` still ultimately propagates -- just
+        only after this method has guaranteed no entry is left stuck at
+        `RETIRING` forever (which would otherwise permanently block every
+        future `acquire_or_reserve()`/`unload()`/`unload_all()` call for
+        that id -- see `_BUSY_FOR_UNLOAD_STATES`).
         """
 
         with self._metadata_lock:
@@ -317,8 +347,15 @@ class ModelRuntimeCache:
             for _, entry in targets:
                 entry.state = RuntimeState.RETIRING
 
+        first_exception: BaseException | None = None
         for canonical_id, entry in targets:
-            self._finish_retirement(canonical_id, entry)
+            try:
+                self._finish_retirement(canonical_id, entry)
+            except BaseException as exc:  # noqa: BLE001 - every target must still be finalized; see docstring
+                if first_exception is None:
+                    first_exception = exc
+        if first_exception is not None:
+            raise first_exception
 
     def loaded_ids(self) -> list[str]:
         with self._metadata_lock:
@@ -366,7 +403,34 @@ class ModelRuntimeCache:
           existing entry that could be evicted to make room is itself
           leased (the "pinned-only eviction" case -- there is nothing this
           call could wait for that only time, not another caller's
-          eventual `release()`, would resolve).
+          eventual `release()`, would resolve),
+        - capacity that a victim's cleanup freed got claimed by a different,
+          concurrent reservation before this call could re-claim it (see
+          the "no cascading eviction" note below).
+
+        PR4a Codex-review Finding 3 (round 1): reservation creation is
+        atomic with its own capacity check. Two cases:
+
+        - No victim needed (room already available, or no existing entry to
+          replace): the fresh `LOADING` reservation is created in the *same*
+          short `M` transaction that decided room was available -- nothing
+          else can observe "room available" and also claim it first, since
+          both checks happen under the same, uninterrupted `M` hold.
+        - A victim is needed: cleanup runs outside `M` (it can be slow), so
+          by the time this method re-acquires `M` afterward, a *different*
+          concurrent caller may already have claimed the capacity the
+          cleanup just freed (this call's own `M` hold ended the moment
+          cleanup started). The follow-up `M` transaction below therefore
+          does not blindly insert -- it removes the victim (via
+          `_finish_retirement`, which is itself what frees the slot) and
+          then re-runs the exact same capacity check used for the no-victim
+          case. If that recheck finds room, the reservation is created in
+          that same transaction. If it does not (someone else took the slot
+          in the interim), this raises `RuntimeBusyError` rather than
+          selecting and retiring a second victim -- deliberately not a
+          cascading/looping eviction: that would let one caller's miss
+          retire an unbounded number of other entries, whereas a caller that
+          loses this narrow, genuinely rare race can simply retry.
         """
 
         bucket = media_type if media_type in self.media_limits else _DEFAULT_BUCKET
@@ -399,20 +463,40 @@ class ModelRuntimeCache:
                     bucket, budget_for=canonical_id
                 )
 
-            if victim_entry is not None:
-                # Left in `self._entries` (not yet removed) so a concurrent
-                # caller sees it as RETIRING, never as silently absent --
-                # required for the "retiring reacquire" contract (issue
-                # #414's own required test 11): absent would look like a
-                # normal cache miss and invite a second, overlapping load.
-                victim_entry.state = RuntimeState.RETIRING
+            if victim_entry is None:
+                # Finding 3, no-victim case: reserve atomically, in this
+                # exact transaction -- nothing can race this, since nothing
+                # else can observe "room available" without also holding M.
+                reserved = RuntimeEntry(
+                    canonical_id, bucket, RuntimeState.LOADING,
+                    generation=self._next_generation_locked(canonical_id),
+                )
+                self._entries[canonical_id] = reserved
+                return reserved
+
+            # Left in `self._entries` (not yet removed) so a concurrent
+            # caller sees it as RETIRING, never as silently absent --
+            # required for the "retiring reacquire" contract (issue
+            # #414's own required test 11): absent would look like a
+            # normal cache miss and invite a second, overlapping load.
+            victim_entry.state = RuntimeState.RETIRING
 
         # --- cleanup + removal outside M ---
-        if victim_entry is not None:
-            self._finish_retirement(victim_id, victim_entry)  # type: ignore[arg-type]
+        self._finish_retirement(victim_id, victim_entry)  # type: ignore[arg-type]
 
-        # --- short M: establish the LOADING reservation ---
+        # --- short M: recheck capacity, then establish the reservation
+        #     (Finding 3, victim case: never assume the slot cleanup just
+        #     freed is still free) ---
         with self._metadata_lock:
+            retry_victim_id, retry_victim_entry = self._select_capacity_victim_locked(
+                bucket, budget_for=canonical_id
+            )
+            if retry_victim_entry is not None:
+                raise RuntimeBusyError(
+                    f"Capacity for {canonical_id!r} in bucket {bucket!r} was "
+                    "claimed by another reservation while a previous "
+                    "occupant was being retired; retry."
+                )
             reserved = RuntimeEntry(
                 canonical_id, bucket, RuntimeState.LOADING,
                 generation=self._next_generation_locked(canonical_id),
@@ -469,25 +553,64 @@ class ModelRuntimeCache:
             if current is reserved_entry:
                 del self._entries[canonical_id]
 
-    def release_lease(
-        self, canonical_id: str, entry: RuntimeEntry, *, mark_invalid: bool
-    ) -> None:
-        """Decrement `entry`'s lease count (short M); mark INVALID if requested.
+    def release_lease(self, canonical_id: str, entry: RuntimeEntry) -> None:
+        """Decrement `entry`'s lease count (short M).
 
         Silently does nothing if `entry` is no longer the current entry for
         `canonical_id` (a stale handle from an earlier generation -- see
         `RuntimeEntry.generation`'s own docstring): whoever replaced it
         already owns this slot's lease count, and a stale release must never
         decrement a lease that was never its own to begin with.
+
+        Does not touch `entry.state` -- see `mark_invalid()` for that, which
+        `RuntimeHandle.release()` deliberately calls as its own, earlier,
+        separate transaction (Codex-review Finding 2, round 1: the two used
+        to be one call with a `mark_invalid=` flag, combined into the same
+        transaction as the lease decrement; splitting them is what lets the
+        INVALID transition become visible to an E-waiter *before* this
+        decrement -- and before E itself is released -- rather than after).
         """
 
         with self._metadata_lock:
             current = self._entries.get(canonical_id)
             if current is not entry:
                 return
-            if mark_invalid and entry.state is RuntimeState.READY:
-                entry.state = RuntimeState.INVALID
             entry.lease_count = max(0, entry.lease_count - 1)
+
+    def mark_invalid(self, canonical_id: str, entry: RuntimeEntry) -> None:
+        """Mark `entry` INVALID if it is still current and `READY` (short M).
+
+        Called by `RuntimeHandle.release()` *before* it releases E (see that
+        method's own docstring) -- so any other caller already parked
+        waiting on E for this exact entry can never win E and observe a
+        still-`READY` runtime that is about to be invalidated out from under
+        it. A no-op if `entry` is stale (already replaced/removed) or
+        already non-`READY`.
+        """
+
+        with self._metadata_lock:
+            current = self._entries.get(canonical_id)
+            if current is not entry:
+                return
+            if entry.state is RuntimeState.READY:
+                entry.state = RuntimeState.INVALID
+
+    def is_current_and_ready(self, canonical_id: str, entry: RuntimeEntry) -> bool:
+        """Whether `entry` is still `canonical_id`'s live, usable entry (short M).
+
+        Used by `ModelService._acquire_execution_lock()` immediately after
+        winning E: the entry this caller pinned earlier may have been marked
+        `INVALID` (or, in principle, replaced) by another lease-holder's
+        exception-unwind while this caller was still waiting on E -- see
+        `RuntimeHandle.release()`'s own docstring (Codex-review Finding 2,
+        round 1). A caller that gets `False` back must never read
+        `entry.runtime`; it must release E itself and raise
+        `RuntimeBusyError` instead of handing a handle to user code.
+        """
+
+        with self._metadata_lock:
+            current = self._entries.get(canonical_id)
+            return current is entry and entry.state is RuntimeState.READY
 
     def _next_generation_locked(self, canonical_id: str) -> int:
         """Next monotonic generation for `canonical_id`. Caller must hold M."""
@@ -599,14 +722,29 @@ class ModelRuntimeCache:
         pipeline's own `.to("cpu")`, ...) via `on_evict`, which the
         metadata-lock docstring at the top of this module forbids doing
         under `M`.
+
+        PR4a Codex-review Finding 6 (round 1): metadata removal happens in a
+        `finally`, not merely after cleanup returns. `_run_cleanup()` itself
+        only swallows `Exception`; a `BaseException` (a custom cancellation
+        signal, `KeyboardInterrupt`, ...) escaping `on_evict` used to skip
+        the `del self._entries[canonical_id]` below entirely, stranding this
+        entry at `RETIRING` forever -- a permanent block on every future
+        `acquire_or_reserve()`/`unload()`/`unload_all()` call for this exact
+        canonical id (see `_BUSY_FOR_UNLOAD_STATES`). The `finally` below
+        guarantees the entry is always removed once cleanup has been
+        attempted, whatever it raised; the exception (if any) still
+        propagates to this method's own caller once metadata is consistent
+        again.
         """
 
-        if entry.runtime is not None:
-            self._run_cleanup(canonical_id, entry.runtime)
-        with self._metadata_lock:
-            current = self._entries.get(canonical_id)
-            if current is entry:
-                del self._entries[canonical_id]
+        try:
+            if entry.runtime is not None:
+                self._run_cleanup(canonical_id, entry.runtime)
+        finally:
+            with self._metadata_lock:
+                current = self._entries.get(canonical_id)
+                if current is entry:
+                    del self._entries[canonical_id]
 
     def _run_cleanup(self, model_id: str, runtime_obj: Any) -> None:
         """Call `self._on_evict`, if any -- see `OnEvictCallback`'s own
@@ -622,6 +760,22 @@ class ModelRuntimeCache:
             logger.warning(
                 "on_evict callback failed for model %r.", model_id, exc_info=True
             )
+
+    def dispose_unpublished(self, model_id: str, runtime_obj: Any) -> None:
+        """Clean up a runtime that was loaded but never made it into the cache.
+
+        PR4a Codex-review Finding 4 (round 1): `ModelService.resolve_runtime()`
+        calls this when `put()` raises `RuntimeBusyError` after
+        `loader.load()` already succeeded -- the loaded `runtime_obj` was
+        never published anywhere, so nothing else in the process can ever
+        reach it once that call unwinds; without an explicit disposal it
+        just leaks (accelerator memory included). Runs the exact same
+        `on_evict` hook eviction/unload/replacement use, on this object
+        only -- it never touches `self._entries`, so it is safe to call
+        without holding (and does not itself acquire) `self._metadata_lock`.
+        """
+
+        self._run_cleanup(model_id, runtime_obj)
 
 
 def resolve_media_cache_limits(
