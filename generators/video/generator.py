@@ -71,26 +71,35 @@ class VideoGenerator(BaseGenerator):
         context: "GenerationContext | None" = None,
     ) -> GenerationResult:
         requested_model_id = request.model_id.strip() or None
-        manifest, runtime_obj = self.model_service.resolve_runtime(
+
+        # PR4b / FP-001 + FP-002: render is the runtime-use interval.  Keep
+        # the leased execution boundary through runtime routing, mutable
+        # runtime work, and cancellation checks that guard the render.  Exit
+        # it before file-only quality and semantic scoring so CLIP/CLAP can
+        # later share the same process-wide admission domain without a
+        # forbidden same-thread nested acquisition.
+        with self.model_service.acquire_runtime(
             requested_model_id,
             media_type="video",
             task_type=self.task_type,
-        )
-
-        effective_params = {**manifest.default_params, **request.params}
-        runtime = self.runtime_router.resolve(runtime_obj)
-        if context is not None:
-            context.raise_if_cancelled()
-        render_result = runtime.render(
-            request=request,
-            manifest=manifest,
-            runtime_obj=runtime_obj,
-            output_dir=self.output_dir,
-            effective_params=effective_params,
-            context=context,
-        )
-        if context is not None:
-            context.raise_if_cancelled()
+        ) as handle:
+            manifest = handle.manifest
+            runtime_obj = handle.runtime
+            effective_params = {**manifest.default_params, **request.params}
+            runtime = self.runtime_router.resolve(runtime_obj)
+            if context is not None:
+                context.raise_if_cancelled()
+            render_result = runtime.render(
+                request=request,
+                manifest=manifest,
+                runtime_obj=runtime_obj,
+                output_dir=self.output_dir,
+                effective_params=effective_params,
+                context=context,
+            )
+            if context is not None:
+                context.raise_if_cancelled()
+            runtime_type = type(runtime_obj).__name__
 
         output_path = Path(str(render_result["output_path"]))
         quality_report = evaluate_video_output(output_path)
@@ -132,7 +141,7 @@ class VideoGenerator(BaseGenerator):
                 "model_runtime": manifest.runtime,
                 "model_provider": manifest.provider,
                 "loader": manifest.loader,
-                "runtime_type": type(runtime_obj).__name__,
+                "runtime_type": runtime_type,
                 "runtime_adapter": runtime_metadata.get("runtime_adapter"),
                 "output_format": render_result.get(
                     "output_format", output_path.suffix.lstrip(".") or "gif"
