@@ -327,6 +327,28 @@ class RuntimeHandle:
         # exclusive: this method can never observe `_released` mid-flight,
         # only fully before or fully after any given `release()` call's
         # own transition.
+        # Codex re-review, PR4a v1 final-convergence pass: the process-wide
+        # admission slot (G) this handle owns is credited to
+        # `self._owner_thread` -- the thread whose `acquire_runtime()` call
+        # actually acquired it -- not to whichever thread happens to call
+        # `__enter__()`. If a handle were entered on a *different* thread
+        # (acquired on thread A, handed off, entered by thread B), G's own
+        # nested-acquisition ban (`RuntimeAdmissionController.acquire()`)
+        # would see no holding recorded for B at all: B could then start a
+        # second, unrelated `acquire_runtime()` call of its own and block
+        # on G, while a third thread contending for this handle's own E
+        # can only ever be unblocked by *this* handle's `__exit__()` --
+        # which only B, now the context owner, will ever call. That is
+        # exactly the cross-thread deadlock cycle the unconditional G-level
+        # ban exists to prevent, reintroduced through a path the ban's own
+        # per-thread bookkeeping cannot see. Rather than re-keying admission
+        # tracking by "whichever thread enters" (real complexity, and still
+        # wouldn't cover a handle used as a context manager on one thread
+        # then handed to *another* for `release()`), v1 keeps this simple:
+        # a handle must be entered on the exact same thread that acquired
+        # it. Cross-thread hand-off remains supported for `release()` only
+        # (see that method's own docstring).
+        owner_thread = current_thread()
         with self._release_guard:
             if self._released:
                 raise RuntimeError(
@@ -339,6 +361,18 @@ class RuntimeHandle:
                     f"{self._canonical_id!r} -- the inner block's __exit__ "
                     "would release E/lease/G while the outer block is still "
                     "using them."
+                )
+            if owner_thread is not self._owner_thread:
+                raise RuntimeError(
+                    f"Cannot enter a RuntimeHandle for {self._canonical_id!r} "
+                    "as a context manager on a different thread than the one "
+                    "that acquired it via acquire_runtime() -- the process-wide "
+                    "admission slot this handle holds is credited to the "
+                    "acquiring thread, and a different thread entering the "
+                    "context could then independently acquire another runtime "
+                    "and deadlock against this handle's own execution lock, "
+                    "which only the entering thread's own __exit__() could "
+                    "ever release."
                 )
             self._entered = True
         # PR4a v1 final-convergence pass (issue #414): no handoff signal is

@@ -2776,6 +2776,53 @@ class RuntimeSafetyCoreTests(unittest.TestCase):
         self.assertEqual(entry.lease_count, 0)
         self.assertFalse(entry.execution_lock.locked())
 
+    def test_enter_on_a_different_thread_than_the_acquiring_thread_is_rejected(self):
+        # Codex re-review (post-convergence auto-re-review, PR #415): the
+        # process-wide admission slot (G) a handle holds is credited to
+        # the thread that called acquire_runtime(), not to whichever
+        # thread happens to call __enter__(). Entering on a *different*
+        # thread than the acquiring one would let that thread start an
+        # unrelated acquire_runtime() call of its own -- G's nested-
+        # acquisition ban has no recorded holding for it -- while a third
+        # thread contending for this handle's own E can only ever be
+        # unblocked by this handle's own __exit__(), which only the
+        # entering thread will ever call: the exact cross-thread deadlock
+        # cycle the G-level ban exists to prevent, reintroduced through a
+        # path its per-thread bookkeeping cannot see. Rejected immediately
+        # instead, before anything is torn down.
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service({"model-a": manifest_a}, {"fake": loader})
+
+        handle = service.acquire_runtime("model-a", "image")
+        entry = handle._entry
+
+        enter_result: dict[str, object] = {}
+
+        def other_thread():
+            try:
+                handle.__enter__()
+                enter_result["entered"] = True
+            except RuntimeError as exc:
+                enter_result["error"] = exc
+
+        t = Thread(target=other_thread)
+        t.start()
+        t.join(timeout=5)
+
+        self.assertIsInstance(enter_result.get("error"), RuntimeError)
+        self.assertNotIn("entered", enter_result)
+        # Nothing torn down by the rejected attempt.
+        self.assertFalse(handle._entered)
+        self.assertEqual(entry.lease_count, 1)
+        self.assertTrue(entry.execution_lock.locked())
+
+        # The handle remains fully usable, normally, on its own acquiring
+        # (this) thread.
+        with handle:
+            self.assertIs(handle.runtime, entry.runtime)
+        self.assertEqual(entry.lease_count, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
