@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from threading import Event, Lock, Semaphore, Thread, current_thread
+from threading import Lock, Semaphore, Thread, current_thread
 from typing import Any
 
 from .cache import ModelRuntimeCache
@@ -99,13 +99,26 @@ class RuntimeAdmissionController:
             raise ValueError(f"admission capacity must be at least 1, got {capacity!r}.")
         self.capacity = capacity
         self._semaphore = Semaphore(capacity)
-        # Codex re-review, found on this round's own fix commits: a thread
-        # that already holds every one of this controller's slots by
-        # itself (its own earlier, still-open `acquire_runtime()` calls
-        # account for all of `capacity`) and then tries to *block* waiting
-        # for one more would deadlock unconditionally -- only that same
-        # thread could ever release one of its own slots to free room for
-        # itself, and it cannot do that while parked here.
+        # PR4a v1 (final-convergence pass on issue #414, addressing a
+        # Codex-review finding that survived several earlier, narrower fix
+        # rounds): a thread that already holds even *one* open
+        # `RuntimeHandle` is unconditionally refused another, regardless of
+        # `capacity` and regardless of canonical id. This used to only
+        # fire once a thread had exhausted every one of `capacity`'s slots
+        # by itself, which left a real cross-thread deadlock cycle open
+        # whenever `capacity > 1`: thread A holds entry X and, while still
+        # holding it, blocks acquiring G for a *different* entry Y; thread
+        # B holds the process's other G slot and is itself blocked waiting
+        # on X's E, which only A can release -- but A can never release X
+        # until its own nested call for Y returns. `capacity > 1` allowing
+        # one thread to hold multiple simultaneous runtimes is not a PR4a
+        # requirement (v1 favors simplicity over that scheduling
+        # machinery); a "hold N runtimes on one thread at once" use case,
+        # if ever needed, is a separate, future, deliberately-designed
+        # deadlock-free multi-runtime acquisition protocol, not something
+        # this gate should permit implicitly. `capacity > 1` still has a
+        # meaning here: it bounds how many *different* threads may each
+        # hold one runtime at the same time.
         #
         # Ownership is tracked by *acquiring* thread in a plain dict guarded
         # by `_held_lock`, deliberately NOT `threading.local()`: this
@@ -128,27 +141,39 @@ class RuntimeAdmissionController:
         # worker that acquires a handle and then exits before a supported
         # cleanup thread releases it could have its numeric id reassigned
         # to an unrelated, later-started thread, which would then inherit
-        # its held-count (and, via `RuntimeEntry.execution_lock_owner`, its
-        # E ownership too) and be wrongly rejected as "recursive". A
-        # `Thread` object's identity is not recycled this way: a new OS
-        # thread always gets a new Python `Thread` object, never the
-        # exited one's.
+        # its held-count and be wrongly rejected as "recursive". A `Thread`
+        # object's identity is not recycled this way: a new OS thread
+        # always gets a new Python `Thread` object, never the exited one's.
         self._held_lock = Lock()
         self._held_by_thread: dict[Thread, int] = {}
 
     def acquire(self, deadline: float | None) -> bool:
+        """Acquire one process-wide admission slot for `current_thread()`.
+
+        Unconditionally rejects (via `RuntimeError`, immediately, before
+        touching the semaphore at all) any attempt from a thread that
+        already holds an open slot from an earlier, still-open
+        `acquire_runtime()` call -- whether this call would block
+        (`deadline is None` or still in the future) or not (`deadline`
+        already past, i.e. `wait_timeout=0`). See `__init__`'s own comment
+        for why this is unconditional on `capacity` rather than only
+        firing once every slot is exhausted, and why a non-blocking probe
+        is refused the same way rather than being allowed to succeed in
+        creating a second, nested handle.
+        """
+
         owner_thread = current_thread()
-        would_block = deadline is None or deadline - time.monotonic() > 0
         with self._held_lock:
             held = self._held_by_thread.get(owner_thread, 0)
-        if would_block and held >= self.capacity:
+        if held >= 1:
             raise RuntimeError(
-                "Recursive acquire_runtime() call detected: this thread "
-                f"already holds all {self.capacity} process-wide admission "
-                "slot(s) from earlier, still-open acquire_runtime() "
-                "call(s). Release at least one RuntimeHandle before "
-                "acquiring another -- waiting here could never be "
-                "resolved by any other thread."
+                "Nested acquire_runtime() call detected: this thread "
+                "already holds an open RuntimeHandle from an earlier, "
+                "still-open acquire_runtime() call. PR4a v1 does not "
+                "support one thread holding more than one RuntimeHandle "
+                "at a time, regardless of canonical id or admission "
+                "capacity -- release the existing RuntimeHandle before "
+                "acquiring another."
             )
         acquired = _acquire_with_deadline(self._semaphore, deadline)
         if acquired:
@@ -239,7 +264,8 @@ class RuntimeHandle:
         "_released",
         "_release_guard",
         "_entered",
-        "_enter_committed",
+        "_pending_release",
+        "_pending_invalidation",
     )
 
     def __init__(
@@ -269,18 +295,14 @@ class RuntimeHandle:
         self._released = False
         self._release_guard = Lock()
         self._entered = False
-        # Codex re-review, found on this round's own fix commits: sharing
-        # `_release_guard` between `__enter__()` and `release()` closes the
-        # check-and-set race, but `__enter__()` still exits that guard
-        # *before* returning `self` to its caller -- an ordinary thread
-        # switch in that last, tiny gap could let a concurrent cross-thread
-        # `release()` (an explicitly supported pattern) run to completion,
-        # after which `__enter__()` resumes and hands back a handle whose
-        # E/lease/G are already gone. `release()` waits on this `Event`
-        # before tearing anything down whenever it observes `_entered` is
-        # already `True` -- see `release()`'s own docstring for why this
-        # wait is bounded and does not reintroduce an unbounded wait.
-        self._enter_committed = Event()
+        # PR4a v1 final-convergence pass (issue #414): `_entered` now marks
+        # this handle "entering-or-active" for its *entire* remaining
+        # lifetime, not just the brief `__enter__()`/`release()` handoff --
+        # see `release()`'s own docstring for what that buys. Set once,
+        # inside `_release_guard`, in `__enter__()`; only ever cleared by
+        # going `_released = True` (never back to `False`).
+        self._pending_release = False
+        self._pending_invalidation = False
 
     def __enter__(self) -> "RuntimeHandle":
         # Codex re-review, found on this round's own fix commits: this
@@ -319,31 +341,17 @@ class RuntimeHandle:
                     "using them."
                 )
             self._entered = True
-        # Signaled *after* releasing the guard, immediately before
-        # returning -- see `_enter_committed`'s own docstring (on
-        # `__init__`) and `release()`'s docstring for why a concurrent
-        # `release()` waits on this rather than racing ahead the instant
-        # it observes `_entered` already `True`.
-        #
-        # Known, accepted limitation (Codex re-review, this round): a
-        # concurrent `release()` woken by this exact `.set()` call can
-        # still race ahead of this method's own, immediately-following
-        # `return self` -- there is no operation this method can perform
-        # that is simultaneously "signal a waiter it may proceed" and
-        # "this thread has fully returned control to its caller", since
-        # those are necessarily two separate statements. Moving the
-        # signal even later (there is nowhere later to move it -- this is
-        # already the last statement before the return) cannot close this;
-        # it is the same structural class as the other instruction-
-        # boundary windows documented on `_acquire_with_deadline()` and
-        # `release()` itself, just reachable via ordinary GIL scheduling
-        # rather than an async exception. Closing it completely would
-        # need either OS-level scheduling control over this exact handoff
-        # or the `with`-body itself acknowledging activation back to
-        # `release()` -- a fundamentally different, caller-cooperating
-        # design, not a fix to this method -- so it is documented here
-        # rather than chased further.
-        self._enter_committed.set()
+        # PR4a v1 final-convergence pass (issue #414): no handoff signal is
+        # needed here any more -- `_entered = True`, set above, is now a
+        # persistent "entering-or-active" marker for this handle's entire
+        # remaining lifetime (see `release()`'s own docstring). A
+        # concurrent `release()` that observes `_entered` already `True`
+        # never proceeds to unwind E/lease/G itself, no matter how soon
+        # after the line above it runs -- it only records a deferred
+        # request and returns immediately. There is therefore no window,
+        # of any size, between committing `_entered` here and this
+        # method's own `return self` in which a concurrent `release()`
+        # could tear down what this call is about to hand its caller.
         return self
 
     def __exit__(
@@ -352,143 +360,145 @@ class RuntimeHandle:
         exc: BaseException | None,
         tb: Any,
     ) -> None:
-        self.release(had_exception=exc_type is not None)
+        """Perform the real E -> lease -> G unwind for this handle's `with` block.
 
-    def release(self, *, had_exception: bool = False) -> None:
-        """Mark INVALID (if needed) while E is still held, then release
-        E -> lease -> G, in that order. Idempotent.
-
-        `had_exception=True` (always true when released via `__exit__` for
-        an exception that propagated out of the `with` block) marks the
-        entry `INVALID` rather than leaving it `READY` for reuse -- a
-        conservative correctness-first policy for v1, *not* a classification
-        of which exceptions actually leave a runtime unsafe to reuse (a
-        cancellation, or a pure input-validation failure the runtime never
-        even started acting on, is treated identically to a genuine
-        mid-inference crash). This may cause extra reloads; PR4b, once
-        generator boundaries are migrated onto this API, is where that
-        policy can be narrowed with real evidence about which exception
-        classes are actually safe to shrug off.
-
-        PR4a's own Codex-review Finding 2 (round 1): the INVALID transition
-        must become visible *before* E is released, not after -- otherwise a
-        second caller already parked waiting on E (it pinned the same entry
-        while this caller was still using it) can acquire E and start using
-        a runtime this caller has already deemed unsafe, in the gap between
-        "E released" and "lease decremented + marked INVALID" that a naive
-        single combined step would leave open. So this method does the
-        INVALID transition as its own short metadata transaction *first*,
-        while E is still owned; only then releases E; only then, separately,
-        decrements the lease (a runtime otherwise reused instantly by that
-        same second caller, with its lease not yet decremented, would look
-        briefly over-leased -- harmless, since the count is only ever a
-        lower bound on "do not evict", but decrementing before the INVALID
-        transition is even visible is the actual hazard, not this ordering).
-        The corresponding other half of this fix is on the *acquiring* side:
-        see `ModelService._acquire_execution_lock()`, which revalidates the
-        entry immediately after winning E, precisely to catch this window
-        from a waiter's perspective too.
-
-        Codex re-review (found on this round's own fix commits): the
-        `_released` check-and-set below is guarded by `_release_guard`
-        (a private, per-handle `Lock`) because it is not otherwise atomic
-        -- two threads calling `release()` on the exact same handle at once
-        (e.g. the `with` block's own `__exit__` racing a separate
-        cancellation/cleanup path that also holds a reference to this
-        handle) could both observe `_released is False` before either sets
-        it `True`, both proceed into the unwind below, and the second
-        `execution_lock.release()` would raise (releasing an unlocked
-        `Lock`) -- whose `finally` chain would still reach
-        `self._admission.release()` a *second* time, permanently inflating
-        the process-wide admission capacity by one. Only the flag
-        transition itself needs the lock; at most one caller can ever pass
-        it, so the actual release work below never needs it too.
-
-        Codex re-review (found on this round's own fix commits, again):
-        a *losing* concurrent caller's own `had_exception=True` must not
-        be silently discarded just because a *different*, concurrent
-        `release(had_exception=False)` call happened to win the guard
-        above -- the failed runtime would otherwise stay `READY` and
-        could be handed to a new caller. `mark_invalid()` is therefore
-        attempted by every caller whose own `had_exception` is `True`,
-        whether or not that particular call is the one performing the
-        rest of the unwind. This is a best-effort strengthening, not an
-        adversarial-scheduling-proof guarantee: if a `had_exception=True`
-        call arrives only *after* a `had_exception=False` call has
-        already fully completed E's release (not merely raced it), a
-        third caller could in principle have already won E and be using
-        the runtime by the time this one marks it invalid -- closing that
-        residual gap completely would require blocking the winner's own
-        unwind on the arrival of every other in-flight `release()` call
-        for this same handle, which has no bound and would itself become
-        a new "wait indefinitely" hazard. Every realistic use of this
-        method -- an exception unwinding through `__exit__`, racing a
-        supervisor/cancellation thread's own explicit `release()` call
-        for the same handle -- has both calls already in flight within
-        the same short window, which this closes.
-
-        Known, accepted limitation (Codex re-review, this round): if a
-        `BaseException` lands after the `with self._release_guard:` block
-        above has already set `self._released = True` but before the
-        `try:` below begins, none of E/lease/G is ever released, and
-        every subsequent call to this method returns immediately (since
-        `_released` already reads `True`) without retrying -- a permanent
-        leak of all three resources. Folding that gap's few bytecode
-        instructions into the same guarded region would not remove it,
-        only relocate it to the next statement boundary; genuinely
-        closing it needs OS-level signal masking around the entire
-        acquire-then-own transition, which is outside PR4a's scope (see
-        `_acquire_with_deadline()`'s own docstring for the same
-        conclusion on the acquiring side of this exact class of window).
-
-        Codex re-review (found on this round's own fix commits, once
-        more): sharing `_release_guard` with `__enter__()` closes the
-        check-and-set race on `_released`/`_entered` themselves, but
-        `__enter__()` still exits that guard *before* returning `self` to
-        its caller -- an ordinary thread switch in that last, tiny gap
-        (no exception needed this time, just routine scheduling) could
-        let this method run to completion first, so the entering thread
-        would resume and hand its caller a handle whose E/lease/G are
-        already gone. So immediately after this method's own guard
-        section observes `self._entered` is already `True`, it waits on
-        `_enter_committed` -- the `Event` `__enter__()` sets as its own
-        very last step -- before touching any resource. This is bounded,
-        not a new "wait indefinitely" hazard: once `_entered` reads
-        `True`, `__enter__()` has already exited its half of the shared
-        guard and has nothing left to do but signal and return, so the
-        wait is satisfied within a handful of instructions in every
-        realistic case; the timeout is a pure safety net against the same
-        vanishingly-rare async-interruption class documented above, and
-        this method still proceeds (rather than hanging forever) if it is
-        ever actually hit.
-
-        Known, accepted limitation (Codex re-review, this round): waking
-        from `_enter_committed.wait()` only proves `__enter__()` has
-        called `.set()`, not that it has finished its own, immediately
-        following `return self` -- this thread can still race ahead of
-        that final statement and complete its own unwind before the
-        entering thread's caller actually regains control. See
-        `__enter__()`'s own docstring, at its `_enter_committed.set()`
-        call, for why this specific residual gap cannot be closed by
-        moving the signal, and is documented rather than chased further.
+        PR4a v1 final-convergence pass (issue #414): `__exit__()` is the
+        *only* call path allowed to actually release E/lease/G while
+        `_entered` is `True` -- it always runs on the context owner's own
+        thread (Python guarantees a `with` block's `__exit__` runs on
+        whichever thread is executing that block), at the exact point the
+        body has finished, whether normally or via an exception. Any
+        *other* caller reaching `release()` during this same window (see
+        that method's own docstring) only records a deferred request; this
+        method is what actually acts on it.
         """
 
         with self._release_guard:
-            already_released = self._released
+            if self._released:
+                # Already unwound: only reachable if something outside this
+                # `with` block already called `release()` before entering
+                # (impossible -- `_entered` would then be `False` at
+                # `__enter__()` time and this method could not be running),
+                # so this is purely a defensive no-op, not a real path.
+                return
             self._released = True
-            entered = self._entered
-            if had_exception:
+            had_exception = exc_type is not None
+            # A cross-thread `release(had_exception=True)` call during this
+            # `with` block's own execution already marked the entry
+            # INVALID immediately (see `release()`'s docstring) -- calling
+            # `mark_invalid()` again here is a harmless no-op in that case.
+            # This still needs to run when *this* call's own `had_exception`
+            # is `True` even if no deferred request ever arrived, and OR-
+            # combines with any deferred request's own flag so either side
+            # lands on the safe (INVALID) side.
+            if had_exception or self._pending_invalidation:
                 self._cache.mark_invalid(self._canonical_id, self._entry)
-        if already_released:
-            return
-        if entered:
-            self._enter_committed.wait(timeout=5.0)
+        self._teardown()
+
+    def release(self, *, had_exception: bool = False) -> None:
+        """Manually release this handle. Idempotent; safe from any thread.
+
+        Two entirely different behaviors depending on this handle's state,
+        both required by PR4a v1's final-convergence pass on issue #414:
+
+        1. Not yet entered as a context manager (`_entered` is still
+           `False`): releases E -> lease -> G immediately, exactly as
+           before -- the "acquire, use without `with`, then call
+           `release()` when done" pattern this method has always supported.
+        2. Entering or active (`_entered` is `True`, `_released` is still
+           `False`): this call, whichever thread it runs on, does **not**
+           touch E/lease/G at all -- it only records a deferred request
+           (`_pending_release = True`, OR-combined into
+           `_pending_invalidation`) and returns immediately. The actual
+           unwind is performed later by this handle's own `__exit__()`
+           (see that method's docstring). This is the fix for a Codex
+           re-review finding that survived several earlier, narrower
+           rounds: previously, a cross-thread `release()` racing the tail
+           end of `__enter__()` could tear down E/lease/G while the `with`
+           body was about to start (or had already started) running,
+           reachable via ordinary thread scheduling alone, no exception
+           required. Deferring unconditionally whenever `_entered` is
+           `True` -- rather than adding yet another `Event` to narrow the
+           handoff window further -- removes the race structurally: there
+           is no longer any call path by which anything other than this
+           handle's own `__exit__()` can free a resource the `with` body
+           might still be using, for as long as that body is running.
+           This also means an *intentional* same-thread `release()` call
+           made from *inside* the handle's own `with` body no longer frees
+           anything early either -- the actual unwind still waits for
+           `__exit__()` -- which is the simpler of the two v1-acceptable
+           designs (the alternative, turning this into an explicit error
+           in that case, adds a new failure mode for no added safety, since
+           the body keeps E/lease/G either way).
+
+        `had_exception=True` marks the entry `INVALID` (rather than leaving
+        it `READY` for reuse) immediately, inside `_release_guard`, in
+        *both* of the cases above -- not deferred, even when the rest of
+        the unwind is -- so a second caller already parked waiting on E for
+        this exact entry can never win E and observe a still-`READY`
+        runtime this caller has already deemed unsafe (PR4a's own
+        Codex-review Finding 2, round 1). This is a conservative,
+        correctness-first policy for v1, not a classification of which
+        exceptions actually leave a runtime unsafe to reuse; PR4b can
+        narrow it with real evidence once generator boundaries migrate onto
+        this API. `mark_invalid()` is itself idempotent and safe to call
+        from any thread at any time (a short, standalone metadata
+        transaction -- see its own docstring), so calling it here even when
+        this particular call ends up only deferring the rest of the unwind
+        is always safe, and `__exit__()` calling it again afterward (OR-
+        combining with `_pending_invalidation`) is a harmless no-op.
+
+        Codex re-review (found on an earlier round's fix commits): the
+        `_released`/`_entered` reads and the `_released = True` write below
+        are guarded by `_release_guard` (a private, per-handle `Lock`)
+        because they are not otherwise atomic -- two threads calling
+        `release()` on the exact same handle at once could both observe
+        `_released is False` before either sets it `True` and both proceed
+        into the immediate-unwind path, double-releasing E/lease/G and
+        permanently inflating the process-wide admission capacity by one.
+        Only the flag transition itself needs the lock; the actual release
+        work (case 1) or deferred-request bookkeeping (case 2) either needs
+        no further synchronization or is itself entirely inside the guard.
+
+        Known, accepted limitation (Codex re-review, an earlier round): if
+        a `BaseException` lands after `_release_guard` has already set
+        `self._released = True` (case 1) but before `_teardown()` actually
+        runs, none of E/lease/G is ever released, and every later call to
+        this method returns immediately -- a permanent leak of all three.
+        Closing this needs OS-level signal masking around the whole
+        transition, which is outside PR4a's scope; see
+        `_acquire_with_deadline()`'s own docstring for the identical
+        conclusion on the acquiring side of this exact class of window.
+        Not reachable through normal cooperative job cancellation, and
+        does not include ordinary thread-scheduling races -- see this
+        module's `RuntimeAdmissionController.release()` for the same
+        scoping on the process-wide-admission side of this class of
+        window.
+        """
+
+        with self._release_guard:
+            if self._released:
+                if had_exception:
+                    self._cache.mark_invalid(self._canonical_id, self._entry)
+                return
+            if had_exception:
+                self._pending_invalidation = True
+                self._cache.mark_invalid(self._canonical_id, self._entry)
+            if self._entered:
+                # Entering or active: defer the real unwind to __exit__().
+                self._pending_release = True
+                return
+            self._released = True
+        self._teardown()
+
+    def _teardown(self) -> None:
+        """Actually release E -> lease -> G, in that order. Called at most
+        once per handle, only by `release()`'s not-yet-entered path or by
+        `__exit__()` -- both already hold the sole `self._released = True`
+        transition guaranteeing this runs exactly once.
+        """
+
         try:
-            # Cleared before the actual release so no window exists
-            # where E is free but a stale owner id could still match a
-            # same-thread recursive-acquisition check (see
-            # `RuntimeEntry.execution_lock_owner`'s own docstring).
-            self._entry.execution_lock_owner = None
             self._entry.execution_lock.release()
         finally:
             try:
@@ -720,51 +730,31 @@ class ModelService:
         resolve raises `RuntimeBusyError` immediately instead of waiting --
         see `ModelRuntimeCache.acquire_or_reserve()`'s own docstring.
 
-        Do not call this method again, on the same thread, once it already
-        holds every one of G's slots by itself (its own earlier, still-open
-        `acquire_runtime()` calls -- production defaults to
-        `admission_capacity=1`, so ordinarily this means holding even one
-        handle at all) -- release at least one handle first. A *blocking*
-        attempt in that state is rejected immediately with a plain
-        `RuntimeError` (Codex re-review, found on this round's own fix
-        commits): only this same thread could ever release one of its own
-        slots to free room for itself, so waiting here would deadlock it
-        against itself forever. Holding *fewer* than `capacity` slots and
-        acquiring one more is ordinary, legitimate usage (e.g. a job step
-        that needs two different models loaded at once, with capacity
-        raised to allow it), and a non-blocking attempt (`wait_timeout=0`,
-        or any deadline already past) is never rejected this way either --
-        it cannot deadlock, since it already fails fast with an ordinary,
-        retryable `RuntimeBusyError` on its own. Recursing onto the exact
-        same canonical entry's E -- reachable with `admission_capacity > 1`,
-        where G alone would not have rejected the attempt -- is also
-        rejected immediately with a plain `RuntimeError`, via
-        `RuntimeEntry.execution_lock_owner` (see `_acquire_execution_lock()`'s
-        own docstring); `entry.execution_lock` is otherwise a plain,
-        non-reentrant `threading.Lock` with no owner-thread bookkeeping of
-        its own, and would hang the same way acquiring any non-reentrant
-        lock twice on one thread always does.
-
-        Known, accepted limitation (Codex re-review, this round): with
-        `admission_capacity > 1`, holding fewer than every G slot and
-        nesting another acquisition for a genuinely *different* canonical
-        entry is deliberately still allowed to block (see "ordinary,
-        legitimate usage" above) -- which means a specific cross-thread
-        cycle remains possible in principle: thread A holds entry X and,
-        while still holding it, blocks acquiring G for entry Y; thread B
-        holds the process's other G slot and is itself blocked waiting on
-        X's E, which only A can release, but A cannot release X until its
-        own nested call for Y returns. Rejecting *every* blocking nested
-        acquisition unconditionally (regardless of how many slots this
-        thread already holds) would close this, but would also reject the
-        legitimate "two different models at once" usage this same
-        paragraph explicitly documents as supported, and detecting only
-        the genuinely cyclic case in general requires full wait-for-graph
-        deadlock detection across G and every entry's E -- a materially
-        larger feature than PR4a's own stated scope (no new complex
-        admission/scheduling machinery). Avoid nesting `acquire_runtime()`
-        calls across different canonical ids from the same thread whenever
-        another thread might be concurrently contending for either one.
+        Do not call this method again, on the same thread, while it already
+        holds an open `RuntimeHandle` from an earlier, still-open
+        `acquire_runtime()` call -- release that handle first.
+        `RuntimeAdmissionController.acquire()` rejects any such nested
+        attempt immediately with a plain `RuntimeError`, unconditionally,
+        regardless of canonical id (same or different) and regardless of
+        `admission_capacity` (see that class's own docstring). PR4a v1
+        deliberately does not support one thread holding more than one
+        `RuntimeHandle` at a time: `admission_capacity > 1` still has a
+        real meaning -- it bounds how many *different* threads may each
+        hold one runtime at once -- but it is not a way to let a single
+        thread hold several. A prior version of this rule only fired once
+        a thread had exhausted every one of `capacity`'s slots by itself,
+        which left a real cross-thread deadlock cycle open whenever
+        `capacity > 1`: thread A holds entry X and, while still holding
+        it, blocks acquiring G for a *different* entry Y; thread B holds
+        the process's other G slot and is itself blocked waiting on X's E,
+        which only A can release -- but A can never release X until its
+        own nested call for Y returns. Rejecting every nested acquisition
+        unconditionally (this method never needs full wait-for-graph
+        deadlock detection to do it) closes this cycle outright. A
+        genuine "hold several runtimes on one thread at once" use case, if
+        ever needed, is out of scope for PR4a and belongs in a separate,
+        deliberately designed deadlock-free multi-runtime acquisition
+        protocol, not an implicit side effect of raising `capacity`.
 
         `wait_timeout`, if given, is a *single* overall deadline bounding
         ONLY how long this call waits on contended G/L/E synchronization --
@@ -805,7 +795,7 @@ class ModelService:
         try:
             entry = self._acquire_or_load_entry(manifest, media_type, deadline)
             try:
-                self._acquire_execution_lock(manifest.id, entry, deadline, owner_thread)
+                self._acquire_execution_lock(manifest.id, entry, deadline)
                 try:
                     return RuntimeHandle(
                         manifest=manifest,
@@ -824,7 +814,6 @@ class ModelService:
                     # itself (an async BaseException, a hypothetical
                     # allocation failure, ...) must not leave any of them
                     # held with no handle ever created to release them.
-                    entry.execution_lock_owner = None
                     entry.execution_lock.release()
                     raise
             except BaseException:
@@ -929,7 +918,6 @@ class ModelService:
         canonical_id: str,
         entry: RuntimeEntry,
         deadline: float | None,
-        owner_thread: Thread,
     ) -> None:
         """Acquire `entry.execution_lock` ("E") and revalidate it afterward.
 
@@ -957,35 +945,21 @@ class ModelService:
         future caller. This method now guarantees E is released on any
         exception it does not itself successfully return past.
 
-        Codex re-review (found on this round's own fix commit, again):
-        with `admission_capacity > 1`, a thread already holding a handle
-        on this exact canonical entry could reach this method a second
-        time (the lease-hit path in `acquire_or_reserve()` has no
-        knowledge of E at all) and then block forever trying to acquire
-        its own already-held, non-reentrant `execution_lock`. Checking
-        `entry.execution_lock_owner` before attempting acquisition fails
-        fast with a clear error instead of deadlocking; see that field's
-        own docstring on `RuntimeEntry` for why this check needs no
-        separate lock of its own. Like the analogous G-level check in
-        `RuntimeAdmissionController.acquire()`, this only fires for a
-        genuinely *blocking* attempt -- a non-blocking one (`deadline`
-        already past) is left to `_acquire_with_deadline()`'s own
-        non-blocking `acquire(blocking=False)`, which fails fast with an
-        ordinary, retryable `RuntimeBusyError` and cannot deadlock either
-        way.
+        PR4a v1 final-convergence pass (issue #414): a same-thread
+        recursive call that could reach this exact entry a second time --
+        the scenario a same-thread E-level ownership check used to guard
+        against here -- is now categorically impossible: any nested
+        `acquire_runtime()` call from a thread that already holds an open
+        `RuntimeHandle` is rejected at the G level, unconditionally, before
+        `ModelService.acquire_runtime()` ever reaches
+        `_acquire_or_load_entry()` or this method (see
+        `RuntimeAdmissionController.acquire()`'s own docstring). This
+        method therefore no longer needs its own owner-thread bookkeeping
+        on `entry`; `entry.execution_lock` is used exactly like an ordinary
+        non-reentrant `threading.Lock`, contended only across genuinely
+        different threads.
         """
 
-        would_block = deadline is None or deadline - time.monotonic() > 0
-        if would_block and entry.execution_lock_owner == owner_thread:
-            raise RuntimeError(
-                f"Recursive acquire_runtime() call detected for {canonical_id!r}: "
-                "this thread already holds exclusive execution access to this "
-                "exact canonical entry from an earlier, still-open "
-                "acquire_runtime() call. Release that RuntimeHandle before "
-                "acquiring it again -- entry.execution_lock is a plain, "
-                "non-reentrant lock, and waiting here would deadlock this "
-                "thread against itself."
-            )
         if not _acquire_with_deadline(entry.execution_lock, deadline):
             raise RuntimeBusyError(
                 f"Timed out waiting for exclusive execution access to {canonical_id!r}."
@@ -999,7 +973,6 @@ class ModelService:
         except BaseException:
             entry.execution_lock.release()
             raise
-        entry.execution_lock_owner = owner_thread
 
     # ------------------------------------------------------- canonical unload
 
