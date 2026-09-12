@@ -7,7 +7,7 @@ Date: 2026-09-13
 
 Creative AI Studio already uses multiple AI providers and execution surfaces for planning, implementation, review, and verification. The repository has a cross-agent harness, deterministic broker contracts under `.agents/protocol/v1`, provider-specific configuration in `.claude/` and `.codex/`, repository-wide instructions in `AGENTS.md`, and durable engineering documentation under `docs/`.
 
-The current system can hand work between agents, but the knowledge created by expensive review and debugging cycles is still mostly trapped in pull-request discussions, task reports, ad hoc prompts, and provider-specific context. A future agent can therefore repeat a failure that a previous agent already paid to discover.
+The current system can hand work between agents, but knowledge created by expensive review and debugging cycles is still mostly trapped in pull-request discussions, task reports, ad hoc prompts, and provider-specific context. A future agent can therefore repeat a failure that a previous agent already paid to discover.
 
 The immediate motivating case is PR #415 (PR4a runtime safety). It produced reusable evidence about runtime ownership, lock ordering, deterministic race testing, invalidation ordering, and the distinction between ordinary scheduling races and asynchronous `BaseException` instruction-boundary risks. Those lessons should become reusable repository knowledge instead of remaining only as PR history.
 
@@ -19,7 +19,7 @@ This ADR does not attempt to build autonomous self-improvement, a general RAG sy
 
 ## Decision
 
-### 1. `.agents/` is the provider-neutral source of truth
+### 1. `.agents/` is the provider-neutral source of truth for cognitive artifacts
 
 The existing `.agents/protocol/v1` remains the canonical cross-agent execution protocol. Cognitive infrastructure extends that namespace rather than creating a second agent subsystem.
 
@@ -29,24 +29,29 @@ Target structure:
 .agents/
 ├── protocol/                 # existing deterministic execution contracts
 │   └── v1/
-├── constitution/             # long-lived repository-level agent principles
+├── constitution/             # long-lived agent-engineering principles
 ├── memory/                   # validated reusable engineering knowledge
 │   └── failure-patterns/
 ├── reflections/              # candidate lessons and their validation lifecycle
 │   ├── inbox/
 │   ├── validated/
+│   ├── promoted/
 │   ├── rejected/
 │   └── archive/
 └── skills/                   # reusable procedures derived from validated knowledge
 ```
 
-`CLAUDE.md`, `AGENTS.md`, `.claude/*`, `.codex/*`, future Antigravity configuration, and local-LLM prompts are adapters or indexes. They are not the canonical copy of shared knowledge.
+This source-of-truth claim is deliberately narrow. `.agents/` is authoritative for shared **agent cognitive artifacts**: validated memory, reusable agent procedures, reflection provenance, and cross-agent protocol. It does not replace product or domain sources of truth.
+
+Existing accepted ADRs, domain/API contracts, deterministic tests, current code, and other explicit repository specifications remain primary evidence for the behavior they govern. A cognitive memory summarizes or operationalizes those sources; it must not silently override them.
+
+If a memory conflicts with a primary source, the memory is treated as stale or contradicted until revalidated or superseded. `AGENTS.md`, `CLAUDE.md`, `.claude/*`, `.codex/*`, future provider configuration, and local-LLM prompts may index or adapt cognitive artifacts, but provider-specific copies are not the canonical shared knowledge.
 
 Provider-native memory may improve a local session, but it is never the repository source of truth.
 
 ### 2. Keep memory, reflection, and skill as different artifacts
 
-The system distinguishes three concepts:
+The system distinguishes three concepts.
 
 #### Memory: what is known
 
@@ -89,7 +94,7 @@ A reflection is eligible for promotion only when all of the following are true:
 1. **Concrete evidence exists.** At least one durable source supports the lesson, such as a merged PR, deterministic regression test, code reference, accepted ADR, incident record, or independent review finding.
 2. **The claim is generalized carefully.** The lesson states the reusable invariant without pretending that one example proves a broader claim than the evidence supports.
 3. **An independent validation step exists.** A human, a different provider/model, or a deterministic check validates the proposed lesson. The same agent's self-review alone is insufficient for promotion.
-4. **Contradictions are checked.** Existing canonical memory and current code are checked for conflicts or superseding facts.
+4. **Contradictions are checked.** Existing canonical memory and current primary sources are checked for conflicts or superseding facts.
 5. **Scope and freshness are explicit.** The artifact states where the lesson applies and when it should be reviewed again if it depends on mutable implementation facts.
 
 Promotion states are:
@@ -100,7 +105,7 @@ inbox -> validated -> promoted
       -> archive
 ```
 
-`validated` means the reflection is supported. `promoted` means its reusable content has been incorporated into memory and/or a skill. The reflection remains as provenance rather than becoming the canonical rule itself.
+The directory structure mirrors those durable states. `validated` means the reflection is supported but has not necessarily changed canonical behavior. `promoted` means its reusable content has been incorporated into memory and/or a skill. The promoted reflection remains as provenance rather than becoming the canonical rule itself.
 
 ### 4. Canonical knowledge must carry provenance and lifecycle metadata
 
@@ -116,10 +121,13 @@ created_at: YYYY-MM-DD
 last_verified_at: YYYY-MM-DD
 confidence: high | medium | low
 evidence: []
+validated_by: []
 supersedes: []
 superseded_by: []
 review_after: YYYY-MM-DD | null
 ```
+
+Evidence should identify immutable or durable references whenever practical, for example a PR number plus exact commit SHA, a repository path plus exact commit SHA, an accepted ADR, or a deterministic test name. Moving branch names alone are not sufficient evidence for a mutable implementation claim.
 
 The body should contain, when applicable:
 
@@ -131,6 +139,8 @@ The body should contain, when applicable:
 - limits of the lesson.
 
 Mutable implementation observations must have a review date. Long-lived architectural invariants may use `review_after: null` but still require evidence.
+
+A memory whose `review_after` date has passed is `review_due`; it is not silently deleted, but retrieval must flag it as due for revalidation. A review-due mutable fact may provide context, but it must not be the sole authority for an architectural decision, merge gate, or safety claim until revalidated against current primary sources.
 
 Superseded memories are retained for provenance and marked as superseded rather than silently rewritten as if the old rule never existed.
 
@@ -170,6 +180,8 @@ touches core/models/cache.py or core/models/service.py
     -> concurrency-safety skill
 ```
 
+Retrieval must also surface lifecycle state. Contradicted, superseded, or review-due memory must not be presented as equivalent to current validated memory.
+
 This intentionally creates observable retrieval behavior that can later become evaluation data. Semantic retrieval is reconsidered only after the repository has enough high-quality canonical memories to measure retrieval quality against known expected results.
 
 ### 7. Skills are shared assets; provider adapters are derived views
@@ -193,7 +205,7 @@ Manual copy-and-edit divergence between providers is not an accepted steady stat
 
 Provider-specific metadata such as model choice, effort level, tool declarations, or invocation syntax belongs in the adapter, not in the provider-neutral procedure unless it is genuinely part of the shared engineering contract.
 
-`CLAUDE.md` and `AGENTS.md` should stay concise and act primarily as indexes to durable contracts rather than accumulating every procedural lesson inline.
+`CLAUDE.md` and `AGENTS.md` should stay concise and act primarily as entry points to durable contracts rather than accumulating every procedural lesson inline. This does not remove their role as provider/repository instruction surfaces; it prevents them from becoming duplicate canonical copies of cognitive knowledge.
 
 ### 8. Model routing uses escalation rules, not prestige
 
@@ -252,7 +264,7 @@ PR #415 (PR4a runtime safety core) is the single v0.1 pilot case.
 
 The first reflection must be derived from the merged PR and its durable evidence, not from a free-form recollection alone.
 
-The initial extraction should remain small. It should promote no more than approximately five high-value reusable lessons, with likely candidates including:
+The initial extraction must promote at most five high-value reusable lessons, with likely candidates including:
 
 - load ownership is not execution ownership;
 - leased runtime lifetime must be protected from destructive cleanup;
@@ -311,9 +323,9 @@ Do not default to blaming the model when the environment failed to supply the kn
 
 After this ADR is accepted:
 
-1. Create the minimal `.agents/constitution`, `.agents/memory/failure-patterns`, `.agents/reflections`, and `.agents/skills` structure without introducing a database or service.
+1. Create the minimal `.agents/constitution`, `.agents/memory/failure-patterns`, `.agents/reflections/{inbox,validated,promoted,rejected,archive}`, and `.agents/skills` structure without introducing a database or service.
 2. Create one Golden Reflection for PR #415 with direct evidence links.
-3. Promote a small set of validated failure-pattern memories from that reflection.
+3. Promote at most five validated failure-pattern memories from that reflection.
 4. Create one provider-neutral `concurrency-safety` skill.
 5. Add the smallest Claude and Codex adapter/index changes needed to make the canonical knowledge reachable.
 6. Add deterministic validation that provider adapters do not silently drift from canonical shared skills if generated copies are required.
