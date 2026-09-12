@@ -48,3 +48,25 @@ starting its `Agent` consumes Claude usage and requires operator approval.
 - Never allow two providers to write to the same worktree concurrently.
 - Prefer the other provider for independent verification of high-risk changes.
 - Preserve the patch and verification contract in `docs/agent-harness.md`.
+
+## Desktop shell — verification gate
+
+When any change touches `apps/desktop/`, `apps/api` CORS in `apps/api/main.py` /
+`tests/test_api_extensions.py`, or `apps/web/src/runtime.ts` / `studioClient.ts`,
+follow `docs/desktop/desktop-shell-runbook.md` in addition to the backend and
+frontend gates. Minimum, before calling it complete:
+
+- run the boundary guard: `python3 apps/desktop/scripts/check_no_backend_spawn.py`;
+- `cd apps/desktop/src-tauri && cargo check --all-targets && cargo test --all-targets`;
+- build the bundles: `(cd apps/desktop/src-tauri && cargo tauri build)`;
+- after a full build, run the packaged-app smoke:
+  `./scripts/desktop_smoke.sh` (build-tree binary only — never `open`
+  `/Applications`, which may resolve to the same-bundle-id old install).
+
+Desktop smoke verifies default 8000, CORS read/preflight/JSON write, the
+`API_PORT=8123` non-default flow through root `.env`, and second-instance focus.
+
+Hard invariant: the Rust shell must never spawn Python/FastAPI, initialize CUDA,
+or load model runtimes. Do not put the probe words (python/fastapi/uvicorn/
+cuda/torch/spawn) in Rust code outside comments/strings. Do not touch `models/`.
+A stale root `.env` can divert the non-default-port smoke; the script restores it.

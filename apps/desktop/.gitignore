@@ -1,0 +1,6 @@
+# Rust / Cargo build outputs
+/src-tauri/target/
+/src-tauri/gen/
+
+# Local build artifacts
+dist/
