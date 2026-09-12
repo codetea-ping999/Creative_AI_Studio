@@ -758,6 +758,15 @@ class ModelRuntimeCache:
         falling through to the eviction search below and sacrificing a
         second, perfectly healthy entry that was never actually short on
         room.
+
+        Codex re-review (PR4a v1 final-convergence pass): this method (and
+        `acquire_or_reserve()`, its only caller) evicts at most one victim
+        per call, by design -- never a cascading/looping eviction (see
+        that method's own docstring). If the bucket is more than one entry
+        over budget once every non-evictable (pinned) entry is accounted
+        for, evicting a single healthy entry still cannot bring occupancy
+        under budget, so this raises `RuntimeBusyError` instead of
+        selecting and retiring one anyway for no benefit.
         """
 
         budget = self.media_limits.get(bucket, self.max_entries)
@@ -794,6 +803,31 @@ class ModelRuntimeCache:
                 f"No capacity available for {budget_for!r} in bucket "
                 f"{bucket!r} (budget={budget}): {leased_count} leased, "
                 f"{transitioning_count} mid-transition (loading/retiring)."
+            )
+        # Codex re-review, PR4a v1 final-convergence pass: this method
+        # (and `acquire_or_reserve()`, its only caller) deliberately evicts
+        # at most ONE victim per call, never cascading -- see this method's
+        # own docstring. If the bucket is more than one entry over budget
+        # (e.g. budget=1 with one pinned entry that can never be evicted
+        # plus one evictable entry alongside it), evicting that single
+        # evictable entry still cannot bring occupancy under budget: the
+        # pinned entry alone already consumes it. Selecting and retiring it
+        # anyway would destroy a healthy runtime for no benefit whatsoever
+        # -- `acquire_or_reserve()`'s own post-cleanup recheck would still
+        # see the bucket at or over budget (this same computation, run
+        # again) and deny the reservation regardless. Reject up front
+        # instead, before anything is marked RETIRING.
+        if len(bucket_ids) - retiring_count - 1 >= budget:
+            leased_count = sum(
+                1 for entry_id in bucket_ids if self._entries[entry_id].is_pinned()
+            )
+            transitioning_count = len(bucket_ids) - leased_count
+            raise RuntimeBusyError(
+                f"No capacity available for {budget_for!r} in bucket "
+                f"{bucket!r} (budget={budget}): evicting one candidate "
+                f"would still leave {leased_count} leased, "
+                f"{transitioning_count} mid-transition (loading/retiring) "
+                "-- retry once more capacity frees."
             )
         # `self._entries` preserves LRU order (oldest first); `evictable`
         # was built by iterating it, so its own first element is the

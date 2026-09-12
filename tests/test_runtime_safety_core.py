@@ -1035,6 +1035,40 @@ class RuntimeSafetyCoreTests(unittest.TestCase):
         self.assertEqual(set(cache.loaded_ids()), {"model-a", "model-b"})
         self.assertEqual(cache._entries["model-a"].lease_count, 1)
 
+    def test_select_capacity_victim_denies_immediately_when_one_eviction_cannot_create_room(self):
+        # Codex re-review (PR4a v1 final-convergence pass): with budget=1,
+        # a pinned model-a, and an unpinned model-b -- the exact over-budget
+        # state the previous test documents as a legitimate,
+        # absolute-pin-supremacy outcome of legacy put() -- a fresh
+        # reservation attempt for a third id must not select and destroy
+        # model-b: evicting it alone still leaves model-a occupying the
+        # entire budget by itself, so `acquire_or_reserve()`'s own
+        # post-cleanup recheck would deny the new reservation regardless.
+        # Selecting and retiring model-b anyway would destroy a healthy
+        # runtime for no benefit whatsoever.
+        #
+        # model-a is pinned directly via the cache's own lower-level API
+        # (bypassing G/ModelService entirely), since this targets the
+        # cache-level victim-selection mechanism, not G/L/E service
+        # semantics.
+        cleanup = _RecordingCleanup()
+        cache = ModelRuntimeCache(max_entries=1, on_evict=cleanup)
+
+        entry_a = cache.acquire_or_reserve("model-a", "image")
+        cache.publish_ready_and_pin("model-a", entry_a, {"id": "model-a"})
+        self.assertEqual(cache._entries["model-a"].lease_count, 1)
+
+        cache.put("model-b", {"id": "model-b", "instance": object()})
+        self.assertTrue(cache.has("model-b"))
+
+        with self.assertRaises(RuntimeBusyError):
+            cache.acquire_or_reserve("model-c", "image")
+
+        # model-b must survive completely untouched.
+        self.assertTrue(cache.has("model-b"))
+        self.assertEqual(cleanup.calls, [])
+        self.assertEqual(set(cache.loaded_ids()), {"model-a", "model-b"})
+        self.assertEqual(cache._entries["model-b"].state, RuntimeState.READY)
 
     # ---------------------------- Codex round-1 review (PR #415), 8 findings
 
