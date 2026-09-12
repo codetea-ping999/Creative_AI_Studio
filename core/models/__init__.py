@@ -25,7 +25,8 @@ from .loader import (
 from .manifest import ModelManifest
 from .registry import ModelRegistry
 from .resolver import ModelResolver
-from .service import ModelService
+from .runtime_lease import RuntimeBusyError, RuntimeEntry, RuntimeState
+from .service import ModelService, RuntimeAdmissionController, RuntimeHandle
 
 __all__ = [
     "AudioCraftMusicgenLoader",
@@ -43,6 +44,11 @@ __all__ = [
     "ModelResolver",
     "ModelRuntimeCache",
     "ModelService",
+    "RuntimeAdmissionController",
+    "RuntimeBusyError",
+    "RuntimeEntry",
+    "RuntimeHandle",
+    "RuntimeState",
     "TransformersMusicgenLoader",
     "VoicevoxHttpLoader",
     "create_default_loader_registry",
