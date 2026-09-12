@@ -4,6 +4,35 @@
 - 対象 HEAD: `7c8c6ff` (detached) / `apps/desktop` = Tauri 2 Desktop Shell v0.1
 - 調査方法: コード読解 + 起動中バックエンド (127.0.0.1:8000) への CORS 実測。編集は行っていない。
 
+## 解決状況（2026-09-13 追記）— この調査の指摘は実装済み・検証済み
+
+本レポートは調査時の fault chain の記録です。指摘されたギャップは PR #409
+（`codex/desktop-shell-cors-runtime` @ `d97ada3`）で解決し、パッケージ版 `d97ada3` 時点の
+全検証を通過しました。再現手順・環境メモは `docs/desktop/desktop-shell-runbook.md` に固定しています。
+
+| 本レポートの「推奨対応」 | 対応結果 |
+| --- | --- |
+| 1. CORS 許可リストへ Tauri WebView オリジン追加 | 実装済み（`apps/api/main.py` の exact allowlist に `tauri://localhost` / `http://tauri.localhost`）。read / preflight / JSON write を実測 |
+| 2. CORS 単体テスト | 実装済み（`tests/test_api_extensions.py`） |
+| 3. StudioRuntime（BrowserRuntime / DesktopRuntime）導入 | 実装済み（`apps/web/src/runtime.ts` / `studioClient.ts`）。desktop は IPC で実行時 endpoint 解決 |
+| 4. バックエンド未起動時の UX | 将来課題（`docs/next-tasks.md` に積んだ次ステップを参照） |
+
+検証済みの内容（packaged `.app`、env 上書きなし通常起動）:
+
+- 既定 8000: UI の読み出し一式（`/health` `/projects` `/catalog/loras` `/models` `/gallery` `/metrics`)
+  が API ログに現れる
+- 非既定 8123（`API_PORT=8123 ./scripts/run_api_dev.sh` + root `.env`）: 同様に接続し、
+  8000 には 0 リクエスト
+- CORS read / preflight / JSON write（`tauri://localhost` から POST → 201 → DELETE 204）を両ポートで実測
+- global shortcut 登録失敗は non-fatal（warning のみで shell 継続）— 不正 accelerator での実証
+- 二重起動はフォーカス集約（desktop プロセス 1 つ）
+
+検証コマンドの再実行: `./scripts/desktop_smoke.sh`（詳細は runbook）。
+
+---
+
+（以下は調査当時のレポート本体）
+
 ## 結論 (TL;DR)
 
 パッケージ済み macOS デスクトップアプリ（Tauri WebView）で画像・動画（および音声）の生成ができない原因は、
