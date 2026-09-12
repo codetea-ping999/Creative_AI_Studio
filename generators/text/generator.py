@@ -66,68 +66,84 @@ class TextGenerator(BaseGenerator):
     # it, so cancellation is only honored at the job-boundary for this generator.
     def generate(self, request: GenerationRequest) -> GenerationResult:  # type: ignore[override]
         requested_model_id = request.model_id.strip() or None
-        manifest, runtime_obj = self.model_service.resolve_runtime(
+
+        # PR4b / FP-001 + FP-002: the model call and its one allowed repair
+        # attempt are the runtime-use interval.  Keep E + the lifetime lease
+        # for that whole interval, then release before file/quality work that
+        # does not touch the runtime.  This also leaves room for later local
+        # semantic judges to enter the same process-wide admission domain
+        # without creating a forbidden same-thread nested acquisition.
+        with self.model_service.acquire_runtime(
             requested_model_id,
             media_type="text",
             task_type=self.task_type,
-        )
-        generate_text = runtime_obj["generate"]
+        ) as handle:
+            manifest = handle.manifest
+            runtime_obj = handle.runtime
+            generate_text = runtime_obj["generate"]
 
-        effective_params = {**manifest.default_params, **request.params}
-        task = get_story_task(str(effective_params.pop("task", "logline")))
-        max_tokens = int(
-            effective_params.pop("max_tokens", task.default_max_tokens)
-        )
-        temperature = float(effective_params.pop("temperature", 0.8))
-        top_p = float(effective_params.pop("top_p", 0.95))
-        # Runtime wiring, not generation parameters: strip them so they are not
-        # mistaken for task inputs in the rendered brief.
-        for runtime_key in (
-            "context_window",
-            "n_gpu_layers",
-            "model_file",
-            "chat_format",
-            "model_name",
-            "api_key_env",
-            "timeout_seconds",
-        ):
-            effective_params.pop(runtime_key, None)
+            effective_params = {**manifest.default_params, **request.params}
+            task = get_story_task(str(effective_params.pop("task", "logline")))
+            max_tokens = int(
+                effective_params.pop("max_tokens", task.default_max_tokens)
+            )
+            temperature = float(effective_params.pop("temperature", 0.8))
+            top_p = float(effective_params.pop("top_p", 0.95))
+            # Runtime wiring, not generation parameters: strip them so they are not
+            # mistaken for task inputs in the rendered brief.
+            for runtime_key in (
+                "context_window",
+                "n_gpu_layers",
+                "model_file",
+                "chat_format",
+                "model_name",
+                "api_key_env",
+                "timeout_seconds",
+            ):
+                effective_params.pop(runtime_key, None)
 
-        # Continuity memory (issue #190): POST /stories/{id}/expand injects
-        # `continuity_context` (the rendered prompt block) and
-        # `continuity_snapshot` (the exact ContinuityContext used, for
-        # reproducibility) into params for the "prose" task. Popped here so
-        # neither is echoed into metadata["params"] below, which is about
-        # generation knobs, not story content — the snapshot gets its own
-        # metadata field instead, so it is inspectable without re-parsing the
-        # resolved prompt.
-        continuity_context_text = str(
-            effective_params.pop("continuity_context", "") or ""
-        ).strip()
-        continuity_snapshot = effective_params.pop("continuity_snapshot", None)
+            # Continuity memory (issue #190): POST /stories/{id}/expand injects
+            # `continuity_context` (the rendered prompt block) and
+            # `continuity_snapshot` (the exact ContinuityContext used, for
+            # reproducibility) into params for the "prose" task. Popped here so
+            # neither is echoed into metadata["params"] below, which is about
+            # generation knobs, not story content — the snapshot gets its own
+            # metadata field instead, so it is inspectable without re-parsing the
+            # resolved prompt.
+            continuity_context_text = str(
+                effective_params.pop("continuity_context", "") or ""
+            ).strip()
+            continuity_snapshot = effective_params.pop("continuity_snapshot", None)
 
-        task_params = {
-            "premise": request.prompt,
-            "subject": request.prompt,
-            **effective_params,
-        }
-        if continuity_context_text:
-            task_params["continuity_context"] = continuity_context_text
-        prompt = task.build_prompt(task_params)
-        json_schema = task.json_schema()
+            task_params = {
+                "premise": request.prompt,
+                "subject": request.prompt,
+                **effective_params,
+            }
+            if continuity_context_text:
+                task_params["continuity_context"] = continuity_context_text
+            prompt = task.build_prompt(task_params)
+            json_schema = task.json_schema()
 
-        structured, raw_text, attempts = self._generate_structured(
-            generate_text,
-            task=task,
-            prompt=prompt,
-            system=task.system_prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            seed=request.seed,
-            json_schema=json_schema,
-            supports_json_schema=bool(runtime_obj.get("supports_json_schema")),
-        )
+            structured, raw_text, attempts = self._generate_structured(
+                generate_text,
+                task=task,
+                prompt=prompt,
+                system=task.system_prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                seed=request.seed,
+                json_schema=json_schema,
+                supports_json_schema=bool(runtime_obj.get("supports_json_schema")),
+            )
+            runtime_metadata = {
+                "runtime_type": type(runtime_obj).__name__,
+                "device": runtime_obj.get("device"),
+                "context_window": runtime_obj.get("context_window"),
+                "supports_json_schema": runtime_obj.get("supports_json_schema"),
+                "endpoint_base_url": runtime_obj.get("endpoint_base_url"),
+            }
 
         output_id = f"txt_{uuid4().hex}"
         markdown_path = self.output_dir / f"{output_id}.md"
@@ -167,13 +183,7 @@ class TextGenerator(BaseGenerator):
                 "model_runtime": manifest.runtime,
                 "model_provider": manifest.provider,
                 "loader": manifest.loader,
-                "runtime_type": type(runtime_obj).__name__,
-                "device": runtime_obj.get("device"),
-                "context_window": runtime_obj.get("context_window"),
-                "supports_json_schema": runtime_obj.get("supports_json_schema"),
-                # Recorded so a run against an endpoint always shows where the
-                # prompt was sent.
-                "endpoint_base_url": runtime_obj.get("endpoint_base_url"),
+                **runtime_metadata,
                 "seed": request.seed,
                 "output_format": "md",
                 "structured_path": str(structured_path),
