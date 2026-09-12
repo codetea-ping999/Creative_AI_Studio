@@ -40,6 +40,46 @@ class _FakeCancellation(BaseException):
     that matters for Codex-review Finding 6 (round 1)."""
 
 
+class _PausingReleaseGuard:
+    """Test-only stand-in for `RuntimeHandle._release_guard`.
+
+    The real guard is a plain `threading.Lock`, which forbids arbitrary
+    attribute assignment (a C extension type with no `__dict__`) -- so a
+    test cannot monkeypatch its `acquire`/`release` directly the way it can
+    a plain Python object's methods. Swapping the whole `_release_guard`
+    attribute for one of these (perfectly legal -- `__slots__` restricts
+    attribute *names*, not the values assigned to them) lets a test pause a
+    thread precisely *while it still holds the guard*, right before it
+    would otherwise release it -- a genuine synchronization point, not a
+    timing guess. A second thread contending for the guard in the meantime
+    genuinely blocks on the same real `Lock` underneath, exactly as it
+    would against the real guard.
+    """
+
+    def __init__(self) -> None:
+        self._real_lock = Lock()
+        self.paused = Event()
+        self.let_continue = Event()
+
+    def __enter__(self) -> "_PausingReleaseGuard":
+        self._real_lock.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self.paused.set()
+        try:
+            self.let_continue.wait(timeout=5.0)
+        finally:
+            # Always release, even if the wait above times out (e.g. a
+            # test assertion elsewhere already failed and will never call
+            # `let_continue.set()`) -- otherwise the real lock stays held
+            # forever, hanging any thread still contending for it (and,
+            # transitively, the whole test process at interpreter
+            # shutdown, which waits for every non-daemon thread).
+            self._real_lock.release()
+        return False
+
+
 # --------------------------------------------------------------------------
 # Shared fakes -- deliberately decoupled from any real loader/torch code so
 # every test here proves cache/service concurrency semantics, never a real
@@ -2822,6 +2862,156 @@ class RuntimeSafetyCoreTests(unittest.TestCase):
         with handle:
             self.assertIs(handle.runtime, entry.runtime)
         self.assertEqual(entry.lease_count, 0)
+
+    def test_racing_invalidation_is_published_before_e_can_be_released(self):
+        # PR4a v1 final-convergence pass, Codex-review finding "Publish
+        # racing invalidation before releasing E": reproduces the exact
+        # 3-thread interleaving the finding described --
+        #   A: a normal __exit__() (no exception of its own) wins
+        #      _release_guard
+        #   B: release(had_exception=True) starts, contending for the
+        #      same guard
+        #   A: releases the guard, then releases E
+        #   C: an existing E-waiter wins E and revalidates
+        # -- and proves the fix: B's own mark_invalid() call now runs
+        # *before* B ever touches _release_guard, so it has already
+        # happened by the time A is allowed to proceed past its own
+        # (test-paused) guard section, regardless of whether B has won the
+        # guard yet. C must therefore see the entry INVALID, never READY,
+        # and must never reach "user runtime code".
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service(
+            {"model-a": manifest_a}, {"fake": loader}, admission_capacity=2,
+        )
+
+        a_entered = Event()
+        a_may_exit = Event()
+        a_errors: list[BaseException] = []
+        handle_holder: list = []
+
+        def thread_a():
+            try:
+                handle = service.acquire_runtime("model-a", "image")
+                handle_holder.append(handle)
+                handle.__enter__()
+                a_entered.set()
+                assert a_may_exit.wait(timeout=5.0)
+                handle.__exit__(None, None, None)  # A's own exit is clean
+            except BaseException as exc:  # noqa: BLE001
+                a_errors.append(exc)
+
+        ta = Thread(target=thread_a)
+        ta.start()
+        self.assertTrue(a_entered.wait(timeout=5.0))
+        handle = handle_holder[0]
+        entry = handle._entry
+
+        # Swap in the test-controllable guard *after* __enter__() has
+        # already used the real one -- the only remaining users are this
+        # handle's own __exit__() (thread A, below) and release() (thread
+        # B, below).
+        guard = _PausingReleaseGuard()
+        handle._release_guard = guard
+
+        # C: a genuinely separate acquire_runtime() call for the exact
+        # same entry, proven to be blocked *inside* its own blocking
+        # acquisition of E (not merely "started") by intercepting the
+        # actual module-level blocking-acquire call -- a real
+        # synchronization point, not a timing guess.
+        c_blocked_on_e = Event()
+        original_acquire_with_deadline = service_module._acquire_with_deadline
+
+        def signaling_acquire_with_deadline(lockable, deadline):
+            if lockable is entry.execution_lock:
+                c_blocked_on_e.set()
+            return original_acquire_with_deadline(lockable, deadline)
+
+        c_result: dict[str, object] = {}
+        c_user_code_runs = 0
+
+        def thread_c():
+            nonlocal c_user_code_runs
+            try:
+                c_handle = service.acquire_runtime("model-a", "image")
+            except RuntimeBusyError as exc:
+                c_result["busy"] = exc
+                return
+            except BaseException as exc:  # noqa: BLE001
+                c_result["error"] = exc
+                return
+            c_user_code_runs += 1
+            c_result["handle"] = c_handle
+
+        service_module._acquire_with_deadline = signaling_acquire_with_deadline
+        tc = Thread(target=thread_c)
+        try:
+            tc.start()
+            self.assertTrue(c_blocked_on_e.wait(timeout=5.0))
+        finally:
+            service_module._acquire_with_deadline = original_acquire_with_deadline
+
+        # Let A proceed into __exit__(): it commits _released = True,
+        # decides had_exception=False (its own exit is clean), and is then
+        # paused by the test guard *while still holding it* -- exactly "A
+        # owns _release_guard" in the scenario above.
+        a_may_exit.set()
+        self.assertTrue(guard.paused.wait(timeout=5.0))
+
+        # B: the cross-thread exception release, started only now -- while
+        # A is confirmed still holding the guard, so B's own eventual
+        # attempt to acquire it is guaranteed to genuinely block on the
+        # real lock underneath (not a race against A's own progress).
+        b_errors: list[BaseException] = []
+
+        def thread_b():
+            try:
+                handle.release(had_exception=True)
+            except BaseException as exc:  # noqa: BLE001
+                b_errors.append(exc)
+
+        b_marked_invalid = Event()
+        original_mark_invalid = cache.mark_invalid
+
+        def signaling_mark_invalid(canonical_id, entry_arg):
+            original_mark_invalid(canonical_id, entry_arg)
+            if canonical_id == "model-a":
+                b_marked_invalid.set()
+
+        cache.mark_invalid = signaling_mark_invalid
+        tb = Thread(target=thread_b)
+        try:
+            tb.start()
+            # B's own mark_invalid() call happens *before* it ever touches
+            # _release_guard (the fix) -- so it completes even though A is
+            # still holding that exact guard right now.
+            self.assertTrue(b_marked_invalid.wait(timeout=5.0))
+        finally:
+            cache.mark_invalid = original_mark_invalid
+
+        # The critical invariant: INVALID is already visible *before* A
+        # has been allowed to release E at all.
+        self.assertEqual(entry.state, RuntimeState.INVALID)
+
+        # Now let A actually proceed: release the guard, then release E
+        # via _teardown().
+        guard.let_continue.set()
+        ta.join(timeout=5.0)
+        tb.join(timeout=5.0)
+        tc.join(timeout=5.0)
+
+        self.assertEqual(a_errors, [])
+        self.assertEqual(b_errors, [])
+        # C must never have received a handle or run "user runtime code" --
+        # it lost the revalidation race against the invalidation B already
+        # published.
+        self.assertEqual(c_user_code_runs, 0)
+        self.assertNotIn("handle", c_result)
+        self.assertIsInstance(c_result.get("busy"), RuntimeBusyError)
+
+        # Final state: fully unwound, nothing leaked.
+        self.assertEqual(entry.lease_count, 0)
+        self.assertFalse(entry.execution_lock.locked())
 
 
 if __name__ == "__main__":

@@ -418,13 +418,14 @@ class RuntimeHandle:
             self._released = True
             had_exception = exc_type is not None
             # A cross-thread `release(had_exception=True)` call during this
-            # `with` block's own execution already marked the entry
-            # INVALID immediately (see `release()`'s docstring) -- calling
-            # `mark_invalid()` again here is a harmless no-op in that case.
-            # This still needs to run when *this* call's own `had_exception`
-            # is `True` even if no deferred request ever arrived, and OR-
-            # combines with any deferred request's own flag so either side
-            # lands on the safe (INVALID) side.
+            # `with` block's own execution already published the entry as
+            # INVALID *before* it ever touched `_release_guard` (see that
+            # method's own docstring) -- calling `mark_invalid()` again
+            # here is a harmless no-op in that case. This still needs to
+            # run when *this* call's own `had_exception` is `True` even if
+            # no deferred request ever arrived, and OR-combines with any
+            # deferred request's own flag so either side lands on the safe
+            # (INVALID) side.
             if had_exception or self._pending_invalidation:
                 self._cache.mark_invalid(self._canonical_id, self._entry)
         self._teardown()
@@ -466,21 +467,44 @@ class RuntimeHandle:
            the body keeps E/lease/G either way).
 
         `had_exception=True` marks the entry `INVALID` (rather than leaving
-        it `READY` for reuse) immediately, inside `_release_guard`, in
-        *both* of the cases above -- not deferred, even when the rest of
-        the unwind is -- so a second caller already parked waiting on E for
-        this exact entry can never win E and observe a still-`READY`
+        it `READY` for reuse), so a second caller already parked waiting on
+        E for this exact entry can never win E and observe a still-`READY`
         runtime this caller has already deemed unsafe (PR4a's own
         Codex-review Finding 2, round 1). This is a conservative,
         correctness-first policy for v1, not a classification of which
         exceptions actually leave a runtime unsafe to reuse; PR4b can
         narrow it with real evidence once generator boundaries migrate onto
-        this API. `mark_invalid()` is itself idempotent and safe to call
-        from any thread at any time (a short, standalone metadata
-        transaction -- see its own docstring), so calling it here even when
-        this particular call ends up only deferring the rest of the unwind
-        is always safe, and `__exit__()` calling it again afterward (OR-
-        combining with `_pending_invalidation`) is a harmless no-op.
+        this API.
+
+        PR4a v1 final-convergence pass, Codex-review finding "Publish
+        racing invalidation before releasing E": the `mark_invalid()` call
+        below runs *before* this method ever touches `_release_guard`, not
+        after acquiring it. A prior version called it only once this
+        method had won the guard -- but an ordinary, no-exception
+        `__exit__()` racing this exact call could win that same guard
+        *first* (this call still blocked waiting for it), see no
+        invalidation recorded yet, proceed straight to `_teardown()`, and
+        release E, letting an existing E-waiter (reachable with
+        `admission_capacity > 1`) win E, revalidate a still-`READY` entry,
+        and start using a runtime this call already knew was unsafe --
+        entirely via ordinary thread scheduling, no exception required
+        (unlike the accepted, signal/`BaseException`-only windows
+        documented elsewhere in this module). `mark_invalid()` is a short,
+        standalone metadata transaction with its own lock (`M`, held only
+        for the duration of that one call -- see its own docstring: exact
+        current entry only, no-op if stale or already non-`READY`,
+        idempotent), fully released before this method ever attempts
+        `_release_guard`, so this introduces no new lock-ordering hazard
+        (M is still never held while waiting on G/L/E/`_release_guard`
+        anywhere in this module -- the two are strictly sequential here,
+        never nested). Publishing first, independent of `_release_guard`
+        entirely, means: once an `had_exception=True` call has been
+        *invoked* at all -- even if still blocked waiting for the guard --
+        the entry is already `INVALID` before any other call on this
+        handle can possibly reach `_teardown()`'s own E-release. Calling
+        it unconditionally, before even checking `self._released`, is
+        always safe (idempotent, and a no-op once the entry is stale) and
+        needs no branch of its own.
 
         Codex re-review (found on an earlier round's fix commits): the
         `_released`/`_entered` reads and the `_released = True` write below
@@ -510,14 +534,14 @@ class RuntimeHandle:
         window.
         """
 
+        if had_exception:
+            self._cache.mark_invalid(self._canonical_id, self._entry)
+
         with self._release_guard:
             if self._released:
-                if had_exception:
-                    self._cache.mark_invalid(self._canonical_id, self._entry)
                 return
             if had_exception:
                 self._pending_invalidation = True
-                self._cache.mark_invalid(self._canonical_id, self._entry)
             if self._entered:
                 # Entering or active: defer the real unwind to __exit__().
                 self._pending_release = True
