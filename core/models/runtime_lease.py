@@ -63,6 +63,14 @@ class RuntimeBusyError(RuntimeError):
     """
 
 
+class RuntimeWaitTimeoutError(RuntimeBusyError):
+    """A G/L/E synchronization deadline expired; a cancellable caller may retry.
+
+    Other busy conditions retain their immediate-failure contract rather than
+    being mistaken for temporary lock contention.
+    """
+
+
 class RuntimeEntry:
     """Cache-slot metadata for one canonical runtime id.
 
@@ -164,4 +172,4 @@ class RuntimeEntry:
         )
 
 
-__all__ = ["RuntimeBusyError", "RuntimeEntry", "RuntimeState"]
+__all__ = ["RuntimeBusyError", "RuntimeWaitTimeoutError", "RuntimeEntry", "RuntimeState"]

@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core.models import ModelRegistry  # noqa: E402
+from core.models import ModelRegistry, ModelService  # noqa: E402
+from core.models.cache import ModelRuntimeCache  # noqa: E402
+from core.models.runtime_lease import RuntimeState  # noqa: E402
 from core.models.loader import TemplateTextLoader  # noqa: E402
 from core.models.text_runtimes import (  # noqa: E402
     build_template_runtime,
@@ -24,16 +29,29 @@ from generators.text import STORY_TASKS, TextGenerator, get_story_task  # noqa: 
 
 
 class _FakeModelService:
-    """Minimal ModelService stand-in returning a fixed manifest and runtime."""
+    """Single-threaded lease spy; cache/exclusion behavior has its own tests."""
 
     def __init__(self, manifest, runtime_obj) -> None:
         self._manifest = manifest
         self._runtime_obj = runtime_obj
-        self.resolved_with: tuple | None = None
+        self.acquired_with: tuple | None = None
+        self.lease_active = False
+        self.acquire_count = 0
+        self.release_count = 0
 
-    def resolve_runtime(self, model_id, media_type, task_type=None):
-        self.resolved_with = (model_id, media_type, task_type)
-        return self._manifest, self._runtime_obj
+    def get_manifest(self, model_id, media_type, task_type=None):
+        return self._manifest
+
+    @contextmanager
+    def acquire_runtime(self, model_id, media_type, task_type=None):
+        self.acquired_with = (model_id, media_type, task_type)
+        self.acquire_count += 1
+        self.lease_active = True
+        try:
+            yield SimpleNamespace(manifest=self._manifest, runtime=self._runtime_obj)
+        finally:
+            self.lease_active = False
+            self.release_count += 1
 
 
 def _template_manifest():
@@ -366,6 +384,129 @@ class TextGeneratorTests(unittest.TestCase):
             # The generation-knobs dict is not where story content belongs —
             # it has its own metadata field instead, so it is not duplicated.
             self.assertNotIn("continuity_snapshot", result.metadata["params"])
+
+
+class TextGeneratorLeaseTests(unittest.TestCase):
+    def test_bad_numeric_input_does_not_invalidate_or_reload_runtime(self) -> None:
+        for parameter in ("max_tokens", "temperature", "top_p"):
+            with self.subTest(parameter=parameter), tempfile.TemporaryDirectory() as root:
+                manifest = _template_manifest()
+                loader = Mock()
+                loader.load.side_effect = lambda item: _template_runtime()
+                cache = ModelRuntimeCache()
+                service = ModelService(
+                    registry=None,
+                    resolver=SimpleNamespace(resolve=lambda *args: manifest),
+                    loader_registry=SimpleNamespace(get=lambda name: loader),
+                    runtime_cache=cache,
+                    admission_capacity=1,
+                )
+                generator = TextGenerator(service, output_dir=Path(root))
+                with service.acquire_runtime("template-writer", "text") as handle:
+                    cached_runtime = handle.runtime
+                with self.assertRaises(ValueError):
+                    generator.run(_request("logline", **{parameter: "bad"}))
+                self.assertIs(cache._entries[manifest.id].state, RuntimeState.READY)
+                self.assertEqual(cache._entries[manifest.id].lease_count, 0)
+                self.assertEqual(generator.run(_request("logline")).status, "succeeded")
+                with service.acquire_runtime("template-writer", "text") as handle:
+                    self.assertIs(handle.runtime, cached_runtime)
+                self.assertEqual(loader.load.call_count, 1)
+
+    def test_generation_and_repair_share_one_lease_released_before_quality(self) -> None:
+        for needs_repair in (False, True):
+            with self.subTest(needs_repair=needs_repair), tempfile.TemporaryDirectory() as root:
+                calls = []
+
+                def generate(prompt, **kwargs):
+                    self.assertTrue(service.lease_active)
+                    self.assertEqual(service.acquire_count, 1)
+                    self.assertEqual(service.release_count, 0)
+                    calls.append(prompt)
+                    if needs_repair and len(calls) == 1:
+                        return "not json"
+                    return json.dumps({"loglines": [{"text": "ok"}]})
+
+                def score(*args, **kwargs):
+                    self.assertFalse(service.lease_active)
+                    self.assertEqual(service.release_count, 1)
+                    return evaluate_text_output(*args, **kwargs)
+
+                service = _FakeModelService(
+                    _template_manifest(), {**_template_runtime(), "generate": generate}
+                )
+                generator = TextGenerator(service, output_dir=Path(root))
+                with patch(
+                    "generators.text.generator.evaluate_text_output", side_effect=score
+                ) as judge:
+                    result = generator.run(_request("logline"))
+
+                judge.assert_called_once()
+                self.assertEqual(service.acquired_with, ("template-writer", "text", "story"))
+                self.assertEqual(service.acquire_count, 1)
+                self.assertEqual(service.release_count, 1)
+                self.assertFalse(service.lease_active)
+                self.assertEqual(len(calls), 2 if needs_repair else 1)
+                self.assertEqual(result.metadata["generation_attempts"], len(calls))
+
+    def test_runtime_exception_releases_lease_without_suppressing_error(self) -> None:
+        error = RuntimeError("runtime failed")
+
+        def generate(prompt, **kwargs):
+            self.assertTrue(service.lease_active)
+            raise error
+
+        service = _FakeModelService(
+            _template_manifest(), {**_template_runtime(), "generate": generate}
+        )
+        with tempfile.TemporaryDirectory() as root:
+            generator = TextGenerator(service, output_dir=Path(root))
+            with self.assertRaises(RuntimeError) as caught:
+                generator.run(_request("logline"))
+        self.assertIs(caught.exception, error)
+        self.assertEqual(service.acquire_count, 1)
+        self.assertEqual(service.release_count, 1)
+        self.assertFalse(service.lease_active)
+
+    def test_exhausted_schema_repair_releases_lease(self) -> None:
+        calls = []
+
+        def generate(prompt, **kwargs):
+            self.assertTrue(service.lease_active)
+            self.assertEqual(service.release_count, 0)
+            calls.append(prompt)
+            return "not json"
+
+        service = _FakeModelService(
+            _template_manifest(), {**_template_runtime(), "generate": generate}
+        )
+        with tempfile.TemporaryDirectory() as root:
+            generator = TextGenerator(service, output_dir=Path(root))
+            with self.assertRaisesRegex(ValueError, "after a repair attempt"):
+                generator.run(_request("logline"))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(service.acquire_count, 1)
+        self.assertEqual(service.release_count, 1)
+        self.assertFalse(service.lease_active)
+
+    def test_quality_failure_does_not_hold_or_release_lease_twice(self) -> None:
+        service = _FakeModelService(_template_manifest(), _template_runtime())
+        error = RuntimeError("quality failed")
+
+        def score(*args, **kwargs):
+            self.assertFalse(service.lease_active)
+            self.assertEqual(service.release_count, 1)
+            raise error
+
+        with tempfile.TemporaryDirectory() as root:
+            generator = TextGenerator(service, output_dir=Path(root))
+            with patch("generators.text.generator.evaluate_text_output", side_effect=score):
+                with self.assertRaises(RuntimeError) as caught:
+                    generator.run(_request("logline"))
+        self.assertIs(caught.exception, error)
+        self.assertEqual(service.acquire_count, 1)
+        self.assertEqual(service.release_count, 1)
+        self.assertFalse(service.lease_active)
 
 
 class EndpointGuardTests(unittest.TestCase):

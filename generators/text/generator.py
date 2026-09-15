@@ -67,6 +67,53 @@ class TextGenerator(BaseGenerator):
     def generate(self, request: GenerationRequest) -> GenerationResult:  # type: ignore[override]
         requested_model_id = request.model_id.strip() or None
 
+        # Request parsing must not invalidate a healthy leased runtime.
+        manifest = self.model_service.get_manifest(
+            requested_model_id, media_type="text", task_type=self.task_type
+        )
+        effective_params = {**manifest.default_params, **request.params}
+        task = get_story_task(str(effective_params.pop("task", "logline")))
+        max_tokens = int(
+            effective_params.pop("max_tokens", task.default_max_tokens)
+        )
+        temperature = float(effective_params.pop("temperature", 0.8))
+        top_p = float(effective_params.pop("top_p", 0.95))
+        # Runtime wiring, not generation parameters: strip them so they are not
+        # mistaken for task inputs in the rendered brief.
+        for runtime_key in (
+            "context_window",
+            "n_gpu_layers",
+            "model_file",
+            "chat_format",
+            "model_name",
+            "api_key_env",
+            "timeout_seconds",
+        ):
+            effective_params.pop(runtime_key, None)
+
+        # Continuity memory (issue #190): POST /stories/{id}/expand injects
+        # `continuity_context` (the rendered prompt block) and
+        # `continuity_snapshot` (the exact ContinuityContext used, for
+        # reproducibility) into params for the "prose" task. Popped here so
+        # neither is echoed into metadata["params"] below, which is about
+        # generation knobs, not story content — the snapshot gets its own
+        # metadata field instead, so it is inspectable without re-parsing the
+        # resolved prompt.
+        continuity_context_text = str(
+            effective_params.pop("continuity_context", "") or ""
+        ).strip()
+        continuity_snapshot = effective_params.pop("continuity_snapshot", None)
+
+        task_params = {
+            "premise": request.prompt,
+            "subject": request.prompt,
+            **effective_params,
+        }
+        if continuity_context_text:
+            task_params["continuity_context"] = continuity_context_text
+        prompt = task.build_prompt(task_params)
+        json_schema = task.json_schema()
+
         # PR4b / FP-001 + FP-002: the model call and its one allowed repair
         # attempt are the runtime-use interval.  Keep E + the lifetime lease
         # for that whole interval, then release before file/quality work that
@@ -81,49 +128,6 @@ class TextGenerator(BaseGenerator):
             manifest = handle.manifest
             runtime_obj = handle.runtime
             generate_text = runtime_obj["generate"]
-
-            effective_params = {**manifest.default_params, **request.params}
-            task = get_story_task(str(effective_params.pop("task", "logline")))
-            max_tokens = int(
-                effective_params.pop("max_tokens", task.default_max_tokens)
-            )
-            temperature = float(effective_params.pop("temperature", 0.8))
-            top_p = float(effective_params.pop("top_p", 0.95))
-            # Runtime wiring, not generation parameters: strip them so they are not
-            # mistaken for task inputs in the rendered brief.
-            for runtime_key in (
-                "context_window",
-                "n_gpu_layers",
-                "model_file",
-                "chat_format",
-                "model_name",
-                "api_key_env",
-                "timeout_seconds",
-            ):
-                effective_params.pop(runtime_key, None)
-
-            # Continuity memory (issue #190): POST /stories/{id}/expand injects
-            # `continuity_context` (the rendered prompt block) and
-            # `continuity_snapshot` (the exact ContinuityContext used, for
-            # reproducibility) into params for the "prose" task. Popped here so
-            # neither is echoed into metadata["params"] below, which is about
-            # generation knobs, not story content — the snapshot gets its own
-            # metadata field instead, so it is inspectable without re-parsing the
-            # resolved prompt.
-            continuity_context_text = str(
-                effective_params.pop("continuity_context", "") or ""
-            ).strip()
-            continuity_snapshot = effective_params.pop("continuity_snapshot", None)
-
-            task_params = {
-                "premise": request.prompt,
-                "subject": request.prompt,
-                **effective_params,
-            }
-            if continuity_context_text:
-                task_params["continuity_context"] = continuity_context_text
-            prompt = task.build_prompt(task_params)
-            json_schema = task.json_schema()
 
             structured, raw_text, attempts = self._generate_structured(
                 generate_text,

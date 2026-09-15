@@ -5,7 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from core.jobs.context import GenerationCancelled
 from core.models import ModelService
+from core.models.runtime_lease import RuntimeWaitTimeoutError
+from core.models.service import RuntimeHandle
 from core.quality import (
     enrich_quality_report,
     evaluate_video_output,
@@ -22,6 +25,8 @@ from .runtime import (
     PROCEDURAL_VIDEO_OUTPUT_FORMATS,
     VideoRuntimeRouter,
 )
+
+_CANCELLATION_POLL_SECONDS = 0.1
 
 
 class VideoGenerator(BaseGenerator):
@@ -78,28 +83,30 @@ class VideoGenerator(BaseGenerator):
         # it before file-only quality and semantic scoring so CLIP/CLAP can
         # later share the same process-wide admission domain without a
         # forbidden same-thread nested acquisition.
-        with self.model_service.acquire_runtime(
-            requested_model_id,
-            media_type="video",
-            task_type=self.task_type,
-        ) as handle:
+        cancelled_before_render = False
+        with self._acquire_runtime(requested_model_id, context) as handle:
             manifest = handle.manifest
             runtime_obj = handle.runtime
             effective_params = {**manifest.default_params, **request.params}
             runtime = self.runtime_router.resolve(runtime_obj)
-            if context is not None:
-                context.raise_if_cancelled()
-            render_result = runtime.render(
-                request=request,
-                manifest=manifest,
-                runtime_obj=runtime_obj,
-                output_dir=self.output_dir,
-                effective_params=effective_params,
-                context=context,
-            )
-            if context is not None:
-                context.raise_if_cancelled()
+            cancelled_before_render = context is not None and context.is_cancelled()
+            if not cancelled_before_render:
+                render_result = runtime.render(
+                    request=request,
+                    manifest=manifest,
+                    runtime_obj=runtime_obj,
+                    output_dir=self.output_dir,
+                    effective_params=effective_params,
+                    context=context,
+                )
+                if context is not None:
+                    context.raise_if_cancelled()
             runtime_type = type(runtime_obj).__name__
+
+        # No inference took place: exit cleanly instead of marking the cache
+        # INVALID. Cancellation during/after render still unwinds as unsafe.
+        if cancelled_before_render:
+            raise GenerationCancelled()
 
         output_path = Path(str(render_result["output_path"]))
         quality_report = evaluate_video_output(output_path)
@@ -154,6 +161,26 @@ class VideoGenerator(BaseGenerator):
             },
             error_message=None,
         )
+
+    def _acquire_runtime(
+        self, model_id: str | None, context: "GenerationContext | None"
+    ) -> RuntimeHandle:
+        if context is None:
+            return self.model_service.acquire_runtime(
+                model_id, media_type="video", task_type=self.task_type
+            )
+        while True:
+            context.raise_if_cancelled()
+            try:
+                return self.model_service.acquire_runtime(
+                    model_id, media_type="video", task_type=self.task_type,
+                    wait_timeout=_CANCELLATION_POLL_SECONDS,
+                )
+            except RuntimeWaitTimeoutError:
+                # Only synchronization waits are retryable. Cache capacity,
+                # invalid entries and loader errors must still surface. This
+                # does not preempt a synchronous loader that already started.
+                context.raise_if_cancelled()
 
     def cleanup(self, request: GenerationRequest) -> None:
         return None

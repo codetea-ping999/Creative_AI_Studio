@@ -12,7 +12,7 @@ from .loader import LoaderRegistry
 from .manifest import ModelManifest
 from .registry import ModelRegistry
 from .resolver import ModelResolver
-from .runtime_lease import RuntimeBusyError, RuntimeEntry, RuntimeState
+from .runtime_lease import RuntimeBusyError, RuntimeEntry, RuntimeState, RuntimeWaitTimeoutError
 
 # PR4a (issue #414): the one process-wide "may a heavy runtime load or run
 # right now" slot -- see `ModelService.acquire_runtime()`'s own docstring for
@@ -835,6 +835,11 @@ class ModelService:
         renamed, since PR4a has not shipped/stabilized yet, rather than kept
         under a name that promised more than the implementation -- deliberately
         not turned into a general preemption framework -- delivers.)
+
+        A G/L/E wait deadline raises `RuntimeWaitTimeoutError`, a subtype
+        of `RuntimeBusyError`. Cancellation-aware callers may retry only that
+        subtype; pinned capacity and invalid-entry errors remain immediate
+        failures rather than being silently converted into indefinite waits.
         """
 
         manifest = self.get_manifest(model_id, media_type, task_type)
@@ -845,7 +850,7 @@ class ModelService:
         owner_thread = current_thread()
 
         if not self._admission.acquire(deadline):
-            raise RuntimeBusyError(
+            raise RuntimeWaitTimeoutError(
                 f"No process-wide runtime admission slot available for "
                 f"{manifest.id!r} within the given timeout."
             )
@@ -895,7 +900,7 @@ class ModelService:
     ) -> RuntimeEntry:
         load_lock = self.runtime_cache.lock_for(manifest.id)
         if not _acquire_with_deadline(load_lock, deadline):
-            raise RuntimeBusyError(
+            raise RuntimeWaitTimeoutError(
                 f"Timed out waiting for the load lock for {manifest.id!r}."
             )
         try:
@@ -1019,7 +1024,7 @@ class ModelService:
         """
 
         if not _acquire_with_deadline(entry.execution_lock, deadline):
-            raise RuntimeBusyError(
+            raise RuntimeWaitTimeoutError(
                 f"Timed out waiting for exclusive execution access to {canonical_id!r}."
             )
         try:
