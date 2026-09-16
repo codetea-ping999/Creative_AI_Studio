@@ -12,6 +12,7 @@ from core.models.runtime_lease import RuntimeBusyError, RuntimeState, RuntimeWai
 from core.models.service import ModelService
 from core.schemas import GenerationRequest
 from generators.video.generator import VideoGenerator
+from generators.video.runtime import ProceduralStoryboardRuntime
 
 
 def _build(tmp_path, monkeypatch, *, admission_capacity=1):
@@ -251,3 +252,142 @@ def test_success_releases_before_quality(tmp_path, monkeypatch, with_context):
     context = GenerationContext(is_cancelled=lambda: False) if with_context else None
     assert generator.run(_request(), context=context).status == "succeeded"
     renderer.render.assert_called_once()
+
+
+def test_video_successful_render_with_late_cancellation_preserves_runtime(
+    tmp_path, monkeypatch
+):
+    # Safety convergence pass, Codex finding "raise post-render cancellation
+    # after a clean lease exit": once `runtime.render()` has returned
+    # successfully -- particularly for a fixed-signature renderer that
+    # cannot receive a step-level callback, exactly like this mock -- a
+    # cancellation only now observable is a request to stop *after*
+    # successful use, not a runtime fault, and must not invalidate a
+    # healthy entry.
+    generator, service, cache, loader, renderer = _build(tmp_path, monkeypatch)
+    call_count = {"n": 0}
+
+    def is_cancelled() -> bool:
+        call_count["n"] += 1
+        # call #1: _acquire_runtime()'s own pre-acquisition check (False)
+        # call #2: cancelled_before_render (False) -- render() is called
+        # call #3: the post-render snapshot, reached only after render()
+        # already returned successfully (True)
+        return call_count["n"] > 2
+
+    with pytest.raises(GenerationCancelled):
+        generator.run(_request(), context=GenerationContext(is_cancelled=is_cancelled))
+
+    renderer.render.assert_called_once()
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY
+    assert entry.lease_count == 0
+
+
+def test_learned_video_late_precall_cancellation_does_not_prevent_invocation_or_invalidate(
+    tmp_path, monkeypatch
+):
+    # Safety convergence pass, Codex finding "preserve the runtime on late
+    # pre-render cancellation": LearnedVideoRuntime.render() used to run
+    # its OWN pre-call `context.raise_if_cancelled()` check, independent of
+    # VideoGenerator's own `cancelled_before_render` sample -- cancellation
+    # observed by that second, redundant check escaped as
+    # `GenerationCancelled` before the runtime callable was ever invoked,
+    # yet was indistinguishable from a genuine mid-inference interruption
+    # once it reached VideoGenerator's `with` block, conservatively
+    # invalidating a runtime that was never actually used. That check has
+    # been removed (generators/video/runtime.py); this proves the callable
+    # is still reliably invoked exactly once even when cancellation is
+    # already true by the time render() would have performed it, and that
+    # the eventual cancellation (now only ever caught by VideoGenerator's
+    # own post-render snapshot) still preserves the runtime.
+    invoked = {"n": 0}
+
+    def fake_renderer(**kwargs):
+        invoked["n"] += 1
+        return {"output_path": str(tmp_path / "out.mp4"), "output_id": "out"}
+
+    def manifest(model_id, media_type, task_type=None):
+        return SimpleNamespace(
+            id=model_id, public_model_id=model_id, provider="local", loader="fake",
+            default_params={}, runtime="learned", display_name="fake video",
+        )
+
+    loader = Mock()
+    loader.load.side_effect = lambda item: {
+        "runtime_adapter": "learned_text_to_video", "renderer": fake_renderer,
+    }
+    cache = ModelRuntimeCache(max_entries=4)
+    service = ModelService(
+        registry=None, resolver=SimpleNamespace(resolve=manifest),
+        loader_registry=SimpleNamespace(get=lambda name: loader),
+        runtime_cache=cache, admission_capacity=1,
+    )
+    generator = VideoGenerator(service, output_dir=tmp_path)
+    monkeypatch.setattr("generators.video.generator.evaluate_video_output", lambda *a: {})
+    monkeypatch.setattr("generators.video.generator.evaluate_video_semantics", lambda *a: {})
+    monkeypatch.setattr("generators.video.generator.enrich_quality_report", lambda *a: None)
+
+    call_count = {"n": 0}
+
+    def is_cancelled() -> bool:
+        call_count["n"] += 1
+        # call #1: _acquire_runtime()'s pre-acquisition check (False)
+        # call #2: VideoGenerator's own cancelled_before_render sample
+        # (False) -- render() is therefore called. Cancellation is "true"
+        # for the rest of this run, including the exact position where the
+        # now-removed internal pre-call check used to observe it and raise
+        # before `fake_renderer` was ever invoked.
+        return call_count["n"] > 2
+
+    with pytest.raises(GenerationCancelled):
+        generator.run(
+            GenerationRequest(media_type="video", prompt="test", model_id="target"),
+            context=GenerationContext(is_cancelled=is_cancelled),
+        )
+
+    # The callable ran to completion -- no longer silently skipped by the
+    # removed redundant internal check.
+    assert invoked["n"] == 1
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY
+    assert entry.lease_count == 0
+
+
+def test_invalid_procedural_numeric_params_do_not_invalidate_healthy_runtime(
+    tmp_path, monkeypatch
+):
+    # Safety convergence pass, Codex finding "parse procedural video
+    # parameters before leasing": ProceduralStoryboardRuntime.render()
+    # coerces width/height/fps/duration_seconds/num_frames from the
+    # request before touching runtime_obj or rendering a single frame --
+    # a bad value is a pure input error, not a runtime fault.
+    generator, service, cache, loader, renderer = _build(tmp_path, monkeypatch)
+    generator.runtime_router = SimpleNamespace(
+        resolve=lambda runtime_obj: ProceduralStoryboardRuntime()
+    )
+
+    # Warm the cache with a real, successful procedural render first, so
+    # there is a genuinely healthy runtime to protect.
+    warm = generator.run(
+        GenerationRequest(
+            media_type="video", prompt="test", model_id="target",
+            params={"duration_seconds": 2, "fps": 4},
+        )
+    )
+    assert warm.status == "succeeded"
+    cached_entry = cache._entries["target"]
+    assert cached_entry.state is RuntimeState.READY
+
+    with pytest.raises(ValueError):
+        generator.run(
+            GenerationRequest(
+                media_type="video", prompt="test", model_id="target",
+                params={"width": "not-a-number"},
+            )
+        )
+
+    assert cache._entries["target"] is cached_entry  # never reloaded
+    assert cached_entry.state is RuntimeState.READY
+    assert cached_entry.lease_count == 0
+    assert loader.load.call_count == 1

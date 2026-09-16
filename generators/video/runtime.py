@@ -269,8 +269,26 @@ class LearnedVideoRuntime(BaseVideoRuntime):
             "output_format": request.output_format or effective_params.get("output_format", "mp4"),
             **effective_params,
         }
+        # Deliberately no eager `context.raise_if_cancelled()` here before
+        # `callable_runtime` is invoked: VideoGenerator.generate() already
+        # samples cancellation once, immediately before calling `render()`
+        # at all (`cancelled_before_render`). A second, independent check at
+        # this point used to create an ordinary-scheduling-reachable
+        # (safety convergence pass, PR4b finding "preserve the runtime on
+        # late pre-render cancellation") race: cancellation observed here,
+        # via *this* check, escaped as `GenerationCancelled` before
+        # `callable_runtime` ever ran, yet was indistinguishable from a
+        # genuine mid-inference interruption once it reached
+        # `VideoGenerator.generate()`'s `with` block, conservatively
+        # invalidating a runtime that was never actually used. Removing this
+        # redundant check does not weaken cancellation responsiveness in
+        # practice -- there is no blocking work between VideoGenerator's own
+        # sample and the call below -- and leaves genuine step-level
+        # cancellation (raised from *inside* `callable_runtime`, once it is
+        # actually running, via the opt-in kwarg below) as the only source
+        # of a `GenerationCancelled` this method can raise, which is
+        # unambiguously a real runtime-use interruption.
         if context is not None:
-            context.raise_if_cancelled()
             # The loaded model's own callable is opaque third-party code (see
             # LearnedVideoLoader), so step-level cancellation only happens if
             # the adapter itself opts in: it can pop this kwarg and call it
@@ -278,8 +296,7 @@ class LearnedVideoRuntime(BaseVideoRuntime):
             # adapter under models/video/learned-runtime/runtime.py).
             # `_callable_accepts_kwarg` guards against a fixed-signature
             # renderer (no **kwargs) raising TypeError on this extra
-            # argument -- an adapter that can't take it still gets the
-            # boundary check above, exactly as before this feature existed.
+            # argument.
             if _callable_accepts_kwarg(callable_runtime, "raise_if_cancelled"):
                 generation_kwargs["raise_if_cancelled"] = context.raise_if_cancelled
         generated = callable_runtime(**generation_kwargs)

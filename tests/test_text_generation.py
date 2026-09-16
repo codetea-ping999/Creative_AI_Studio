@@ -7,12 +7,14 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+from threading import Event, Thread
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from core.jobs.context import GenerationCancelled, GenerationContext  # noqa: E402
 from core.models import ModelRegistry, ModelService  # noqa: E402
 from core.models.cache import ModelRuntimeCache  # noqa: E402
 from core.models.runtime_lease import RuntimeState  # noqa: E402
@@ -26,6 +28,7 @@ from core.models.text_runtimes import (  # noqa: E402
 from core.quality import evaluate_text_output  # noqa: E402
 from core.schemas import GenerationRequest  # noqa: E402
 from generators.text import STORY_TASKS, TextGenerator, get_story_task  # noqa: E402
+from generators.text.generator import StorySchemaValidationError  # noqa: E402
 
 
 class _FakeModelService:
@@ -507,6 +510,165 @@ class TextGeneratorLeaseTests(unittest.TestCase):
         self.assertEqual(service.acquire_count, 1)
         self.assertEqual(service.release_count, 1)
         self.assertFalse(service.lease_active)
+
+    def test_schema_invalid_output_does_not_invalidate_or_reload_runtime(self) -> None:
+        # Safety convergence pass, Codex finding "propagate schema failures
+        # after releasing the text lease": inference completed normally on
+        # every attempt (including the one repair) -- only the *output*
+        # never validated against the schema. That is an expected,
+        # output-shape failure, not a runtime fault, and must not
+        # invalidate or force a reload of an otherwise healthy runtime.
+        with tempfile.TemporaryDirectory() as root:
+            manifest = _template_manifest()
+            broken_runtime = {
+                **_template_runtime(),
+                "generate": lambda prompt, **kwargs: "not json, ever",
+            }
+            loader = Mock()
+            loader.load.side_effect = lambda item: broken_runtime
+            cache = ModelRuntimeCache()
+            service = ModelService(
+                registry=None,
+                resolver=SimpleNamespace(resolve=lambda *args: manifest),
+                loader_registry=SimpleNamespace(get=lambda name: loader),
+                runtime_cache=cache,
+                admission_capacity=1,
+            )
+            generator = TextGenerator(service, output_dir=Path(root))
+
+            with self.assertRaises(StorySchemaValidationError):
+                generator.run(_request("logline"))
+
+            entry = cache._entries[manifest.id]
+            self.assertIs(entry.state, RuntimeState.READY)
+            self.assertEqual(entry.lease_count, 0)
+            self.assertEqual(loader.load.call_count, 1)
+            # A ValueError subtype, so existing `except ValueError` callers
+            # (e.g. test_exhausted_schema_repair_releases_lease above) are
+            # unaffected.
+            self.assertIsInstance(StorySchemaValidationError("x"), ValueError)
+            with service.acquire_runtime("template-writer", "text") as handle:
+                self.assertIs(handle.runtime, broken_runtime)  # never reloaded
+            self.assertEqual(loader.load.call_count, 1)
+
+    def test_runtime_callable_exception_still_invalidates_distinctly_from_schema_failure(
+        self,
+    ) -> None:
+        # The other half of the distinction the finding requires: an
+        # exception the runtime callable itself raises (not a schema
+        # validation outcome) is a genuine runtime-use failure and still
+        # conservatively invalidates.
+        with tempfile.TemporaryDirectory() as root:
+            manifest = _template_manifest()
+            error = RuntimeError("the local llm process crashed")
+
+            def failing_generate(prompt, **kwargs):
+                raise error
+
+            broken_runtime = {**_template_runtime(), "generate": failing_generate}
+            loader = Mock()
+            loader.load.side_effect = lambda item: broken_runtime
+            cache = ModelRuntimeCache()
+            service = ModelService(
+                registry=None,
+                resolver=SimpleNamespace(resolve=lambda *args: manifest),
+                loader_registry=SimpleNamespace(get=lambda name: loader),
+                runtime_cache=cache,
+                admission_capacity=1,
+            )
+            generator = TextGenerator(service, output_dir=Path(root))
+
+            with self.assertRaises(RuntimeError) as caught:
+                generator.run(_request("logline"))
+            self.assertIs(caught.exception, error)
+
+            entry = cache._entries[manifest.id]
+            self.assertIs(entry.state, RuntimeState.INVALID)
+            self.assertEqual(entry.lease_count, 0)
+
+    def test_admission_wait_observes_cancellation(self) -> None:
+        # Safety convergence pass, Codex finding "poll cancellation while
+        # text waits for admission": TextGenerator now accepts a context
+        # and uses the same bounded cancellation-aware admission-wait
+        # pattern already proven for Image/VideoGenerator -- text
+        # inference itself is not preempted, only the contended wait for
+        # the process-wide admission slot is cancellation-aware.
+        with tempfile.TemporaryDirectory() as root:
+            def resolver(model_id, media_type, task_type=None):
+                return SimpleNamespace(
+                    id=model_id, public_model_id=model_id, provider="local",
+                    loader="fake", default_params={}, runtime="template",
+                    display_name="fake text",
+                )
+
+            loader = Mock()
+            loader.load.side_effect = lambda item: _template_runtime()
+            cache = ModelRuntimeCache()
+            service = ModelService(
+                registry=None,
+                resolver=SimpleNamespace(resolve=resolver),
+                loader_registry=SimpleNamespace(get=lambda name: loader),
+                runtime_cache=cache,
+                admission_capacity=1,
+            )
+            generator = TextGenerator(service, output_dir=Path(root))
+            cancelled, attempted, finished = Event(), Event(), Event()
+            errors: list[BaseException] = []
+            owner = service.acquire_runtime("owner-model", "text")
+
+            class _ObservedSemaphore:
+                def __init__(self, semaphore, attempted_event):
+                    self._semaphore = semaphore
+                    self._attempted = attempted_event
+
+                def acquire(self, *args, **kwargs):
+                    # The owner already holds the real semaphore; this is
+                    # genuine contention, not a fabricated timing race.
+                    self._attempted.set()
+                    return self._semaphore.acquire(*args, **kwargs)
+
+                def release(self):
+                    return self._semaphore.release()
+
+            service._admission._semaphore = _ObservedSemaphore(
+                service._admission._semaphore, attempted
+            )
+
+            def work() -> None:
+                try:
+                    generator.run(
+                        _request("logline"),
+                        context=GenerationContext(is_cancelled=cancelled.is_set),
+                    )
+                except BaseException as error:  # noqa: BLE001
+                    errors.append(error)
+                finally:
+                    finished.set()
+
+            worker = Thread(target=work)
+            worker.start()
+            try:
+                self.assertTrue(
+                    attempted.wait(2), "worker never attempted contended admission"
+                )
+                cancelled.set()
+                self.assertTrue(
+                    finished.wait(2),
+                    "cancelled worker still waits for unrelated generation",
+                )
+                self.assertEqual(len(errors), 1)
+                self.assertIsInstance(errors[0], GenerationCancelled)
+                # Only the owner's model ever loaded; the cancelled worker
+                # never got far enough to load "template-writer" at all.
+                self.assertEqual(loader.load.call_count, 1)
+            finally:
+                cancelled.set()
+                owner.release()
+                worker.join(3)
+            self.assertFalse(worker.is_alive())
+            # No leaked admission slot after cancellation.
+            with service.acquire_runtime("template-writer", "text", wait_timeout=0):
+                pass
 
 
 class EndpointGuardTests(unittest.TestCase):

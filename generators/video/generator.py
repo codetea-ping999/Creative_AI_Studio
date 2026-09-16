@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 from .runtime import (
     LEARNED_VIDEO_OUTPUT_FORMATS,
     PROCEDURAL_VIDEO_OUTPUT_FORMATS,
+    ProceduralStoryboardRuntime,
     VideoRuntimeRouter,
 )
 
@@ -83,7 +84,34 @@ class VideoGenerator(BaseGenerator):
         # it before file-only quality and semantic scoring so CLIP/CLAP can
         # later share the same process-wide admission domain without a
         # forbidden same-thread nested acquisition.
+        #
+        # Safety convergence pass: three request/cancellation-boundary
+        # failures are distinguished from a genuine runtime-use failure and
+        # deferred until after a clean lease exit, instead of raising from
+        # inside the `with` block (which would conservatively mark a
+        # healthy entry INVALID):
+        #   - `cancelled_before_render`: cancellation observed before
+        #     render() was ever called.
+        #   - `late_cancellation`: render() returned successfully (the
+        #     runtime callable ran to completion) and cancellation is only
+        #     now observable -- a request to stop *after* successful use,
+        #     not a runtime fault.
+        #   - `procedural_param_error`: a procedural request's own
+        #     width/height/fps/duration_seconds/num_frames coercion raised
+        #     (ValueError/TypeError). ProceduralStoryboardRuntime performs
+        #     every one of these conversions before touching runtime_obj or
+        #     rendering a single frame (see generators/video/runtime.py), so
+        #     this is a pure input error, never a runtime fault -- narrowed
+        #     to this concrete runtime class and these two exception types
+        #     so a genuine mid-render failure is never misclassified.
+        # A `GenerationCancelled` that instead escapes render() itself (a
+        # renderer/adapter observing cancellation once its own callable is
+        # already running) is not caught here and still conservatively
+        # invalidates -- see runtime.py's own removal of the redundant
+        # pre-call check that used to make this ambiguous.
         cancelled_before_render = False
+        late_cancellation = False
+        procedural_param_error: Exception | None = None
         with self._acquire_runtime(requested_model_id, context) as handle:
             manifest = handle.manifest
             runtime_obj = handle.runtime
@@ -91,22 +119,30 @@ class VideoGenerator(BaseGenerator):
             runtime = self.runtime_router.resolve(runtime_obj)
             cancelled_before_render = context is not None and context.is_cancelled()
             if not cancelled_before_render:
-                render_result = runtime.render(
-                    request=request,
-                    manifest=manifest,
-                    runtime_obj=runtime_obj,
-                    output_dir=self.output_dir,
-                    effective_params=effective_params,
-                    context=context,
-                )
-                if context is not None:
-                    context.raise_if_cancelled()
+                try:
+                    render_result = runtime.render(
+                        request=request,
+                        manifest=manifest,
+                        runtime_obj=runtime_obj,
+                        output_dir=self.output_dir,
+                        effective_params=effective_params,
+                        context=context,
+                    )
+                except (ValueError, TypeError) as exc:
+                    if not isinstance(runtime, ProceduralStoryboardRuntime):
+                        raise
+                    procedural_param_error = exc
+                else:
+                    if context is not None:
+                        late_cancellation = context.is_cancelled()
             runtime_type = type(runtime_obj).__name__
 
-        # No inference took place: exit cleanly instead of marking the cache
-        # INVALID. Cancellation during/after render still unwinds as unsafe.
-        if cancelled_before_render:
+        # No inference took place, or it completed successfully: exit
+        # cleanly instead of marking the cache INVALID.
+        if cancelled_before_render or late_cancellation:
             raise GenerationCancelled()
+        if procedural_param_error is not None:
+            raise procedural_param_error
 
         output_path = Path(str(render_result["output_path"]))
         quality_report = evaluate_video_output(output_path)

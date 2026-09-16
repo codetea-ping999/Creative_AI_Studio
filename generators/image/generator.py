@@ -141,6 +141,38 @@ class ImageGenerator(BaseGenerator):
             manifest,
             project_id=context.project_id if context is not None else None,
         )
+        # Pure input error: a corrupt, unreadable, or since-deleted
+        # reference image is decoded here, before any runtime is acquired,
+        # so it can never invalidate a healthy one. Decoded/resized
+        # unconditionally whenever a reference resolved; only actually used
+        # inside the lease if `reference_capable` (determined by runtime
+        # inspection) turns out true.
+        reference_image: Image.Image | None = None
+        if reference_image_path is not None:
+            # Reject an oversized/misaligned width or height against the
+            # local provider's fixed, runtime-independent size bounds
+            # before decoding the reference image at all -- avoids
+            # resizing to an absurd resolution for a request that would be
+            # rejected either way. These bounds do not depend on
+            # `reference_capable` (only known once the runtime is
+            # inspected inside the lease below), so this preliminary check
+            # is safe here; the authoritative, reference-support-aware
+            # validate_capabilities() call still runs again inside the
+            # lease once `reference_capable` is known.
+            validate_capabilities(
+                local_diffusers_capabilities(),
+                ImageGenerationSpec(
+                    prompt=resolved_prompt.prompt,
+                    negative_prompt=resolved_prompt.negative_prompt,
+                    width=width,
+                    height=height,
+                    seed=base_seed,
+                    batch_size=1,
+                ),
+            )
+            reference_image = (
+                Image.open(reference_image_path).convert("RGB").resize((width, height))
+            )
         batch_id = f"img_{uuid4().hex}"
 
         # ----------------------------------------------------------------- lease
@@ -164,6 +196,7 @@ class ImageGenerator(BaseGenerator):
         # past that point is a genuine runtime-use failure and is left to
         # propagate, which conservatively marks the entry INVALID.
         cancelled_before_mutation = False
+        late_cancellation = False
         validation_error: Exception | None = None
         reference_capable = False
         lora_metadata: dict[str, object | None] = {"path": None, "scale": None}
@@ -302,11 +335,11 @@ class ImageGenerator(BaseGenerator):
                         )
                     else:
                         reference_conditioning_kwargs = {
-                            "image": (
-                                Image.open(cast(str, reference_image_path))
-                                .convert("RGB")
-                                .resize((width, height))
-                            ),
+                            # Already decoded/resized during preflight above
+                            # -- `reference_capable` being true guarantees
+                            # `reference_image_path` (and therefore
+                            # `reference_image`) was not None.
+                            "image": reference_image,
                             "strength": img2img_strength,
                         }
                         # Mirrors diffusers' own init_timestep computation --
@@ -347,8 +380,25 @@ class ImageGenerator(BaseGenerator):
                     }
 
                     for variation_index in range(variation_count):
-                        if context is not None:
-                            context.raise_if_cancelled()
+                        # Snapshot, not raise: by this point LoRA mutation
+                        # has already happened (once, above the loop), so a
+                        # cancellation observed here -- whether before
+                        # starting a fresh variation or (below) right after
+                        # a variation's provider call returns -- is a
+                        # request to stop after already-successful runtime
+                        # use, not a runtime fault. Raising inside the lease
+                        # would conservatively invalidate a runtime that is
+                        # otherwise perfectly healthy; stopping the loop and
+                        # exiting cleanly instead lets the caller retry
+                        # without an unnecessary reload. Only a
+                        # `GenerationCancelled` raised from *inside* the
+                        # provider call itself (the step callback below,
+                        # invoked while inference is genuinely in progress)
+                        # is a real mid-use interruption and is left to
+                        # propagate and conservatively invalidate.
+                        if context is not None and context.is_cancelled():
+                            late_cancellation = True
+                            break
                         variation_seed = self._derive_variation_seed(
                             base_seed, variation_index
                         )
@@ -374,8 +424,9 @@ class ImageGenerator(BaseGenerator):
                                 pipeline_kwargs=generation_kwargs,
                             )
 
-                        if context is not None:
-                            context.raise_if_cancelled()
+                        if context is not None and context.is_cancelled():
+                            late_cancellation = True
+                            break
                         # Each provider_result.image is a CPU-side PIL image,
                         # never a device/runtime-bound tensor -- holding up
                         # to _MAX_VARIATION_COUNT (4) of them until after the
@@ -395,10 +446,13 @@ class ImageGenerator(BaseGenerator):
                                 (variation_index + 1) / variation_count
                             )
 
-        # No mutation or inference took place: exit cleanly instead of
-        # marking the cache INVALID. Cancellation once inference has begun
-        # still unwinds as unsafe (raised from inside the `with` above).
-        if cancelled_before_mutation:
+        # No mutation or inference took place, or every started variation's
+        # provider call completed successfully before cancellation was
+        # observed: exit cleanly instead of marking the cache INVALID. A
+        # `GenerationCancelled` raised from *inside* a provider call (a
+        # genuine mid-use interruption) is not caught above and still
+        # unwinds as unsafe.
+        if cancelled_before_mutation or late_cancellation:
             raise GenerationCancelled()
         # A validation-only rejection discovered via runtime inspection
         # (unsupported reference/size, or an unreachable reference lock
@@ -418,6 +472,16 @@ class ImageGenerator(BaseGenerator):
         quality_reports: list[dict[str, Any]] = []
         try:
             for entry in collected_variations:
+                # Cancellation is still observed here, even though the
+                # runtime is no longer involved: without this check, every
+                # remaining PNG would be written and scored before
+                # JobRunner notices cancellation at its own outer boundary,
+                # leaving orphaned output files behind. `GenerationCancelled`
+                # is an `Exception`, so it is caught by the `except` below
+                # like any other post-lease failure, reusing the exact same
+                # cleanup that removes whatever this loop already saved.
+                if context is not None:
+                    context.raise_if_cancelled()
                 variation_index = cast(int, entry["variation_index"])
                 output_path = self.output_dir / (
                     f"{batch_id}.png"

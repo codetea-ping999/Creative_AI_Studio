@@ -3014,5 +3014,25 @@ class RuntimeSafetyCoreTests(unittest.TestCase):
         self.assertFalse(entry.execution_lock.locked())
 
 
+class PublicModelFacadeExportsTest(unittest.TestCase):
+    """Safety convergence pass, Codex finding "export the retryable timeout
+    from the model facade": a caller using the public `ModelService
+    .acquire_runtime()` API needs `RuntimeWaitTimeoutError` to distinguish a
+    retryable synchronization deadline from other `RuntimeBusyError`
+    conditions, without reaching into the internal `core.models.runtime_lease`
+    module."""
+
+    def test_runtime_wait_timeout_error_is_importable_from_the_public_facade(
+        self,
+    ) -> None:
+        from core.models import RuntimeWaitTimeoutError as facade_error
+        from core.models.runtime_lease import RuntimeWaitTimeoutError as internal_error
+
+        self.assertIs(facade_error, internal_error)
+        import core.models as facade_module
+
+        self.assertIn("RuntimeWaitTimeoutError", facade_module.__all__)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2707,6 +2707,73 @@ class ModelSystemTests(unittest.TestCase):
             self.assertEqual(list(output_dir.glob("**/*")), [])
             self.assertLess(elapsed, 5.0)
 
+    def test_image_generator_corrupt_reference_file_does_not_invalidate_healthy_runtime(
+        self,
+    ) -> None:
+        # Safety convergence pass, Codex finding "decode reference images
+        # before acquiring the runtime": a reference asset that is corrupt,
+        # unreadable, or deleted after repository lookup is a pure
+        # request-owned failure, not a runtime fault, and must not
+        # invalidate an already-healthy cached pipeline.
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_root = root / "manifests"
+            model_id = self._write_reference_capable_manifest(manifest_root)
+            composer, character_id = self._prepare_character_reference(root)
+            output_dir = root / "outputs"
+
+            with patch(
+                "core.models.loader.DiffusersImageLoader.load",
+                new=_fake_diffusers_load_reference_capable,
+            ):
+                service = create_default_model_service(manifest_root=manifest_root)
+                generator = ImageGenerator(
+                    service, output_dir=output_dir, prompt_composer=composer
+                )
+                # Warm the cache with a successful, reference-free
+                # generation first, so there is a genuinely healthy runtime
+                # to protect.
+                warm_result = generator.run(
+                    GenerationRequest(
+                        media_type="image",
+                        prompt="Mina on the rooftop",
+                        model_id=model_id,
+                        params={"steps": 1, "width": 64, "height": 64},
+                    )
+                )
+                self.assertEqual(warm_result.status, "succeeded")
+                cached_entry = service.runtime_cache._entries[model_id]
+                self.assertIs(cached_entry.state, RuntimeState.READY)
+                files_after_warmup = set(output_dir.glob("**/*.png"))
+
+                # Corrupt the reference asset's backing file in place.
+                asset = composer.asset_repository.get("asset_char_1")
+                Path(asset.path).write_bytes(b"not a real image")
+
+                with self.assertRaises(Exception):
+                    generator.run(
+                        GenerationRequest(
+                            media_type="image",
+                            prompt="Mina on the rooftop",
+                            model_id=model_id,
+                            params={
+                                "steps": 1,
+                                "width": 64,
+                                "height": 64,
+                                "bible_refs": [character_id],
+                            },
+                        )
+                    )
+
+                # Same entry object, still READY, unleased -- never
+                # reloaded, never invalidated.
+                self.assertIs(service.runtime_cache._entries[model_id], cached_entry)
+                self.assertIs(cached_entry.state, RuntimeState.READY)
+                self.assertEqual(cached_entry.lease_count, 0)
+                # No new output was produced by the failed, corrupted-reference
+                # attempt -- only the warm-up call's own file remains.
+                self.assertEqual(set(output_dir.glob("**/*.png")), files_after_warmup)
+
     def test_bootstrap_factory_composes_default_image_generator(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             output_dir = Path(tmp_dir) / "outputs"

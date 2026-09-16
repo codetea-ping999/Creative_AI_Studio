@@ -4,16 +4,22 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
+from core.jobs.context import GenerationCancelled
 from core.models import ModelService
+from core.models.runtime_lease import RuntimeWaitTimeoutError
 from core.models.text_runtimes import extract_json_object
 from core.quality import evaluate_text_output
 from core.schemas import GenerationRequest, GenerationResult
 from generators.base import BaseGenerator
 
 from .tasks import STORY_TASKS, StoryTask, get_story_task
+
+if TYPE_CHECKING:
+    from core.jobs.context import GenerationContext
+    from core.models.service import RuntimeHandle
 
 _SUPPORTED_OUTPUT_FORMATS = frozenset({"md", "markdown", "json"})
 
@@ -22,6 +28,21 @@ _REPAIR_INSTRUCTION = (
     "Error: {error}\n"
     "Return only a single corrected JSON object. No prose, no code fence."
 )
+
+_CANCELLATION_POLL_SECONDS = 0.1
+
+
+class StorySchemaValidationError(ValueError):
+    """A story task's LLM output never validated against its schema, even
+    after one repair attempt.
+
+    A `ValueError` subtype so existing `except ValueError`/`assertRaises`
+    callers are unaffected. Distinct from a bare `ValueError` so
+    `TextGenerator.generate()` can tell this expected, output-*shape*
+    failure (inference completed normally; only its text was malformed)
+    apart from an exception the runtime callable itself raised -- only the
+    latter still conservatively invalidates the leased entry.
+    """
 
 
 class TextGenerator(BaseGenerator):
@@ -61,10 +82,11 @@ class TextGenerator(BaseGenerator):
     def prepare(self, request: GenerationRequest) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Intentionally omits `context`: BaseGenerator.run() introspects generate()'s
-    # signature (see generators/base.py) and calls context-free generators without
-    # it, so cancellation is only honored at the job-boundary for this generator.
-    def generate(self, request: GenerationRequest) -> GenerationResult:  # type: ignore[override]
+    def generate(
+        self,
+        request: GenerationRequest,
+        context: "GenerationContext | None" = None,
+    ) -> GenerationResult:
         requested_model_id = request.model_id.strip() or None
 
         # Request parsing must not invalidate a healthy leased runtime.
@@ -120,34 +142,54 @@ class TextGenerator(BaseGenerator):
         # does not touch the runtime.  This also leaves room for later local
         # semantic judges to enter the same process-wide admission domain
         # without creating a forbidden same-thread nested acquisition.
-        with self.model_service.acquire_runtime(
-            requested_model_id,
-            media_type="text",
-            task_type=self.task_type,
-        ) as handle:
+        #
+        # Safety convergence pass: a schema-still-invalid-after-repair
+        # failure is an expected output-shape outcome, not a runtime fault
+        # (`StorySchemaValidationError`, distinct from an exception the
+        # runtime callable itself raises) -- captured here and re-raised
+        # only after the lease exits normally, so it never invalidates a
+        # healthy runtime.
+        cancelled_before_generation = False
+        schema_error: StorySchemaValidationError | None = None
+        with self._acquire_runtime(requested_model_id, context) as handle:
             manifest = handle.manifest
             runtime_obj = handle.runtime
             generate_text = runtime_obj["generate"]
 
-            structured, raw_text, attempts = self._generate_structured(
-                generate_text,
-                task=task,
-                prompt=prompt,
-                system=task.system_prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                seed=request.seed,
-                json_schema=json_schema,
-                supports_json_schema=bool(runtime_obj.get("supports_json_schema")),
-            )
-            runtime_metadata = {
-                "runtime_type": type(runtime_obj).__name__,
-                "device": runtime_obj.get("device"),
-                "context_window": runtime_obj.get("context_window"),
-                "supports_json_schema": runtime_obj.get("supports_json_schema"),
-                "endpoint_base_url": runtime_obj.get("endpoint_base_url"),
-            }
+            cancelled_before_generation = context is not None and context.is_cancelled()
+            if not cancelled_before_generation:
+                try:
+                    structured, raw_text, attempts = self._generate_structured(
+                        generate_text,
+                        task=task,
+                        prompt=prompt,
+                        system=task.system_prompt,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        seed=request.seed,
+                        json_schema=json_schema,
+                        supports_json_schema=bool(runtime_obj.get("supports_json_schema")),
+                    )
+                except StorySchemaValidationError as exc:
+                    schema_error = exc
+                else:
+                    runtime_metadata = {
+                        "runtime_type": type(runtime_obj).__name__,
+                        "device": runtime_obj.get("device"),
+                        "context_window": runtime_obj.get("context_window"),
+                        "supports_json_schema": runtime_obj.get("supports_json_schema"),
+                        "endpoint_base_url": runtime_obj.get("endpoint_base_url"),
+                    }
+
+        # No inference took place: exit cleanly instead of marking the cache
+        # INVALID. An exception raised directly by the runtime callable
+        # (`generate_text`) itself is not caught above and still unwinds as
+        # unsafe.
+        if cancelled_before_generation:
+            raise GenerationCancelled()
+        if schema_error is not None:
+            raise schema_error
 
         output_id = f"txt_{uuid4().hex}"
         markdown_path = self.output_dir / f"{output_id}.md"
@@ -217,6 +259,33 @@ class TextGenerator(BaseGenerator):
     def cleanup(self, request: GenerationRequest) -> None:
         return None
 
+    def _acquire_runtime(
+        self, model_id: str | None, context: "GenerationContext | None"
+    ) -> "RuntimeHandle":
+        """Cancellation-aware admission wait, mirroring Image/VideoGenerator.
+
+        Bounded polling covers only the wait for a contended process-wide
+        admission slot; text inference itself remains a single blocking
+        call with no preemption once it starts (no new preemption contract
+        is introduced here).
+        """
+
+        if context is None:
+            return self.model_service.acquire_runtime(
+                model_id, media_type="text", task_type=self.task_type
+            )
+        while True:
+            context.raise_if_cancelled()
+            try:
+                return self.model_service.acquire_runtime(
+                    model_id, media_type="text", task_type=self.task_type,
+                    wait_timeout=_CANCELLATION_POLL_SECONDS,
+                )
+            except RuntimeWaitTimeoutError:
+                # Only synchronization waits are retryable. Cache capacity,
+                # invalid entries and loader errors must still surface.
+                context.raise_if_cancelled()
+
     def _generate_structured(
         self,
         generate_text: Any,
@@ -266,7 +335,7 @@ class TextGenerator(BaseGenerator):
                 )
 
         raw_path = self._write_raw_response(task, raw_text)
-        raise ValueError(
+        raise StorySchemaValidationError(
             f"Story task {task.name!r} did not return schema-valid output after a "
             f"repair attempt: {last_error}. Raw response saved to {raw_path}."
         )
@@ -301,4 +370,4 @@ def _extract_lineage_metadata(params: dict[str, Any]) -> dict[str, Any]:
     return lineage_payload
 
 
-__all__ = ["TextGenerator"]
+__all__ = ["StorySchemaValidationError", "TextGenerator"]

@@ -499,3 +499,72 @@ def test_post_lease_semantic_failure_preserves_output_cleanup(tmp_path, monkeypa
     # single lease); only post-lease scoring failed.
     assert cache._entries["target"].state is RuntimeState.READY
     assert len(pipelines["target"].calls) == 2
+
+
+def test_late_cancellation_after_successful_provider_return_preserves_runtime(
+    tmp_path, monkeypatch
+):
+    # Safety convergence pass, Codex finding "raise late image cancellation
+    # after releasing the lease": `_FakePipeline` has no
+    # `callback_on_step_end` parameter (see `_pipeline_accepts_step_callback`),
+    # so cancellation can only become observable at the generator's own
+    # loop-boundary checks -- exactly the "pipeline without a supported step
+    # callback" scenario the finding describes.
+    generator, service, cache, loader, pipelines = _build(tmp_path, monkeypatch)
+    call_count = {"n": 0}
+
+    def is_cancelled() -> bool:
+        call_count["n"] += 1
+        # call #1: _acquire_runtime()'s own pre-acquisition check (False)
+        # call #2: cancelled_before_mutation (False)
+        # call #3: top-of-loop check for variation 0 (False)
+        # call #4: the check right after the provider call returns (True)
+        return call_count["n"] > 3
+
+    with pytest.raises(GenerationCancelled):
+        generator.run(
+            _request(width=64, height=64, steps=1),
+            context=GenerationContext(is_cancelled=is_cancelled),
+        )
+
+    # The provider call genuinely ran and returned successfully before
+    # cancellation was observed.
+    assert len(pipelines["target"].calls) == 1
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY
+    assert entry.lease_count == 0
+    assert list(tmp_path.glob("*.png")) == []  # nothing written post-lease either
+
+
+def test_post_processing_cancellation_removes_partial_outputs(tmp_path, monkeypatch):
+    # Safety convergence pass, Codex finding "keep observing cancellation
+    # during image post-processing": cancellation observed *during* the
+    # post-lease save/quality loop (after the lease has already released
+    # cleanly) must still remove whatever this loop already wrote, via the
+    # existing cleanup path, rather than leaving an orphaned PNG behind.
+    generator, service, cache, loader, pipelines = _build(tmp_path, monkeypatch)
+    call_count = {"n": 0}
+
+    def is_cancelled() -> bool:
+        call_count["n"] += 1
+        # calls 1-6: _acquire_runtime()'s pre-acquisition check,
+        # cancelled_before_mutation, and top-of-loop/after-provider for
+        # both variations -- all inside the (uncancelled) lease.
+        # call #7: post-lease loop's own check for the *first* variation
+        # (False -- it gets written and scored normally).
+        # call #8: post-lease loop's own check for the *second* variation,
+        # reached only after the first variation's file was already
+        # written and scored.
+        return call_count["n"] > 7
+
+    with pytest.raises(GenerationCancelled):
+        generator.run(
+            _request(width=64, height=64, steps=1, variation_count=2),
+            context=GenerationContext(is_cancelled=is_cancelled),
+        )
+
+    assert len(pipelines["target"].calls) == 2  # both variations rendered inside the lease
+    assert list(tmp_path.glob("*.png")) == []  # the first variation's file was cleaned up
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY
+    assert entry.lease_count == 0
