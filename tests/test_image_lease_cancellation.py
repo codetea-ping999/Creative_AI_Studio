@@ -570,6 +570,37 @@ def test_post_processing_cancellation_removes_partial_outputs(tmp_path, monkeypa
     assert entry.lease_count == 0
 
 
+def test_cancellation_during_final_scoring_removes_saved_png(tmp_path, monkeypatch):
+    # Codex P2 finding "Image cancellation during quality/semantic
+    # scoring": the between-variations checkpoint only catches cancellation
+    # requested *between* iterations -- a single-variation request has no
+    # further iteration to catch a stop requested while
+    # evaluate_image_semantics() itself ran. `cancelled` is only set from
+    # *inside* the (monkeypatched) semantic scorer, right before it
+    # returns, proving the new post-scoring checkpoint -- not the existing
+    # pre-save one -- is what catches it.
+    generator, service, cache, loader, pipelines = _build(tmp_path, monkeypatch)
+    cancelled = Event()
+
+    def semantics(*args):
+        cancelled.set()
+        return {}
+
+    monkeypatch.setattr("generators.image.generator.evaluate_image_semantics", semantics)
+
+    with pytest.raises(GenerationCancelled):
+        generator.run(
+            _request(width=64, height=64, steps=1),
+            context=GenerationContext(is_cancelled=cancelled.is_set),
+        )
+
+    assert len(pipelines["target"].calls) == 1  # inference genuinely completed
+    assert list(tmp_path.glob("*.png")) == []  # the scored PNG was cleaned up
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY
+    assert entry.lease_count == 0
+
+
 def test_progress_callback_failure_after_successful_inference_preserves_runtime(
     tmp_path, monkeypatch
 ):

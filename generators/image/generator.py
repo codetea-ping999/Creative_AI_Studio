@@ -519,6 +519,21 @@ class ImageGenerator(BaseGenerator):
                     resolved_prompt.negative_prompt,
                 )
                 enrich_quality_report(quality_report, semantic_report)
+                # Codex P2 finding "Image cancellation during
+                # quality/semantic scoring": the checkpoint above only
+                # catches cancellation requested *between* variations -- a
+                # stop requested while evaluate_image_output()/
+                # evaluate_image_semantics() ran on the current variation,
+                # particularly the final one, was never observed (no
+                # further loop iteration to catch it), leaving the PNG it
+                # just saved behind once JobRunner discards the cancelled
+                # result. Checking again here, right after scoring, closes
+                # that gap for every variation -- still inside this same
+                # `try`, so the `except` below removes every PNG this loop
+                # has saved so far, and the runtime lease released above is
+                # never touched.
+                if context is not None:
+                    context.raise_if_cancelled()
                 quality_reports.append(quality_report)
                 variation_params = {
                     "width": width,

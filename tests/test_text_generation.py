@@ -632,6 +632,61 @@ class TextGeneratorLeaseTests(unittest.TestCase):
             self.assertIs(entry.state, RuntimeState.INVALID)
             self.assertEqual(entry.lease_count, 0)
 
+    def test_late_cancellation_after_successful_generation_writes_no_output(
+        self,
+    ) -> None:
+        # Codex P2 finding "Text late cancellation": a cancellation that
+        # arrives while the blocking generate_text() call (and its one
+        # allowed repair attempt) is running was never rechecked once it
+        # returned -- the lease exited normally, but markdown/JSON files
+        # were written and quality evaluation ran before JobRunner's own
+        # outer boundary ever noticed cancellation, leaving orphaned
+        # outputs. `cancelled` is only set from *inside* the fake runtime
+        # callable itself, immediately before it returns successfully, so
+        # this proves the new post-generation snapshot (not the
+        # pre-generation one) is what catches it.
+        with tempfile.TemporaryDirectory() as root:
+            cancelled = Event()
+
+            def resolver(model_id, media_type, task_type=None):
+                return SimpleNamespace(
+                    id=model_id, public_model_id=model_id, provider="local",
+                    loader="fake", default_params={}, runtime="template",
+                    display_name="fake text",
+                )
+
+            def generate(prompt, **kwargs):
+                result = json.dumps({"loglines": [{"text": "ok"}]})
+                cancelled.set()
+                return result
+
+            loader = Mock()
+            loader.load.side_effect = lambda item: {
+                **_template_runtime(), "generate": generate,
+            }
+            cache = ModelRuntimeCache()
+            service = ModelService(
+                registry=None,
+                resolver=SimpleNamespace(resolve=resolver),
+                loader_registry=SimpleNamespace(get=lambda name: loader),
+                runtime_cache=cache,
+                admission_capacity=1,
+            )
+            generator = TextGenerator(service, output_dir=Path(root))
+
+            with self.assertRaises(GenerationCancelled):
+                generator.run(
+                    _request("logline"),
+                    context=GenerationContext(is_cancelled=cancelled.is_set),
+                )
+
+            self.assertEqual(list(Path(root).glob("*.md")), [])
+            self.assertEqual(list(Path(root).glob("*.json")), [])
+            entry = cache._entries["template-writer"]
+            self.assertIs(entry.state, RuntimeState.READY)
+            self.assertEqual(entry.lease_count, 0)
+            self.assertEqual(loader.load.call_count, 1)
+
     def test_admission_wait_observes_cancellation(self) -> None:
         # Safety convergence pass, Codex finding "poll cancellation while
         # text waits for admission": TextGenerator now accepts a context

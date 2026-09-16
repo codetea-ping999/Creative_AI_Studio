@@ -163,7 +163,21 @@ class TextGenerator(BaseGenerator):
         # runtime callable itself raises) -- captured here and re-raised
         # only after the lease exits normally, so it never invalidates a
         # healthy runtime.
+        #
+        # Codex P2 finding "Text late cancellation": a cancellation that
+        # arrives while the blocking `generate_text()` call (and its one
+        # allowed repair attempt) is running was never rechecked once it
+        # returned -- the lease exited normally, but the generator then
+        # wrote output files and ran quality evaluation before JobRunner's
+        # own outer boundary ever noticed cancellation, leaving orphaned
+        # outputs. `late_cancellation` snapshots cancellation once
+        # generation has genuinely completed, still inside the `with`
+        # block (no runtime mutation happens from reading it), so a stop
+        # request observed only now is treated the same as one observed up
+        # front: raised after the lease exits cleanly, before any file is
+        # written.
         cancelled_before_generation = False
+        late_cancellation = False
         schema_error: StorySchemaValidationError | None = None
         with self._acquire_runtime(requested_model_id, context) as handle:
             manifest = handle.manifest
@@ -195,12 +209,14 @@ class TextGenerator(BaseGenerator):
                         "supports_json_schema": runtime_obj.get("supports_json_schema"),
                         "endpoint_base_url": runtime_obj.get("endpoint_base_url"),
                     }
+                    if context is not None:
+                        late_cancellation = context.is_cancelled()
 
-        # No inference took place: exit cleanly instead of marking the cache
-        # INVALID. An exception raised directly by the runtime callable
-        # (`generate_text`) itself is not caught above and still unwinds as
-        # unsafe.
-        if cancelled_before_generation:
+        # No inference took place, or it completed successfully: exit
+        # cleanly instead of marking the cache INVALID. An exception raised
+        # directly by the runtime callable (`generate_text`) itself is not
+        # caught above and still unwinds as unsafe.
+        if cancelled_before_generation or late_cancellation:
             raise GenerationCancelled()
         if schema_error is not None:
             # The lease has already exited cleanly above -- persisting the
