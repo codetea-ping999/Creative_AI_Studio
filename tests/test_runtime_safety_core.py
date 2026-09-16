@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from threading import Barrier, Event, Lock, Thread
+from threading import Barrier, Condition, Event, Lock, Thread, current_thread
 import unittest
 
 from bootstrap.factories import create_default_model_service
@@ -26,7 +26,12 @@ import core.models.cache as cache_module
 from core.models.loader import LoaderRegistry
 from core.models.registry import ModelRegistry
 from core.models.resolver import ModelResolver
-from core.models.runtime_lease import RuntimeBusyError, RuntimeEntry, RuntimeState
+from core.models.runtime_lease import (
+    RuntimeBusyError,
+    RuntimeEntry,
+    RuntimeState,
+    RuntimeWaitTimeoutError,
+)
 from core.models.service import ModelService, RuntimeAdmissionController
 import core.models.service as service_module
 from core.models.cloud_guard import CloudProviderDisabledError
@@ -874,7 +879,17 @@ class RuntimeSafetyCoreTests(unittest.TestCase):
             # Idle-application invariant: constructing the service graph
             # allocates only lightweight synchronization/data structures --
             # no loader has ever been asked to load anything.
-            self.assertIsInstance(service.runtime_cache._metadata_lock, type(Lock()))
+            #
+            # Multi-waiter INVALID-entry drain (approved contract, PR #420):
+            # `_metadata_lock` ("M") is now a `Condition` (over a plain
+            # `Lock`, not the default `RLock` -- see
+            # `wait_for_stale_entry_drain()`'s own docstring), not a bare
+            # `Lock` -- still exactly the same kind of lightweight,
+            # in-memory synchronization primitive this invariant is about.
+            self.assertIsInstance(service.runtime_cache._metadata_lock, Condition)
+            self.assertIsInstance(
+                service.runtime_cache._metadata_lock._lock, type(Lock())  # type: ignore[attr-defined]
+            )
 
     # ------------------------------------------------- acquire_runtime deadline
 
@@ -1456,6 +1471,448 @@ class RuntimeSafetyCoreTests(unittest.TestCase):
         finally:
             handle_final.release()
         self.assertEqual(loader.load_calls, 3)
+
+    # ------------------------- Multi-waiter INVALID-entry drain (PR #420)
+    #
+    # Codex-reproduced finding: the single-caller "exactly one retry" rule
+    # above is insufficient once `admission_capacity >= 2` lets more than
+    # one caller pin the same entry before it is invalidated -- a caller's
+    # own retry can lose a race against a *different* stale lease-holder's
+    # still-outstanding pin on the exact same entry, even though that pin
+    # is provably draining. See `_RuntimeInvalidEntryDrainingError` and
+    # `ModelService._acquire_entry_after_revalidation_failure()` for the
+    # fix and its full rationale.
+
+    def test_multi_waiter_drain_both_stale_waiters_converge(self):
+        # A owns E; B and C both independently pin the same READY entry and
+        # park behind A on E. Only one of B/C can win E first; the loser is
+        # still pinned on the exact entry the winner's own post-E
+        # revalidation just failed on. Before this fix, the winner's one
+        # internal retry would observe INVALID+still-pinned (because the
+        # loser had not unwound yet) and fail immediately with a plain,
+        # permanent RuntimeBusyError -- even though the loser's pin was
+        # already draining and about to release. This proves neither
+        # thread receives that spurious failure: both converge on a
+        # freshly loaded runtime, loaded exactly once -- and leaves no
+        # G/L/E/lease leak behind.
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service(
+            {"model-a": manifest_a}, {"fake": loader}, admission_capacity=3,
+        )
+
+        handle_a = service.acquire_runtime("model-a", "image")
+        entry_v1 = handle_a._entry
+        self.assertEqual(loader.load_calls, 1)
+
+        # Confirmed once each worker's own initial pin (the READY-hit
+        # increment inside `_acquire_or_load_entry()`) has actually
+        # completed -- a real synchronization point (a method call
+        # returning), not a sleep-then-check guess.
+        pinned = {"b": Event(), "c": Event()}
+        original_acquire_or_load = service._acquire_or_load_entry
+
+        def instrumented_acquire_or_load(manifest, media_type, deadline):
+            entry = original_acquire_or_load(manifest, media_type, deadline)
+            event = pinned.get(current_thread().name)
+            if event is not None:
+                event.set()
+            return entry
+
+        service._acquire_or_load_entry = instrumented_acquire_or_load
+
+        errors: dict[str, BaseException] = {}
+        results: dict[str, object] = {}
+        entries_seen: dict[str, RuntimeEntry] = {}
+
+        def worker(name):
+            # Mirrors a real generator: acquire, use briefly, release --
+            # never holds the handle open indefinitely. This matters
+            # structurally, not just stylistically: E is exclusive per
+            # entry, so if both threads tried to hold a returned handle
+            # open at once, whichever of B/C loses the race for E on the
+            # *fresh* entry would block on this test's own two open
+            # handles rather than on anything this fix is responsible
+            # for -- a self-inflicted deadlock in the test, not a bug.
+            try:
+                handle = service.acquire_runtime("model-a", "image")
+                try:
+                    results[name] = handle.runtime
+                    entries_seen[name] = handle._entry
+                finally:
+                    handle.release()
+            except BaseException as exc:  # noqa: BLE001
+                errors[name] = exc
+
+        tb = Thread(target=worker, args=("b",), name="b")
+        tc = Thread(target=worker, args=("c",), name="c")
+        tb.start()
+        tc.start()
+        self.assertTrue(pinned["b"].wait(timeout=5))
+        self.assertTrue(pinned["c"].wait(timeout=5))
+        service._acquire_or_load_entry = original_acquire_or_load
+        self.assertEqual(entry_v1.lease_count, 3)  # A + B + C
+
+        handle_a.release(had_exception=True)
+        self.assertEqual(entry_v1.state, RuntimeState.INVALID)
+
+        tb.join(timeout=5)
+        tc.join(timeout=5)
+        self.assertFalse(tb.is_alive())
+        self.assertFalse(tc.is_alive())
+
+        self.assertEqual(errors, {})
+        self.assertEqual(set(results), {"b", "c"})
+        self.assertIsNotNone(results["b"])
+        self.assertIsNotNone(results["c"])
+
+        entry_v2 = cache._entries["model-a"]
+        self.assertIsNot(entry_v2, entry_v1)
+        self.assertGreater(entry_v2.generation, entry_v1.generation)
+        self.assertEqual(entry_v2.state, RuntimeState.READY)
+        self.assertIs(entries_seen["b"], entry_v2)
+        self.assertIs(entries_seen["c"], entry_v2)
+
+        # Exactly one fresh load: A's original, plus one reload shared by
+        # both B and C -- never a third/unbounded stale-generation load.
+        self.assertEqual(loader.load_calls, 2)
+
+        # Full G/L/E/lease leak checklist -- both workers already released
+        # their own handles above.
+        self.assertEqual(cache._entries["model-a"].lease_count, 0)
+        self.assertEqual(service._admission._held_by_thread, {})
+        self.assertTrue(cache.lock_for("model-a").acquire(blocking=False))
+        cache.lock_for("model-a").release()
+        self.assertTrue(entry_v1.execution_lock.acquire(blocking=False))
+        entry_v1.execution_lock.release()
+        self.assertTrue(entry_v2.execution_lock.acquire(blocking=False))
+        entry_v2.execution_lock.release()
+
+    def test_healthy_pinned_capacity_busy_never_invokes_drain_logic(self):
+        # A genuinely busy, healthy (READY) entry occupying the only
+        # capacity slot in its bucket must still fail fast, exactly as
+        # before this fix -- the new drain-retry logic exists only for
+        # INVALID-and-pinned entries and must never even be consulted for
+        # an ordinary pinned-capacity failure. Proved by instrumenting
+        # `wait_for_stale_entry_drain()` itself, not by elapsed time.
+        manifest_a = _FakeManifest("model-a")
+        manifest_b = _FakeManifest("model-b")
+        loader = _ImmediateLoader()
+        service, cache = _build_service(
+            {"model-a": manifest_a, "model-b": manifest_b}, {"fake": loader},
+            max_entries=1, admission_capacity=2,
+        )
+
+        handle_a = service.acquire_runtime("model-a", "image")
+
+        drain_calls: list[str] = []
+        original_wait = cache.wait_for_stale_entry_drain
+
+        def instrumented_wait(canonical_id, entry, deadline):
+            drain_calls.append(canonical_id)
+            return original_wait(canonical_id, entry, deadline)
+
+        cache.wait_for_stale_entry_drain = instrumented_wait
+
+        # A different thread, not this one -- G's own nested-acquire ban
+        # rejects a same-thread second `acquire_runtime()` call
+        # unconditionally, regardless of canonical id, which would
+        # otherwise mask the actual pinned-capacity busy path this test
+        # targets (see test_pinned_eviction_returns_busy_without_touching_the_pinned_entry
+        # for the same requirement).
+        result: dict[str, object] = {}
+
+        def worker():
+            try:
+                service.acquire_runtime("model-b", "image", wait_timeout=1.0)
+            except BaseException as exc:  # noqa: BLE001
+                result["error"] = exc
+
+        try:
+            tb = Thread(target=worker)
+            tb.start()
+            tb.join(timeout=5)
+            self.assertFalse(tb.is_alive())
+            # Exactly the plain, public type -- not RuntimeWaitTimeoutError,
+            # and not a leaked private drain-signal subtype.
+            self.assertIs(type(result.get("error")), RuntimeBusyError)
+        finally:
+            cache.wait_for_stale_entry_drain = original_wait
+            handle_a.release()
+
+        self.assertEqual(drain_calls, [])
+
+    def test_generation_isolation_does_not_attach_drain_retry_to_a_different_entry(self):
+        # A caller's own revalidation failure on `entry_v1` must only ever
+        # trigger a drain-wait for `entry_v1` itself, by object identity --
+        # never for a *different*, newer-generation entry under the same
+        # canonical id that happens, independently, to also be INVALID and
+        # pinned. Constructed directly at the cache layer for a precise,
+        # deterministic proof of this one scope-guard boundary, rather than
+        # via a timing-dependent multi-thread race.
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service(
+            {"model-a": manifest_a}, {"fake": loader}, admission_capacity=2,
+        )
+
+        # entry_v1: a stale entry a caller already failed revalidation on,
+        # but which has since fully drained and is no longer
+        # `cache._entries`'s current entry for "model-a" at all.
+        entry_v1 = cache.acquire_or_reserve("model-a", "image")
+        cache.publish_ready_and_pin("model-a", entry_v1, {"id": "model-a", "gen": 1})
+        cache.mark_invalid("model-a", entry_v1)
+        cache.release_lease("model-a", entry_v1)
+        self.assertEqual(entry_v1.lease_count, 0)
+
+        # entry_v2: a genuinely different, newer generation, independently
+        # invalidated while still pinned by an unrelated caller -- the
+        # drain this test proves must never be conflated with entry_v1's.
+        entry_v2 = cache.acquire_or_reserve("model-a", "image")
+        self.assertIsNot(entry_v2, entry_v1)
+        self.assertGreater(entry_v2.generation, entry_v1.generation)
+        cache.publish_ready_and_pin("model-a", entry_v2, {"id": "model-a", "gen": 2})
+        second_pin = cache.acquire_or_reserve("model-a", "image")
+        self.assertIs(second_pin, entry_v2)
+        cache.mark_invalid("model-a", entry_v2)
+        self.assertEqual(entry_v2.lease_count, 2)
+
+        drain_calls: list[RuntimeEntry] = []
+        original_wait = cache.wait_for_stale_entry_drain
+
+        def instrumented_wait(canonical_id, entry, deadline):
+            drain_calls.append(entry)
+            return original_wait(canonical_id, entry, deadline)
+
+        cache.wait_for_stale_entry_drain = instrumented_wait
+        try:
+            with self.assertRaises(RuntimeBusyError) as caught:
+                service._acquire_entry_after_revalidation_failure(
+                    manifest_a, "image", None, entry_v1,
+                )
+            self.assertIs(type(caught.exception), RuntimeBusyError)
+        finally:
+            cache.wait_for_stale_entry_drain = original_wait
+
+        # The drain-wait must never even be invoked for entry_v2 -- it is
+        # not the entry this caller's own revalidation failure was about.
+        self.assertEqual(drain_calls, [])
+        # entry_v2's own, genuinely still-outstanding pins are left
+        # completely untouched by this rejected retry.
+        self.assertEqual(entry_v2.lease_count, 2)
+        self.assertEqual(entry_v2.state, RuntimeState.INVALID)
+
+        cache.release_lease("model-a", entry_v2)
+        cache.release_lease("model-a", entry_v2)
+
+    def test_drain_wait_bounded_by_caller_deadline_surfaces_wait_timeout(self):
+        # B must itself go through a real pin -> E-race -> revalidation
+        # failure to ever reach the drain-wait at all -- a fresh caller
+        # with no revalidation failure of its own fails fast instead (see
+        # test_healthy_pinned_capacity_busy_never_invokes_drain_logic and
+        # test_invalid_entry_still_leased_by_another_caller_denies_new_acquires).
+        # A *separate* straggler's stale pin -- taken directly at the
+        # cache layer, never touching E -- deliberately never releases
+        # within this test, so B's own drain-wait can never converge on
+        # its own: this proves the wait bounds itself strictly by B's own
+        # acquisition deadline, never by however long the drain might
+        # legitimately take, and never degrades into a plain, permanent
+        # RuntimeBusyError solely because the drain has not finished yet.
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service(
+            {"model-a": manifest_a}, {"fake": loader}, admission_capacity=2,
+        )
+
+        handle_a = service.acquire_runtime("model-a", "image")
+        entry_v1 = handle_a._entry
+
+        straggler_pin = cache.acquire_or_reserve("model-a", "image")
+        self.assertIs(straggler_pin, entry_v1)
+
+        pinned_b = Event()
+        original_acquire_or_load = service._acquire_or_load_entry
+
+        def instrumented_acquire_or_load(manifest, media_type, deadline):
+            entry = original_acquire_or_load(manifest, media_type, deadline)
+            pinned_b.set()
+            return entry
+
+        service._acquire_or_load_entry = instrumented_acquire_or_load
+
+        b_result: dict[str, BaseException] = {}
+
+        def worker_b():
+            try:
+                service.acquire_runtime("model-a", "image", wait_timeout=0.2)
+            except BaseException as exc:  # noqa: BLE001
+                b_result["error"] = exc
+
+        tb = Thread(target=worker_b)
+        tb.start()
+        self.assertTrue(pinned_b.wait(timeout=5))
+        service._acquire_or_load_entry = original_acquire_or_load
+        self.assertEqual(entry_v1.lease_count, 3)  # A + straggler + B
+
+        handle_a.release(had_exception=True)
+        self.assertEqual(entry_v1.state, RuntimeState.INVALID)
+
+        tb.join(timeout=5)
+        self.assertFalse(tb.is_alive())
+
+        # The deadline-shaped subtype a cancellation-aware generator's own
+        # bounded polling loop already retries -- never the plain,
+        # permanent RuntimeBusyError a spurious multi-waiter failure would
+        # raise.
+        self.assertIs(type(b_result.get("error")), RuntimeWaitTimeoutError)
+
+        # No leak from B's failed attempt: only the straggler's
+        # deliberately-still-outstanding pin remains.
+        self.assertEqual(entry_v1.lease_count, 1)
+        self.assertEqual(entry_v1.state, RuntimeState.INVALID)
+        self.assertEqual(service._admission._held_by_thread, {})
+        self.assertTrue(cache.lock_for("model-a").acquire(blocking=False))
+        cache.lock_for("model-a").release()
+        self.assertTrue(entry_v1.execution_lock.acquire(blocking=False))
+        entry_v1.execution_lock.release()
+
+        # Once the straggler finally does release, the system converges
+        # normally.
+        cache.release_lease("model-a", entry_v1)
+        self.assertEqual(entry_v1.lease_count, 0)
+        handle_retry = service.acquire_runtime("model-a", "image", wait_timeout=0)
+        try:
+            self.assertIsNotNone(handle_retry.runtime)
+            self.assertEqual(loader.load_calls, 2)
+        finally:
+            handle_retry.release()
+
+    def test_deadline_none_drain_wait_blocks_without_spinning_then_progresses(self):
+        # Same shape as the deadline-bounded test above -- B must itself
+        # fail its own revalidation before the drain-wait is even
+        # reachable -- but with `wait_timeout=None`: the wait may
+        # legitimately block for a stale lease to drain, but must never
+        # busy-spin. Proved two ways, both timing-independent: the
+        # underlying `Condition.wait()` is called at most once (a real,
+        # indefinite OS-level block a notification wakes -- not a tight
+        # retry loop), and the cache-level reservation check itself runs
+        # only a small, fixed number of times. B makes no progress until
+        # the straggler's lease is explicitly released from a controlled
+        # point in this test -- never from elapsed wall-clock time.
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service(
+            {"model-a": manifest_a}, {"fake": loader}, admission_capacity=2,
+        )
+
+        handle_a = service.acquire_runtime("model-a", "image")
+        entry_v1 = handle_a._entry
+
+        straggler_pin = cache.acquire_or_reserve("model-a", "image")
+        self.assertIs(straggler_pin, entry_v1)
+
+        pinned_b = Event()
+        original_acquire_or_load = service._acquire_or_load_entry
+
+        def instrumented_acquire_or_load(manifest, media_type, deadline):
+            entry = original_acquire_or_load(manifest, media_type, deadline)
+            pinned_b.set()
+            return entry
+
+        service._acquire_or_load_entry = instrumented_acquire_or_load
+
+        errors: list[BaseException] = []
+        b_result: dict[str, object] = {}
+
+        def worker_b():
+            try:
+                b_result["handle"] = service.acquire_runtime("model-a", "image")
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        tb = Thread(target=worker_b)
+        tb.start()
+        self.assertTrue(pinned_b.wait(timeout=5))
+        service._acquire_or_load_entry = original_acquire_or_load
+        self.assertEqual(entry_v1.lease_count, 3)  # A + straggler + B
+
+        # Counts real `Condition.wait()` calls on M -- the definitive,
+        # timing-independent proof this is a genuine block-then-wake, not
+        # a tight retry loop: a busy-spin variant would call this (or an
+        # equivalent) far more than once before converging.
+        wait_calls: list[float | None] = []
+        original_condition_wait = cache._metadata_lock.wait
+
+        def counting_wait(timeout=None):
+            wait_calls.append(timeout)
+            return original_condition_wait(timeout)
+
+        cache._metadata_lock.wait = counting_wait
+
+        # A second, independent, timing-robust proof of the same property:
+        # the number of times the cache-level pin/reserve check itself
+        # runs while draining. A spin loop would retry this unboundedly
+        # fast; correct code calls it only the small, fixed number of
+        # times genuine state transitions require.
+        reserve_calls: list[str] = []
+        original_acquire_or_reserve = cache.acquire_or_reserve
+
+        def counting_acquire_or_reserve(canonical_id, media_type):
+            reserve_calls.append(canonical_id)
+            return original_acquire_or_reserve(canonical_id, media_type)
+
+        cache.acquire_or_reserve = counting_acquire_or_reserve
+
+        b_entered_drain_wait = Event()
+        original_wait_for_drain = cache.wait_for_stale_entry_drain
+
+        def instrumented_wait_for_drain(canonical_id, entry, deadline):
+            b_entered_drain_wait.set()
+            return original_wait_for_drain(canonical_id, entry, deadline)
+
+        cache.wait_for_stale_entry_drain = instrumented_wait_for_drain
+
+        handle_a.release(had_exception=True)
+        self.assertEqual(entry_v1.state, RuntimeState.INVALID)
+
+        self.assertTrue(b_entered_drain_wait.wait(timeout=5))
+
+        # Release the straggler's stale lease -- the only thing that can
+        # possibly let B's wait converge (nothing else in this test could
+        # have caused it to return yet).
+        cache.release_lease("model-a", entry_v1)
+
+        tb.join(timeout=5)
+        cache.wait_for_stale_entry_drain = original_wait_for_drain
+        cache.acquire_or_reserve = original_acquire_or_reserve
+        cache._metadata_lock.wait = original_condition_wait
+
+        self.assertFalse(tb.is_alive())
+        self.assertEqual(errors, [])
+        self.assertIn("handle", b_result)
+
+        # Not a spin: at most one genuine block on the Condition (it may
+        # legitimately be zero, if the release above and B's own predicate
+        # check happened to interleave such that B never needed to park
+        # at all -- either way, never more than one).
+        self.assertLessEqual(len(wait_calls), 1)
+        # A small, fixed number of reservation-check calls -- never
+        # growing with however long the drain happened to take.
+        self.assertLessEqual(len(reserve_calls), 3)
+
+        handle_b = b_result["handle"]
+        try:
+            entry_v2 = cache._entries["model-a"]
+            self.assertIsNot(entry_v2, entry_v1)
+            self.assertGreater(entry_v2.generation, entry_v1.generation)
+            self.assertEqual(entry_v2.state, RuntimeState.READY)
+            self.assertEqual(entry_v2.lease_count, 1)
+            self.assertEqual(loader.load_calls, 2)
+        finally:
+            handle_b.release()
+
+        self.assertEqual(cache._entries["model-a"].lease_count, 0)
+        self.assertEqual(service._admission._held_by_thread, {})
 
     # ---------------------------------------------------- Finding 3 (P2)
     def test_capacity_reservation_is_atomic_for_racing_misses_into_an_empty_bucket(self):

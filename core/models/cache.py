@@ -20,6 +20,16 @@ docstring, which owns the *global* ordering across G/L/E/M):
   holding it. A multi-step operation (evict-then-load-then-publish) instead
   acquires/releases M several times, doing the slow work in between with M
   released (see ``acquire_or_reserve()``/``_finish_retirement()`` below).
+  ``M`` is a ``threading.Condition`` (wrapping a plain, non-reentrant
+  ``Lock``, not the default ``RLock``, so an accidental same-thread nested
+  ``with self._metadata_lock:`` still deadlocks loudly instead of silently
+  succeeding), not a bare lock -- see ``wait_for_stale_entry_drain()`` and
+  ``release_lease()``'s own ``notify_all()`` call. ``Condition.wait()``
+  atomically releases the underlying lock for the duration of the wait and
+  only reacquires it just before returning, so a thread parked in it is
+  *not* "holding M while blocked" in the sense the rule above forbids --
+  the short critical sections before/after a wait remain exactly as short
+  as any other M transaction in this class.
 - ``L`` (per-canonical-id, ``lock_for()``): unchanged from before PR4a --
   serializes "resolve this exact id's cache miss" so two concurrent misses
   for the same id never both load and ``put()`` (the second ``put()`` would
@@ -45,10 +55,16 @@ from collections import OrderedDict
 from collections.abc import Iterable, Mapping
 import logging
 import os
-from threading import Lock
+from threading import Condition, Lock
+import time
 from typing import Any, Callable
 
-from .runtime_lease import RuntimeBusyError, RuntimeEntry, RuntimeState
+from .runtime_lease import (
+    RuntimeBusyError,
+    RuntimeEntry,
+    RuntimeState,
+    _RuntimeInvalidEntryDrainingError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -131,7 +147,13 @@ class ModelRuntimeCache:
         self._entries: OrderedDict[str, RuntimeEntry] = OrderedDict()
         self._load_locks: dict[str, Lock] = {}
         self._load_locks_guard = Lock()
-        self._metadata_lock = Lock()
+        # See the class docstring's "M" section: a Condition (over a plain
+        # Lock, not the default RLock) so `wait_for_stale_entry_drain()` can
+        # block for a lease-count change without polling, while every
+        # ordinary `with self._metadata_lock:` transaction elsewhere in
+        # this class keeps working completely unchanged (Condition is a
+        # drop-in context manager over its underlying lock).
+        self._metadata_lock = Condition(Lock())
         # Highest generation ever assigned to a canonical id, kept even
         # after that id's entry is fully removed (unload/retirement) --
         # deliberately NOT derived from "the entry being replaced" alone,
@@ -515,10 +537,21 @@ class ModelRuntimeCache:
                     )
                 # INVALID.
                 if existing.is_pinned():
-                    raise RuntimeBusyError(
+                    # Multi-waiter INVALID-entry drain (approved contract,
+                    # PR #420): a type change only -- this branch's message,
+                    # timing, and "never wait here, decide immediately"
+                    # behavior are all unchanged. `_RuntimeInvalidEntryDrainingError`
+                    # is a `RuntimeBusyError` subtype every existing `except
+                    # RuntimeBusyError:` still catches identically; only
+                    # `ModelService`, and only for a caller that already had
+                    # its own post-E revalidation failure on this *exact*
+                    # entry, treats it specially -- see that private type's
+                    # own docstring in `core/models/runtime_lease.py`.
+                    raise _RuntimeInvalidEntryDrainingError(
                         f"{canonical_id!r} is invalid and still in use by "
                         f"{existing.lease_count} active lease(s); retry once "
-                        "those release."
+                        "those release.",
+                        entry=existing,
                     )
                 victim_id, victim_entry = canonical_id, existing
             else:
@@ -667,6 +700,16 @@ class ModelRuntimeCache:
             if current is not entry:
                 return
             entry.lease_count = max(0, entry.lease_count - 1)
+            # Multi-waiter INVALID-entry drain (approved contract, PR
+            # #420): this decrement is the only state change
+            # `wait_for_stale_entry_drain()` ever waits for, so every
+            # decrement notifies unconditionally (not only ones that reach
+            # zero) -- a woken waiter re-checks its own predicate against
+            # its own entry and simply goes back to sleep if that entry's
+            # count is still nonzero, exactly like any other
+            # spurious-wakeup-tolerant `Condition` consumer. Must be called
+            # while still holding M, as `Condition.notify_all()` requires.
+            self._metadata_lock.notify_all()
             if entry.lease_count == 0:
                 deferred_victims = self._evict_bucket_overflow_locked(entry.media_bucket)
         # Codex re-review, found on this round's own fix commits: every
@@ -719,6 +762,65 @@ class ModelRuntimeCache:
         with self._metadata_lock:
             current = self._entries.get(canonical_id)
             return current is entry and entry.state is RuntimeState.READY
+
+    def wait_for_stale_entry_drain(
+        self, canonical_id: str, entry: RuntimeEntry, deadline: float | None
+    ) -> bool:
+        """Block until `entry` is no longer `canonical_id`'s pinned, current entry.
+
+        Multi-waiter INVALID-entry drain (approved contract, PR #420). The
+        *only* caller of this method is `ModelService`'s handling of
+        `_RuntimeInvalidEntryDrainingError`, and only for a caller that
+        already had its own post-E revalidation failure on this exact
+        `entry` -- see that exception's own docstring in
+        `core/models/runtime_lease.py` for the full scope/rationale.
+
+        Waits on the same `Condition` `release_lease()` notifies on every
+        lease-count decrement (see that method), so this returns as soon as
+        possible after either:
+
+        - `entry.is_pinned()` becomes `False` (its last stale lease
+          released) -- the caller should retry `acquire_or_reserve()`,
+          which will now retire and reload it, or
+        - `entry` is no longer `self._entries[canonical_id]` at all (a
+          different caller already resolved the drain and installed a
+          fresh entry first) -- the caller should retry
+          `acquire_or_reserve()`, which will see whatever is current now.
+
+        Returns `True` once either condition holds (the caller should
+        retry immediately); `False` if `deadline` elapsed first with
+        `entry` still current and pinned (the caller should surface
+        `RuntimeWaitTimeoutError`). `deadline is None` waits without a
+        timeout -- a real, non-spinning OS-level block, never a poll loop
+        -- exactly like `_acquire_with_deadline()`'s own `deadline is None`
+        case elsewhere in this codebase; it still terminates because
+        `entry.lease_count` is monotonically non-increasing and bounded
+        (see `_RuntimeInvalidEntryDrainingError`'s docstring), so every
+        remaining stale lease-holder's own O(1) unwind eventually notifies
+        this wait awake.
+
+        Must be called *without* holding `self._metadata_lock`, `L`
+        (`lock_for(canonical_id)`), or `entry.execution_lock` ("E") -- by
+        the time `ModelService` reaches here, its caller has already
+        released its own stale lease, E, and L (see
+        `_RuntimeExecutionRevalidationFailed`'s own unwind), holding only
+        G for the rest of this `acquire_runtime()` call, which this method
+        never touches. This method acquires and releases M itself, several
+        times, exactly like every other public method on this class; it
+        never holds M while genuinely blocked (see the class docstring's
+        "M" section).
+        """
+
+        with self._metadata_lock:
+            while self._entries.get(canonical_id) is entry and entry.is_pinned():
+                if deadline is None:
+                    self._metadata_lock.wait()
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._metadata_lock.wait(timeout=remaining)
+            return True
 
     def _next_generation_locked(self, canonical_id: str) -> int:
         """Next monotonic generation for `canonical_id`. Caller must hold M."""

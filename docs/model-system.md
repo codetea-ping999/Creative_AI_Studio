@@ -212,6 +212,43 @@ INVALID化・削除・差し替えのいずれかが起きていた場合はEを
 `RuntimeBusyError`を送出します。この順序が崩れない限り、
 この4資源の組み合わせで自己deadlockは起きません。
 
+**INVALID entryのhandoff retryとmulti-waiter drain**（issue #414
+follow-up, PR #420）：上記の再検証に失敗した caller（＝E獲得直後に
+対象entryがINVALIDだったcaller）は、L -> Eの取得シーケンスを
+同じ`acquire_runtime()`呼び出しの中で、同じ`deadline`に束縛された
+まま内部的にretryします。これ自体は「自分自身の stale lease を
+既に解放済み」という前提があるため安全です（他のcallerの将来の
+行動を待つのではなく、自分自身がすでに行った解放が entry を
+evict/reload可能にしている）。
+
+ただし `admission_capacity >= 2` では、同じ READY entry を複数の
+caller が pin した状態で invalidate されうるため、retryした
+caller が同じ entry を再度 `acquire_or_reserve()` した際に
+「INVALIDのままだが**別の** stale lease 保持者がまだ pin している」
+状態に出会うことがあります。この状態は最小限、かつ厳密に scope された
+条件下でのみ内部的に retry 可能な唯一の `RuntimeBusyError` 原因です：
+
+> post-E revalidation に失敗した caller は、その失敗の原因となった
+> **まさにその** entry/generation が stale lease の drain 待ちである
+> 間に限り、caller 自身の acquisition deadline の範囲内で内部的に
+> 待機・retry してよい。それ以外の busy/capacity 状態
+> （健全な entry が genuinely busy、LOADING/RETIRING、別の
+> entry/generation、容量競合など）は引き続き即座に非retryの
+> `RuntimeBusyError`のままです。
+
+この待機は `ModelRuntimeCache.wait_for_stale_entry_drain()` が
+`threading.Condition`（`_metadata_lock`をLockではなくConditionに
+した上で、`release_lease()`が lease 減算のたびに`notify_all()`する）
+で実装しており、poll/busy-spinは一切行いません。deadlineが尽きれば
+既存の公開`RuntimeWaitTimeoutError`が送出されるため、
+cancellation-awareなgenerator側の既存の`wait_timeout`ポーリング
+ループはそのまま機能します。この仕組みはG/L/E順序・
+`RuntimeEntry`の構造・publicな例外taxonomy・generator側の契約を
+一切変更しません（`core/models/runtime_lease.py`の
+`_RuntimeInvalidEntryDrainingError`はprivateなtype変更のみで、
+message・timing・「ここでは待たず即決定する」という
+`acquire_or_reserve()`自体の挙動は不変です）。
+
 **admissionの共有範囲**（Codex round 1 review, Finding 1）：
 `ModelService.__init__`が`admission`/`admission_capacity`を
 どちらも受け取らない場合、`core.models.service.get_default_admission_controller()`
