@@ -59,6 +59,35 @@ class StorySchemaValidationError(ValueError):
         self.last_error = last_error
 
 
+class _StructuredGenerationCancelled(Exception):
+    """Private signal: cancellation observed between schema attempts.
+
+    Codex P2 finding "Text: observe cancellation between schema attempts":
+    raised only by `TextGenerator._generate_structured()`, once the first
+    inference attempt has completed and cancellation is observable, but
+    *before* a repair attempt would otherwise start -- so a job that has
+    already been asked to stop never pays for a second, doomed-to-be-
+    discarded model call.
+
+    Caught only by `TextGenerator.generate()`'s own call site, still
+    inside the active runtime lease. Deliberately not `GenerationCancelled`
+    itself: raising that here would unwind through the
+    `with self._acquire_runtime(...)` block and mark a healthy runtime
+    `INVALID` (see `RuntimeHandle.__exit__`) merely because this caller
+    decided not to use its own already-successful first inference attempt.
+    `generate()` catches this, records `late_cancellation` exactly like the
+    existing post-success cancellation sample, lets the lease exit
+    normally, and only then raises the real `GenerationCancelled`.
+
+    Never exported; not a new public exception taxonomy.
+    """
+
+    def __init__(self, *, raw_text: str, attempts: int) -> None:
+        super().__init__("generation cancelled between schema attempts")
+        self.raw_text = raw_text
+        self.attempts = attempts
+
+
 class TextGenerator(BaseGenerator):
     """Generate story documents with the resolved text runtime."""
 
@@ -176,6 +205,23 @@ class TextGenerator(BaseGenerator):
         # request observed only now is treated the same as one observed up
         # front: raised after the lease exits cleanly, before any file is
         # written.
+        #
+        # Codex P2 finding "Text: observe cancellation between schema
+        # attempts": that same `late_cancellation` sample used to run only
+        # on the success path (the `else` clause below) -- a terminal
+        # schema failure (`StorySchemaValidationError`, raised after the
+        # repair attempt is also invalid) skipped it entirely, so
+        # cancellation observed during either attempt was lost and the
+        # failed-response diagnostic got persisted before JobRunner's own
+        # boundary ever noticed the stop request. `_generate_structured()`
+        # now checks cancellation itself right after the first attempt
+        # completes and, if observed, skips the repair call and signals
+        # back via `_StructuredGenerationCancelled` (never
+        # `GenerationCancelled` itself -- see that class's own docstring
+        # for why). The `except StorySchemaValidationError` branch below
+        # also re-samples cancellation, so a stop that only becomes
+        # observable once *both* attempts have completed (repair included)
+        # is caught too.
         cancelled_before_generation = False
         late_cancellation = False
         schema_error: StorySchemaValidationError | None = None
@@ -198,9 +244,14 @@ class TextGenerator(BaseGenerator):
                         seed=request.seed,
                         json_schema=json_schema,
                         supports_json_schema=bool(runtime_obj.get("supports_json_schema")),
+                        context=context,
                     )
+                except _StructuredGenerationCancelled:
+                    late_cancellation = True
                 except StorySchemaValidationError as exc:
                     schema_error = exc
+                    if context is not None:
+                        late_cancellation = context.is_cancelled()
                 else:
                     runtime_metadata = {
                         "runtime_type": type(runtime_obj).__name__,
@@ -216,6 +267,12 @@ class TextGenerator(BaseGenerator):
         # cleanly instead of marking the cache INVALID. An exception raised
         # directly by the runtime callable (`generate_text`) itself is not
         # caught above and still unwinds as unsafe.
+        #
+        # `late_cancellation` is checked before `schema_error` deliberately:
+        # cancellation must take precedence over persisting the
+        # failed-response diagnostic (`_write_raw_response()` below) when
+        # both became true from the same completed attempt(s) -- this
+        # `raise` exits the function before that write ever happens.
         if cancelled_before_generation or late_cancellation:
             raise GenerationCancelled()
         if schema_error is not None:
@@ -342,6 +399,7 @@ class TextGenerator(BaseGenerator):
         seed: int | None,
         json_schema: dict[str, Any],
         supports_json_schema: bool,
+        context: "GenerationContext | None" = None,
     ) -> tuple[dict[str, Any], str, int]:
         """Generate, validate, and repair once before failing.
 
@@ -349,6 +407,17 @@ class TextGenerator(BaseGenerator):
         formatting slip the model can fix when shown the error. A second failure
         means the model cannot satisfy the contract, and reporting that with the
         raw text preserved is more useful than looping.
+
+        Codex P2 finding "Text: observe cancellation between schema
+        attempts": cancellation is sampled once the first attempt's
+        inference has completed (reading it here does not touch the
+        runtime) and, if observed, the repair call is skipped entirely --
+        raising `_StructuredGenerationCancelled` to tell `generate()`
+        rather than starting a second, doomed-to-be-discarded model call.
+        This never raises `GenerationCancelled` itself: that would unwind
+        through the active `with self._acquire_runtime(...)` block in
+        `generate()` and mark a perfectly healthy runtime `INVALID` merely
+        for having produced output this caller no longer wants.
         """
 
         current_prompt = prompt
@@ -376,6 +445,9 @@ class TextGenerator(BaseGenerator):
                     f"### PREVIOUS RESPONSE\n{raw_text[:2000]}\n\n"
                     f"### CORRECTION\n{_REPAIR_INSTRUCTION.format(error=last_error)}"
                 )
+
+            if attempt == 1 and context is not None and context.is_cancelled():
+                raise _StructuredGenerationCancelled(raw_text=raw_text, attempts=attempt)
 
         # Deliberately no `_write_raw_response()` call here: persisting the
         # diagnostic is filesystem I/O, not part of the runtime-use

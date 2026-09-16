@@ -544,6 +544,81 @@ def test_video_encoding_failure_after_successful_rendering_preserves_runtime(
     assert list(tmp_path.glob("*.gif")) == []  # encoding never actually wrote anything
 
 
+def test_malformed_runtime_owned_palette_invalidates_healthy_runtime(
+    tmp_path, monkeypatch
+):
+    # Codex P2 finding "Video: restrict deferred procedural parameter
+    # failures": the broad `except (ValueError, TypeError)` that used to
+    # wrap the entire `render()` call also caught a genuine runtime
+    # defect -- a malformed palette hex string *owned by the cached
+    # runtime*, not the request -- and incorrectly treated it as a
+    # harmless procedural-parameter input error. A bad palette must
+    # invalidate; only the five request-owned numeric params (width,
+    # height, fps, duration_seconds, num_frames) are input errors.
+    generator, service, cache, loader, renderer = _build(tmp_path, monkeypatch)
+    generator.runtime_router = SimpleNamespace(
+        resolve=lambda runtime_obj: ProceduralStoryboardRuntime()
+    )
+    # 6 hex characters but not valid hex digits -- passes the runtime's own
+    # length check, then raises inside `_hex_to_rgb()`'s `int(..., 16)`.
+    loader.load.side_effect = lambda item: {"id": item.id, "palette": ["zzzzzz"]}
+
+    with pytest.raises(ValueError):
+        generator.run(
+            GenerationRequest(
+                media_type="video", prompt="test", model_id="target",
+                params={"duration_seconds": 2, "fps": 4},
+            )
+        )
+
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.INVALID
+    assert entry.lease_count == 0
+
+
+def test_procedural_progress_publication_failure_does_not_invalidate_runtime(
+    tmp_path, monkeypatch
+):
+    # Codex P2 finding "Video: progress publication must not invalidate
+    # procedural runtime": `context.report_progress()` writes through
+    # JobRepository/event publication in production -- a failure there is
+    # boundary bookkeeping, not a rendering fault, and must not escape the
+    # active lease and invalidate an otherwise-healthy runtime. It must
+    # still be raised, but only after the lease has released.
+    generator, service, cache, loader, renderer = _build(tmp_path, monkeypatch)
+    generator.runtime_router = SimpleNamespace(
+        resolve=lambda runtime_obj: ProceduralStoryboardRuntime()
+    )
+    progress_error = RuntimeError("simulated JobRepository failure")
+
+    def failing_on_progress(fraction):
+        raise progress_error
+
+    context = GenerationContext(
+        is_cancelled=lambda: False,
+        on_progress=failing_on_progress,
+        min_interval_seconds=0,
+        min_progress_delta=0,
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        generator.run(
+            GenerationRequest(
+                media_type="video", prompt="test", model_id="target",
+                params={"duration_seconds": 2, "fps": 4},
+            ),
+            context=context,
+        )
+    assert caught.value is progress_error
+
+    # Rendering itself was never aborted by the progress failure.
+    assert list(tmp_path.glob("*.gif")) == []  # raised before the deferred encode
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY
+    assert entry.lease_count == 0
+    assert loader.load.call_count == 1
+
+
 def test_render_exception_still_invalidates_used_runtime(tmp_path, monkeypatch):
     # The other half of the distinction every finding in this pass
     # requires: an exception the render() callable itself raises (not a

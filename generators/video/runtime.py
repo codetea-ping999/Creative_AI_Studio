@@ -40,6 +40,39 @@ class BaseVideoRuntime(ABC):
         """Render a video asset and return its file paths and metadata."""
 
 
+def coerce_procedural_render_params(effective_params: dict[str, Any]) -> dict[str, Any]:
+    """Coerce and pop the procedural runtime's own request-owned numeric params.
+
+    Codex P2 finding "Video: restrict deferred procedural parameter
+    failures": `width`/`height`/`fps`/`duration_seconds`/`num_frames` are
+    the only inputs to `ProceduralStoryboardRuntime.render()` that come
+    from the request/manifest defaults rather than the loaded runtime
+    itself (contrast `runtime_obj.get("palette")`, coerced by
+    `_hex_to_rgb()` inside `render()` -- a malformed value there is a
+    genuine runtime defect, not a request error). Extracted to a
+    standalone function so `VideoGenerator.generate()` can wrap *only*
+    this conversion in a narrow `try/except`, immediately before calling
+    `render()`, instead of a broad `except (ValueError, TypeError)` around
+    the entire render call -- which used to also catch a bad palette and
+    incorrectly treat it as a harmless input error instead of invalidating
+    the runtime that produced it. Raises `ValueError`/`TypeError` exactly
+    as the original inline coercion did.
+    """
+
+    width = max(256, int(effective_params.pop("width", 576)))
+    height = max(256, int(effective_params.pop("height", 320)))
+    fps = max(4, int(effective_params.pop("fps", 8)))
+    duration_seconds = max(2, int(effective_params.pop("duration_seconds", 4)))
+    num_frames = max(12, int(effective_params.pop("num_frames", duration_seconds * fps)))
+    return {
+        "width": width,
+        "height": height,
+        "fps": fps,
+        "duration_seconds": duration_seconds,
+        "num_frames": num_frames,
+    }
+
+
 class ProceduralStoryboardRuntime(BaseVideoRuntime):
     """Generate lightweight animated storyboard previews as gif assets."""
 
@@ -53,11 +86,17 @@ class ProceduralStoryboardRuntime(BaseVideoRuntime):
         effective_params: dict[str, Any],
         context: "GenerationContext | None" = None,
     ) -> dict[str, Any]:
-        width = max(256, int(effective_params.pop("width", 576)))
-        height = max(256, int(effective_params.pop("height", 320)))
-        fps = max(4, int(effective_params.pop("fps", 8)))
-        duration_seconds = max(2, int(effective_params.pop("duration_seconds", 4)))
-        num_frames = max(12, int(effective_params.pop("num_frames", duration_seconds * fps)))
+        # Already coerced by `VideoGenerator.generate()` via
+        # `coerce_procedural_render_params()` before this call, on any
+        # path reached through the real router -- re-coercing here is a
+        # harmless no-op on already-valid ints, and keeps this method
+        # self-sufficient for any caller that skips that step.
+        coerced = coerce_procedural_render_params(effective_params)
+        width = coerced["width"]
+        height = coerced["height"]
+        fps = coerced["fps"]
+        duration_seconds = coerced["duration_seconds"]
+        num_frames = coerced["num_frames"]
         camera_motion = (
             str(effective_params.pop("camera_motion", "push-in")).strip() or "push-in"
         )
@@ -71,6 +110,7 @@ class ProceduralStoryboardRuntime(BaseVideoRuntime):
         rng = random.Random(request.seed if request.seed is not None else hash(request.prompt))
 
         frames = []
+        progress_error: Exception | None = None
         for frame_index in range(num_frames):
             if context is not None:
                 context.raise_if_cancelled()
@@ -89,7 +129,25 @@ class ProceduralStoryboardRuntime(BaseVideoRuntime):
                 )
             )
             if context is not None:
-                context.report_progress((frame_index + 1) / num_frames)
+                # Codex P2 finding "Video: progress publication must not
+                # invalidate procedural runtime": `report_progress()`
+                # writes through JobRepository/event publication in
+                # production -- external bookkeeping, not a rendering
+                # fault (see this module's fault-boundary note, mirroring
+                # Image). A transient DB/event failure here must not
+                # escape through this render() call and invalidate a
+                # runtime that is rendering frames correctly. Captured
+                # (the first one; never swallowed) and frame rendering
+                # keeps going -- retaining progress updates for any later
+                # frame whose report succeeds -- instead of aborting an
+                # otherwise-healthy render over a boundary hiccup.
+                # `VideoGenerator.generate()` re-raises it only once this
+                # lease has already exited cleanly.
+                try:
+                    context.report_progress((frame_index + 1) / num_frames)
+                except Exception as exc:
+                    if progress_error is None:
+                        progress_error = exc
 
         # Deliberately no GIF encoding (filesystem I/O) here: frame
         # generation above is the actual runtime-use interval this
@@ -104,6 +162,10 @@ class ProceduralStoryboardRuntime(BaseVideoRuntime):
             "pending_frames": frames,
             "pending_frame_duration_ms": frame_duration_ms,
             "output_format": "gif",
+            # `None` when every `report_progress()` call succeeded (or no
+            # `context` was supplied). `VideoGenerator.generate()` raises
+            # this itself, only once this lease has already released.
+            "progress_error": progress_error,
             "params": {
                 "width": width,
                 "height": height,
@@ -473,6 +535,7 @@ __all__ = [
     "ProceduralStoryboardRuntime",
     "SUPPORTED_VIDEO_OUTPUT_FORMATS",
     "VideoRuntimeRouter",
+    "coerce_procedural_render_params",
     "encode_frames_as_gif",
     "frame_duration_ms_from_fps",
 ]

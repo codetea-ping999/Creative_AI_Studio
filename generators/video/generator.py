@@ -25,6 +25,7 @@ from .runtime import (
     PROCEDURAL_VIDEO_OUTPUT_FORMATS,
     ProceduralStoryboardRuntime,
     VideoRuntimeRouter,
+    coerce_procedural_render_params,
     encode_frames_as_gif,
     frame_duration_ms_from_fps,
 )
@@ -106,12 +107,34 @@ class VideoGenerator(BaseGenerator):
         #     not a runtime fault.
         #   - `procedural_param_error`: a procedural request's own
         #     width/height/fps/duration_seconds/num_frames coercion raised
-        #     (ValueError/TypeError). ProceduralStoryboardRuntime performs
-        #     every one of these conversions before touching runtime_obj or
-        #     rendering a single frame (see generators/video/runtime.py), so
-        #     this is a pure input error, never a runtime fault -- narrowed
-        #     to this concrete runtime class and these two exception types
-        #     so a genuine mid-render failure is never misclassified.
+        #     (ValueError/TypeError). This is a pure input error, never a
+        #     runtime fault.
+        #
+        # Codex P2 finding "Video: restrict deferred procedural parameter
+        # failures": `procedural_param_error` used to be caught with a
+        # broad `except (ValueError, TypeError)` around the *entire*
+        # `runtime.render(...)` call below -- which correctly protected a
+        # healthy runtime from a malformed request-owned numeric parameter,
+        # but also masked a genuine runtime defect (e.g. a malformed
+        # palette hex string owned by the cached runtime raising inside
+        # `_hex_to_rgb()`, deep in the render call this same broad catch
+        # covered). The five numeric params are now coerced by
+        # `coerce_procedural_render_params()` in a *narrow* `try/except`,
+        # immediately before `render()` is even called -- classifying only
+        # the exact request-owned conversion, never anything the renderer
+        # itself raises. `render()` is no longer wrapped in any
+        # exception-deferring `try/except` at all: any exception it raises
+        # (a genuine renderer/runtime fault, `ValueError`/`TypeError`
+        # included) now always escapes through the lease and invalidates,
+        # exactly like every other runtime-use failure.
+        #   - `progress_error`: Codex P2 finding "Video: progress
+        #     publication must not invalidate procedural runtime" --
+        #     `ProceduralStoryboardRuntime.render()` captures a
+        #     `context.report_progress()` failure itself (external
+        #     JobRepository/event-publication bookkeeping, not a rendering
+        #     fault) and hands it back via `render_result["progress_error"]`
+        #     instead of letting it escape the lease; raised here only
+        #     after that lease has already exited cleanly.
         # A `GenerationCancelled` that instead escapes render() itself (a
         # renderer/adapter observing cancellation once its own callable is
         # already running) is not caught here and still conservatively
@@ -120,14 +143,22 @@ class VideoGenerator(BaseGenerator):
         cancelled_before_invocation = False
         late_cancellation = False
         procedural_param_error: Exception | None = None
+        progress_error: Exception | None = None
         with self._acquire_runtime(requested_model_id, context) as handle:
             manifest = handle.manifest
             runtime_obj = handle.runtime
             effective_params = {**manifest.default_params, **request.params}
             runtime = self.runtime_router.resolve(runtime_obj)
-            cancelled_before_render = context is not None and context.is_cancelled()
-            if not cancelled_before_render:
+            if isinstance(runtime, ProceduralStoryboardRuntime):
                 try:
+                    effective_params.update(
+                        coerce_procedural_render_params(effective_params)
+                    )
+                except (ValueError, TypeError) as exc:
+                    procedural_param_error = exc
+            if procedural_param_error is None:
+                cancelled_before_render = context is not None and context.is_cancelled()
+                if not cancelled_before_render:
                     render_result = runtime.render(
                         request=request,
                         manifest=manifest,
@@ -136,17 +167,15 @@ class VideoGenerator(BaseGenerator):
                         effective_params=effective_params,
                         context=context,
                     )
-                except (ValueError, TypeError) as exc:
-                    if not isinstance(runtime, ProceduralStoryboardRuntime):
-                        raise
-                    procedural_param_error = exc
-                else:
                     if isinstance(render_result, dict) and render_result.get(
                         "cancelled_before_invocation"
                     ):
                         cancelled_before_invocation = True
-                    elif context is not None:
-                        late_cancellation = context.is_cancelled()
+                    else:
+                        if context is not None:
+                            late_cancellation = context.is_cancelled()
+                        if isinstance(render_result, dict):
+                            progress_error = render_result.get("progress_error")
             runtime_type = type(runtime_obj).__name__
 
         # No inference took place, or it completed successfully: exit
@@ -155,6 +184,8 @@ class VideoGenerator(BaseGenerator):
             raise GenerationCancelled()
         if procedural_param_error is not None:
             raise procedural_param_error
+        if progress_error is not None:
+            raise progress_error
 
         # Safety convergence pass: `render()` (for a runtime that returns
         # raw frames rather than an already-encoded file -- procedural

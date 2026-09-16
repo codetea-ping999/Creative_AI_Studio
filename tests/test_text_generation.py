@@ -687,6 +687,115 @@ class TextGeneratorLeaseTests(unittest.TestCase):
             self.assertEqual(entry.lease_count, 0)
             self.assertEqual(loader.load.call_count, 1)
 
+    def test_cancellation_after_first_schema_attempt_skips_repair(self) -> None:
+        # Codex P2 finding "Text: observe cancellation between schema
+        # attempts": cancellation becomes observable (set from *inside* the
+        # fake runtime callable, right after it returns its first,
+        # schema-invalid response) before the repair attempt would start.
+        # The repair model call must never happen.
+        with tempfile.TemporaryDirectory() as root:
+            cancelled = Event()
+            calls: list[str] = []
+
+            def generate(prompt, **kwargs):
+                calls.append(prompt)
+                cancelled.set()
+                return "not json at all"
+
+            def resolver(model_id, media_type, task_type=None):
+                return SimpleNamespace(
+                    id=model_id, public_model_id=model_id, provider="local",
+                    loader="fake", default_params={}, runtime="template",
+                    display_name="fake text",
+                )
+
+            loader = Mock()
+            loader.load.side_effect = lambda item: {
+                **_template_runtime(), "generate": generate,
+            }
+            cache = ModelRuntimeCache()
+            service = ModelService(
+                registry=None,
+                resolver=SimpleNamespace(resolve=resolver),
+                loader_registry=SimpleNamespace(get=lambda name: loader),
+                runtime_cache=cache,
+                admission_capacity=1,
+            )
+            generator = TextGenerator(service, output_dir=Path(root))
+
+            with self.assertRaises(GenerationCancelled):
+                generator.run(
+                    _request("logline"),
+                    context=GenerationContext(is_cancelled=cancelled.is_set),
+                )
+
+            self.assertEqual(len(calls), 1)  # the repair call never started
+            self.assertEqual(list(Path(root).glob("failed_*.txt")), [])
+            entry = cache._entries["template-writer"]
+            self.assertIs(entry.state, RuntimeState.READY)
+            self.assertEqual(entry.lease_count, 0)
+            self.assertEqual(loader.load.call_count, 1)
+
+    def test_cancellation_after_exhausted_repair_precedes_diagnostic_persistence(
+        self,
+    ) -> None:
+        # Codex P2 finding "Text: observe cancellation between schema
+        # attempts", the other half: both attempts complete (the repair is
+        # also schema-invalid, a genuine terminal failure), and
+        # cancellation only becomes observable during that second,
+        # completed attempt -- after `_generate_structured()` has already
+        # committed to its `StorySchemaValidationError` path (cancellation
+        # is only ever sampled between attempt 1 and the repair, never
+        # after the repair itself finishes). `generate()`'s own
+        # `except StorySchemaValidationError` branch must still notice it
+        # and let cancellation win over persisting the failed-response
+        # diagnostic.
+        with tempfile.TemporaryDirectory() as root:
+            cancelled = Event()
+            calls: list[str] = []
+
+            def generate(prompt, **kwargs):
+                calls.append(prompt)
+                if len(calls) == 2:
+                    cancelled.set()
+                return "still not json"
+
+            def resolver(model_id, media_type, task_type=None):
+                return SimpleNamespace(
+                    id=model_id, public_model_id=model_id, provider="local",
+                    loader="fake", default_params={}, runtime="template",
+                    display_name="fake text",
+                )
+
+            loader = Mock()
+            loader.load.side_effect = lambda item: {
+                **_template_runtime(), "generate": generate,
+            }
+            cache = ModelRuntimeCache()
+            service = ModelService(
+                registry=None,
+                resolver=SimpleNamespace(resolve=resolver),
+                loader_registry=SimpleNamespace(get=lambda name: loader),
+                runtime_cache=cache,
+                admission_capacity=1,
+            )
+            generator = TextGenerator(service, output_dir=Path(root))
+
+            with self.assertRaises(GenerationCancelled):
+                generator.run(
+                    _request("logline"),
+                    context=GenerationContext(is_cancelled=cancelled.is_set),
+                )
+
+            self.assertEqual(len(calls), 2)  # first attempt + repair both ran
+            # Cancellation took precedence: the failed-response diagnostic
+            # was never written.
+            self.assertEqual(list(Path(root).glob("failed_*.txt")), [])
+            entry = cache._entries["template-writer"]
+            self.assertIs(entry.state, RuntimeState.READY)
+            self.assertEqual(entry.lease_count, 0)
+            self.assertEqual(loader.load.call_count, 1)
+
     def test_admission_wait_observes_cancellation(self) -> None:
         # Safety convergence pass, Codex finding "poll cancellation while
         # text waits for admission": TextGenerator now accepts a context
