@@ -208,6 +208,32 @@ class RuntimeAdmissionController:
         self._semaphore.release()
 
 
+class _RuntimeExecutionRevalidationFailed(RuntimeBusyError):
+    """Private signal: `E` was won, but the pinned entry is no longer usable.
+
+    Raised only by `_acquire_execution_lock()`, and only for the one
+    condition documented on that method: this caller's own lease was taken
+    on a `READY` entry, another lease-holder's conservative failure-unwind
+    (`RuntimeHandle.release(had_exception=True)`) marked it `INVALID` while
+    this caller was still parked waiting on `E`, and this caller then won
+    `E` onto an entry that is now known-unsafe.
+
+    This is a `RuntimeBusyError` subtype purely so it is caught by the same
+    exact clause `_acquire_entry_and_execution_lock()`'s callers already use
+    for lease cleanup -- it changes nothing about what any *existing*
+    `except RuntimeBusyError:` catches. It is deliberately never exported
+    (not in this module's `__all__`, not re-exported from `core.models`):
+    the only code that may ever catch it by name is
+    `ModelService.acquire_runtime()` itself, which uses it to decide,
+    internally, whether this specific handoff is worth one bounded retry
+    (see that method's own docstring) -- no other `RuntimeBusyError` raise
+    site in this module or in `ModelRuntimeCache` (pinned capacity, busy
+    unload/reservation targets, ...) is reclassified by this type; every one
+    of those keeps raising the plain, public `RuntimeBusyError`, unretried,
+    exactly as before.
+    """
+
+
 _default_admission_controller: RuntimeAdmissionController | None = None
 _default_admission_controller_lock = Lock()
 
@@ -840,6 +866,32 @@ class ModelService:
         of `RuntimeBusyError`. Cancellation-aware callers may retry only that
         subtype; pinned capacity and invalid-entry errors remain immediate
         failures rather than being silently converted into indefinite waits.
+
+        One narrow exception to "immediate failure": if step 6's
+        revalidation fails -- this caller won E onto an entry another
+        lease-holder's failure-unwind invalidated during the wait -- steps
+        3-6 (L -> E, including a fresh `loader.load()` if needed) are
+        retried internally, exactly once, still inside this same call's G
+        hold and still bounded by this same `deadline` (never reset, never
+        given a fresh budget). This is safe to retry, unlike every other
+        `RuntimeBusyError` cause here: by the time this caller observes the
+        failure, its own losing attempt has already released its own stale
+        lease on the now-`INVALID` entry (see
+        `_acquire_entry_and_execution_lock()`), which is exactly what makes
+        that entry immediately evictable/reloadable -- not a wait on some
+        other, unrelated caller's future action, the case `RuntimeBusyError`
+        exists to refuse. If the retry hits this exact condition a second
+        time, this method gives up and raises the plain, public
+        `RuntimeBusyError` -- no third attempt. Every other cause of
+        `RuntimeBusyError` from steps 3-6 (pinned eviction victim, a
+        `LOADING`/`RETIRING` busy target, capacity claimed by a concurrent
+        reservation, ...) is never retried by this method; it still fails
+        immediately, exactly as before. If the shared `deadline` is
+        exhausted during the retry, `RuntimeWaitTimeoutError` surfaces from
+        the normal G/L/E-timeout path (see `_acquire_with_deadline()`), so a
+        cancellation-aware generator's own polling loop still observes it
+        precisely as it does today -- this method has no knowledge of job
+        cancellation and does not add any.
         """
 
         manifest = self.get_manifest(model_id, media_type, task_type)
@@ -856,34 +908,32 @@ class ModelService:
             )
 
         try:
-            entry = self._acquire_or_load_entry(manifest, media_type, deadline)
+            # `_acquire_entry_with_execution_lock()` releases its OWN stale
+            # lease internally whenever ITS OWN attempt(s) fail (see that
+            # method and `_acquire_entry_and_execution_lock()`) -- so if
+            # this call raises, there is nothing further to release here;
+            # if it returns, `entry` carries a live lease and a held E that
+            # nothing else will release except what follows below.
+            entry = self._acquire_entry_with_execution_lock(manifest, media_type, deadline)
             try:
-                self._acquire_execution_lock(manifest.id, entry, deadline)
-                try:
-                    return RuntimeHandle(
-                        manifest=manifest,
-                        runtime=entry.runtime,
-                        cache=self.runtime_cache,
-                        canonical_id=manifest.id,
-                        entry=entry,
-                        admission=self._admission,
-                        owner_thread=owner_thread,
-                    )
-                except BaseException:
-                    # Codex re-review, found on this round's own fix
-                    # commits: G, the lease, and E were all already
-                    # acquired above by the time construction reaches
-                    # here -- an exception during `RuntimeHandle.__init__`
-                    # itself (an async BaseException, a hypothetical
-                    # allocation failure, ...) must not leave any of them
-                    # held with no handle ever created to release them.
-                    entry.execution_lock.release()
-                    raise
+                return RuntimeHandle(
+                    manifest=manifest,
+                    runtime=entry.runtime,
+                    cache=self.runtime_cache,
+                    canonical_id=manifest.id,
+                    entry=entry,
+                    admission=self._admission,
+                    owner_thread=owner_thread,
+                )
             except BaseException:
-                # We hold a lease (a pin) but will never use it -- release it
-                # rather than leaking a lease with no corresponding handle,
-                # which would otherwise make this entry permanently
-                # un-evictable/un-unloadable ("pinned runtime" is absolute).
+                # Codex re-review, found on this round's own fix
+                # commits: G, the lease, and E were all already
+                # acquired above by the time construction reaches
+                # here -- an exception during `RuntimeHandle.__init__`
+                # itself (an async BaseException, a hypothetical
+                # allocation failure, ...) must not leave any of them
+                # held with no handle ever created to release them.
+                entry.execution_lock.release()
                 self.runtime_cache.release_lease(manifest.id, entry)
                 raise
         except BaseException:
@@ -894,6 +944,64 @@ class ModelService:
             # may run on a different thread than the one that acquired.
             self._admission.release(owner_thread)
             raise
+
+    def _acquire_entry_with_execution_lock(
+        self, manifest: ModelManifest, media_type: str, deadline: float | None
+    ) -> RuntimeEntry:
+        """L -> E for this manifest, with exactly one internal retry for one
+        specific, provably-safe-to-retry condition.
+
+        Called with G already held by this call's own caller
+        (`acquire_runtime()`); this method never touches G itself.
+
+        Contract (see `acquire_runtime()`'s own docstring for the full
+        rationale): if the first attempt's `_acquire_execution_lock()` call
+        raises `_RuntimeExecutionRevalidationFailed` -- this caller won E
+        onto an entry another lease-holder's failure-unwind invalidated
+        during the wait -- this retries the *entire* L -> E sub-sequence
+        exactly once more, still bounded by the same `deadline` (a retry
+        that has to wait can still time out into the ordinary, cancellable
+        `RuntimeWaitTimeoutError` path). If the second attempt hits this
+        exact condition again, this gives up and raises the plain, public
+        `RuntimeBusyError` instead -- never a third attempt, and never for
+        any other `RuntimeBusyError` cause (those propagate, unretried, from
+        either attempt).
+        """
+
+        try:
+            return self._acquire_entry_and_execution_lock(manifest, media_type, deadline)
+        except _RuntimeExecutionRevalidationFailed:
+            try:
+                return self._acquire_entry_and_execution_lock(manifest, media_type, deadline)
+            except _RuntimeExecutionRevalidationFailed as exc:
+                raise RuntimeBusyError(str(exc)) from exc
+
+    def _acquire_entry_and_execution_lock(
+        self, manifest: ModelManifest, media_type: str, deadline: float | None
+    ) -> RuntimeEntry:
+        """One L -> E attempt: pin/load an entry, then win and revalidate E.
+
+        Releases the lease this one attempt itself took if
+        `_acquire_execution_lock()` raises for any reason -- including
+        `_RuntimeExecutionRevalidationFailed`, which is exactly what makes a
+        follow-up attempt (see `_acquire_entry_with_execution_lock()`) safe:
+        by the time that follow-up runs, this attempt's own stale lease on
+        the now-`INVALID` entry is already gone, so the entry is genuinely
+        free to be retired and replaced rather than looking, to a fresh
+        `acquire_or_reserve()` call, still pinned by this same caller.
+        """
+
+        entry = self._acquire_or_load_entry(manifest, media_type, deadline)
+        try:
+            self._acquire_execution_lock(manifest.id, entry, deadline)
+        except BaseException:
+            # We hold a lease (a pin) but will never use it -- release it
+            # rather than leaking a lease with no corresponding handle,
+            # which would otherwise make this entry permanently
+            # un-evictable/un-unloadable ("pinned runtime" is absolute).
+            self.runtime_cache.release_lease(manifest.id, entry)
+            raise
+        return entry
 
     def _acquire_or_load_entry(
         self, manifest: ModelManifest, media_type: str, deadline: float | None
@@ -994,8 +1102,14 @@ class ModelService:
         `runtime_cache.is_current_and_ready()`; a `False` result means this
         entry was invalidated (or, in principle, replaced) out from under
         this caller during the wait, and E is released again before raising
-        `RuntimeBusyError` -- this method only ever cleans up what it itself
-        acquired (E); the caller's own lease is the caller's own cleanup.
+        `_RuntimeExecutionRevalidationFailed` (a private `RuntimeBusyError`
+        subtype -- see its own docstring) -- this method only ever cleans up
+        what it itself acquired (E); the caller's own lease is the caller's
+        own cleanup. `acquire_runtime()` catches this exact private type,
+        internally, to retry this one condition exactly once (see that
+        method's own docstring); every other busy/capacity/pinned condition
+        in this module still raises the plain, public `RuntimeBusyError`
+        this private type only narrowly, deliberately shadows here.
 
         Codex re-review (found on this round's own fix commit): everything
         after winning E is wrapped in `try`/`except BaseException` below,
@@ -1029,7 +1143,7 @@ class ModelService:
             )
         try:
             if not self.runtime_cache.is_current_and_ready(canonical_id, entry):
-                raise RuntimeBusyError(
+                raise _RuntimeExecutionRevalidationFailed(
                     f"{canonical_id!r} became invalid while waiting for exclusive "
                     "execution access; retry."
                 )

@@ -171,6 +171,25 @@ class _ControllableLoader:
         return {"id": manifest.id, "instance": object()}
 
 
+class _SecondCallBlocksLoader:
+    """Immediate on every `load()` call except the 2nd, which blocks until
+    released -- lets a test pin down the exact moment a *retried* load (the
+    2nd call for one canonical id) is in flight, for real lock-contention
+    synchronization rather than a sleep-based guess."""
+
+    def __init__(self, *, started: Event, release: Event):
+        self.load_calls = 0
+        self.started = started
+        self.release = release
+
+    def load(self, manifest):
+        self.load_calls += 1
+        if self.load_calls == 2:
+            self.started.set()
+            assert self.release.wait(timeout=5), "release event was never set"
+        return {"id": manifest.id, "instance": object()}
+
+
 class _RecordingImmediateLoader:
     """Like `_ImmediateLoader`, but appends to a shared, lock-protected sequence."""
 
@@ -1233,8 +1252,22 @@ class RuntimeSafetyCoreTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     RuntimeAdmissionController(bad_capacity)
 
-    # ---------------------------------------------------- Finding 2 (P2)
+    # ---------------------------------------------------- Finding 2 (P2) + INVALID-handoff retry
     def test_invalid_marking_is_visible_to_an_e_waiter_before_it_wins_e(self):
+        # This proves two layered things:
+        #  1. (Unchanged since PR4a) `RuntimeHandle.release()` publishes
+        #     INVALID strictly before it releases E -- an E-waiter can never
+        #     revalidate a still-READY runtime another caller already
+        #     deemed unsafe. This is still exactly true and still what makes
+        #     (2) below safe.
+        #  2. (New) `acquire_runtime()` no longer treats "won E onto an
+        #     entry invalidated during the wait" as an immediate, permanent
+        #     failure -- B's own call transparently retries the L -> E
+        #     sub-sequence once, internally, and succeeds with a freshly
+        #     loaded runtime, because B's own losing attempt already
+        #     released its own stale lease on the now-INVALID entry before
+        #     the retry ever runs (see `_acquire_entry_and_execution_lock()`
+        #     in core/models/service.py).
         manifest_a = _FakeManifest("model-a")
         loader = _ImmediateLoader()
         # admission_capacity=2 so B's own acquire_runtime() call reaches E
@@ -1245,8 +1278,9 @@ class RuntimeSafetyCoreTests(unittest.TestCase):
         )
 
         handle_a = service.acquire_runtime("model-a", "image")
-        entry = handle_a._entry
-        self.assertEqual(entry.lease_count, 1)
+        entry_v1 = handle_a._entry
+        self.assertEqual(entry_v1.lease_count, 1)
+        self.assertEqual(loader.load_calls, 1)
 
         b_thread_started = Event()
         errors: list[BaseException] = []
@@ -1278,25 +1312,150 @@ class RuntimeSafetyCoreTests(unittest.TestCase):
         # transition has unconditionally already happened, and B's own
         # revalidation (`is_current_and_ready()`) is guaranteed to see it.
         handle_a.release(had_exception=True)
-        self.assertEqual(entry.state, RuntimeState.INVALID)
+        self.assertEqual(entry_v1.state, RuntimeState.INVALID)
 
         tb.join(timeout=5)
         self.assertEqual(errors, [])
-        self.assertNotIn("handle", b_result)  # B's user code must never run
-        self.assertIsInstance(b_result.get("busy"), RuntimeBusyError)
+        self.assertNotIn("busy", b_result)  # the internal retry must absorb this
+        self.assertIn("handle", b_result)
+        handle_b = b_result["handle"]
 
-        # Zero lease leak, zero G leak from B's own failed attempt: A's own
-        # lease was already released above, and B's own pin -- taken, then
-        # unwound, inside its own acquire_runtime() call -- left nothing
-        # behind.
-        self.assertEqual(entry.lease_count, 0)
-        # A fresh, immediate (wait_timeout=0) acquisition succeeds -- proving
-        # neither the lease nor the process-wide admission slot were leaked.
+        try:
+            # B's retry triggered a genuinely fresh load (loader call #2),
+            # not a stale read of A's old, now-cleaned-up runtime object.
+            self.assertEqual(loader.load_calls, 2)
+            self.assertIsNotNone(handle_b.runtime)
+            self.assertIsNot(handle_b.runtime, handle_a.runtime)
+
+            entry_v2 = cache._entries["model-a"]
+            self.assertIsNot(entry_v2, entry_v1)  # a fresh RuntimeEntry, not the old one
+            self.assertGreater(entry_v2.generation, entry_v1.generation)
+            self.assertEqual(entry_v2.state, RuntimeState.READY)
+            self.assertEqual(entry_v2.lease_count, 1)  # only B's own current lease
+        finally:
+            handle_b.release()
+
+        # Zero lease/G leak overall: A's lease/G were released above, and
+        # B's internal retry left nothing outstanding once its own handle is
+        # released -- checked precisely (not just "a later call succeeds"),
+        # since admission_capacity=2 alone would tolerate a 1-slot G leak.
+        self.assertEqual(cache._entries["model-a"].lease_count, 0)
+        self.assertEqual(service._admission._held_by_thread, {})
+
+        # A fresh, immediate (wait_timeout=0) acquisition still succeeds --
+        # the system is left fully healthy after B's retry-and-release.
         handle_retry = service.acquire_runtime("model-a", "image", wait_timeout=0)
         try:
             self.assertIsNotNone(handle_retry.runtime)
         finally:
             handle_retry.release()
+
+    # ---------------------------------------- INVALID-handoff retry is bounded
+    def test_invalid_handoff_retry_is_bounded_to_one_attempt(self):
+        """If B's internally-retried L -> E attempt *also* wins E onto an
+        entry a second, independent failure invalidated in the meantime,
+        `acquire_runtime()` must give up -- raising the plain, public
+        `RuntimeBusyError` -- rather than retrying a third time.
+
+        The second failure is injected by wrapping
+        `cache.publish_ready_and_pin()` so that `mark_invalid()` (the same
+        FP-005 publish-before-handoff primitive `RuntimeHandle.release()`
+        itself uses) runs on B's own thread, immediately after B's retried
+        load publishes -- strictly *before* B's own thread can possibly go
+        on to attempt `entry_v2.execution_lock.acquire()`, since
+        `_acquire_or_load_entry()` cannot call `_acquire_execution_lock()`
+        until this wrapped call has returned. This is a same-thread
+        sequencing guarantee, not a timing guess -- the only other
+        synchronization point needed is real contention on the loader's own
+        blocking second call.
+        """
+        manifest_a = _FakeManifest("model-a")
+        second_load_started = Event()
+        second_load_release = Event()
+        loader = _SecondCallBlocksLoader(
+            started=second_load_started, release=second_load_release,
+        )
+        service, cache = _build_service(
+            {"model-a": manifest_a}, {"fake": loader}, admission_capacity=2,
+        )
+
+        handle_a = service.acquire_runtime("model-a", "image")
+        entry_v1 = handle_a._entry
+        self.assertEqual(loader.load_calls, 1)
+
+        b_thread_started = Event()
+        errors: list[BaseException] = []
+        b_result: dict[str, object] = {}
+
+        def worker_b():
+            b_thread_started.set()
+            try:
+                b_result["handle"] = service.acquire_runtime("model-a", "image")
+            except RuntimeBusyError as exc:
+                b_result["busy"] = exc
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        tb = Thread(target=worker_b)
+        tb.start()
+        self.assertTrue(b_thread_started.wait(timeout=5))
+
+        # A fails; B wins E onto the now-INVALID entry_v1, loses its first
+        # revalidation, releases its own stale lease, and (still on its own
+        # thread) begins its one internal retry: acquire_or_reserve() sees
+        # entry_v1 INVALID + unpinned, retires it, and reserves a fresh
+        # LOADING entry_v2 before calling loader.load() a second time.
+        handle_a.release(had_exception=True)
+        self.assertEqual(entry_v1.state, RuntimeState.INVALID)
+
+        # B's retry is now genuinely blocked *inside* its own second
+        # loader.load() call -- a real synchronization point, not a guess.
+        self.assertTrue(second_load_started.wait(timeout=5))
+        entry_v2 = cache._entries["model-a"]
+        self.assertIsNot(entry_v2, entry_v1)
+        self.assertEqual(entry_v2.state, RuntimeState.LOADING)
+
+        original_publish = cache.publish_ready_and_pin
+
+        def publish_then_invalidate_again(canonical_id, reserved_entry, runtime_obj):
+            published = original_publish(canonical_id, reserved_entry, runtime_obj)
+            cache.mark_invalid(canonical_id, published)
+            return published
+
+        cache.publish_ready_and_pin = publish_then_invalidate_again
+        second_load_release.set()
+
+        tb.join(timeout=5)
+        # Restored only after B's own acquire_runtime() call has fully
+        # returned (joined) -- B is the only other caller that can reach
+        # publish_ready_and_pin() for "model-a" during this window.
+        cache.publish_ready_and_pin = original_publish
+
+        self.assertEqual(errors, [])
+        self.assertNotIn("handle", b_result)
+        # Exactly the plain, public RuntimeBusyError -- not a leaked private
+        # subtype, and not RuntimeWaitTimeoutError.
+        self.assertIs(type(b_result.get("busy")), RuntimeBusyError)
+
+        # Exactly two loads total: A's original, plus B's one internal
+        # retry. No third attempt was ever made.
+        self.assertEqual(loader.load_calls, 2)
+
+        # No lease/E/G leak from B's exhausted retry.
+        self.assertEqual(entry_v2.state, RuntimeState.INVALID)
+        self.assertEqual(entry_v2.lease_count, 0)
+        self.assertTrue(entry_v2.execution_lock.acquire(blocking=False))
+        entry_v2.execution_lock.release()
+        self.assertEqual(service._admission._held_by_thread, {})
+
+        # The system is still healthy afterward: a fresh call replaces the
+        # now-INVALID entry_v2 with a third, genuinely new load.
+        handle_final = service.acquire_runtime("model-a", "image", wait_timeout=0)
+        try:
+            self.assertIsNotNone(handle_final.runtime)
+        finally:
+            handle_final.release()
+        self.assertEqual(loader.load_calls, 3)
 
     # ---------------------------------------------------- Finding 3 (P2)
     def test_capacity_reservation_is_atomic_for_racing_misses_into_an_empty_bucket(self):
@@ -2877,8 +3036,13 @@ class RuntimeSafetyCoreTests(unittest.TestCase):
         # *before* B ever touches _release_guard, so it has already
         # happened by the time A is allowed to proceed past its own
         # (test-paused) guard section, regardless of whether B has won the
-        # guard yet. C must therefore see the entry INVALID, never READY,
-        # and must never reach "user runtime code".
+        # guard yet. C must therefore see the entry INVALID, never READY --
+        # this part of the proof is unchanged. What C's own acquire_runtime()
+        # call does about that (below) has changed: it no longer fails
+        # outright on this first loss -- it retries the L -> E sub-sequence
+        # internally, exactly once, and succeeds with a freshly loaded
+        # runtime, since C's own losing attempt already released its own
+        # stale lease on the now-INVALID entry before the retry runs.
         manifest_a = _FakeManifest("model-a")
         loader = _ImmediateLoader()
         service, cache = _build_service(
@@ -3002,16 +3166,30 @@ class RuntimeSafetyCoreTests(unittest.TestCase):
 
         self.assertEqual(a_errors, [])
         self.assertEqual(b_errors, [])
-        # C must never have received a handle or run "user runtime code" --
-        # it lost the revalidation race against the invalidation B already
-        # published.
-        self.assertEqual(c_user_code_runs, 0)
-        self.assertNotIn("handle", c_result)
-        self.assertIsInstance(c_result.get("busy"), RuntimeBusyError)
+        # C loses its first revalidation against the invalidation B already
+        # published (the FP-005 ordering proof above still holds exactly as
+        # before), but its own acquire_runtime() call absorbs that loss with
+        # one internal retry and succeeds -- a fresh runtime, not the one A
+        # was using.
+        self.assertEqual(c_user_code_runs, 1)
+        self.assertIn("handle", c_result)
+        self.assertNotIn("busy", c_result)
+        c_handle = c_result["handle"]
+        self.assertIsNotNone(c_handle.runtime)
+        self.assertIsNot(c_handle.runtime, handle.runtime)
+        self.assertEqual(loader.load_calls, 2)  # A's original load + C's retry-triggered reload
+        c_handle.release()
 
-        # Final state: fully unwound, nothing leaked.
+        # Final state: fully unwound, nothing leaked -- including on the
+        # OLD entry object A/B/C's first attempt all touched (now retired
+        # and replaced by C's retry, but still checkable directly).
         self.assertEqual(entry.lease_count, 0)
         self.assertFalse(entry.execution_lock.locked())
+        new_entry = cache._entries["model-a"]
+        self.assertIsNot(new_entry, entry)
+        self.assertEqual(new_entry.lease_count, 0)
+        self.assertFalse(new_entry.execution_lock.locked())
+        self.assertEqual(service._admission._held_by_thread, {})
 
 
 class PublicModelFacadeExportsTest(unittest.TestCase):
