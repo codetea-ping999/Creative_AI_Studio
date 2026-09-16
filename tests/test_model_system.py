@@ -37,6 +37,7 @@ try:
         release_runtime,
     )
     from core.models.cache import resolve_media_cache_limits
+    from core.models.runtime_lease import RuntimeState
     from core.prompting import PromptComposer
     from core.reference_capabilities import (
         DEFAULT_REFERENCE_STRENGTH,
@@ -1232,6 +1233,15 @@ class ModelSystemTests(unittest.TestCase):
             self.assertEqual(reported_progress, [0.25, 0.5, 0.75, 1.0])
 
     def test_image_generator_stops_diffusers_pipeline_when_cancelled(self) -> None:
+        # PR4b / FP-002: cancellation observed mid-inference (inside the
+        # step callback, after the runtime lease's mutation/inference
+        # interval has already begun) is a genuine runtime-use failure and
+        # conservatively marks the leased entry INVALID -- it is no longer
+        # safe to assume the same cached pipeline instance is still READY
+        # afterward, so this reads the cache entry directly (bypassing the
+        # READY-only `get()` filter) rather than through
+        # `service.get_runtime()`, which would now (correctly) reload a
+        # fresh pipeline instead of returning the one actually used.
         with TemporaryDirectory() as tmp_dir:
             output_dir = Path(tmp_dir) / "outputs"
             cancellation_state = {"requested": False}
@@ -1263,13 +1273,12 @@ class ModelSystemTests(unittest.TestCase):
                         ),
                         context,
                     )
-                pipeline = service.get_runtime(
-                    "sdxl",
-                    "image",
-                    "text-to-image",
-                )["pipeline"]
+                entry = service.runtime_cache._entries["sdxl-local"]
+                pipeline = entry.runtime["pipeline"]
 
             self.assertEqual(pipeline.steps_invoked, 2)
+            self.assertIs(entry.state, RuntimeState.INVALID)
+            self.assertEqual(entry.lease_count, 0)
             self.assertEqual(list(output_dir.glob("*")), [])
 
     def test_image_generator_removes_completed_variations_when_later_one_is_cancelled(

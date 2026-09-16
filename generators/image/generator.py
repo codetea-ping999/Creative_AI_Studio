@@ -11,7 +11,10 @@ from uuid import uuid4
 
 from PIL import Image
 
+from core.jobs.context import GenerationCancelled
 from core.models import ModelService
+from core.models.runtime_lease import RuntimeWaitTimeoutError
+from core.models.service import RuntimeHandle
 from core.prompting import PromptComposer
 from core.quality import (
     enrich_quality_report,
@@ -39,6 +42,7 @@ if TYPE_CHECKING:
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _MAX_VARIATION_COUNT = 4
 _SEED_MODULUS = 1 << 63
+_CANCELLATION_POLL_SECONDS = 0.1
 
 
 class ImageGenerator(BaseGenerator):
@@ -77,12 +81,17 @@ class ImageGenerator(BaseGenerator):
         import torch
 
         requested_model_id = request.model_id.strip() or None
-        manifest, runtime_obj = self.model_service.resolve_runtime(
-            requested_model_id,
-            media_type="image",
-            task_type=self.task_type,
+
+        # ------------------------------------------------------------- preflight
+        # PR4b / FP-001 + FP-002: everything in this section is pure request
+        # parsing, parameter normalization, prompt/reference resolution, and
+        # LoRA path existence checking -- none of it touches a runtime, so
+        # none of it may run inside the lease below. A bad width/height, a
+        # missing LoRA file, or an unresolvable reference asset must fail
+        # before a healthy runtime is ever acquired, let alone invalidated.
+        manifest = self.model_service.get_manifest(
+            requested_model_id, media_type="image", task_type=self.task_type
         )
-        pipeline = runtime_obj["pipeline"]
         effective_params = {**manifest.default_params, **request.params}
         resolved_prompt = resolve_generation_prompt(
             request,
@@ -111,7 +120,11 @@ class ImageGenerator(BaseGenerator):
         if not lora_path and resolved_prompt.lora:
             lora_path = resolved_prompt.lora.get("path")
             lora_scale = float(resolved_prompt.lora.get("scale", lora_scale))
-        lora_metadata = self._configure_lora(runtime_obj, pipeline, lora_path, lora_scale)
+        # Pure input error: a nonexistent/invalid LoRA path is rejected here,
+        # before any runtime is acquired, so it can never invalidate a
+        # healthy one. `_apply_lora()` inside the lease receives the already
+        # -resolved path and never re-touches the filesystem.
+        resolved_lora_path = self._resolve_optional_path(lora_path)
         base_seed = (
             resolved_prompt.seed
             if resolved_prompt.seed is not None
@@ -128,215 +141,290 @@ class ImageGenerator(BaseGenerator):
             manifest,
             project_id=context.project_id if context is not None else None,
         )
-        # A reference is only actually honored when a dedicated img2img-shaped
-        # runtime exists and its own call signature takes image/strength
-        # (#201: one supported conditioning path, not every image model
-        # family -- StableDiffusionXLPipeline itself never accepts these, see
-        # core/models/loader.py's separate img2img_pipeline). When a
-        # reference was requested but this can't be honored,
-        # `reference_capable` stays False and `capabilities.supports_reference_image`
-        # below stays at its default False -- `validate_capabilities` then
-        # rejects the request before any pipeline call, rather than silently
-        # dropping the reference or passing it into a call that doesn't
-        # accept it.
-        reference_pipeline = runtime_obj.get("img2img_pipeline")
-        reference_capable = (
-            reference_image_path is not None
-            and reference_pipeline is not None
-            and self._pipeline_accepts_reference_image(reference_pipeline)
-        )
-        if reference_capable:
-            # Diffusers img2img's get_timesteps() ignores the computed
-            # `strength` (from the public 0=no-effect/1=follow-closely
-            # contract, see below) whenever `denoising_start` is also set --
-            # and `denoising_end` applies its own cutoff *after* strength has
-            # already selected the timestep range. `timesteps`/`sigmas`
-            # (custom schedules) go further still: diffusers replaces
-            # num_inference_steps with the custom schedule's own length
-            # before applying strength at all, so the floor/progress
-            # denominator computed below (from the *requested*
-            # num_inference_steps) would no longer match what diffusers
-            # actually runs. Every one of these silently breaks the
-            # reference's lock strength or progress reporting, so all are
-            # rejected outright for a reference job rather than forwarded
-            # alongside strength.
-            for incompatible_param in (
-                "denoising_start",
-                "denoising_end",
-                "timesteps",
-                "sigmas",
-            ):
-                if incompatible_param in effective_params:
-                    raise UnsupportedImageParameterError(
-                        f"Model {manifest.public_model_id!r}: "
-                        f"{incompatible_param!r} cannot be combined with "
-                        "reference-image conditioning -- diffusers img2img's "
-                        "timestep selection from denoising_start/denoising_end/"
-                        "timesteps/sigmas does not compose with the computed "
-                        "'strength', so the reference's lock strength would "
-                        f"not be honored. Remove {incompatible_param!r} from "
-                        "params or drop the reference."
-                    )
-        # LoRA is configured on `pipeline` above, but `img2img_pipeline` (see
-        # core/models/loader.py) wraps the *same* unet/text-encoder objects
-        # rather than copies, so a loaded adapter is visible to both --
-        # nothing extra is needed here for "LoRA + reference" to compose.
-        active_pipeline = reference_pipeline if reference_capable else pipeline
-        # Route the pipeline call through the provider-neutral contract
-        # (generators/image/providers.py) so this local diffusers path and a
-        # future cloud provider are invoked and validated the same way; the
-        # kwargs passed to `pipeline` below are unchanged from before this
-        # contract existed, so behavior is identical to a direct call.
-        provider = LocalDiffusersImageProvider(
-            model_id=manifest.public_model_id,
-            pipeline=active_pipeline,
-            capabilities=(
-                local_diffusers_capabilities(supports_reference_image=True)
-                if reference_capable
-                else None
-            ),
-        )
-        spec_lora_path = lora_metadata["path"]
-        spec_lora_scale = lora_metadata["scale"]
-        request_spec = ImageGenerationSpec(
-            prompt=resolved_prompt.prompt,
-            negative_prompt=resolved_prompt.negative_prompt,
-            width=width,
-            height=height,
-            seed=base_seed,
-            # One call below produces exactly one image (`replace(request_spec,
-            # seed=...)` is called once per variation, inside the loop) --
-            # batch_size describes that single call, not the job-wide
-            # variation_count. A provider with an honestly small max_batch
-            # would otherwise reject every multi-variation request.
-            batch_size=1,
-            lora_path=str(spec_lora_path) if spec_lora_path is not None else None,
-            lora_scale=(
-                float(cast(float, spec_lora_scale)) if spec_lora_scale is not None else 1.0
-            ),
-            # Set whenever a reference resolved, regardless of pipeline
-            # support -- this is what makes validate_capabilities() actually
-            # reject an unsupported request instead of validating nothing.
-            reference_image_path=reference_image_path,
-        )
-        # Checked here -- before the reference image is even opened, let
-        # alone resized -- rather than only inside generate_image() inside
-        # the variation loop below: an absurd width/height (e.g. 100000)
-        # must be rejected before Pillow attempts a matching allocation, not
-        # after.
-        if provider.capabilities is not None:
-            validate_capabilities(provider.capabilities, request_spec)
-        reference_conditioning_kwargs: dict[str, Any] = {}
-        # Diffusers img2img only ever runs int(num_inference_steps *
-        # strength) denoising steps internally (see the strength comment
-        # below), not the full requested count -- a step callback driven by
-        # the requested count would then top out well under 100% and jump
-        # straight to whatever the *next* variation (or job completion)
-        # reports, never itself reaching a completed fraction. Defaults to
-        # the plain requested count for the non-reference (text2img) path,
-        # where every requested step actually runs.
-        effective_inference_steps = num_inference_steps
-        if reference_capable:
-            # A real img2img call derives its output size from `image`
-            # itself rather than accepting width/height (unlike the text2img
-            # call below), so the reference is resized to the requested
-            # output dimensions instead of forwarding width/height.
-            # ReferenceImageInput.strength is 0=no effect, 1=follow the
-            # reference most closely (core/reference_capabilities.py).
-            # diffusers img2img `strength` is the opposite: the fraction
-            # of denoising applied to the *source* image, so 0=closest to
-            # the reference and 1=ignores it almost entirely. Inverting
-            # here keeps the public contract's meaning intact for callers
-            # regardless of which pipeline convention ends up serving it.
-            # Diffusers computes init_timestep = int(num_inference_steps
-            # * strength) and needs at least one surviving step. An earlier
-            # version of this code floored `img2img_strength` up to whatever
-            # value guaranteed one step, but that silently *replaced* a
-            # strong requested lock with a much weaker one whenever the
-            # step count was too low to represent it (e.g. num_inference_steps
-            # =1 forced every request, regardless of lock strength, to
-            # diffusers strength 1.0 -- the least reference-preserving
-            # setting) while still reporting the lock as applied. Rejecting
-            # the combination outright is more honest: the caller finds out
-            # their steps/strength combination cannot be honored, rather
-            # than silently getting a materially different result than
-            # what they asked for.
-            img2img_strength = 1.0 - cast(float, reference_strength)
-            if int(num_inference_steps * img2img_strength) < 1:
-                raise UnsupportedImageParameterError(
-                    f"Model {manifest.public_model_id!r}: the requested "
-                    f"reference lock strength {reference_strength} combined "
-                    f"with {num_inference_steps} inference step(s) would "
-                    "leave diffusers with zero denoising steps to actually "
-                    "run. Increase num_inference_steps or reduce the "
-                    "reference strength."
-                )
-            reference_conditioning_kwargs = {
-                "image": (
-                    Image.open(cast(str, reference_image_path))
-                    .convert("RGB")
-                    .resize((width, height))
-                ),
-                "strength": img2img_strength,
-            }
-            # Mirrors diffusers' own init_timestep computation, using the
-            # exact same expression checked above so this can never disagree
-            # with it -- the check above already guarantees this is >= 1.
-            effective_inference_steps = int(num_inference_steps * img2img_strength)
-        common_generation_kwargs = {
-            "prompt": resolved_prompt.prompt,
-            "negative_prompt": resolved_prompt.negative_prompt,
-            "guidance_scale": guidance_scale,
-            "num_inference_steps": num_inference_steps,
-            **({} if reference_capable else {"width": width, "height": height}),
-            **effective_params,
-            **reference_conditioning_kwargs,
-        }
         batch_id = f"img_{uuid4().hex}"
+
+        # ----------------------------------------------------------------- lease
+        # PR4b / FP-001 + FP-002: acquire the runtime once and hold it for
+        # every variation -- pipeline/img2img-pipeline inspection, LoRA
+        # mutation, and every variation's actual inference all happen inside
+        # this one lease. It is released *before* file writes and
+        # quality/semantic scoring, which do not touch the runtime, so a
+        # future local semantic judge sharing the same process-wide admission
+        # domain (CLIP/CLAP) never faces a same-thread nested acquisition.
+        #
+        # `validation_error` covers the one case that needs runtime
+        # *inspection* (does this pipeline accept a reference image? does the
+        # declared capability/size contract accept this request?) but not
+        # runtime *mutation* -- reference-capability discovery only reads
+        # pipeline call signatures, it never calls into diffusers. When set,
+        # the lease is left to exit normally (no exception raised inside the
+        # `with`), so `RuntimeHandle.__exit__` releases a still-healthy entry
+        # instead of marking it INVALID; the error is raised only after the
+        # lease is gone. Once LoRA mutation actually begins, every failure
+        # past that point is a genuine runtime-use failure and is left to
+        # propagate, which conservatively marks the entry INVALID.
+        cancelled_before_mutation = False
+        validation_error: Exception | None = None
+        reference_capable = False
+        lora_metadata: dict[str, object | None] = {"path": None, "scale": None}
+        runtime_type = ""
+        pipeline_class_name = ""
+        device: object = None
+        load_dtype: object = None
+        torch_dtype: object = None
+        image_provider_id = ""
+        collected_variations: list[dict[str, Any]] = []
+
+        with self._acquire_runtime(requested_model_id, context) as handle:
+            manifest = handle.manifest
+            runtime_obj = handle.runtime
+            pipeline = runtime_obj["pipeline"]
+
+            cancelled_before_mutation = context is not None and context.is_cancelled()
+            if not cancelled_before_mutation:
+                # A reference is only actually honored when a dedicated
+                # img2img-shaped runtime exists and its own call signature
+                # takes image/strength (#201: one supported conditioning
+                # path, not every image model family -- StableDiffusionXLPipeline
+                # itself never accepts these, see core/models/loader.py's
+                # separate img2img_pipeline). This is inspection only (a
+                # signature check), never a pipeline call.
+                reference_pipeline = runtime_obj.get("img2img_pipeline")
+                reference_capable = (
+                    reference_image_path is not None
+                    and reference_pipeline is not None
+                    and self._pipeline_accepts_reference_image(reference_pipeline)
+                )
+                if reference_capable:
+                    # Diffusers img2img's get_timesteps() ignores the computed
+                    # `strength` whenever `denoising_start` is also set --
+                    # and `denoising_end`/`timesteps`/`sigmas` each silently
+                    # break the reference's lock strength or progress
+                    # reporting the same way. Rejected outright for a
+                    # reference job rather than forwarded alongside strength.
+                    for incompatible_param in (
+                        "denoising_start",
+                        "denoising_end",
+                        "timesteps",
+                        "sigmas",
+                    ):
+                        if incompatible_param in effective_params:
+                            validation_error = UnsupportedImageParameterError(
+                                f"Model {manifest.public_model_id!r}: "
+                                f"{incompatible_param!r} cannot be combined with "
+                                "reference-image conditioning -- diffusers img2img's "
+                                "timestep selection from denoising_start/denoising_end/"
+                                "timesteps/sigmas does not compose with the computed "
+                                "'strength', so the reference's lock strength would "
+                                f"not be honored. Remove {incompatible_param!r} from "
+                                "params or drop the reference."
+                            )
+                            break
+
+                # LoRA is applied to `pipeline` below, but `img2img_pipeline`
+                # wraps the *same* unet/text-encoder objects rather than
+                # copies, so a loaded adapter is visible to both -- nothing
+                # extra is needed for "LoRA + reference" to compose.
+                active_pipeline = reference_pipeline if reference_capable else pipeline
+                # Route the pipeline call through the provider-neutral
+                # contract (generators/image/providers.py) so this local
+                # diffusers path and a future cloud provider are invoked and
+                # validated the same way.
+                provider = LocalDiffusersImageProvider(
+                    model_id=manifest.public_model_id,
+                    pipeline=active_pipeline,
+                    capabilities=(
+                        local_diffusers_capabilities(supports_reference_image=True)
+                        if reference_capable
+                        else None
+                    ),
+                )
+                spec_lora_path = (
+                    str(resolved_lora_path) if resolved_lora_path is not None else None
+                )
+                request_spec = ImageGenerationSpec(
+                    prompt=resolved_prompt.prompt,
+                    negative_prompt=resolved_prompt.negative_prompt,
+                    width=width,
+                    height=height,
+                    seed=base_seed,
+                    # One call below produces exactly one image -- batch_size
+                    # describes that single call, not the job-wide
+                    # variation_count.
+                    batch_size=1,
+                    lora_path=spec_lora_path,
+                    lora_scale=float(lora_scale) if spec_lora_path is not None else 1.0,
+                    # Set whenever a reference resolved, regardless of
+                    # pipeline support -- this is what makes
+                    # validate_capabilities() actually reject an unsupported
+                    # request instead of validating nothing.
+                    reference_image_path=reference_image_path,
+                )
+                # Checked here -- before the reference image is even opened,
+                # let alone resized -- rather than only inside
+                # generate_image() inside the variation loop below: an
+                # absurd width/height (e.g. 100000) must be rejected before
+                # Pillow attempts a matching allocation, not after. This is
+                # still inspection-only (reference_capable came from a
+                # signature check, not a pipeline call), so a rejection here
+                # still exits the lease without invalidating it.
+                if validation_error is None and provider.capabilities is not None:
+                    try:
+                        validate_capabilities(provider.capabilities, request_spec)
+                    except UnsupportedImageParameterError as exc:
+                        validation_error = exc
+
+                reference_conditioning_kwargs: dict[str, Any] = {}
+                # Diffusers img2img only ever runs int(num_inference_steps *
+                # strength) denoising steps internally -- defaults to the
+                # plain requested count for the non-reference (text2img)
+                # path, where every requested step actually runs.
+                effective_inference_steps = num_inference_steps
+                if validation_error is None and reference_capable:
+                    # ReferenceImageInput.strength is 0=no effect, 1=follow
+                    # the reference most closely; diffusers img2img
+                    # `strength` is the opposite (0=closest to the
+                    # reference, 1=ignores it), so it is inverted here.
+                    # Diffusers computes init_timestep = int(num_inference_steps
+                    # * strength) and needs at least one surviving step;
+                    # rejecting a combination that would leave zero is more
+                    # honest than silently flooring it to a materially
+                    # different, weaker lock.
+                    img2img_strength = 1.0 - cast(float, reference_strength)
+                    if int(num_inference_steps * img2img_strength) < 1:
+                        validation_error = UnsupportedImageParameterError(
+                            f"Model {manifest.public_model_id!r}: the requested "
+                            f"reference lock strength {reference_strength} combined "
+                            f"with {num_inference_steps} inference step(s) would "
+                            "leave diffusers with zero denoising steps to actually "
+                            "run. Increase num_inference_steps or reduce the "
+                            "reference strength."
+                        )
+                    else:
+                        reference_conditioning_kwargs = {
+                            "image": (
+                                Image.open(cast(str, reference_image_path))
+                                .convert("RGB")
+                                .resize((width, height))
+                            ),
+                            "strength": img2img_strength,
+                        }
+                        # Mirrors diffusers' own init_timestep computation --
+                        # the check above already guarantees this is >= 1.
+                        effective_inference_steps = int(
+                            num_inference_steps * img2img_strength
+                        )
+
+                if validation_error is None:
+                    # Runtime mutation begins here. Every failure from this
+                    # point on (a bad LoRA file diffusers itself rejects, a
+                    # provider/inference error, mid-render cancellation) is a
+                    # genuine runtime-use failure and is left to propagate,
+                    # which conservatively marks this entry INVALID via
+                    # RuntimeHandle.__exit__.
+                    lora_metadata = self._apply_lora(
+                        runtime_obj, pipeline, resolved_lora_path, lora_scale
+                    )
+                    runtime_type = type(runtime_obj).__name__
+                    pipeline_class_name = type(active_pipeline).__name__
+                    device = runtime_obj["device"]
+                    load_dtype = runtime_obj.get("load_dtype")
+                    torch_dtype = runtime_obj["torch_dtype"]
+                    image_provider_id = provider.provider_id
+
+                    common_generation_kwargs = {
+                        "prompt": resolved_prompt.prompt,
+                        "negative_prompt": resolved_prompt.negative_prompt,
+                        "guidance_scale": guidance_scale,
+                        "num_inference_steps": num_inference_steps,
+                        **(
+                            {}
+                            if reference_capable
+                            else {"width": width, "height": height}
+                        ),
+                        **effective_params,
+                        **reference_conditioning_kwargs,
+                    }
+
+                    for variation_index in range(variation_count):
+                        if context is not None:
+                            context.raise_if_cancelled()
+                        variation_seed = self._derive_variation_seed(
+                            base_seed, variation_index
+                        )
+                        generation_kwargs = dict(common_generation_kwargs)
+                        generation_kwargs["generator"] = self._create_generator(
+                            variation_seed, runtime_obj["device"], torch
+                        )
+                        step_callback = self._build_step_callback(
+                            active_pipeline,
+                            effective_inference_steps,
+                            context,
+                            variation_index=variation_index,
+                            variation_count=variation_count,
+                        )
+                        if step_callback is not None:
+                            generation_kwargs["callback_on_step_end"] = step_callback
+
+                        variation_request_id = f"{batch_id}_v{variation_index + 1}"
+                        with torch.inference_mode():
+                            provider_result = provider.generate_image(
+                                replace(request_spec, seed=variation_seed),
+                                request_id=variation_request_id,
+                                pipeline_kwargs=generation_kwargs,
+                            )
+
+                        if context is not None:
+                            context.raise_if_cancelled()
+                        # Each provider_result.image is a CPU-side PIL image,
+                        # never a device/runtime-bound tensor -- holding up
+                        # to _MAX_VARIATION_COUNT (4) of them until after the
+                        # lease releases is bounded, ordinary memory, not a
+                        # reason to re-acquire the runtime per variation.
+                        collected_variations.append(
+                            {
+                                "variation_index": variation_index,
+                                "seed": variation_seed,
+                                "image": provider_result.image,
+                                "provider_id": provider_result.identity.provider_id,
+                                "provider_request_id": provider_result.identity.request_id,
+                            }
+                        )
+                        if context is not None and step_callback is None:
+                            context.report_progress(
+                                (variation_index + 1) / variation_count
+                            )
+
+        # No mutation or inference took place: exit cleanly instead of
+        # marking the cache INVALID. Cancellation once inference has begun
+        # still unwinds as unsafe (raised from inside the `with` above).
+        if cancelled_before_mutation:
+            raise GenerationCancelled()
+        # A validation-only rejection discovered via runtime inspection
+        # (unsupported reference/size, or an unreachable reference lock
+        # strength) -- the lease already exited normally above, so raising
+        # here never touches a still-healthy runtime's INVALID state.
+        if validation_error is not None:
+            raise validation_error
+
+        # -------------------------------------------------------- post-lease
+        # File writes and quality/semantic scoring happen with the runtime
+        # lease already released -- semantic scoring in particular must
+        # observe the lease inactive so a future CLIP/CLAP admission
+        # participant sharing this process-wide gate never nests inside this
+        # generator's own runtime-execution ownership.
         output_paths: list[str] = []
         variation_metadata: list[dict[str, Any]] = []
         quality_reports: list[dict[str, Any]] = []
-
         try:
-            for variation_index in range(variation_count):
-                if context is not None:
-                    context.raise_if_cancelled()
-                variation_seed = self._derive_variation_seed(
-                    base_seed,
-                    variation_index,
-                )
-                generation_kwargs = dict(common_generation_kwargs)
-                generation_kwargs["generator"] = self._create_generator(
-                    variation_seed,
-                    runtime_obj["device"],
-                    torch,
-                )
-                step_callback = self._build_step_callback(
-                    active_pipeline,
-                    effective_inference_steps,
-                    context,
-                    variation_index=variation_index,
-                    variation_count=variation_count,
-                )
-                if step_callback is not None:
-                    generation_kwargs["callback_on_step_end"] = step_callback
-
-                variation_request_id = f"{batch_id}_v{variation_index + 1}"
-                with torch.inference_mode():
-                    provider_result = provider.generate_image(
-                        replace(request_spec, seed=variation_seed),
-                        request_id=variation_request_id,
-                        pipeline_kwargs=generation_kwargs,
-                    )
-
-                if context is not None:
-                    context.raise_if_cancelled()
+            for entry in collected_variations:
+                variation_index = cast(int, entry["variation_index"])
                 output_path = self.output_dir / (
                     f"{batch_id}.png"
                     if variation_count == 1
                     else f"{batch_id}_v{variation_index + 1}.png"
                 )
-                image = provider_result.image
+                image = cast(Image.Image, entry["image"])
                 image.save(output_path)
                 output_paths.append(str(output_path))
 
@@ -361,19 +449,15 @@ class ImageGenerator(BaseGenerator):
                 variation_metadata.append(
                     {
                         "variation_index": variation_index,
-                        "seed": variation_seed,
+                        "seed": entry["seed"],
                         "output_path": str(output_path),
                         "preview_path": str(output_path),
                         "params": variation_params,
                         "quality_report": quality_report,
-                        "provider_id": provider_result.identity.provider_id,
-                        "provider_request_id": provider_result.identity.request_id,
+                        "provider_id": entry["provider_id"],
+                        "provider_request_id": entry["provider_request_id"],
                     }
                 )
-                if context is not None and step_callback is None:
-                    context.report_progress((variation_index + 1) / variation_count)
-                if context is not None:
-                    context.raise_if_cancelled()
         except Exception:
             for saved_path in output_paths:
                 Path(saved_path).unlink(missing_ok=True)
@@ -405,19 +489,6 @@ class ImageGenerator(BaseGenerator):
                 "requested_prompt": request.prompt,
                 "prompt_composition": resolved_prompt.composition,
                 "reference_asset_ids": resolved_prompt.reference_asset_ids,
-                # `considered_references` is whichever source
-                # (request.references or Bible-derived resolved_references,
-                # see _resolve_references_for_conditioning) actually fed
-                # conditioning -- distinct from `resolved_prompt
-                # .resolved_references` above, which is Bible-only audit
-                # trail regardless of which source won. #201:
-                # reference_conditioning_applied is true only when exactly
-                # one reference was considered and reached the pipeline as
-                # image/strength conditioning; more than one considered
-                # reference, or one this pipeline can't honor, already
-                # failed generation before reaching here (see
-                # request_spec.reference_image_path / validate_capabilities
-                # and _resolve_references_for_conditioning's own checks).
                 "resolved_references": [
                     reference.model_dump(mode="json")
                     for reference in resolved_prompt.resolved_references
@@ -426,27 +497,22 @@ class ImageGenerator(BaseGenerator):
                     reference.model_dump(mode="json") for reference in considered_references
                 ],
                 "reference_conditioning_applied": reference_capable,
-                # Not `considered_references[0]` -- a zero-strength reference
-                # can sort first in that list without being the one actually
-                # applied (#201 follow-up, fourteenth Codex round); the
-                # asset id `_resolve_references_for_conditioning` resolved
-                # conditioning against is authoritative here.
                 "reference_applied_asset_id": (
                     reference_applied_asset_id if reference_capable else None
                 ),
                 "requested_model_id": requested_model_id,
                 "model_id": manifest.public_model_id,
                 "manifest_id": manifest.id,
-                "image_provider_id": provider.provider_id,
+                "image_provider_id": image_provider_id,
                 "model_display_name": manifest.display_name,
                 "model_runtime": manifest.runtime,
                 "model_provider": manifest.provider,
                 "loader": manifest.loader,
-                "runtime_type": type(runtime_obj).__name__,
-                "pipeline_class": type(active_pipeline).__name__,
-                "device": runtime_obj["device"],
-                "load_dtype": runtime_obj.get("load_dtype"),
-                "torch_dtype": runtime_obj["torch_dtype"],
+                "runtime_type": runtime_type,
+                "pipeline_class": pipeline_class_name,
+                "device": device,
+                "load_dtype": load_dtype,
+                "torch_dtype": torch_dtype,
                 "lora_path": lora_metadata["path"],
                 "lora_scale": lora_metadata["scale"],
                 "seed": base_seed,
@@ -462,6 +528,26 @@ class ImageGenerator(BaseGenerator):
             },
             error_message=None,
         )
+
+    def _acquire_runtime(
+        self, model_id: str | None, context: "GenerationContext | None"
+    ) -> RuntimeHandle:
+        if context is None:
+            return self.model_service.acquire_runtime(
+                model_id, media_type="image", task_type=self.task_type
+            )
+        while True:
+            context.raise_if_cancelled()
+            try:
+                return self.model_service.acquire_runtime(
+                    model_id, media_type="image", task_type=self.task_type,
+                    wait_timeout=_CANCELLATION_POLL_SECONDS,
+                )
+            except RuntimeWaitTimeoutError:
+                # Only synchronization waits are retryable. Cache capacity,
+                # invalid entries and loader errors must still surface. This
+                # does not preempt a synchronous loader that already started.
+                context.raise_if_cancelled()
 
     def cleanup(self, request: GenerationRequest) -> None:
         return None
@@ -518,6 +604,10 @@ class ImageGenerator(BaseGenerator):
         ``considered_references[0]`` -- a zero-strength reference can
         legitimately be requested first and a later, non-zero-strength one
         still be the one applied.
+
+        This performs no runtime access at all -- only manifest lookups and
+        asset-repository resolution -- so it belongs in `generate()`'s
+        preflight section, entirely before any runtime lease is acquired.
 
         `request.references` -- the documented top-level field `JobService`
         already validates against `manifest.reference_capability` before a
@@ -731,14 +821,22 @@ class ImageGenerator(BaseGenerator):
         generator_device = device if str(device).startswith("cuda") else "cpu"
         return torch.Generator(device=generator_device).manual_seed(seed)
 
-    def _configure_lora(
+    def _apply_lora(
         self,
         runtime_obj: dict[str, object],
         pipeline: Any,
-        lora_path: object,
+        resolved_path: Path | None,
         lora_scale: float,
     ) -> dict[str, object | None]:
-        resolved_path = self._resolve_optional_path(lora_path)
+        """Runtime-mutating half of LoRA configuration.
+
+        `resolved_path` is already-validated (existence-checked in
+        `generate()`'s preflight section via `_resolve_optional_path()`)
+        before this is ever called -- this method only touches
+        `runtime_obj`/`pipeline` state and never re-touches the filesystem,
+        so it belongs entirely inside the runtime lease.
+        """
+
         active_path = runtime_obj.get("active_lora_path")
         active_adapter = runtime_obj.get("active_lora_adapter")
 
@@ -754,7 +852,7 @@ class ImageGenerator(BaseGenerator):
 
             adapter_name = f"lora_{uuid4().hex[:8]}"
             load_path, weight_name = self._resolve_lora_source(resolved_path)
-            load_kwargs = {"adapter_name": adapter_name}
+            load_kwargs: dict[str, object] = {"adapter_name": adapter_name}
             if weight_name is not None:
                 load_kwargs["weight_name"] = weight_name
             pipeline.load_lora_weights(load_path, **load_kwargs)
