@@ -42,7 +42,21 @@ class StorySchemaValidationError(ValueError):
     failure (inference completed normally; only its text was malformed)
     apart from an exception the runtime callable itself raised -- only the
     latter still conservatively invalidates the leased entry.
+
+    Carries `task_name`/`raw_text`/`last_error` rather than an
+    already-built "Raw response saved to ..." message: `_generate_structured()`
+    raises this *without* writing the diagnostic file itself, so a
+    filesystem failure while persisting that diagnostic can never be
+    mistaken for a runtime fault either. `TextGenerator.generate()`
+    persists the raw response and builds the final, actionable message
+    only after its lease has already exited cleanly.
     """
+
+    def __init__(self, message: str, *, task_name: str, raw_text: str, last_error: str) -> None:
+        super().__init__(message)
+        self.task_name = task_name
+        self.raw_text = raw_text
+        self.last_error = last_error
 
 
 class TextGenerator(BaseGenerator):
@@ -189,7 +203,20 @@ class TextGenerator(BaseGenerator):
         if cancelled_before_generation:
             raise GenerationCancelled()
         if schema_error is not None:
-            raise schema_error
+            # The lease has already exited cleanly above -- persisting the
+            # diagnostic and building the final, actionable message
+            # happens here, entirely outside it, so a write failure (full
+            # or read-only output filesystem) is never mistaken for a
+            # runtime fault.
+            raw_path = self._write_raw_response(task, schema_error.raw_text)
+            raise StorySchemaValidationError(
+                f"Story task {schema_error.task_name!r} did not return "
+                f"schema-valid output after a repair attempt: "
+                f"{schema_error.last_error}. Raw response saved to {raw_path}.",
+                task_name=schema_error.task_name,
+                raw_text=schema_error.raw_text,
+                last_error=schema_error.last_error,
+            )
 
         output_id = f"txt_{uuid4().hex}"
         markdown_path = self.output_dir / f"{output_id}.md"
@@ -334,10 +361,19 @@ class TextGenerator(BaseGenerator):
                     f"### CORRECTION\n{_REPAIR_INSTRUCTION.format(error=last_error)}"
                 )
 
-        raw_path = self._write_raw_response(task, raw_text)
+        # Deliberately no `_write_raw_response()` call here: persisting the
+        # diagnostic is filesystem I/O, not part of the runtime-use
+        # interval this method is responsible for. `TextGenerator.generate()`
+        # writes it -- and builds the final, actionable message -- only
+        # after the lease has already exited cleanly, so a write failure
+        # (e.g. a full or read-only output filesystem) is never mistaken
+        # for a runtime fault.
         raise StorySchemaValidationError(
             f"Story task {task.name!r} did not return schema-valid output after a "
-            f"repair attempt: {last_error}. Raw response saved to {raw_path}."
+            f"repair attempt: {last_error}.",
+            task_name=task.name,
+            raw_text=raw_text,
+            last_error=last_error,
         )
 
     def _write_raw_response(self, task: StoryTask, raw_text: str) -> Path:

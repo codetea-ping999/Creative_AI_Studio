@@ -568,3 +568,33 @@ def test_post_processing_cancellation_removes_partial_outputs(tmp_path, monkeypa
     entry = cache._entries["target"]
     assert entry.state is RuntimeState.READY
     assert entry.lease_count == 0
+
+
+def test_progress_callback_failure_after_successful_inference_preserves_runtime(
+    tmp_path, monkeypatch
+):
+    # Safety convergence pass, Codex finding "defer progress callback
+    # failures until after lease release": with no step callback support,
+    # `context.report_progress()` runs after the provider call already
+    # returned successfully, while the lease is still active. In
+    # production this hook writes through JobRepository.update_if_status();
+    # a transient DB/event-publication failure there must not invalidate
+    # a healthy runtime.
+    generator, service, cache, loader, pipelines = _build(tmp_path, monkeypatch)
+
+    def failing_progress(fraction: float) -> None:
+        raise RuntimeError("simulated job-repository write failure")
+
+    with pytest.raises(RuntimeError):
+        generator.run(
+            _request(width=64, height=64, steps=1),
+            context=GenerationContext(
+                is_cancelled=lambda: False, on_progress=failing_progress
+            ),
+        )
+
+    assert len(pipelines["target"].calls) == 1  # inference genuinely ran
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY
+    assert entry.lease_count == 0
+    assert list(tmp_path.glob("*.png")) == []  # never reached post-lease save

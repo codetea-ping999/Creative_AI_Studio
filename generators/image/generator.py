@@ -197,6 +197,7 @@ class ImageGenerator(BaseGenerator):
         # propagate, which conservatively marks the entry INVALID.
         cancelled_before_mutation = False
         late_cancellation = False
+        progress_error: Exception | None = None
         validation_error: Exception | None = None
         reference_capable = False
         lora_metadata: dict[str, object | None] = {"path": None, "scale": None}
@@ -442,9 +443,22 @@ class ImageGenerator(BaseGenerator):
                             }
                         )
                         if context is not None and step_callback is None:
-                            context.report_progress(
-                                (variation_index + 1) / variation_count
-                            )
+                            # The provider call already returned
+                            # successfully above -- this variation's
+                            # runtime use is done. In production this hook
+                            # writes through JobRepository, so a transient
+                            # DB/event-publication failure here must not be
+                            # allowed to escape the lease and invalidate a
+                            # runtime that rendered correctly; capture it
+                            # and stop starting further variations instead,
+                            # exactly like `late_cancellation` above.
+                            try:
+                                context.report_progress(
+                                    (variation_index + 1) / variation_count
+                                )
+                            except Exception as exc:
+                                progress_error = exc
+                                break
 
         # No mutation or inference took place, or every started variation's
         # provider call completed successfully before cancellation was
@@ -454,6 +468,12 @@ class ImageGenerator(BaseGenerator):
         # unwinds as unsafe.
         if cancelled_before_mutation or late_cancellation:
             raise GenerationCancelled()
+        # A boundary progress-publication failure observed only after a
+        # variation's runtime use already completed successfully -- the
+        # lease already exited normally above, so raising here never
+        # touches a still-healthy runtime's INVALID state.
+        if progress_error is not None:
+            raise progress_error
         # A validation-only rejection discovered via runtime inspection
         # (unsupported reference/size, or an unreachable reference lock
         # strength) -- the lease already exited normally above, so raising

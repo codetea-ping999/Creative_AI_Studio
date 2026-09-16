@@ -25,6 +25,7 @@ from .runtime import (
     PROCEDURAL_VIDEO_OUTPUT_FORMATS,
     ProceduralStoryboardRuntime,
     VideoRuntimeRouter,
+    encode_frames_as_gif,
 )
 
 _CANCELLATION_POLL_SECONDS = 0.1
@@ -143,6 +144,28 @@ class VideoGenerator(BaseGenerator):
             raise GenerationCancelled()
         if procedural_param_error is not None:
             raise procedural_param_error
+
+        # Safety convergence pass: `render()` (for a runtime that returns
+        # raw frames rather than an already-encoded file -- procedural
+        # storyboards, and a learned adapter returning a frame list) no
+        # longer performs the GIF/filesystem encode itself; it hands back
+        # `pending_frames` instead. Encoding happens here, with the lease
+        # already released, so an output-filesystem failure (disk-full,
+        # permission denial) can no longer invalidate a runtime that
+        # finished rendering correctly.
+        pending_frames = render_result.get("pending_frames")
+        if pending_frames:
+            output_id, encoded_path = encode_frames_as_gif(
+                pending_frames,
+                self.output_dir,
+                int(render_result["pending_frame_duration_ms"]),
+            )
+            render_result = {
+                **render_result,
+                "output_id": output_id,
+                "output_path": str(encoded_path),
+                "preview_paths": [str(encoded_path)],
+            }
 
         output_path = Path(str(render_result["output_path"]))
         quality_report = evaluate_video_output(output_path)

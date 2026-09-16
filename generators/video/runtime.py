@@ -91,21 +91,18 @@ class ProceduralStoryboardRuntime(BaseVideoRuntime):
             if context is not None:
                 context.report_progress((frame_index + 1) / num_frames)
 
-        output_id = f"vid_{uuid4().hex}"
-        output_path = output_dir / f"{output_id}.gif"
+        # Deliberately no GIF encoding (filesystem I/O) here: frame
+        # generation above is the actual runtime-use interval this
+        # method is responsible for. `pending_frames` hands the raw,
+        # already-rendered frames back to `VideoGenerator.generate()`,
+        # which encodes them via `encode_frames_as_gif()` only *after* its
+        # runtime lease has released -- an output-filesystem failure
+        # (disk-full, permission denial) during encoding is then no longer
+        # able to invalidate a runtime that finished rendering correctly.
         frame_duration_ms = max(50, int(1000 / fps))
-        frames[0].save(
-            output_path,
-            save_all=True,
-            append_images=frames[1:],
-            duration=frame_duration_ms,
-            loop=0,
-            disposal=2,
-        )
         return {
-            "output_id": output_id,
-            "output_path": str(output_path),
-            "preview_paths": [str(output_path)],
+            "pending_frames": frames,
+            "pending_frame_duration_ms": frame_duration_ms,
             "output_format": "gif",
             "params": {
                 "width": width,
@@ -361,20 +358,16 @@ class LearnedVideoRuntime(BaseVideoRuntime):
             and generated
             and all(isinstance(frame, Image.Image) for frame in generated)
         ):
-            output_id = f"vid_{uuid4().hex}"
-            output_path = output_dir / f"{output_id}.gif"
-            generated[0].save(
-                output_path,
-                save_all=True,
-                append_images=generated[1:],
-                duration=max(50, int(1000 / max(1, int(effective_params.get("fps", 8))))),
-                loop=0,
-                disposal=2,
-            )
+            # Same reasoning as ProceduralStoryboardRuntime.render(): no GIF
+            # encoding (filesystem I/O) here -- the adapter already
+            # finished its own runtime-use interval by returning these
+            # frames. `pending_frames` defers the actual encode to
+            # `VideoGenerator.generate()`, after its lease has released.
             return {
-                "output_id": output_id,
-                "output_path": str(output_path),
-                "preview_paths": [str(output_path)],
+                "pending_frames": generated,
+                "pending_frame_duration_ms": max(
+                    50, int(1000 / max(1, int(effective_params.get("fps", 8))))
+                ),
                 "output_format": "gif",
                 "params": dict(effective_params),
                 "runtime_metadata": {
@@ -388,6 +381,33 @@ class LearnedVideoRuntime(BaseVideoRuntime):
             "Learned video runtime returned an unsupported payload. "
             "Use output_path, frames, or a saved file path."
         )
+
+
+def encode_frames_as_gif(
+    frames: list[Image.Image], output_dir: Path, frame_duration_ms: int
+) -> tuple[str, Path]:
+    """Encode already-rendered `frames` to a GIF file. Pure filesystem I/O.
+
+    Deliberately standalone (not a method on either runtime class) so
+    `VideoGenerator.generate()` can call it itself, *after* its runtime
+    lease has released, for a `render()` result carrying `pending_frames`
+    -- see `ProceduralStoryboardRuntime.render()` and
+    `LearnedVideoRuntime._normalize_generated_output()`. A disk-full or
+    permission failure here is an output-filesystem fault, never a
+    runtime fault.
+    """
+
+    output_id = f"vid_{uuid4().hex}"
+    output_path = output_dir / f"{output_id}.gif"
+    frames[0].save(
+        output_path,
+        save_all=True,
+        append_images=frames[1:],
+        duration=frame_duration_ms,
+        loop=0,
+        disposal=2,
+    )
+    return output_id, output_path
 
 
 def _callable_accepts_kwarg(callable_obj: Any, name: str) -> bool:
@@ -432,4 +452,5 @@ __all__ = [
     "ProceduralStoryboardRuntime",
     "SUPPORTED_VIDEO_OUTPUT_FORMATS",
     "VideoRuntimeRouter",
+    "encode_frames_as_gif",
 ]

@@ -546,9 +546,55 @@ class TextGeneratorLeaseTests(unittest.TestCase):
             # A ValueError subtype, so existing `except ValueError` callers
             # (e.g. test_exhausted_schema_repair_releases_lease above) are
             # unaffected.
-            self.assertIsInstance(StorySchemaValidationError("x"), ValueError)
+            self.assertIsInstance(
+                StorySchemaValidationError(
+                    "x", task_name="logline", raw_text="x", last_error="x"
+                ),
+                ValueError,
+            )
             with service.acquire_runtime("template-writer", "text") as handle:
                 self.assertIs(handle.runtime, broken_runtime)  # never reloaded
+            self.assertEqual(loader.load.call_count, 1)
+
+    def test_diagnostic_persistence_failure_after_successful_calls_preserves_runtime(
+        self,
+    ) -> None:
+        # Safety convergence pass, Codex finding "move failed-response
+        # persistence outside the lease": both model calls complete
+        # normally (the output is merely schema-invalid); persisting the
+        # raw-response diagnostic now happens after the lease has already
+        # exited, so a filesystem failure while writing it (e.g. a full or
+        # read-only output filesystem) is not a runtime fault.
+        with tempfile.TemporaryDirectory() as root:
+            manifest = _template_manifest()
+            broken_runtime = {
+                **_template_runtime(),
+                "generate": lambda prompt, **kwargs: "not json, ever",
+            }
+            loader = Mock()
+            loader.load.side_effect = lambda item: broken_runtime
+            cache = ModelRuntimeCache()
+            service = ModelService(
+                registry=None,
+                resolver=SimpleNamespace(resolve=lambda *args: manifest),
+                loader_registry=SimpleNamespace(get=lambda name: loader),
+                runtime_cache=cache,
+                admission_capacity=1,
+            )
+            generator = TextGenerator(service, output_dir=Path(root))
+
+            def failing_write_raw_response(task, raw_text):
+                raise OSError("simulated disk-full while writing diagnostic")
+
+            with patch.object(
+                generator, "_write_raw_response", side_effect=failing_write_raw_response
+            ):
+                with self.assertRaises(OSError):
+                    generator.run(_request("logline"))
+
+            entry = cache._entries[manifest.id]
+            self.assertIs(entry.state, RuntimeState.READY)
+            self.assertEqual(entry.lease_count, 0)
             self.assertEqual(loader.load.call_count, 1)
 
     def test_runtime_callable_exception_still_invalidates_distinctly_from_schema_failure(

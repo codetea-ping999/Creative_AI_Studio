@@ -391,3 +391,54 @@ def test_invalid_procedural_numeric_params_do_not_invalidate_healthy_runtime(
     assert cached_entry.state is RuntimeState.READY
     assert cached_entry.lease_count == 0
     assert loader.load.call_count == 1
+
+
+def test_video_encoding_failure_after_successful_rendering_preserves_runtime(
+    tmp_path, monkeypatch
+):
+    # Safety convergence pass, Codex finding "exclude video encoding from
+    # the runtime fault boundary": ProceduralStoryboardRuntime.render()
+    # already finished generating every frame (the actual runtime-use
+    # interval) and returned `pending_frames`; only the post-lease GIF
+    # encode (a disk-full/permission failure, simulated here) fails.
+    generator, service, cache, loader, renderer = _build(tmp_path, monkeypatch)
+    generator.runtime_router = SimpleNamespace(
+        resolve=lambda runtime_obj: ProceduralStoryboardRuntime()
+    )
+
+    def failing_encode(frames, output_dir, frame_duration_ms):
+        raise OSError("simulated disk-full while encoding gif")
+
+    monkeypatch.setattr("generators.video.generator.encode_frames_as_gif", failing_encode)
+
+    with pytest.raises(OSError):
+        generator.run(
+            GenerationRequest(
+                media_type="video", prompt="test", model_id="target",
+                params={"duration_seconds": 2, "fps": 4},
+            )
+        )
+
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY
+    assert entry.lease_count == 0
+    assert loader.load.call_count == 1
+    assert list(tmp_path.glob("*.gif")) == []  # encoding never actually wrote anything
+
+
+def test_render_exception_still_invalidates_used_runtime(tmp_path, monkeypatch):
+    # The other half of the distinction every finding in this pass
+    # requires: an exception the render() callable itself raises (not a
+    # boundary/encoding/diagnostic failure) is a genuine runtime-use
+    # failure and still conservatively invalidates.
+    generator, service, cache, loader, renderer = _build(tmp_path, monkeypatch)
+    error = RuntimeError("simulated learned-runtime inference failure")
+    renderer.render.side_effect = error
+
+    with pytest.raises(RuntimeError) as caught:
+        generator.run(_request())
+    assert caught.value is error
+
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.INVALID
+    assert entry.lease_count == 0
