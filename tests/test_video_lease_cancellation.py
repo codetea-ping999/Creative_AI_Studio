@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from PIL import Image
 
 from core.jobs.context import GenerationCancelled, GenerationContext
 from core.models.cache import ModelRuntimeCache
@@ -12,7 +13,33 @@ from core.models.runtime_lease import RuntimeBusyError, RuntimeState, RuntimeWai
 from core.models.service import ModelService
 from core.schemas import GenerationRequest
 from generators.video.generator import VideoGenerator
-from generators.video.runtime import ProceduralStoryboardRuntime
+from generators.video.runtime import ProceduralStoryboardRuntime, encode_frames_as_gif
+
+
+def _learned_video_generator(tmp_path, monkeypatch, *, renderer):
+    """Build a VideoGenerator wired to a real LearnedVideoRuntime (not a mock)."""
+
+    def manifest(model_id, media_type, task_type=None):
+        return SimpleNamespace(
+            id=model_id, public_model_id=model_id, provider="local", loader="fake",
+            default_params={}, runtime="learned", display_name="fake video",
+        )
+
+    loader = Mock()
+    loader.load.side_effect = lambda item: {
+        "runtime_adapter": "learned_text_to_video", "renderer": renderer,
+    }
+    cache = ModelRuntimeCache(max_entries=4)
+    service = ModelService(
+        registry=None, resolver=SimpleNamespace(resolve=manifest),
+        loader_registry=SimpleNamespace(get=lambda name: loader),
+        runtime_cache=cache, admission_capacity=1,
+    )
+    generator = VideoGenerator(service, output_dir=tmp_path)
+    monkeypatch.setattr("generators.video.generator.evaluate_video_output", lambda *a: {})
+    monkeypatch.setattr("generators.video.generator.evaluate_video_semantics", lambda *a: {})
+    monkeypatch.setattr("generators.video.generator.enrich_quality_report", lambda *a: None)
+    return generator, service, cache, loader
 
 
 def _build(tmp_path, monkeypatch, *, admission_capacity=1):
@@ -284,49 +311,28 @@ def test_video_successful_render_with_late_cancellation_preserves_runtime(
     assert entry.lease_count == 0
 
 
-def test_learned_video_late_precall_cancellation_does_not_prevent_invocation_or_invalidate(
+def test_learned_video_precall_cancellation_skips_invocation_and_preserves_runtime(
     tmp_path, monkeypatch
 ):
-    # Safety convergence pass, Codex finding "preserve the runtime on late
-    # pre-render cancellation": LearnedVideoRuntime.render() used to run
-    # its OWN pre-call `context.raise_if_cancelled()` check, independent of
-    # VideoGenerator's own `cancelled_before_render` sample -- cancellation
-    # observed by that second, redundant check escaped as
-    # `GenerationCancelled` before the runtime callable was ever invoked,
-    # yet was indistinguishable from a genuine mid-inference interruption
-    # once it reached VideoGenerator's `with` block, conservatively
-    # invalidating a runtime that was never actually used. That check has
-    # been removed (generators/video/runtime.py); this proves the callable
-    # is still reliably invoked exactly once even when cancellation is
-    # already true by the time render() would have performed it, and that
-    # the eventual cancellation (now only ever caught by VideoGenerator's
-    # own post-render snapshot) still preserves the runtime.
+    # Codex P2 finding "learned-video pre-call cancellation":
+    # LearnedVideoRuntime.render() checks cancellation itself, immediately
+    # before invoking the opaque renderer callable, closing the window
+    # between VideoGenerator's own `cancelled_before_render` sample and
+    # actual inference. An already-cancelled job must never start expensive
+    # inference -- zero renderer calls -- and the check must not raise
+    # `GenerationCancelled` from inside the lease (which would
+    # conservatively invalidate a runtime this call never touched): it
+    # returns a sentinel instead, so VideoGenerator lets the lease exit
+    # cleanly before raising.
     invoked = {"n": 0}
 
     def fake_renderer(**kwargs):
         invoked["n"] += 1
         return {"output_path": str(tmp_path / "out.mp4"), "output_id": "out"}
 
-    def manifest(model_id, media_type, task_type=None):
-        return SimpleNamespace(
-            id=model_id, public_model_id=model_id, provider="local", loader="fake",
-            default_params={}, runtime="learned", display_name="fake video",
-        )
-
-    loader = Mock()
-    loader.load.side_effect = lambda item: {
-        "runtime_adapter": "learned_text_to_video", "renderer": fake_renderer,
-    }
-    cache = ModelRuntimeCache(max_entries=4)
-    service = ModelService(
-        registry=None, resolver=SimpleNamespace(resolve=manifest),
-        loader_registry=SimpleNamespace(get=lambda name: loader),
-        runtime_cache=cache, admission_capacity=1,
+    generator, service, cache, loader = _learned_video_generator(
+        tmp_path, monkeypatch, renderer=fake_renderer
     )
-    generator = VideoGenerator(service, output_dir=tmp_path)
-    monkeypatch.setattr("generators.video.generator.evaluate_video_output", lambda *a: {})
-    monkeypatch.setattr("generators.video.generator.evaluate_video_semantics", lambda *a: {})
-    monkeypatch.setattr("generators.video.generator.enrich_quality_report", lambda *a: None)
 
     call_count = {"n": 0}
 
@@ -334,10 +340,9 @@ def test_learned_video_late_precall_cancellation_does_not_prevent_invocation_or_
         call_count["n"] += 1
         # call #1: _acquire_runtime()'s pre-acquisition check (False)
         # call #2: VideoGenerator's own cancelled_before_render sample
-        # (False) -- render() is therefore called. Cancellation is "true"
-        # for the rest of this run, including the exact position where the
-        # now-removed internal pre-call check used to observe it and raise
-        # before `fake_renderer` was ever invoked.
+        # (False) -- render() is therefore entered.
+        # call #3: LearnedVideoRuntime.render()'s own pre-invocation check,
+        # immediately before calling `fake_renderer` (True).
         return call_count["n"] > 2
 
     with pytest.raises(GenerationCancelled):
@@ -346,9 +351,122 @@ def test_learned_video_late_precall_cancellation_does_not_prevent_invocation_or_
             context=GenerationContext(is_cancelled=is_cancelled),
         )
 
-    # The callable ran to completion -- no longer silently skipped by the
-    # removed redundant internal check.
+    assert invoked["n"] == 0  # zero renderer calls
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY
+    assert entry.lease_count == 0
+    assert loader.load.call_count == 1  # runtime was loaded once, never reloaded
+
+
+def test_invalid_learned_video_fps_does_not_invalidate_healthy_runtime(
+    tmp_path, monkeypatch
+):
+    # Codex P2 finding "learned-video request parameter parsing": for
+    # learned-video paths, a request-owned `fps` (used only to derive the
+    # GIF frame duration when the adapter returns raw frames) used to be
+    # converted only after expensive inference had already completed --
+    # inside the active lease. A malformed value (e.g. `fps="bad"`) then
+    # raised `ValueError` from inside the `with` block and incorrectly
+    # invalidated a runtime whose inference genuinely succeeded. It is now
+    # parsed only after the lease has released, so it fails as a plain
+    # input error that never touches the runtime cache.
+    invoked = {"n": 0}
+
+    def fake_renderer(**kwargs):
+        invoked["n"] += 1
+        return [Image.new("RGB", (4, 4)) for _ in range(3)]
+
+    generator, service, cache, loader = _learned_video_generator(
+        tmp_path, monkeypatch, renderer=fake_renderer
+    )
+
+    warm = generator.run(
+        GenerationRequest(media_type="video", prompt="test", model_id="target")
+    )
+    assert warm.status == "succeeded"
+    cached_entry = cache._entries["target"]
+    assert cached_entry.state is RuntimeState.READY
     assert invoked["n"] == 1
+
+    with pytest.raises(ValueError):
+        generator.run(
+            GenerationRequest(
+                media_type="video", prompt="test", model_id="target",
+                params={"fps": "bad"},
+            )
+        )
+
+    # The renderer itself ran fine both times -- inference is not at fault.
+    assert invoked["n"] == 2
+    assert cache._entries["target"] is cached_entry  # never reloaded
+    assert cached_entry.state is RuntimeState.READY
+    assert cached_entry.lease_count == 0
+    assert loader.load.call_count == 1
+
+
+def test_learned_video_renderer_exception_still_invalidates_runtime(
+    tmp_path, monkeypatch
+):
+    # The other half of finding 1's distinction: a genuine exception raised
+    # by the opaque renderer callable itself (not the pre-call cancellation
+    # check, not the deferred fps parse) is a real runtime-use failure and
+    # must still conservatively invalidate.
+    error = RuntimeError("simulated learned-runtime inference failure")
+
+    def failing_renderer(**kwargs):
+        raise error
+
+    generator, service, cache, loader = _learned_video_generator(
+        tmp_path, monkeypatch, renderer=failing_renderer
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        generator.run(
+            GenerationRequest(media_type="video", prompt="test", model_id="target")
+        )
+    assert caught.value is error
+
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.INVALID
+    assert entry.lease_count == 0
+
+
+def test_cancellation_during_deferred_gif_encode_removes_encoded_output(
+    tmp_path, monkeypatch
+):
+    # Codex P2 finding "cancellation during deferred GIF encoding": GIF
+    # encoding happens outside the runtime lease, but a cancellation
+    # requested while it runs was previously never checked before
+    # quality/semantic scoring -- JobRunner discards the cancelled result
+    # afterwards, leaving the just-written GIF behind as an orphan file.
+    # `cancelled` only flips to True once the real encode has actually
+    # written the file, so this proves the check fires strictly after
+    # encoding (not before) and that the file it wrote is cleaned up.
+    generator, service, cache, loader, renderer = _build(tmp_path, monkeypatch)
+    generator.runtime_router = SimpleNamespace(
+        resolve=lambda runtime_obj: ProceduralStoryboardRuntime()
+    )
+    cancelled = Event()
+
+    def encode_then_cancel(frames, output_dir, frame_duration_ms):
+        result = encode_frames_as_gif(frames, output_dir, frame_duration_ms)
+        cancelled.set()
+        return result
+
+    monkeypatch.setattr(
+        "generators.video.generator.encode_frames_as_gif", encode_then_cancel
+    )
+
+    with pytest.raises(GenerationCancelled):
+        generator.run(
+            GenerationRequest(
+                media_type="video", prompt="test", model_id="target",
+                params={"duration_seconds": 2, "fps": 4},
+            ),
+            context=GenerationContext(is_cancelled=cancelled.is_set),
+        )
+
+    assert list(tmp_path.glob("*.gif")) == []  # orphaned encode output removed
     entry = cache._entries["target"]
     assert entry.state is RuntimeState.READY
     assert entry.lease_count == 0

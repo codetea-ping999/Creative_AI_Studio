@@ -26,6 +26,7 @@ from .runtime import (
     ProceduralStoryboardRuntime,
     VideoRuntimeRouter,
     encode_frames_as_gif,
+    frame_duration_ms_from_fps,
 )
 
 _CANCELLATION_POLL_SECONDS = 0.1
@@ -86,13 +87,19 @@ class VideoGenerator(BaseGenerator):
         # later share the same process-wide admission domain without a
         # forbidden same-thread nested acquisition.
         #
-        # Safety convergence pass: three request/cancellation-boundary
-        # failures are distinguished from a genuine runtime-use failure and
-        # deferred until after a clean lease exit, instead of raising from
-        # inside the `with` block (which would conservatively mark a
-        # healthy entry INVALID):
+        # Safety convergence pass: request/cancellation-boundary failures are
+        # distinguished from a genuine runtime-use failure and deferred
+        # until after a clean lease exit, instead of raising from inside the
+        # `with` block (which would conservatively mark a healthy entry
+        # INVALID):
         #   - `cancelled_before_render`: cancellation observed before
         #     render() was ever called.
+        #   - `cancelled_before_invocation`: for a learned runtime,
+        #     cancellation observed by LearnedVideoRuntime.render()'s own
+        #     pre-call check, immediately before invoking the opaque
+        #     renderer callable -- it returns a sentinel instead of raising
+        #     (see generators/video/runtime.py) so the callable is never
+        #     invoked, yet nothing unwinds through this `with` block.
         #   - `late_cancellation`: render() returned successfully (the
         #     runtime callable ran to completion) and cancellation is only
         #     now observable -- a request to stop *after* successful use,
@@ -108,9 +115,9 @@ class VideoGenerator(BaseGenerator):
         # A `GenerationCancelled` that instead escapes render() itself (a
         # renderer/adapter observing cancellation once its own callable is
         # already running) is not caught here and still conservatively
-        # invalidates -- see runtime.py's own removal of the redundant
-        # pre-call check that used to make this ambiguous.
+        # invalidates.
         cancelled_before_render = False
+        cancelled_before_invocation = False
         late_cancellation = False
         procedural_param_error: Exception | None = None
         with self._acquire_runtime(requested_model_id, context) as handle:
@@ -134,13 +141,17 @@ class VideoGenerator(BaseGenerator):
                         raise
                     procedural_param_error = exc
                 else:
-                    if context is not None:
+                    if isinstance(render_result, dict) and render_result.get(
+                        "cancelled_before_invocation"
+                    ):
+                        cancelled_before_invocation = True
+                    elif context is not None:
                         late_cancellation = context.is_cancelled()
             runtime_type = type(runtime_obj).__name__
 
         # No inference took place, or it completed successfully: exit
         # cleanly instead of marking the cache INVALID.
-        if cancelled_before_render or late_cancellation:
+        if cancelled_before_render or cancelled_before_invocation or late_cancellation:
             raise GenerationCancelled()
         if procedural_param_error is not None:
             raise procedural_param_error
@@ -155,10 +166,21 @@ class VideoGenerator(BaseGenerator):
         # finished rendering correctly.
         pending_frames = render_result.get("pending_frames")
         if pending_frames:
+            if "pending_frame_duration_ms" in render_result:
+                frame_duration_ms = int(render_result["pending_frame_duration_ms"])
+            else:
+                # Codex P2 finding "learned-video request parameter
+                # parsing": the learned adapter's `fps` is parsed here,
+                # after its lease has already released, so a malformed
+                # request value (e.g. `fps="bad"`) raises with no runtime
+                # involved at all instead of invalidating a healthy one.
+                frame_duration_ms = frame_duration_ms_from_fps(
+                    render_result.get("pending_frame_fps", 8)
+                )
             output_id, encoded_path = encode_frames_as_gif(
                 pending_frames,
                 self.output_dir,
-                int(render_result["pending_frame_duration_ms"]),
+                frame_duration_ms,
             )
             render_result = {
                 **render_result,
@@ -166,6 +188,16 @@ class VideoGenerator(BaseGenerator):
                 "output_path": str(encoded_path),
                 "preview_paths": [str(encoded_path)],
             }
+            # Codex P2 finding "cancellation during deferred GIF encoding":
+            # a cancellation requested while this post-lease encode ran was
+            # otherwise never observed before quality/semantic scoring --
+            # JobRunner discards the cancelled result afterwards, leaving
+            # the file just written above as an orphan. The lease already
+            # released above, so raising here cannot re-enter or invalidate
+            # it.
+            if context is not None and context.is_cancelled():
+                encoded_path.unlink(missing_ok=True)
+                raise GenerationCancelled()
 
         output_path = Path(str(render_result["output_path"]))
         quality_report = evaluate_video_output(output_path)

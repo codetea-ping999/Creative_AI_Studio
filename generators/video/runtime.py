@@ -266,25 +266,6 @@ class LearnedVideoRuntime(BaseVideoRuntime):
             "output_format": request.output_format or effective_params.get("output_format", "mp4"),
             **effective_params,
         }
-        # Deliberately no eager `context.raise_if_cancelled()` here before
-        # `callable_runtime` is invoked: VideoGenerator.generate() already
-        # samples cancellation once, immediately before calling `render()`
-        # at all (`cancelled_before_render`). A second, independent check at
-        # this point used to create an ordinary-scheduling-reachable
-        # (safety convergence pass, PR4b finding "preserve the runtime on
-        # late pre-render cancellation") race: cancellation observed here,
-        # via *this* check, escaped as `GenerationCancelled` before
-        # `callable_runtime` ever ran, yet was indistinguishable from a
-        # genuine mid-inference interruption once it reached
-        # `VideoGenerator.generate()`'s `with` block, conservatively
-        # invalidating a runtime that was never actually used. Removing this
-        # redundant check does not weaken cancellation responsiveness in
-        # practice -- there is no blocking work between VideoGenerator's own
-        # sample and the call below -- and leaves genuine step-level
-        # cancellation (raised from *inside* `callable_runtime`, once it is
-        # actually running, via the opt-in kwarg below) as the only source
-        # of a `GenerationCancelled` this method can raise, which is
-        # unambiguously a real runtime-use interruption.
         if context is not None:
             # The loaded model's own callable is opaque third-party code (see
             # LearnedVideoLoader), so step-level cancellation only happens if
@@ -296,6 +277,22 @@ class LearnedVideoRuntime(BaseVideoRuntime):
             # argument.
             if _callable_accepts_kwarg(callable_runtime, "raise_if_cancelled"):
                 generation_kwargs["raise_if_cancelled"] = context.raise_if_cancelled
+            # Codex P2 finding "learned-video pre-call cancellation":
+            # VideoGenerator.generate() samples cancellation once, before
+            # calling `render()` at all (`cancelled_before_render`), but
+            # resolving the runtime router and building `generation_kwargs`
+            # above is enough intervening work for cancellation to land in
+            # that window. A *second* boundary check belongs immediately
+            # before this actually-expensive call so an already-cancelled
+            # job never starts inference. It must not raise
+            # `GenerationCancelled` here, though: that would unwind through
+            # `VideoGenerator.generate()`'s `with` block and conservatively
+            # invalidate a runtime this call never touched. A boolean check
+            # plus a sentinel return lets `VideoGenerator` observe the
+            # cancellation, let the lease exit cleanly, and raise only once
+            # the runtime is no longer under active use.
+            if context.is_cancelled():
+                return {"cancelled_before_invocation": True}
         generated = callable_runtime(**generation_kwargs)
         return self._normalize_generated_output(
             generated=generated,
@@ -363,11 +360,21 @@ class LearnedVideoRuntime(BaseVideoRuntime):
             # finished its own runtime-use interval by returning these
             # frames. `pending_frames` defers the actual encode to
             # `VideoGenerator.generate()`, after its lease has released.
+            #
+            # Codex P2 finding "learned-video request parameter parsing":
+            # unlike ProceduralStoryboardRuntime (which coerces its own
+            # `fps` before rendering a single frame), `fps` here is a
+            # request-owned value this adapter never validates itself.
+            # Converting it to a duration eagerly, right here, would still
+            # be inside the active lease -- a malformed value (e.g.
+            # `fps="bad"`) would raise `ValueError` after inference already
+            # completed successfully and incorrectly invalidate a healthy
+            # runtime. The raw value is instead passed through unconverted;
+            # `VideoGenerator.generate()` parses it only once its lease has
+            # released, via `frame_duration_ms_from_fps()`.
             return {
                 "pending_frames": generated,
-                "pending_frame_duration_ms": max(
-                    50, int(1000 / max(1, int(effective_params.get("fps", 8))))
-                ),
+                "pending_frame_fps": effective_params.get("fps", 8),
                 "output_format": "gif",
                 "params": dict(effective_params),
                 "runtime_metadata": {
@@ -408,6 +415,20 @@ def encode_frames_as_gif(
         disposal=2,
     )
     return output_id, output_path
+
+
+def frame_duration_ms_from_fps(fps: Any) -> int:
+    """Convert a request-owned, possibly-unvalidated `fps` value to a GIF frame duration.
+
+    Kept standalone so `VideoGenerator.generate()` can parse `fps` itself,
+    after a `pending_frames` runtime lease has already released -- a
+    malformed value (e.g. `fps="bad"`) then raises `ValueError` with no
+    runtime involved at all, instead of raising from inside
+    `LearnedVideoRuntime.render()`'s active lease. See
+    `LearnedVideoRuntime._normalize_generated_output()`.
+    """
+
+    return max(50, int(1000 / max(1, int(fps))))
 
 
 def _callable_accepts_kwarg(callable_obj: Any, name: str) -> bool:
@@ -453,4 +474,5 @@ __all__ = [
     "SUPPORTED_VIDEO_OUTPUT_FORMATS",
     "VideoRuntimeRouter",
     "encode_frames_as_gif",
+    "frame_duration_ms_from_fps",
 ]
