@@ -147,8 +147,22 @@ class VideoGenerator(BaseGenerator):
         # marking a healthy, never-used runtime INVALID.
         # `render_cancellation_probe_error` is raised only after the lease
         # has already exited cleanly.
+        #
+        # Lane A/B follow-up: the same fault class reaches two more probe
+        # sites still inside this lease -- `render_probe_error` covers a
+        # `safe_is_cancelled()`-wrapped probe *inside* `runtime.render()`
+        # itself (`ProceduralStoryboardRuntime`'s per-frame check and
+        # `LearnedVideoRuntime`'s pre-invocation check, both in
+        # generators/video/runtime.py, handed back via the same
+        # `render_result["probe_error"]` sentinel as a `progress_error`),
+        # and `post_render_probe_error` covers the post-render recheck just
+        # below, once `render()` has already returned successfully. Both
+        # are raised only after the lease has already exited cleanly, same
+        # as `render_cancellation_probe_error`.
         cancelled_before_render = False
         render_cancellation_probe_error: Exception | None = None
+        render_probe_error: Exception | None = None
+        post_render_probe_error: Exception | None = None
         cancelled_before_invocation = False
         late_cancellation = False
         procedural_param_error: Exception | None = None
@@ -182,9 +196,16 @@ class VideoGenerator(BaseGenerator):
                         "cancelled_before_invocation"
                     ):
                         cancelled_before_invocation = True
+                    elif (
+                        isinstance(render_result, dict)
+                        and render_result.get("probe_error") is not None
+                    ):
+                        render_probe_error = render_result["probe_error"]
                     else:
                         if context is not None:
-                            late_cancellation = context.is_cancelled()
+                            late_cancellation, post_render_probe_error = (
+                                safe_is_cancelled(context)
+                            )
                         if isinstance(render_result, dict):
                             progress_error = render_result.get("progress_error")
             runtime_type = type(runtime_obj).__name__
@@ -197,6 +218,15 @@ class VideoGenerator(BaseGenerator):
             # this must be checked and raised before anything below ever
             # references it.
             raise render_cancellation_probe_error
+        if render_probe_error is not None:
+            # A probe inside `runtime.render()` itself raised (frame-loop
+            # or pre-invocation check, generators/video/runtime.py) --
+            # `render_result` only ever carries the minimal `probe_error`
+            # sentinel in this case, never `pending_frames`/`output_path`,
+            # so this must also be checked before anything below reads it.
+            raise render_probe_error
+        if post_render_probe_error is not None:
+            raise post_render_probe_error
         if cancelled_before_render or cancelled_before_invocation or late_cancellation:
             # A learned renderer that writes its own file and returns
             # `output_path` directly (rather than `pending_frames`) has

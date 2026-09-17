@@ -12,8 +12,10 @@ from uuid import uuid4
 
 from PIL import Image, ImageDraw, ImageFont
 
+from core.jobs.context import GenerationCancelled
 from core.models import ModelManifest
 from core.schemas import GenerationRequest
+from generators.common import safe_is_cancelled
 
 if TYPE_CHECKING:
     from core.jobs.context import GenerationContext
@@ -113,7 +115,28 @@ class ProceduralStoryboardRuntime(BaseVideoRuntime):
         progress_error: Exception | None = None
         for frame_index in range(num_frames):
             if context is not None:
-                context.raise_if_cancelled()
+                # PR4b Lane B: `context.is_cancelled()` itself can raise
+                # (JobRepository I/O -- see
+                # `generators/common/cancellation.py`), the same fault mode
+                # `VideoGenerator.generate()`'s own pre-render probe already
+                # guards against, one call frame up. That is external
+                # bookkeeping, not a rendering fault, so it must not
+                # propagate through this `render()` call and invalidate a
+                # runtime that is rendering frames correctly -- captured and
+                # handed back via the same `probe_error` sentinel as a
+                # `report_progress()` failure below, so `VideoGenerator`
+                # raises it only once its lease has already released.
+                # A genuine cancellation request (`cancelled` true, no probe
+                # exception) still raises `GenerationCancelled` here exactly
+                # as `context.raise_if_cancelled()` used to -- mid-render
+                # cancellation keeps its existing conservative invalidation
+                # behavior; only the probe's own external exception is
+                # isolated.
+                cancelled, frame_probe_error = safe_is_cancelled(context)
+                if frame_probe_error is not None:
+                    return {"probe_error": frame_probe_error}
+                if cancelled:
+                    raise GenerationCancelled()
             frames.append(
                 self._render_frame(
                     index=frame_index,
@@ -353,7 +376,18 @@ class LearnedVideoRuntime(BaseVideoRuntime):
             # plus a sentinel return lets `VideoGenerator` observe the
             # cancellation, let the lease exit cleanly, and raise only once
             # the runtime is no longer under active use.
-            if context.is_cancelled():
+            #
+            # PR4b Lane B: `context.is_cancelled()` itself can raise
+            # (JobRepository I/O). Observed here, before the loaded model
+            # (potentially GPU-weight-resident) is ever invoked, that is a
+            # bookkeeping failure, not a runtime fault -- `safe_is_cancelled()`
+            # keeps it from propagating and hands it back the same way as
+            # the `cancelled` sentinel, so `VideoGenerator` raises it only
+            # once this lease has already released.
+            cancelled, probe_error = safe_is_cancelled(context)
+            if probe_error is not None:
+                return {"probe_error": probe_error}
+            if cancelled:
                 return {"cancelled_before_invocation": True}
         generated = callable_runtime(**generation_kwargs)
         return self._normalize_generated_output(

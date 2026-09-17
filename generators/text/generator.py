@@ -88,6 +88,29 @@ class _StructuredGenerationCancelled(Exception):
         self.attempts = attempts
 
 
+class _StructuredGenerationProbeError(Exception):
+    """Private signal: the between-attempts cancellation probe itself raised.
+
+    PR4b Lane A follow-up: mirrors `_StructuredGenerationCancelled`'s own
+    rationale exactly, for the sibling fault. The probe between schema
+    attempts (`_generate_structured()`, right before a repair call) uses
+    `safe_is_cancelled()`, which can hand back a `probe_error` instead of a
+    bool -- a JobRepository/bookkeeping failure, not a runtime fault, and
+    the first inference attempt already completed successfully by the time
+    it is observed. Raising that exact exception here directly would unwind
+    through `TextGenerator.generate()`'s `with self._acquire_runtime(...)`
+    block and mark a healthy runtime `INVALID` for a bookkeeping hiccup.
+
+    Caught only by `generate()`'s own call site, still inside the active
+    lease; `generate()` re-raises the wrapped `probe_error` verbatim only
+    once the lease has already exited cleanly. Never exported.
+    """
+
+    def __init__(self, probe_error: Exception) -> None:
+        super().__init__("cancellation probe failed between schema attempts")
+        self.probe_error = probe_error
+
+
 class TextGenerator(BaseGenerator):
     """Generate story documents with the resolved text runtime."""
 
@@ -232,6 +255,16 @@ class TextGenerator(BaseGenerator):
         cancelled_before_generation = False
         cancellation_probe_error: Exception | None = None
         late_cancellation = False
+        # Lane A follow-up: the between-attempts probe
+        # (`_StructuredGenerationProbeError`, raised by
+        # `_generate_structured()`) and the two post-completion rechecks
+        # below all run *after* the first inference attempt has already
+        # completed successfully, still inside the active lease -- the same
+        # JobRepository-I/O fault class `cancellation_probe_error` above
+        # guards against reaches these sites too. All three share this one
+        # variable since exactly one of them can fire per call; raised only
+        # after the lease has already exited cleanly.
+        late_cancellation_probe_error: Exception | None = None
         schema_error: StorySchemaValidationError | None = None
         with self._acquire_runtime(requested_model_id, context) as handle:
             manifest = handle.manifest
@@ -258,10 +291,14 @@ class TextGenerator(BaseGenerator):
                     )
                 except _StructuredGenerationCancelled:
                     late_cancellation = True
+                except _StructuredGenerationProbeError as exc:
+                    late_cancellation_probe_error = exc.probe_error
                 except StorySchemaValidationError as exc:
                     schema_error = exc
                     if context is not None:
-                        late_cancellation = context.is_cancelled()
+                        late_cancellation, late_cancellation_probe_error = (
+                            safe_is_cancelled(context)
+                        )
                 else:
                     runtime_metadata = {
                         "runtime_type": type(runtime_obj).__name__,
@@ -271,7 +308,9 @@ class TextGenerator(BaseGenerator):
                         "endpoint_base_url": runtime_obj.get("endpoint_base_url"),
                     }
                     if context is not None:
-                        late_cancellation = context.is_cancelled()
+                        late_cancellation, late_cancellation_probe_error = (
+                            safe_is_cancelled(context)
+                        )
 
         # No inference took place, or it completed successfully: exit
         # cleanly instead of marking the cache INVALID. An exception raised
@@ -285,6 +324,8 @@ class TextGenerator(BaseGenerator):
         # `raise` exits the function before that write ever happens.
         if cancellation_probe_error is not None:
             raise cancellation_probe_error
+        if late_cancellation_probe_error is not None:
+            raise late_cancellation_probe_error
         if cancelled_before_generation or late_cancellation:
             raise GenerationCancelled()
         if schema_error is not None:
@@ -454,8 +495,26 @@ class TextGenerator(BaseGenerator):
                     f"### CORRECTION\n{_REPAIR_INSTRUCTION.format(error=last_error)}"
                 )
 
-            if attempt == 1 and context is not None and context.is_cancelled():
-                raise _StructuredGenerationCancelled(raw_text=raw_text, attempts=attempt)
+            if attempt == 1 and context is not None:
+                # PR4b Lane A follow-up: `context.is_cancelled()` itself can
+                # raise (JobRepository I/O -- see
+                # `generators/common/cancellation.py`), the same fault mode
+                # `TextGenerator.generate()`'s own pre-generation probe
+                # already guards against. Observed here, the first
+                # inference attempt has already completed successfully, so
+                # this is a bookkeeping failure, not a runtime fault.
+                # `safe_is_cancelled()` isolates it into
+                # `_StructuredGenerationProbeError`, mirroring
+                # `_StructuredGenerationCancelled` immediately below exactly
+                # -- neither may be `GenerationCancelled`/the raw exception
+                # itself, since either would unwind through
+                # `generate()`'s `with self._acquire_runtime(...)` block and
+                # mark this healthy runtime INVALID.
+                cancelled, probe_error = safe_is_cancelled(context)
+                if probe_error is not None:
+                    raise _StructuredGenerationProbeError(probe_error)
+                if cancelled:
+                    raise _StructuredGenerationCancelled(raw_text=raw_text, attempts=attempt)
 
         # Deliberately no `_write_raw_response()` call here: persisting the
         # diagnostic is filesystem I/O, not part of the runtime-use

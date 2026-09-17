@@ -489,6 +489,191 @@ class TextGeneratorLeaseTests(unittest.TestCase):
                 self.assertIs(handle.runtime, cached_runtime)  # never reloaded
             self.assertEqual(loader.load.call_count, 1)
 
+    def test_probe_error_between_schema_attempts_preserves_runtime(self) -> None:
+        # Lane A follow-up (code-review finding): the between-attempts
+        # cancellation probe in `_generate_structured()` runs after the
+        # first inference attempt has already completed (schema-invalid,
+        # so a repair attempt would otherwise follow). The same fallible
+        # -probe fault class the pre-generation probe guards against
+        # reaches this site too -- observed here, it must not invalidate a
+        # runtime whose first call just completed successfully, and the
+        # repair attempt must never start.
+        with tempfile.TemporaryDirectory() as root:
+            manifest = _template_manifest()
+            calls: list[str] = []
+
+            def schema_invalid_generate(prompt, **kwargs):
+                calls.append(prompt)
+                return "not json"
+
+            runtime_obj = {**_template_runtime(), "generate": schema_invalid_generate}
+            loader = Mock()
+            loader.load.side_effect = lambda item: runtime_obj
+            cache = ModelRuntimeCache()
+            service = ModelService(
+                registry=None,
+                resolver=SimpleNamespace(resolve=lambda *args: manifest),
+                loader_registry=SimpleNamespace(get=lambda name: loader),
+                runtime_cache=cache,
+                admission_capacity=1,
+            )
+            generator = TextGenerator(service, output_dir=Path(root))
+            with service.acquire_runtime("template-writer", "text") as handle:
+                cached_runtime = handle.runtime
+
+            probe_error = RuntimeError("job repository unavailable")
+            call_count = {"n": 0}
+
+            def is_cancelled() -> bool:
+                call_count["n"] += 1
+                # call #1: _acquire_runtime()'s own pre-acquisition check (False)
+                # call #2: the pre-generation probe (False)
+                # call #3: the between-attempts probe, after the first
+                # (schema-invalid) generate_text() call completes -- raises.
+                if call_count["n"] >= 3:
+                    raise probe_error
+                return False
+
+            with self.assertRaises(RuntimeError) as caught:
+                generator.run(
+                    _request("logline"),
+                    context=GenerationContext(is_cancelled=is_cancelled),
+                )
+
+            self.assertIs(caught.exception, probe_error)
+            self.assertEqual(call_count["n"], 3)
+            self.assertEqual(len(calls), 1)  # the repair attempt never started
+            entry = cache._entries[manifest.id]
+            self.assertIs(entry.state, RuntimeState.READY)
+            self.assertEqual(entry.lease_count, 0)
+            with service.acquire_runtime("template-writer", "text") as handle:
+                self.assertIs(handle.runtime, cached_runtime)  # never reloaded
+            self.assertEqual(loader.load.call_count, 1)
+
+    def test_late_cancellation_probe_error_after_successful_generation_preserves_runtime(
+        self,
+    ) -> None:
+        # Lane A follow-up (code-review finding): the post-generation
+        # recheck on the success path runs after inference has already
+        # completed successfully. The same fallible-probe fault class the
+        # pre-generation probe guards against reaches this site too --
+        # observed here, it must not invalidate a runtime that just
+        # generated correctly, and no output file may be written.
+        with tempfile.TemporaryDirectory() as root:
+            manifest = _template_manifest()
+            runtime_obj = {**_template_runtime()}
+            loader = Mock()
+            loader.load.side_effect = lambda item: runtime_obj
+            cache = ModelRuntimeCache()
+            service = ModelService(
+                registry=None,
+                resolver=SimpleNamespace(resolve=lambda *args: manifest),
+                loader_registry=SimpleNamespace(get=lambda name: loader),
+                runtime_cache=cache,
+                admission_capacity=1,
+            )
+            generator = TextGenerator(service, output_dir=Path(root))
+            with service.acquire_runtime("template-writer", "text") as handle:
+                cached_runtime = handle.runtime
+
+            probe_error = RuntimeError("job repository unavailable")
+            call_count = {"n": 0}
+
+            def is_cancelled() -> bool:
+                call_count["n"] += 1
+                # call #1: _acquire_runtime()'s own pre-acquisition check (False)
+                # call #2: the pre-generation probe (False)
+                # call #3: the post-generation success-path recheck, after
+                # generation already completed successfully -- raises.
+                if call_count["n"] >= 3:
+                    raise probe_error
+                return False
+
+            with self.assertRaises(RuntimeError) as caught:
+                generator.run(
+                    _request("logline"),
+                    context=GenerationContext(is_cancelled=is_cancelled),
+                )
+
+            self.assertIs(caught.exception, probe_error)
+            self.assertEqual(call_count["n"], 3)
+            entry = cache._entries[manifest.id]
+            self.assertIs(entry.state, RuntimeState.READY)
+            self.assertEqual(entry.lease_count, 0)
+            with service.acquire_runtime("template-writer", "text") as handle:
+                self.assertIs(handle.runtime, cached_runtime)  # never reloaded
+            self.assertEqual(loader.load.call_count, 1)
+            self.assertEqual(list(Path(root).glob("*.md")), [])  # nothing written
+
+    def test_late_cancellation_probe_error_after_exhausted_repair_preserves_runtime(
+        self,
+    ) -> None:
+        # Lane A follow-up (code-review finding): the post-generation
+        # recheck on the schema-failure path runs after *both* the first
+        # attempt and the repair attempt have already completed (still
+        # schema-invalid). The same fallible-probe fault class reaches this
+        # site too -- observed here, it must not invalidate a runtime whose
+        # inference genuinely completed twice, and the failed-response
+        # diagnostic must never be persisted (the probe error takes
+        # precedence, exactly like an ordinary late cancellation).
+        with tempfile.TemporaryDirectory() as root:
+            manifest = _template_manifest()
+            calls: list[str] = []
+
+            def always_invalid_generate(prompt, **kwargs):
+                calls.append(prompt)
+                return "not json, ever"
+
+            runtime_obj = {**_template_runtime(), "generate": always_invalid_generate}
+            loader = Mock()
+            loader.load.side_effect = lambda item: runtime_obj
+            cache = ModelRuntimeCache()
+            service = ModelService(
+                registry=None,
+                resolver=SimpleNamespace(resolve=lambda *args: manifest),
+                loader_registry=SimpleNamespace(get=lambda name: loader),
+                runtime_cache=cache,
+                admission_capacity=1,
+            )
+            generator = TextGenerator(service, output_dir=Path(root))
+            with service.acquire_runtime("template-writer", "text") as handle:
+                cached_runtime = handle.runtime
+
+            probe_error = RuntimeError("job repository unavailable")
+            call_count = {"n": 0}
+
+            def is_cancelled() -> bool:
+                call_count["n"] += 1
+                # call #1: _acquire_runtime()'s own pre-acquisition check (False)
+                # call #2: the pre-generation probe (False)
+                # call #3: the between-attempts probe, after the first
+                # attempt (False) -- the repair attempt proceeds.
+                # call #4: the post-generation recheck, after both attempts
+                # have completed and schema validation still failed --
+                # raises.
+                if call_count["n"] >= 4:
+                    raise probe_error
+                return False
+
+            with self.assertRaises(RuntimeError) as caught:
+                generator.run(
+                    _request("logline"),
+                    context=GenerationContext(is_cancelled=is_cancelled),
+                )
+
+            self.assertIs(caught.exception, probe_error)
+            self.assertEqual(call_count["n"], 4)
+            self.assertEqual(len(calls), 2)  # both attempts ran
+            entry = cache._entries[manifest.id]
+            self.assertIs(entry.state, RuntimeState.READY)
+            self.assertEqual(entry.lease_count, 0)
+            with service.acquire_runtime("template-writer", "text") as handle:
+                self.assertIs(handle.runtime, cached_runtime)  # never reloaded
+            self.assertEqual(loader.load.call_count, 1)
+            # The raw-response diagnostic must never be written -- the
+            # probe error takes precedence, exactly like late_cancellation.
+            self.assertEqual(list(Path(root).glob("failed_*.txt")), [])
+
     def test_bad_numeric_input_does_not_invalidate_or_reload_runtime(self) -> None:
         for parameter in ("max_tokens", "temperature", "top_p"):
             with self.subTest(parameter=parameter), tempfile.TemporaryDirectory() as root:

@@ -142,6 +142,46 @@ def test_precall_cancellation_probe_error_preserves_runtime_and_skips_render(
     assert loader.load.call_count == 1
 
 
+def test_post_render_probe_error_preserves_runtime(tmp_path, monkeypatch):
+    # Lane A follow-up (code-review finding): the post-render recheck
+    # (`late_cancellation`) runs after `runtime.render()` has already
+    # returned successfully. The same fallible-probe fault class the
+    # pre-render probe guards against reaches this site too -- observed
+    # here, it must not invalidate a runtime that just rendered correctly;
+    # the lease must exit cleanly and the exact external exception must be
+    # re-raised once it is gone.
+    generator, service, cache, loader, renderer = _build(tmp_path, monkeypatch)
+    original_acquire = service.acquire_runtime
+    with original_acquire("target", "video") as handle:
+        cached_runtime = handle.runtime
+
+    probe_error = RuntimeError("job repository unavailable")
+    call_count = {"n": 0}
+
+    def is_cancelled() -> bool:
+        call_count["n"] += 1
+        # call #1: _acquire_runtime()'s own pre-acquisition check (False)
+        # call #2: cancelled_before_render (False) -- render() is called
+        # call #3: the post-render recheck, right after render() already
+        # returned successfully -- raises.
+        if call_count["n"] >= 3:
+            raise probe_error
+        return False
+
+    with pytest.raises(RuntimeError) as caught:
+        generator.run(_request(), context=GenerationContext(is_cancelled=is_cancelled))
+
+    assert caught.value is probe_error
+    assert call_count["n"] == 3
+    renderer.render.assert_called_once()
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY
+    assert entry.lease_count == 0
+    with original_acquire("target", "video", wait_timeout=0) as handle:
+        assert handle.runtime is cached_runtime  # never reloaded
+    assert loader.load.call_count == 1
+
+
 class _ObservedSemaphore:
     def __init__(self, semaphore, attempted):
         self._semaphore = semaphore
@@ -410,6 +450,56 @@ def test_learned_video_precall_cancellation_skips_invocation_and_preserves_runti
     assert loader.load.call_count == 1  # runtime was loaded once, never reloaded
 
 
+def test_learned_video_precall_probe_error_preserves_runtime(tmp_path, monkeypatch):
+    # Lane A follow-up (code-review finding): LearnedVideoRuntime.render()'s
+    # own pre-invocation cancellation check -- immediately before calling
+    # the (potentially GPU-weight-resident) opaque renderer -- can itself
+    # raise the same fallible-probe fault the generator's own
+    # cancelled_before_render probe guards against, one call frame up.
+    # Observed here, before the renderer is ever invoked, it must not
+    # invalidate a healthy, unused runtime; the lease must exit cleanly and
+    # the exact external exception must be re-raised once it is gone.
+    invoked = {"n": 0}
+
+    def fake_renderer(**kwargs):
+        invoked["n"] += 1
+        return {"output_path": str(tmp_path / "out.mp4"), "output_id": "out"}
+
+    generator, service, cache, loader = _learned_video_generator(
+        tmp_path, monkeypatch, renderer=fake_renderer
+    )
+
+    probe_error = RuntimeError("job repository unavailable")
+    call_count = {"n": 0}
+
+    def is_cancelled() -> bool:
+        call_count["n"] += 1
+        # call #1: _acquire_runtime()'s pre-acquisition check (False)
+        # call #2: VideoGenerator's own cancelled_before_render sample
+        # (False) -- render() is therefore entered.
+        # call #3: LearnedVideoRuntime.render()'s own pre-invocation check,
+        # immediately before calling `fake_renderer` -- raises.
+        if call_count["n"] >= 3:
+            raise probe_error
+        return False
+
+    with pytest.raises(RuntimeError) as caught:
+        generator.run(
+            GenerationRequest(media_type="video", prompt="test", model_id="target"),
+            context=GenerationContext(is_cancelled=is_cancelled),
+        )
+
+    assert caught.value is probe_error
+    assert call_count["n"] == 3
+    assert invoked["n"] == 0  # zero renderer calls
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY
+    assert entry.lease_count == 0
+    with service.acquire_runtime("target", "video", wait_timeout=0):
+        pass
+    assert loader.load.call_count == 1  # runtime was loaded once, never reloaded
+
+
 def test_invalid_learned_video_fps_does_not_invalidate_healthy_runtime(
     tmp_path, monkeypatch
 ):
@@ -557,6 +647,67 @@ def test_invalid_procedural_numeric_params_do_not_invalidate_healthy_runtime(
             )
         )
 
+    assert cache._entries["target"] is cached_entry  # never reloaded
+    assert cached_entry.state is RuntimeState.READY
+    assert cached_entry.lease_count == 0
+    assert loader.load.call_count == 1
+
+
+def test_procedural_frame_loop_probe_error_preserves_runtime(tmp_path, monkeypatch):
+    # Lane A/B follow-up (code-review finding): ProceduralStoryboardRuntime's
+    # own per-frame cancellation check (frame_index=0, before any frame is
+    # rendered) can itself raise the same fallible-probe fault the
+    # generator's own cancelled_before_render probe guards against, one
+    # call frame deeper. Observed here, it must not invalidate a healthy
+    # runtime -- the lease must exit cleanly and the exact external
+    # exception re-raised once it is gone. A genuine `GenerationCancelled`
+    # (the ordinary case) is covered by
+    # test_video_successful_render_with_late_cancellation_preserves_runtime
+    # and the procedural-specific tests above; this proves only the
+    # probe's own external exception is isolated, not the cancellation
+    # semantics themselves.
+    generator, service, cache, loader, renderer = _build(tmp_path, monkeypatch)
+    generator.runtime_router = SimpleNamespace(
+        resolve=lambda runtime_obj: ProceduralStoryboardRuntime()
+    )
+
+    # Warm the cache with a real, successful procedural render first, so
+    # there is a genuinely healthy runtime to protect.
+    warm = generator.run(
+        GenerationRequest(
+            media_type="video", prompt="test", model_id="target",
+            params={"duration_seconds": 2, "fps": 4},
+        )
+    )
+    assert warm.status == "succeeded"
+    cached_entry = cache._entries["target"]
+    assert cached_entry.state is RuntimeState.READY
+
+    probe_error = RuntimeError("job repository unavailable")
+    call_count = {"n": 0}
+
+    def is_cancelled() -> bool:
+        call_count["n"] += 1
+        # call #1: _acquire_runtime()'s own pre-acquisition check (False)
+        # call #2: VideoGenerator's own cancelled_before_render probe
+        # (False) -- render() is therefore entered.
+        # call #3: ProceduralStoryboardRuntime.render()'s own frame-loop
+        # check, frame_index=0, before any frame is rendered -- raises.
+        if call_count["n"] >= 3:
+            raise probe_error
+        return False
+
+    with pytest.raises(RuntimeError) as caught:
+        generator.run(
+            GenerationRequest(
+                media_type="video", prompt="test", model_id="target",
+                params={"duration_seconds": 2, "fps": 4},
+            ),
+            context=GenerationContext(is_cancelled=is_cancelled),
+        )
+
+    assert caught.value is probe_error
+    assert call_count["n"] == 3
     assert cache._entries["target"] is cached_entry  # never reloaded
     assert cached_entry.state is RuntimeState.READY
     assert cached_entry.lease_count == 0

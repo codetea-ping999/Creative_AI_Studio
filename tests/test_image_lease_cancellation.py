@@ -394,6 +394,93 @@ def test_lora_mutation_probe_error_preserves_runtime_and_skips_mutation(
     assert loader.load.call_count == 1
 
 
+def test_variation_top_of_loop_probe_error_preserves_runtime(tmp_path, monkeypatch):
+    # Lane A follow-up (code-review finding): the per-variation loop's own
+    # top-of-loop cancellation check runs after _apply_lora() has already
+    # mutated the pipeline -- the same fallible-probe fault class the two
+    # earlier probes guard against reaches this site too. Observed here,
+    # before variation 0 has even started, it must skip that variation
+    # entirely, release the still-healthy (already-mutated) lease cleanly,
+    # and re-raise the exact external exception once it is gone.
+    generator, service, cache, loader, pipelines = _build(tmp_path, monkeypatch)
+    with service.acquire_runtime("target", "image"):
+        pass
+    assert cache._entries["target"].state is RuntimeState.READY
+
+    probe_error = RuntimeError("job repository unavailable")
+    call_count = {"n": 0}
+
+    def is_cancelled() -> bool:
+        call_count["n"] += 1
+        # call #1: _acquire_runtime()'s own pre-acquisition check (False)
+        # call #2: cancelled_before_mutation (False)
+        # call #3: P2-B's cancelled_before_lora probe (False)
+        # call #4: top-of-loop check for variation 0 -- raises
+        if call_count["n"] >= 4:
+            raise probe_error
+        return False
+
+    with pytest.raises(RuntimeError) as caught:
+        generator.run(
+            _request(width=64, height=64, steps=1),
+            context=GenerationContext(is_cancelled=is_cancelled),
+        )
+
+    assert caught.value is probe_error
+    assert call_count["n"] == 4
+    assert pipelines["target"].calls == []  # inference never started
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY
+    assert entry.lease_count == 0
+    with service.acquire_runtime("target", "image", wait_timeout=0):
+        pass
+    assert loader.load.call_count == 1
+
+
+def test_variation_after_provider_call_probe_error_preserves_runtime(tmp_path, monkeypatch):
+    # Lane A follow-up (code-review finding): the per-variation loop's own
+    # after-provider-call cancellation check runs after a variation's
+    # inference has already completed successfully. Observed here, it must
+    # not discard/re-invalidate the runtime that just rendered correctly --
+    # release the lease cleanly and re-raise the exact external exception
+    # once it is gone.
+    generator, service, cache, loader, pipelines = _build(tmp_path, monkeypatch)
+    with service.acquire_runtime("target", "image"):
+        pass
+    assert cache._entries["target"].state is RuntimeState.READY
+
+    probe_error = RuntimeError("job repository unavailable")
+    call_count = {"n": 0}
+
+    def is_cancelled() -> bool:
+        call_count["n"] += 1
+        # call #1: _acquire_runtime()'s own pre-acquisition check (False)
+        # call #2: cancelled_before_mutation (False)
+        # call #3: P2-B's cancelled_before_lora probe (False)
+        # call #4: top-of-loop check for variation 0 (False)
+        # call #5: the check right after the provider call returns -- raises
+        if call_count["n"] >= 5:
+            raise probe_error
+        return False
+
+    with pytest.raises(RuntimeError) as caught:
+        generator.run(
+            _request(width=64, height=64, steps=1),
+            context=GenerationContext(is_cancelled=is_cancelled),
+        )
+
+    assert caught.value is probe_error
+    assert call_count["n"] == 5
+    assert len(pipelines["target"].calls) == 1  # the provider call genuinely ran
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY
+    assert entry.lease_count == 0
+    assert list(tmp_path.glob("*.png")) == []  # nothing written post-lease either
+    with service.acquire_runtime("target", "image", wait_timeout=0):
+        pass
+    assert loader.load.call_count == 1
+
+
 class _ObservedSemaphore:
     def __init__(self, semaphore, attempted):
         self._semaphore = semaphore

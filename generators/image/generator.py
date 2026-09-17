@@ -213,6 +213,16 @@ class ImageGenerator(BaseGenerator):
         # the inference calls that follow it in a broad catch.
         cancelled_before_lora = False
         lora_probe_error: Exception | None = None
+        # Lane A follow-up: the per-variation loop's own two cancellation
+        # checks below run *after* `_apply_lora()` has already mutated the
+        # pipeline (and, for the second one, after a variation's inference
+        # already completed) -- the same JobRepository-I/O fault class the
+        # two probes above guard against reaches these sites too.
+        # `variation_probe_error` isolates it the same way: the loop stops
+        # starting further variations (exactly like `late_cancellation`
+        # below), and the lease still exits cleanly since nothing raises
+        # inside the `with` block for this case.
+        variation_probe_error: Exception | None = None
         late_cancellation = False
         progress_error: Exception | None = None
         validation_error: Exception | None = None
@@ -439,9 +449,13 @@ class ImageGenerator(BaseGenerator):
                         # invoked while inference is genuinely in progress)
                         # is a real mid-use interruption and is left to
                         # propagate and conservatively invalidate.
-                        if context is not None and context.is_cancelled():
-                            late_cancellation = True
-                            break
+                        if context is not None:
+                            cancelled, variation_probe_error = safe_is_cancelled(context)
+                            if variation_probe_error is not None:
+                                break
+                            if cancelled:
+                                late_cancellation = True
+                                break
                         variation_seed = self._derive_variation_seed(
                             base_seed, variation_index
                         )
@@ -468,9 +482,13 @@ class ImageGenerator(BaseGenerator):
                                 pipeline_kwargs=generation_kwargs,
                             )
 
-                        if context is not None and context.is_cancelled():
-                            late_cancellation = True
-                            break
+                        if context is not None:
+                            cancelled, variation_probe_error = safe_is_cancelled(context)
+                            if variation_probe_error is not None:
+                                break
+                            if cancelled:
+                                late_cancellation = True
+                                break
                         # Each provider_result.image is a CPU-side PIL image,
                         # never a device/runtime-bound tensor -- holding up
                         # to _MAX_VARIATION_COUNT (4) of them until after the
@@ -520,6 +538,12 @@ class ImageGenerator(BaseGenerator):
             raise mutation_probe_error
         if lora_probe_error is not None:
             raise lora_probe_error
+        # Lane A follow-up: this probe can also fire mid-loop, after LoRA is
+        # already mutated and/or earlier variations already succeeded --
+        # still a bookkeeping failure, not a runtime fault, raised only
+        # after the lease has already exited cleanly above.
+        if variation_probe_error is not None:
+            raise variation_probe_error
         # No mutation or inference took place, or every started variation's
         # provider call completed successfully before cancellation was
         # observed: exit cleanly instead of marking the cache INVALID. A
