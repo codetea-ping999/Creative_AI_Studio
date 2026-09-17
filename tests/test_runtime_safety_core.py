@@ -14,12 +14,18 @@ contract this suite exists to hold in place.
 
 from __future__ import annotations
 
+import gc
 import json
+import math
+import os
 from pathlib import Path
+import queue
 from tempfile import TemporaryDirectory
 from threading import Barrier, Condition, Event, Lock, Thread, current_thread
 import time
 import unittest
+from unittest import mock
+import weakref
 
 from bootstrap.factories import create_default_model_service
 from core.models.cache import ModelRuntimeCache
@@ -35,7 +41,7 @@ from core.models.runtime_lease import (
 )
 from core.models.service import ModelService, RuntimeAdmissionController
 import core.models.service as service_module
-from core.models.cloud_guard import CloudProviderDisabledError
+from core.models.cloud_guard import CloudProviderDisabledError, cloud_provider_env_flag
 
 
 class _FakeCancellation(BaseException):
@@ -245,6 +251,65 @@ class _RecordingCleanup:
         if self._sequence is not None:
             with self._seq_lock:
                 self._sequence.append(f"{model_id}-cleanup-end")
+
+
+class _Cancelled(Exception):
+    """Stand-in for `GenerationCancelled` (an ordinary `Exception`) raised by a
+    `wait_checkpoint` -- kept local so this suite never imports job code."""
+
+
+class _WeakrefRuntime:
+    """A runtime object that supports weak references, so a test can prove
+    nothing still strongly retains it -- or the `RuntimeEntry` that owns it
+    (`RuntimeEntry` itself has `__slots__` without `__weakref__`)."""
+
+
+class _WeakrefTrackingLoader:
+    def __init__(self):
+        self.load_calls = 0
+        self.refs: list[weakref.ref] = []
+
+    def load(self, manifest):
+        self.load_calls += 1
+        runtime_obj = _WeakrefRuntime()
+        self.refs.append(weakref.ref(runtime_obj))
+        return runtime_obj
+
+
+class _SingleWorker:
+    """WorkerPool-like executor: ONE persistent thread runs submitted jobs
+    sequentially (see `core/jobs/worker_pool.py::WorkerPool._run_worker()`),
+    so a test can prove what a later, logically unrelated job on the very
+    same `Thread` object can or cannot inherit from an earlier one."""
+
+    def __init__(self, name: str):
+        self._jobs: queue.Queue = queue.Queue()
+        self.thread = Thread(target=self._run, name=name, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        while True:
+            job = self._jobs.get()
+            if job is None:
+                return
+            fn, done, box = job
+            try:
+                box["thread"] = current_thread()
+                box["result"] = fn()
+            except BaseException as exc:  # noqa: BLE001
+                box["error"] = exc
+            finally:
+                done.set()
+
+    def submit(self, fn):
+        done: Event = Event()
+        box: dict = {}
+        self._jobs.put((fn, done, box))
+        return done, box
+
+    def stop(self):
+        self._jobs.put(None)
+        self.thread.join(timeout=5)
 
 
 def _build_service(
@@ -1686,10 +1751,14 @@ class RuntimeSafetyCoreTests(unittest.TestCase):
             return original_wait(canonical_id, entry, deadline)
 
         cache.wait_for_stale_entry_drain = instrumented_wait
+        # This call's own operation-local stale-drain state, armed with the
+        # entry its (simulated) revalidation failure was about.
+        drain = service_module._StaleDrainOperation()
+        drain.entry = entry_v1
         try:
             with self.assertRaises(RuntimeBusyError) as caught:
                 service._acquire_entry_after_revalidation_failure(
-                    manifest_a, "image", None, entry_v1,
+                    manifest_a, "image", None, drain,
                 )
             self.assertIs(type(caught.exception), RuntimeBusyError)
         finally:
@@ -1915,323 +1984,992 @@ class RuntimeSafetyCoreTests(unittest.TestCase):
         self.assertEqual(cache._entries["model-a"].lease_count, 0)
         self.assertEqual(service._admission._held_by_thread, {})
 
-    # --------------- PR #420 follow-up P2: stale-drain-across-polling-timeout
+    # ---------- PR #420: operation-scoped stale-drain polling (wait_checkpoint)
     #
-    # Codex-reproduced finding: `wait_timeout` bounds ONE `acquire_runtime()`
-    # call, never the caller's overall logical operation. A cancellation-
-    # aware generator's own polling loop (see e.g.
-    # `generators/image/generator.py::ImageGenerator._acquire_runtime()`,
-    # deliberately unchanged by this fix) reacts to `RuntimeWaitTimeoutError`
-    # by calling the *public* `acquire_runtime()` again -- a fresh call that,
-    # before this fix, carries no memory of the exact stale entry the
-    # previous call's own revalidation failure already earned drain-wait
-    # eligibility on. See `ModelService._remember_stale_drain_continuation()`
-    # / `_pop_stale_drain_continuation()` for the fix.
+    # Approved ownership contract (Design C): stale-drain eligibility belongs
+    # to exactly ONE public `acquire_runtime()` call and never survives it.
+    # A cancellation-aware caller expresses "keep waiting in short slices,
+    # but let me stop between them" with `wait_checkpoint=`, never by
+    # re-calling the public API in its own loop -- separate public calls are
+    # always independent, fresh callers. See `ModelService.acquire_runtime()`.
 
-    def test_stale_drain_continuation_survives_a_polling_timeout_then_converges(self):
-        """B's own polling loop must see `RuntimeWaitTimeoutError` on every
-        poll slice the straggler's still-outstanding stale lease forces --
-        never the permanent, non-retryable `RuntimeBusyError` a lost
-        continuation would produce -- and must converge the instant the
-        straggler finally releases.
+    def _build_stale_drain_scenario(self, loader=None):
+        """A holds entry S; a straggler lease is taken directly at the cache
+        layer (the established stand-in for a second, still-outstanding
+        stale lease-holder -- see
+        test_drain_wait_bounded_by_caller_deadline_surfaces_wait_timeout)."""
 
-        Setup mirrors `test_drain_wait_bounded_by_caller_deadline_surfaces_wait_timeout`:
-        a stale lease taken directly at the cache layer
-        (`cache.acquire_or_reserve()`) stands in for a second, genuinely
-        still-outstanding lease-holder ("C" in the task's own failure
-        model) -- operationally indistinguishable, from
-        `_RuntimeInvalidEntryDrainingError`'s own `lease_count`-only
-        invariant, from a caller that reached the same pin through a real
-        `acquire_runtime()` call. What is new here is that B's own caller
-        (this test's `worker_b_polling_loop`) mirrors a real
-        cancellation-aware generator: each `RuntimeWaitTimeoutError` is
-        answered with a brand-new, *public* `acquire_runtime()` call, on
-        the same thread, exactly as `generators/image/generator.py`'s own
-        `_acquire_runtime()` already does today.
-
-        Before this fix: B's second call's own first attempt lands on
-        entry_v1 -- still INVALID, still pinned by the straggler -- with no
-        revalidation failure of ITS OWN yet in that new call, and is
-        converted immediately to the plain, permanent, non-retryable
-        `RuntimeBusyError` (asserted below via `second_call_result`'s exact
-        type) even though entry_v1 is still provably, boundedly draining
-        and B already earned the right to wait for it.
-        """
         manifest_a = _FakeManifest("model-a")
-        loader = _ImmediateLoader()
+        loader = loader if loader is not None else _ImmediateLoader()
         service, cache = _build_service(
             {"model-a": manifest_a}, {"fake": loader}, admission_capacity=2,
         )
-
         handle_a = service.acquire_runtime("model-a", "image")
-        entry_v1 = handle_a._entry
+        self.assertIs(cache.acquire_or_reserve("model-a", "image"), handle_a._entry)
+        return service, cache, loader, handle_a
 
-        # "C": a second, genuinely still-outstanding stale lease-holder on
-        # the exact same entry -- deliberately released only much later in
-        # this test, from a single controlled point.
-        straggler_pin = cache.acquire_or_reserve("model-a", "image")
-        self.assertIs(straggler_pin, entry_v1)
+    def _gate_pin(self, service, thread_name, *, on_call=1):
+        """Park `thread_name`'s `on_call`-th `_acquire_or_load_entry()` call
+        right after it has pinned its entry, until `proceed` is set.
 
-        pinned_b = Event()
-        original_acquire_or_load = service._acquire_or_load_entry
+        Makes a post-E revalidation failure deterministic: the test
+        invalidates the pinned entry (releasing its E) while the caller is
+        parked here, holding only G and its own lease -- so the caller's
+        next step always wins a free E onto an INVALID entry, never racing
+        its own slice deadline. Returns `(pinned, proceed)`; restored by
+        `del service._acquire_or_load_entry`."""
 
-        def instrumented_acquire_or_load(manifest, media_type, deadline):
-            entry = original_acquire_or_load(manifest, media_type, deadline)
-            pinned_b.set()
+        pinned, proceed = Event(), Event()
+        original = service._acquire_or_load_entry
+        calls = {"n": 0}
+
+        def gated(manifest, media_type, deadline):
+            entry = original(manifest, media_type, deadline)
+            if current_thread().name == thread_name:
+                calls["n"] += 1
+                if calls["n"] == on_call:
+                    pinned.set()
+                    proceed.wait(timeout=5)
             return entry
 
-        service._acquire_or_load_entry = instrumented_acquire_or_load
+        service._acquire_or_load_entry = gated
+        return pinned, proceed
 
-        b_events: list[tuple[str, object]] = []
-        b_error: dict[str, BaseException] = {}
-        second_call_done = Event()
-        allow_third_call = Event()
+    def _record_drain_waits(self, cache):
+        """Record every `wait_for_stale_entry_drain()` as `(thread name,
+        entry generation, converged)` -- generations, never entry objects,
+        so the recorder itself can never retain a `RuntimeEntry`. Returns
+        `(records, timed_out)`; restored by `del cache.wait_for_stale_entry_drain`."""
 
-        def worker_b_polling_loop():
-            # Mirrors generators/image/generator.py's own
-            # `_acquire_runtime()` cancellation-aware loop exactly: on
-            # `RuntimeWaitTimeoutError`, call the *public* acquire_runtime()
-            # again -- nothing internal to one call is retried by this test
-            # harness itself.
+        records: list[tuple[str, int, bool]] = []
+        timed_out = Event()
+        original = cache.wait_for_stale_entry_drain
+
+        def recording(canonical_id, entry, deadline):
+            converged = original(canonical_id, entry, deadline)
+            records.append((current_thread().name, entry.generation, converged))
+            if not converged:
+                timed_out.set()
+            return converged
+
+        cache.wait_for_stale_entry_drain = recording
+        return records, timed_out
+
+    def _resources_held(self, service, cache, canonical_id, entry=None):
+        """Called from INSIDE a `wait_checkpoint`: which of G/L/M/E does this
+        thread (or anyone) still hold? Non-blocking probes only; the caller
+        guarantees no other thread is inside the cache meanwhile."""
+
+        held: list[str] = []
+        if current_thread() in service._admission._held_by_thread:
+            held.append("G")
+        load_lock = cache.lock_for(canonical_id)
+        if load_lock.acquire(blocking=False):
+            load_lock.release()
+        else:
+            held.append("L")
+        if cache._metadata_lock.acquire(blocking=False):
+            cache._metadata_lock.release()
+        else:
+            held.append("M")
+        if entry is not None:
+            if entry.execution_lock.acquire(blocking=False):
+                entry.execution_lock.release()
+            else:
+                held.append("E")
+        return held
+
+    def _assert_service_retains_no_entry(self, service):
+        for name, value in vars(service).items():
+            self.assertNotIsInstance(value, RuntimeEntry, name)
+            if isinstance(value, dict):
+                for item in list(value.values()) + list(value.keys()):
+                    self.assertNotIsInstance(item, RuntimeEntry, name)
+
+    def _assert_exception_chain_carries_no_entry(self, exc):
+        seen = 0
+        visited: set[int] = set()
+        pending: list[BaseException | None] = [exc]
+        while pending:
+            current = pending.pop()
+            if current is None or id(current) in visited:
+                continue
+            visited.add(id(current))
+            seen += 1
+            self.assertIsNone(
+                getattr(current, "entry", None),
+                f"{type(current).__name__} in the surfaced chain carries a RuntimeEntry",
+            )
+            pending.extend([current.__cause__, current.__context__])
+        self.assertGreaterEqual(seen, 1)
+
+    # 1 + 2 + 14: converge across repeated slices, nothing held at checkpoints
+    def test_checkpointed_acquire_converges_across_stale_drain_timeout_slices(self):
+        service, cache, loader, handle_a = self._build_stale_drain_scenario()
+        stale = handle_a._entry
+        pinned, proceed = self._gate_pin(service, "b")
+        drain_records, _ = self._record_drain_waits(cache)
+        reached, release = Event(), Event()
+        checkpoint_timeouts_seen: list[int] = []
+        held_at_checkpoint: list[tuple[int, list[str]]] = []
+        result: dict = {}
+
+        def checkpoint():
+            timeouts = sum(1 for _, _, converged in drain_records if not converged)
+            first = not checkpoint_timeouts_seen
+            checkpoint_timeouts_seen.append(timeouts)
+            # Before the first slice A still legitimately owns S's E and a
+            # lease; from the second checkpoint on, only the straggler does.
+            held = self._resources_held(service, cache, "model-a", None if first else stale)
+            if not first and stale.lease_count != 1:
+                held.append(f"lease_count={stale.lease_count}")
+            held_at_checkpoint.append((len(checkpoint_timeouts_seen), held))
+            if timeouts >= 3 and not reached.is_set():
+                reached.set()
+                release.wait(timeout=5)
+
+        def worker():
             try:
-                try:
-                    service.acquire_runtime("model-a", "image", wait_timeout=0.2)
-                    self.fail("first poll slice unexpectedly succeeded")
-                except RuntimeWaitTimeoutError as exc:
-                    b_events.append(("first_call", type(exc)))
-
-                try:
-                    service.acquire_runtime("model-a", "image", wait_timeout=0.2)
-                    self.fail("second poll slice unexpectedly succeeded")
-                except RuntimeBusyError as exc:
-                    # Deliberately caught at the plain, public
-                    # `RuntimeBusyError` level -- the exact type recorded
-                    # is the RED/GREEN assertion: `RuntimeBusyError` itself
-                    # (the bug -- permanent, non-retryable) versus
-                    # `RuntimeWaitTimeoutError` (the fix -- retryable).
-                    b_events.append(("second_call", type(exc)))
-                finally:
-                    second_call_done.set()
-
-                self.assertTrue(allow_third_call.wait(timeout=5))
-
-                # Third call: once the straggler has released, this must
-                # converge -- on the SAME thread, proving the continuation
-                # chain resolves to genuine success, not merely to a
-                # retryable exception type.
-                handle = service.acquire_runtime("model-a", "image", wait_timeout=5)
-                b_events.append(("third_call", handle))
+                result["handle"] = service.acquire_runtime(
+                    "model-a", "image", wait_checkpoint=checkpoint, poll_interval=0.05,
+                )
             except BaseException as exc:  # noqa: BLE001
-                b_error["error"] = exc
+                result["error"] = exc
 
-        tb = Thread(target=worker_b_polling_loop, daemon=True)
+        tb = Thread(target=worker, name="b", daemon=True)
         try:
             tb.start()
-            self.assertTrue(pinned_b.wait(timeout=5))
-            service._acquire_or_load_entry = original_acquire_or_load
-            self.assertEqual(entry_v1.lease_count, 3)  # A + straggler + B
-
+            self.assertTrue(pinned.wait(timeout=5))
+            self.assertEqual(stale.lease_count, 3)  # A + straggler + B
             handle_a.release(had_exception=True)
-            self.assertEqual(entry_v1.state, RuntimeState.INVALID)
+            self.assertIs(stale.state, RuntimeState.INVALID)
+            proceed.set()
 
-            # Requirement: B's second call must land -- deterministically,
-            # bounded by `second_call_done`, never a sleep guess.
-            self.assertTrue(second_call_done.wait(timeout=5))
-
-            # entry_v1 must still be the cache's one and only entry
-            # throughout both timed-out poll slices -- the straggler's pin
-            # never let an unrelated second load happen, and no
-            # replacement entry was ever installed while it was still
-            # pinned (generation identity, requirement 2).
-            self.assertIs(cache._entries["model-a"], entry_v1)
+            self.assertTrue(reached.wait(timeout=5))
+            # B is parked inside its own checkpoint after >= 3 drain-timeout
+            # slices -- every one of them on S itself, the same exact
+            # generation, never a replacement, never another thread.
+            self.assertGreaterEqual(len(drain_records), 3)
+            self.assertEqual(
+                {(name, gen, ok) for name, gen, ok in drain_records},
+                {("b", stale.generation, False)},
+            )
+            self.assertIs(cache._entries["model-a"], stale)
             self.assertEqual(loader.load_calls, 1)
+            self.assertEqual(stale.lease_count, 1)
 
-            self.assertEqual([kind for kind, _ in b_events], ["first_call", "second_call"])
-            self.assertIs(b_events[0][1], RuntimeWaitTimeoutError)
-            # The core assertion this test exists for: B's second, public
-            # `acquire_runtime()` call -- carrying no explicit memory of
-            # entry_v1 of its own -- still surfaces the retryable
-            # `RuntimeWaitTimeoutError`, exactly like the first call, never
-            # the permanent `RuntimeBusyError` a lost continuation across
-            # the polling boundary would produce.
-            self.assertIs(b_events[1][1], RuntimeWaitTimeoutError)
-
-            # No leak from either timed-out attempt: only the straggler's
-            # deliberately-still-outstanding pin remains.
-            self.assertEqual(entry_v1.lease_count, 1)
-            self.assertEqual(entry_v1.state, RuntimeState.INVALID)
-            self.assertEqual(service._admission._held_by_thread, {})
-            self.assertTrue(cache.lock_for("model-a").acquire(blocking=False))
-            cache.lock_for("model-a").release()
-            self.assertTrue(entry_v1.execution_lock.acquire(blocking=False))
-            entry_v1.execution_lock.release()
-
-            # Now let "C" release -- the only thing that can let the drain
-            # converge (requirement 3).
-            cache.release_lease("model-a", entry_v1)
-            self.assertEqual(entry_v1.lease_count, 0)
-            allow_third_call.set()
-
+            cache.release_lease("model-a", stale)  # the straggler finally drains
+            release.set()
             tb.join(timeout=5)
             self.assertFalse(tb.is_alive())
-            self.assertEqual(b_error, {})
-            self.assertEqual(
-                [kind for kind, _ in b_events],
-                ["first_call", "second_call", "third_call"],
-            )
-            handle_b = b_events[2][1]
+            self.assertNotIn("error", result)
+            handle_b = result["handle"]
             try:
-                self.assertIsNotNone(handle_b.runtime)
-                entry_v2 = cache._entries["model-a"]
-                self.assertIsNot(entry_v2, entry_v1)
-                self.assertGreater(entry_v2.generation, entry_v1.generation)
-                self.assertEqual(entry_v2.state, RuntimeState.READY)
+                self.assertIsNot(handle_b._entry, stale)
+                self.assertGreater(handle_b._entry.generation, stale.generation)
                 self.assertEqual(loader.load_calls, 2)
             finally:
                 handle_b.release()
 
-            self.assertEqual(cache._entries["model-a"].lease_count, 0)
+            self.assertEqual(
+                [item for item in held_at_checkpoint if item[1]], [],
+                "wait_checkpoint ran while runtime resources were still held",
+            )
+            self.assertGreaterEqual(len(checkpoint_timeouts_seen), 4)
             self.assertEqual(service._admission._held_by_thread, {})
-            # The continuation token itself must never outlive its own
-            # single use: nothing left behind for this thread once B's
-            # operation has fully resolved.
-            self.assertIsNone(service._stale_drain_continuation.get(tb))
+            self._assert_service_retains_no_entry(service)
         finally:
-            # Unconditional teardown: never leave a non-daemon thread
-            # blocked forever on a regression in this fix (the same class
-            # of test-harness hazard as the RETIRING tests below) -- `tb`
-            # is already daemon=True, and every gating Event is force-set
-            # here regardless of which assertion above failed, so this
-            # thread can always finish (or safely be abandoned as a daemon)
-            # rather than hanging the suite.
-            allow_third_call.set()
-            second_call_done.set()
+            proceed.set()
+            release.set()
             tb.join(timeout=5)
 
-    def test_stale_drain_continuation_is_scoped_to_its_own_thread(self):
-        # A continuation token recorded for one thread must never let a
-        # *different*, genuinely fresh caller thread bypass the "no
-        # revalidation failure of its own yet" fail-fast rule for the same
-        # entry -- eligibility is per-caller, never global.
-        manifest_a = _FakeManifest("model-a")
-        loader = _ImmediateLoader()
-        service, cache = _build_service(
-            {"model-a": manifest_a}, {"fake": loader}, admission_capacity=2,
-        )
+    # 3 + 8 + 9: cancellation at a checkpoint abandons state, retains nothing
+    def test_checkpoint_cancellation_after_drain_timeout_abandons_stale_state(self):
+        loader = _WeakrefTrackingLoader()
+        service, cache, _, handle_a = self._build_stale_drain_scenario(loader)
+        stale = handle_a._entry
+        pinned, proceed = self._gate_pin(service, "b")
+        drain_records, drain_timed_out = self._record_drain_waits(cache)
+        cancellation = _Cancelled("job cancelled while waiting for a stale drain")
+        checkpoint_calls = {"n": 0}
+        result: dict = {}
 
-        entry_v1 = cache.acquire_or_reserve("model-a", "image")
-        cache.publish_ready_and_pin("model-a", entry_v1, {"id": "model-a"})
-        straggler_pin = cache.acquire_or_reserve("model-a", "image")
-        self.assertIs(straggler_pin, entry_v1)
-        cache.mark_invalid("model-a", entry_v1)
-        self.assertEqual(entry_v1.lease_count, 2)
+        def checkpoint():
+            checkpoint_calls["n"] += 1
+            if drain_timed_out.is_set():
+                raise cancellation
 
-        # This test's own (main) thread holds a stale-drain continuation
-        # token for entry_v1, as if it had itself timed out mid-drain-wait
-        # in an earlier `acquire_runtime()` call.
-        service._remember_stale_drain_continuation(entry_v1)
-
-        drain_calls: list[RuntimeEntry] = []
-        original_wait = cache.wait_for_stale_entry_drain
-
-        def instrumented_wait(canonical_id, entry, deadline):
-            drain_calls.append(entry)
-            return original_wait(canonical_id, entry, deadline)
-
-        cache.wait_for_stale_entry_drain = instrumented_wait
-
-        other_result: dict[str, BaseException] = {}
-
-        def other_thread():
+        def worker():
             try:
-                service._acquire_entry_with_execution_lock(manifest_a, "image", None)
+                service.acquire_runtime(
+                    "model-a", "image", wait_checkpoint=checkpoint, poll_interval=0.05,
+                )
             except BaseException as exc:  # noqa: BLE001
-                other_result["error"] = exc
+                result["error"] = exc
 
-        t = Thread(target=other_thread, daemon=True)
+        tb = Thread(target=worker, name="b", daemon=True)
         try:
-            t.start()
-            t.join(timeout=5)
-            self.assertFalse(t.is_alive())
-            # A genuinely different thread, with no token of its own, still
-            # fails fast -- exactly the existing, unmodified contract.
-            self.assertIs(type(other_result.get("error")), RuntimeBusyError)
-            self.assertEqual(drain_calls, [])
-
-            # This thread's own token is untouched by the other thread's
-            # call -- still available for a genuine continuation here.
-            self.assertIs(service._pop_stale_drain_continuation(), entry_v1)
+            tb.start()
+            self.assertTrue(pinned.wait(timeout=5))
+            handle_a.release(had_exception=True)
+            proceed.set()
+            tb.join(timeout=5)
+            self.assertFalse(tb.is_alive())
         finally:
-            cache.wait_for_stale_entry_drain = original_wait
-            t.join(timeout=5)
+            proceed.set()
+            tb.join(timeout=5)
 
-        cache.release_lease("model-a", entry_v1)
-        cache.release_lease("model-a", entry_v1)
+        # The checkpoint's own exception object, unchanged, with no
+        # runtime-internal exception attached as its context.
+        self.assertIs(result.get("error"), cancellation)
+        self.assertIsNone(cancellation.__context__)
+        self.assertIsNone(cancellation.__cause__)
+        self.assertEqual(checkpoint_calls["n"], 2)  # before slice 1, after its timeout
+        self.assertEqual([ok for _, _, ok in drain_records], [False])
 
-    def test_stale_drain_continuation_does_not_transfer_to_a_replacement_entry(self):
-        # A continuation token recorded for entry_v1 must never grant free
-        # drain-wait access to a *different* entry_v2 under the same
-        # canonical id, even though both are independently INVALID and
-        # pinned -- the same generation-isolation guarantee
-        # test_generation_isolation_does_not_attach_drain_retry_to_a_different_entry
-        # already proves for the intra-call retry, extended across the
-        # public call boundary this fix introduces (requirement 5: a
-        # replacement generation must never inherit stale eligibility).
+        # Nothing leaked: only the straggler's lease remains.
+        self.assertEqual(stale.lease_count, 1)
+        self.assertEqual(service._admission._held_by_thread, {})
+        self.assertTrue(stale.execution_lock.acquire(blocking=False))
+        stale.execution_lock.release()
+        self.assertTrue(cache.lock_for("model-a").acquire(blocking=False))
+        cache.lock_for("model-a").release()
+        self._assert_service_retains_no_entry(service)
+
+        # Retention proof, with the surfaced cancellation still alive: once
+        # the cache itself drops S, S (and its runtime) must be collectable.
+        del cache.wait_for_stale_entry_drain
+        del service._acquire_or_load_entry
+        runtime_ref = loader.refs[0]
+        cache.release_lease("model-a", stale)
+        del stale, handle_a
+        service.unload_model("model-a")
+        self.assertNotIn("model-a", cache._entries)
+        gc.collect()
+        self.assertIsNone(runtime_ref(), "the abandoned stale entry is still strongly retained")
+        self.assertIs(result["error"], cancellation)
+
+    # 4 (plain API): the documented contract -- separate calls never share state
+    def test_reused_worker_thread_after_abandoned_plain_polling_is_a_fresh_caller(self):
+        service, cache, loader, handle_a = self._build_stale_drain_scenario()
+        stale = handle_a._entry
+        pinned, proceed = self._gate_pin(service, "worker")
+        drain_records, drain_timed_out = self._record_drain_waits(cache)
+        pool = _SingleWorker("worker")
+
+        def job_one():
+            # A hand-written poll loop of plain calls that gives up (as a
+            # cancelled job would) right after its first stale-drain timeout.
+            while True:
+                try:
+                    return service.acquire_runtime("model-a", "image", wait_timeout=0.05)
+                except RuntimeWaitTimeoutError:
+                    if drain_timed_out.is_set():
+                        raise _Cancelled("job one cancelled")
+
+        def job_two():
+            return service.acquire_runtime("model-a", "image", wait_timeout=1.0)
+
+        try:
+            done_one, box_one = pool.submit(job_one)
+            self.assertTrue(pinned.wait(timeout=5))
+            handle_a.release(had_exception=True)
+            proceed.set()
+            self.assertTrue(done_one.wait(timeout=5))
+            self.assertIsInstance(box_one.get("error"), _Cancelled)
+            waits_after_job_one = len(drain_records)
+            self.assertEqual(waits_after_job_one, 1)
+
+            # S is still INVALID and still pinned by the straggler.
+            self.assertIs(cache._entries["model-a"], stale)
+            self.assertEqual(stale.lease_count, 1)
+
+            done_two, box_two = pool.submit(job_two)
+            self.assertTrue(done_two.wait(timeout=5))
+            self.assertIs(box_two["thread"], box_one["thread"])
+            # A logically unrelated job on the very same worker thread is a
+            # fresh caller: immediate, plain, non-retryable busy -- it never
+            # waits on the old job's stale drain.
+            self.assertIs(type(box_two.get("error")), RuntimeBusyError)
+            self.assertEqual(len(drain_records), waits_after_job_one)
+            self._assert_service_retains_no_entry(service)
+            self.assertEqual(service._admission._held_by_thread, {})
+        finally:
+            proceed.set()
+            pool.stop()
+        cache.release_lease("model-a", stale)
+
+    # 4 (checkpoint API)
+    def test_reused_worker_thread_after_abandoned_checkpoint_polling_is_a_fresh_caller(self):
+        service, cache, loader, handle_a = self._build_stale_drain_scenario()
+        stale = handle_a._entry
+        pinned, proceed = self._gate_pin(service, "worker")
+        drain_records, drain_timed_out = self._record_drain_waits(cache)
+        pool = _SingleWorker("worker")
+        job_two_checkpoints = {"n": 0}
+
+        def cancelling_checkpoint():
+            if drain_timed_out.is_set():
+                raise _Cancelled("job one cancelled")
+
+        def counting_checkpoint():
+            job_two_checkpoints["n"] += 1
+
+        def job_one():
+            return service.acquire_runtime(
+                "model-a", "image", wait_checkpoint=cancelling_checkpoint, poll_interval=0.05,
+            )
+
+        def job_two_checkpointed():
+            return service.acquire_runtime(
+                "model-a", "image", wait_checkpoint=counting_checkpoint, poll_interval=0.05,
+            )
+
+        def job_two_plain():
+            return service.acquire_runtime("model-a", "image", wait_timeout=1.0)
+
+        try:
+            done_one, box_one = pool.submit(job_one)
+            self.assertTrue(pinned.wait(timeout=5))
+            handle_a.release(had_exception=True)
+            proceed.set()
+            self.assertTrue(done_one.wait(timeout=5))
+            self.assertIsInstance(box_one.get("error"), _Cancelled)
+            waits_after_job_one = len(drain_records)
+            self.assertEqual(waits_after_job_one, 1)
+            self.assertEqual(stale.lease_count, 1)
+
+            for job in (job_two_checkpointed, job_two_plain):
+                with self.subTest(job=job.__name__):
+                    done, box = pool.submit(job)
+                    self.assertTrue(done.wait(timeout=5))
+                    self.assertIs(box["thread"], box_one["thread"])
+                    self.assertIs(type(box.get("error")), RuntimeBusyError)
+                    self.assertEqual(len(drain_records), waits_after_job_one)
+            # Checkpointed job two failed fast on its very first slice.
+            self.assertEqual(job_two_checkpoints["n"], 1)
+            self._assert_service_retains_no_entry(service)
+            self.assertEqual(service._admission._held_by_thread, {})
+        finally:
+            proceed.set()
+            pool.stop()
+        cache.release_lease("model-a", stale)
+
+    # 5: a replacement generation never inherits stale eligibility
+    def test_checkpointed_acquire_never_transfers_eligibility_to_a_replacement_generation(self):
+        service, cache, loader, handle_a = self._build_stale_drain_scenario()
+        stale = handle_a._entry
+        pinned, proceed = self._gate_pin(service, "b")
+        drain_records, drain_timed_out = self._record_drain_waits(cache)
+        reached, release = Event(), Event()
+        checkpoint_calls = {"n": 0}
+        result: dict = {}
+
+        def checkpoint():
+            checkpoint_calls["n"] += 1
+            if drain_timed_out.is_set() and not reached.is_set():
+                reached.set()
+                release.wait(timeout=5)
+
+        def worker():
+            try:
+                result["handle"] = service.acquire_runtime(
+                    "model-a", "image", wait_checkpoint=checkpoint, poll_interval=0.05,
+                )
+            except BaseException as exc:  # noqa: BLE001
+                result["error"] = exc
+
+        tb = Thread(target=worker, name="b", daemon=True)
+        replacement = None
+        try:
+            tb.start()
+            self.assertTrue(pinned.wait(timeout=5))
+            handle_a.release(had_exception=True)
+            proceed.set()
+            self.assertTrue(reached.wait(timeout=5))
+
+            # B holds nothing while parked. Drain S, replace it with a new
+            # generation T, and make T itself INVALID and still pinned.
+            cache.release_lease("model-a", stale)
+            replacement = cache.acquire_or_reserve("model-a", "image")
+            self.assertIsNot(replacement, stale)
+            self.assertGreater(replacement.generation, stale.generation)
+            cache.publish_ready_and_pin("model-a", replacement, {"id": "model-a", "gen": 2})
+            self.assertIs(cache.acquire_or_reserve("model-a", "image"), replacement)
+            cache.mark_invalid("model-a", replacement)
+            self.assertEqual(replacement.lease_count, 2)
+            waits_before = len(drain_records)
+
+            release.set()
+            tb.join(timeout=5)
+            self.assertFalse(tb.is_alive())
+            self.assertNotIn("handle", result)
+            self.assertIs(type(result.get("error")), RuntimeBusyError)
+            self.assertEqual(len(drain_records), waits_before)  # never waited on T
+            self.assertEqual(checkpoint_calls["n"], 2)
+            self.assertEqual(replacement.lease_count, 2)
+            self.assertIs(replacement.state, RuntimeState.INVALID)
+            self.assertEqual(service._admission._held_by_thread, {})
+            self.assertTrue(replacement.execution_lock.acquire(blocking=False))
+            replacement.execution_lock.release()
+        finally:
+            proceed.set()
+            release.set()
+            tb.join(timeout=5)
+            if replacement is not None:
+                while replacement.lease_count:
+                    cache.release_lease("model-a", replacement)
+
+    # existing one-revalidation-retry bound, per logical operation
+    def test_checkpointed_acquire_keeps_one_revalidation_retry_per_logical_operation(self):
+        service, cache, loader, handle_a = self._build_stale_drain_scenario()
+        stale = handle_a._entry
+        pinned, proceed = self._gate_pin(service, "b")
+        drain_records, drain_timed_out = self._record_drain_waits(cache)
+        reached, release = Event(), Event()
+        result: dict = {}
+
+        def checkpoint():
+            if drain_timed_out.is_set() and not reached.is_set():
+                reached.set()
+                release.wait(timeout=5)
+
+        def worker():
+            try:
+                result["handle"] = service.acquire_runtime(
+                    "model-a", "image", wait_checkpoint=checkpoint, poll_interval=0.05,
+                )
+            except BaseException as exc:  # noqa: BLE001
+                result["error"] = exc
+
+        tb = Thread(target=worker, name="b", daemon=True)
+        handle_c = None
+        pinned_again = proceed_again = None
+        try:
+            tb.start()
+            self.assertTrue(pinned.wait(timeout=5))
+            handle_a.release(had_exception=True)
+            proceed.set()
+            self.assertTrue(reached.wait(timeout=5))
+
+            # While B is parked (holding nothing): S drains and C loads a
+            # fresh generation T, holding its E.
+            cache.release_lease("model-a", stale)
+            handle_c = service.acquire_runtime("model-a", "image")
+            fresh = handle_c._entry
+            self.assertIsNot(fresh, stale)
+            self.assertEqual(loader.load_calls, 2)
+
+            # B's next slice pins T and parks; C then fails, invalidating T
+            # while B holds a lease on it -- a SECOND post-E revalidation
+            # failure within B's one logical operation.
+            pinned_again, proceed_again = self._gate_pin(service, "b")
+            release.set()
+            self.assertTrue(pinned_again.wait(timeout=5))
+            handle_c.release(had_exception=True)
+            handle_c = None
+            proceed_again.set()
+
+            tb.join(timeout=5)
+            self.assertFalse(tb.is_alive())
+            self.assertNotIn("handle", result)
+            self.assertIs(type(result.get("error")), RuntimeBusyError)
+            self.assertEqual(loader.load_calls, 2)  # no third load
+            self.assertEqual(fresh.lease_count, 0)
+            self.assertIs(fresh.state, RuntimeState.INVALID)
+            self.assertEqual(service._admission._held_by_thread, {})
+        finally:
+            proceed.set()
+            release.set()
+            if proceed_again is not None:
+                proceed_again.set()
+            if handle_c is not None:
+                handle_c.release()
+            tb.join(timeout=5)
+
+    # 6: an ordinary checkpoint exception propagates unchanged
+    def test_checkpoint_runtime_error_propagates_unchanged(self):
         manifest_a = _FakeManifest("model-a")
         loader = _ImmediateLoader()
-        service, cache = _build_service(
-            {"model-a": manifest_a}, {"fake": loader}, admission_capacity=2,
-        )
+        service, cache = _build_service({"model-a": manifest_a}, {"fake": loader})
 
-        entry_v1 = cache.acquire_or_reserve("model-a", "image")
-        cache.publish_ready_and_pin("model-a", entry_v1, {"id": "model-a", "gen": 1})
-        cache.mark_invalid("model-a", entry_v1)
-        cache.release_lease("model-a", entry_v1)
-        self.assertEqual(entry_v1.lease_count, 0)
+        probe_failure = RuntimeError("cancellation probe failed")
 
-        entry_v2 = cache.acquire_or_reserve("model-a", "image")
-        self.assertIsNot(entry_v2, entry_v1)
-        self.assertGreater(entry_v2.generation, entry_v1.generation)
-        cache.publish_ready_and_pin("model-a", entry_v2, {"id": "model-a", "gen": 2})
-        second_pin = cache.acquire_or_reserve("model-a", "image")
-        self.assertIs(second_pin, entry_v2)
-        cache.mark_invalid("model-a", entry_v2)
-        self.assertEqual(entry_v2.lease_count, 2)
+        def failing_checkpoint():
+            raise probe_failure
 
-        # Simulate a prior `acquire_runtime()` call on this thread that
-        # timed out mid-drain-wait on entry_v1 -- a generation that has
-        # since fully drained and is no longer current at all.
-        service._remember_stale_drain_continuation(entry_v1)
+        # Before the first slice: the checkpoint runs before the model id is
+        # even resolved ("missing-model" would raise KeyError otherwise).
+        with self.assertRaises(RuntimeError) as caught:
+            service.acquire_runtime("missing-model", "image", wait_checkpoint=failing_checkpoint)
+        self.assertIs(caught.exception, probe_failure)
+        self.assertEqual(loader.load_calls, 0)
+        self.assertEqual(service._admission._held_by_thread, {})
 
-        drain_calls: list[RuntimeEntry] = []
-        original_wait = cache.wait_for_stale_entry_drain
+        # After a genuinely timed-out G slice.
+        owner = service.acquire_runtime("model-a", "image")
+        calls = {"n": 0}
+        second_failure = RuntimeError("cancellation probe failed after a slice")
+        result: dict = {}
 
-        def instrumented_wait(canonical_id, entry, deadline):
-            drain_calls.append(entry)
-            return original_wait(canonical_id, entry, deadline)
+        def checkpoint():
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise second_failure
 
-        cache.wait_for_stale_entry_drain = instrumented_wait
+        def worker():
+            try:
+                service.acquire_runtime(
+                    "model-a", "image", wait_checkpoint=checkpoint, poll_interval=0.05,
+                )
+            except BaseException as exc:  # noqa: BLE001
+                result["error"] = exc
+
+        tb = Thread(target=worker, daemon=True)
         try:
-            with self.assertRaises(RuntimeBusyError) as caught:
-                service._acquire_entry_with_execution_lock(manifest_a, "image", None)
-            self.assertIs(type(caught.exception), RuntimeBusyError)
+            tb.start()
+            tb.join(timeout=5)
+            self.assertFalse(tb.is_alive())
+            self.assertIs(result.get("error"), second_failure)
+            self.assertIsNone(second_failure.__context__)
+            self.assertEqual(calls["n"], 2)
+            self.assertEqual(set(service._admission._held_by_thread), {current_thread()})
         finally:
-            cache.wait_for_stale_entry_drain = original_wait
+            owner.release()
+            tb.join(timeout=5)
+        with service.acquire_runtime("model-a", "image", wait_timeout=0):
+            pass
 
-        # entry_v2's own drain must never even be consulted through the
-        # stale entry_v1 token -- it fails fast exactly like a fresh
-        # caller's would.
-        self.assertEqual(drain_calls, [])
-        self.assertEqual(entry_v2.lease_count, 2)
-        self.assertEqual(entry_v2.state, RuntimeState.INVALID)
+    # 7: a BaseException from the checkpoint leaks nothing
+    def test_checkpoint_base_exception_leaks_no_resource_or_stale_state(self):
+        service, cache, loader, handle_a = self._build_stale_drain_scenario()
+        stale = handle_a._entry
+        pinned, proceed = self._gate_pin(service, "b")
+        drain_records, drain_timed_out = self._record_drain_waits(cache)
+        interruption = _FakeCancellation()
+        result: dict = {}
 
-        # The mismatched token is discarded (single-use, popped
-        # unconditionally at the top of the call), not left behind to be
-        # (mis)applied to some later, unrelated call.
-        self.assertIsNone(service._pop_stale_drain_continuation())
+        def checkpoint():
+            if drain_timed_out.is_set():
+                raise interruption
 
-        cache.release_lease("model-a", entry_v2)
-        cache.release_lease("model-a", entry_v2)
+        def worker():
+            try:
+                service.acquire_runtime(
+                    "model-a", "image", wait_checkpoint=checkpoint, poll_interval=0.05,
+                )
+            except BaseException as exc:  # noqa: BLE001
+                result["error"] = exc
+
+        tb = Thread(target=worker, name="b", daemon=True)
+        try:
+            tb.start()
+            self.assertTrue(pinned.wait(timeout=5))
+            handle_a.release(had_exception=True)
+            proceed.set()
+            tb.join(timeout=5)
+            self.assertFalse(tb.is_alive())
+        finally:
+            proceed.set()
+            tb.join(timeout=5)
+
+        self.assertIs(result.get("error"), interruption)
+        self.assertIsNone(interruption.__context__)
+        self.assertEqual(stale.lease_count, 1)  # straggler only
+        self.assertEqual(service._admission._held_by_thread, {})
+        self.assertTrue(stale.execution_lock.acquire(blocking=False))
+        stale.execution_lock.release()
+        self.assertTrue(cache.lock_for("model-a").acquire(blocking=False))
+        cache.lock_for("model-a").release()
+        self.assertTrue(cache._metadata_lock.acquire(blocking=False))
+        cache._metadata_lock.release()
+        self._assert_service_retains_no_entry(service)
+        cache.release_lease("model-a", stale)
+
+    # 8 + 9 (plain mode): a surfaced drain timeout retains nothing
+    def test_surfaced_stale_drain_timeout_does_not_retain_the_stale_entry(self):
+        loader = _WeakrefTrackingLoader()
+        service, cache, _, handle_a = self._build_stale_drain_scenario(loader)
+        stale = handle_a._entry
+        pinned, proceed = self._gate_pin(service, "b")
+        drain_records, _ = self._record_drain_waits(cache)
+        result: dict = {}
+
+        def worker():
+            try:
+                service.acquire_runtime("model-a", "image", wait_timeout=0.05)
+            except BaseException as exc:  # noqa: BLE001
+                result["error"] = exc
+
+        tb = Thread(target=worker, name="b", daemon=True)
+        try:
+            tb.start()
+            self.assertTrue(pinned.wait(timeout=5))
+            handle_a.release(had_exception=True)
+            proceed.set()
+            tb.join(timeout=5)
+            self.assertFalse(tb.is_alive())
+        finally:
+            proceed.set()
+            tb.join(timeout=5)
+
+        surfaced = result.get("error")
+        self.assertIs(type(surfaced), RuntimeWaitTimeoutError)
+        self.assertEqual([ok for _, _, ok in drain_records], [False])
+        self._assert_exception_chain_carries_no_entry(surfaced)
+        self._assert_service_retains_no_entry(service)
+
+        del cache.wait_for_stale_entry_drain
+        del service._acquire_or_load_entry
+        runtime_ref = loader.refs[0]
+        cache.release_lease("model-a", stale)
+        del stale, handle_a
+        service.unload_model("model-a")
+        gc.collect()
+        self.assertIsNone(runtime_ref(), "the surfaced timeout still retains the stale entry")
+        self.assertIs(result["error"], surfaced)
+
+    # 9 (plain mode): a surfaced fail-fast busy error retains nothing
+    def test_surfaced_fail_fast_busy_does_not_retain_the_invalid_entry(self):
+        loader = _WeakrefTrackingLoader()
+        service, cache, _, handle_a = self._build_stale_drain_scenario(loader)
+        stale = handle_a._entry
+        handle_a.release(had_exception=True)
+        self.assertEqual(stale.lease_count, 1)  # straggler only
+
+        with self.assertRaises(RuntimeBusyError) as caught:
+            service.acquire_runtime("model-a", "image", wait_timeout=0)
+        surfaced = caught.exception
+        self.assertIs(type(surfaced), RuntimeBusyError)
+        self._assert_exception_chain_carries_no_entry(surfaced)
+
+        runtime_ref = loader.refs[0]
+        cache.release_lease("model-a", stale)
+        del stale, handle_a, caught
+        service.unload_model("model-a")
+        gc.collect()
+        self.assertIsNone(runtime_ref(), "the surfaced busy error still retains the INVALID entry")
+        self.assertIs(type(surfaced), RuntimeBusyError)
+
+    # 10: another thread never inherits operation state
+    def test_checkpointed_operation_state_is_invisible_to_other_threads(self):
+        service, cache, loader, handle_a = self._build_stale_drain_scenario()
+        stale = handle_a._entry
+        pinned, proceed = self._gate_pin(service, "b")
+        drain_records, drain_timed_out = self._record_drain_waits(cache)
+        reached, release = Event(), Event()
+        result: dict = {}
+
+        def checkpoint_b():
+            if drain_timed_out.is_set() and not reached.is_set():
+                reached.set()
+                release.wait(timeout=5)
+
+        def worker_b():
+            try:
+                result["b"] = service.acquire_runtime(
+                    "model-a", "image", wait_checkpoint=checkpoint_b, poll_interval=0.05,
+                )
+            except BaseException as exc:  # noqa: BLE001
+                result["b_error"] = exc
+
+        d_checkpoints = {"n": 0}
+
+        def checkpoint_d():
+            d_checkpoints["n"] += 1
+
+        def worker_d():
+            for mode in ("checkpointed", "plain"):
+                try:
+                    if mode == "checkpointed":
+                        service.acquire_runtime(
+                            "model-a", "image", wait_checkpoint=checkpoint_d, poll_interval=0.05,
+                        )
+                    else:
+                        service.acquire_runtime("model-a", "image", wait_timeout=1.0)
+                    result[f"d_{mode}"] = "acquired"
+                except BaseException as exc:  # noqa: BLE001
+                    result[f"d_{mode}"] = exc
+
+        tb = Thread(target=worker_b, name="b", daemon=True)
+        td = Thread(target=worker_d, name="d", daemon=True)
+        try:
+            tb.start()
+            self.assertTrue(pinned.wait(timeout=5))
+            handle_a.release(had_exception=True)
+            proceed.set()
+            self.assertTrue(reached.wait(timeout=5))
+
+            # B has earned eligibility on S and is parked mid-operation.
+            td.start()
+            td.join(timeout=5)
+            self.assertFalse(td.is_alive())
+            self.assertIs(type(result.get("d_checkpointed")), RuntimeBusyError)
+            self.assertIs(type(result.get("d_plain")), RuntimeBusyError)
+            self.assertEqual(d_checkpoints["n"], 1)
+            self.assertEqual([name for name, _, _ in drain_records if name == "d"], [])
+
+            # B's own operation still converges once S drains.
+            cache.release_lease("model-a", stale)
+            release.set()
+            tb.join(timeout=5)
+            self.assertFalse(tb.is_alive())
+            self.assertNotIn("b_error", result)
+            try:
+                self.assertGreater(result["b"]._entry.generation, stale.generation)
+            finally:
+                result["b"].release()
+            self.assertEqual(service._admission._held_by_thread, {})
+        finally:
+            proceed.set()
+            release.set()
+            tb.join(timeout=5)
+            td.join(timeout=5)
+
+    # 11: a finite wait_timeout is one overall deadline, never reset per slice
+    def test_checkpoint_finite_wait_timeout_is_one_overall_deadline(self):
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service({"model-a": manifest_a}, {"fake": loader})
+        owner = service.acquire_runtime("model-a", "image")  # holds the only G slot
+
+        def run_contended(wait_timeout, poll_interval):
+            outcome: dict = {"checkpoints": 0}
+
+            def checkpoint():
+                outcome["checkpoints"] += 1
+
+            def worker():
+                started = time.monotonic()
+                try:
+                    service.acquire_runtime(
+                        "model-a", "image", wait_timeout=wait_timeout,
+                        wait_checkpoint=checkpoint, poll_interval=poll_interval,
+                    )
+                except BaseException as exc:  # noqa: BLE001
+                    outcome["error"] = exc
+                outcome["elapsed"] = time.monotonic() - started
+
+            tb = Thread(target=worker, daemon=True)
+            tb.start()
+            # A per-slice deadline reset would never end: a bounded join that
+            # the thread survives is the failure signal, not a timing guess.
+            tb.join(timeout=5)
+            self.assertFalse(tb.is_alive())
+            return outcome
+
+        try:
+            spanning = run_contended(0.3, 0.05)
+            self.assertIs(type(spanning.get("error")), RuntimeWaitTimeoutError)
+            self.assertIsNone(spanning["error"].__context__)
+            self.assertGreaterEqual(spanning["elapsed"], 0.3)
+            self.assertGreaterEqual(spanning["checkpoints"], 2)
+            self.assertLessEqual(spanning["checkpoints"], 1 + math.ceil(0.3 / 0.05) + 1)
+
+            capped = run_contended(0.02, 5.0)
+            self.assertIs(type(capped.get("error")), RuntimeWaitTimeoutError)
+            self.assertEqual(capped["checkpoints"], 1)
+            self.assertLess(capped["elapsed"], 5.0)
+            self.assertEqual(set(service._admission._held_by_thread), {current_thread()})
+        finally:
+            owner.release()
+
+    # 12: wait_timeout=None waits in real, bounded slices -- never spins
+    def test_checkpoint_none_timeout_waits_in_bounded_slices_without_spinning(self):
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service({"model-a": manifest_a}, {"fake": loader})
+        owner = service.acquire_runtime("model-a", "image")
+
+        semaphore_calls: list[tuple[str, tuple, dict]] = []
+        real_semaphore = service._admission._semaphore
+
+        class _RecordingSemaphore:
+            def acquire(self, *args, **kwargs):
+                semaphore_calls.append((current_thread().name, args, kwargs))
+                return real_semaphore.acquire(*args, **kwargs)
+
+            def release(self):
+                return real_semaphore.release()
+
+        service._admission._semaphore = _RecordingSemaphore()
+        stamps: list[float] = []
+        fourth_checkpoint = Event()
+        result: dict = {}
+
+        def checkpoint():
+            stamps.append(time.monotonic())
+            if len(stamps) == 4:
+                fourth_checkpoint.set()
+
+        def worker():
+            try:
+                handle = service.acquire_runtime(
+                    "model-a", "image", wait_checkpoint=checkpoint, poll_interval=0.2,
+                )
+                handle.release()
+                result["ok"] = True
+            except BaseException as exc:  # noqa: BLE001
+                result["error"] = exc
+
+        tb = Thread(target=worker, name="poller", daemon=True)
+        try:
+            tb.start()
+            self.assertTrue(fourth_checkpoint.wait(timeout=5))
+            owner.release()
+            owner = None
+            tb.join(timeout=5)
+            self.assertFalse(tb.is_alive())
+            self.assertEqual(result, {"ok": True})
+        finally:
+            if owner is not None:
+                owner.release()
+            tb.join(timeout=5)
+            service._admission._semaphore = real_semaphore
+
+        self.assertGreaterEqual(len(stamps), 4)
+        for earlier, later in zip(stamps, stamps[1:]):
+            self.assertGreaterEqual(later - earlier, 0.2 - 1e-6)
+        poller_calls = [kwargs for name, _, kwargs in semaphore_calls if name == "poller"]
+        self.assertEqual(len(poller_calls), len(stamps))  # one G attempt per slice
+        self.assertTrue(all(kwargs.get("timeout", 0) > 0 for kwargs in poller_calls))
+
+    # 13: wait_timeout=0 stays a single non-blocking attempt
+    def test_checkpoint_wait_timeout_zero_is_a_single_non_blocking_attempt(self):
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service({"model-a": manifest_a}, {"fake": loader})
+        owner = service.acquire_runtime("model-a", "image")
+        semaphore_calls: list[dict] = []
+        real_semaphore = service._admission._semaphore
+
+        class _RecordingSemaphore:
+            def acquire(self, *args, **kwargs):
+                semaphore_calls.append(dict(kwargs))
+                return real_semaphore.acquire(*args, **kwargs)
+
+            def release(self):
+                return real_semaphore.release()
+
+        checkpoints = {"n": 0}
+        result: dict = {}
+
+        def checkpoint():
+            checkpoints["n"] += 1
+
+        def worker():
+            try:
+                service.acquire_runtime(
+                    "model-a", "image", wait_timeout=0,
+                    wait_checkpoint=checkpoint, poll_interval=5.0,
+                )
+            except BaseException as exc:  # noqa: BLE001
+                result["error"] = exc
+
+        service._admission._semaphore = _RecordingSemaphore()
+        tb = Thread(target=worker, daemon=True)
+        try:
+            tb.start()
+            tb.join(timeout=5)
+            self.assertFalse(tb.is_alive())
+        finally:
+            service._admission._semaphore = real_semaphore
+            owner.release()
+            tb.join(timeout=5)
+
+        self.assertIs(type(result.get("error")), RuntimeWaitTimeoutError)
+        self.assertEqual(checkpoints["n"], 1)
+        self.assertEqual(semaphore_calls, [{"blocking": False}])
+
+    def test_invalid_wait_parameters_are_rejected_before_any_resource(self):
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service({"model-a": manifest_a}, {"fake": loader})
+        resolve_calls = {"n": 0}
+        original_resolve = service.resolver.resolve
+
+        def counting_resolve(*args, **kwargs):
+            resolve_calls["n"] += 1
+            return original_resolve(*args, **kwargs)
+
+        service.resolver.resolve = counting_resolve
+        checkpoints = {"n": 0}
+
+        def checkpoint():
+            checkpoints["n"] += 1
+
+        cases = [
+            ({"poll_interval": 0}, ValueError),
+            ({"poll_interval": -0.1}, ValueError),
+            ({"poll_interval": math.nan}, ValueError),
+            ({"poll_interval": math.inf}, ValueError),
+            ({"poll_interval": True}, TypeError),
+            ({"poll_interval": "0.1"}, TypeError),
+            ({"wait_checkpoint": "not callable"}, TypeError),
+            ({"wait_checkpoint": checkpoint, "wait_timeout": -1}, ValueError),
+            ({"wait_checkpoint": checkpoint, "wait_timeout": math.nan}, ValueError),
+            ({"wait_checkpoint": checkpoint, "wait_timeout": math.inf}, ValueError),
+            ({"wait_checkpoint": checkpoint, "wait_timeout": True}, TypeError),
+        ]
+        for kwargs, expected in cases:
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(expected):
+                    service.acquire_runtime("model-a", "image", **kwargs)
+        self.assertEqual(resolve_calls["n"], 0)
+        self.assertEqual(checkpoints["n"], 0)
+        self.assertEqual(loader.load_calls, 0)
+        self.assertEqual(service._admission._held_by_thread, {})
+        self.assertNotIn("model-a", cache._entries)
+
+        # Plain mode keeps its existing `wait_timeout` semantics untouched.
+        with service.acquire_runtime("model-a", "image", wait_timeout=-1):
+            pass
+
+    def test_checkpoint_mode_rechecks_cloud_opt_in_before_every_slice(self):
+        # Revoking a cloud opt-in while a checkpointed call is between slices
+        # must deny its next slice -- the same "revocation blocks even a
+        # waiting caller" property a generator's old per-slice public calls
+        # had -- and the refusal must leave nothing held or loaded.
+        cloud = _FakeManifest("cloud-model", provider="cloud")
+        local = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service(
+            {"cloud-model": cloud, "model-a": local}, {"fake": loader},
+            max_entries=2,
+        )
+        owner = service.acquire_runtime("model-a", "image")  # holds the only G slot
+        provider_flag = cloud_provider_env_flag("cloud-model")
+        checkpoints = {"n": 0}
+        result: dict = {}
+
+        def checkpoint():
+            checkpoints["n"] += 1
+            if checkpoints["n"] == 2:  # only ever reached after a timed-out slice
+                os.environ[provider_flag] = "false"
+
+        def worker():
+            try:
+                service.acquire_runtime(
+                    "cloud-model", "image", wait_checkpoint=checkpoint, poll_interval=0.05,
+                )
+            except BaseException as exc:  # noqa: BLE001
+                result["error"] = exc
+
+        tb = Thread(target=worker, daemon=True)
+        with mock.patch.dict(os.environ, {"ALLOW_CLOUD_PROVIDERS": "true", provider_flag: "true"}):
+            try:
+                tb.start()
+                tb.join(timeout=5)
+                self.assertFalse(tb.is_alive())
+            finally:
+                owner.release()
+                tb.join(timeout=5)
+
+        self.assertIsInstance(result.get("error"), CloudProviderDisabledError)
+        self.assertEqual(checkpoints["n"], 2)
+        self.assertEqual(loader.load_calls, 1)  # only the owner's local model
+        self.assertNotIn("cloud-model", cache._entries)
+        self.assertEqual(service._admission._held_by_thread, {})
 
     # ------------------- PR #420 follow-up P2: stale-drain-through-RETIRING
     def test_stale_drain_converges_through_the_exact_entrys_own_retiring_window(self):

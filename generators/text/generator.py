@@ -9,7 +9,6 @@ from uuid import uuid4
 
 from core.jobs.context import GenerationCancelled
 from core.models import ModelService
-from core.models.runtime_lease import RuntimeWaitTimeoutError
 from core.models.text_runtimes import extract_json_object
 from core.quality import evaluate_text_output
 from core.schemas import GenerationRequest, GenerationResult
@@ -362,29 +361,25 @@ class TextGenerator(BaseGenerator):
     def _acquire_runtime(
         self, model_id: str | None, context: "GenerationContext | None"
     ) -> "RuntimeHandle":
-        """Cancellation-aware admission wait, mirroring Image/VideoGenerator.
+        """Cancellation-aware runtime wait, mirroring Image/VideoGenerator.
 
-        Bounded polling covers only the wait for a contended process-wide
-        admission slot; text inference itself remains a single blocking
-        call with no preemption once it starts (no new preemption contract
-        is introduced here).
+        One checkpointed `acquire_runtime()` call: ModelService waits in
+        bounded slices and calls `context.raise_if_cancelled` between them
+        with nothing held. Only synchronization waits are waited out; cache
+        capacity, invalid entries and loader errors still surface. Text
+        inference itself remains a single blocking call with no preemption
+        once it starts (no new preemption contract is introduced here).
         """
 
         if context is None:
             return self.model_service.acquire_runtime(
                 model_id, media_type="text", task_type=self.task_type
             )
-        while True:
-            context.raise_if_cancelled()
-            try:
-                return self.model_service.acquire_runtime(
-                    model_id, media_type="text", task_type=self.task_type,
-                    wait_timeout=_CANCELLATION_POLL_SECONDS,
-                )
-            except RuntimeWaitTimeoutError:
-                # Only synchronization waits are retryable. Cache capacity,
-                # invalid entries and loader errors must still surface.
-                context.raise_if_cancelled()
+        return self.model_service.acquire_runtime(
+            model_id, media_type="text", task_type=self.task_type,
+            wait_checkpoint=context.raise_if_cancelled,
+            poll_interval=_CANCELLATION_POLL_SECONDS,
+        )
 
     def _generate_structured(
         self,

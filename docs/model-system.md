@@ -173,7 +173,9 @@ runtime が evict される」といった race を型として塞いでいま�
   generator 側をすべて `acquire_runtime()` へ移行するまでの互換維持用と
   位置づけます。新規呼び出しをここへ追加しないでください
 - 新しい `ModelService.acquire_runtime(model_id, media_type, task_type=None,
-  *, wait_timeout=None) -> RuntimeHandle` が安全な取得経路です
+  *, wait_timeout=None, wait_checkpoint=None, poll_interval=0.1) -> RuntimeHandle`
+  が安全な取得経路です（`wait_checkpoint`/`poll_interval`は後述の
+  「checkpoint mode」を参照）
 
 ```python
 with model_service.acquire_runtime(model_id, media_type, task_type) as handle:
@@ -240,14 +242,66 @@ caller が同じ entry を再度 `acquire_or_reserve()` した際に
 `threading.Condition`（`_metadata_lock`をLockではなくConditionに
 した上で、`release_lease()`が lease 減算のたびに`notify_all()`する）
 で実装しており、poll/busy-spinは一切行いません。deadlineが尽きれば
-既存の公開`RuntimeWaitTimeoutError`が送出されるため、
-cancellation-awareなgenerator側の既存の`wait_timeout`ポーリング
-ループはそのまま機能します。この仕組みはG/L/E順序・
-`RuntimeEntry`の構造・publicな例外taxonomy・generator側の契約を
-一切変更しません（`core/models/runtime_lease.py`の
-`_RuntimeInvalidEntryDrainingError`はprivateなtype変更のみで、
-message・timing・「ここでは待たず即決定する」という
-`acquire_or_reserve()`自体の挙動は不変です）。
+既存の公開`RuntimeWaitTimeoutError`が送出されます。この仕組みはG/L/E
+順序・`RuntimeEntry`の構造・publicな例外taxonomyを一切変更しません
+（`core/models/runtime_lease.py`の`_RuntimeInvalidEntryDrainingError`は
+privateなtype変更のみで、message・timing・「ここでは待たず即決定する」
+という`acquire_or_reserve()`自体の挙動は不変です）。
+
+**stale-drain資格の所有権：1回の公開呼び出しに限定**（PR #420）：
+上記の「再検証失敗の原因となった**まさにその** entry を待ってよい」
+という資格は、**1回の`acquire_runtime()`呼び出し**だけが所有し、その
+呼び出しを越えて生き残ることはありません。資格は呼び出しローカルな
+private holder に保持され、成功・timeout・checkpoint例外・その他
+あらゆる例外のいずれで終わっても`finally`で破棄されます。
+`ModelService`のfieldにも、threadをkeyにしたdict/thread-localにも
+保存しません。したがって別々の公開呼び出し（callerが自前で書いた
+plainな呼び出しのretryループを含む）は常に独立したfresh callerであり、
+WorkerPoolのworker threadが後で別jobに再利用されても資格は引き継がれず、
+INVALIDかつpin中のentryに対しては即座に非retryの`RuntimeBusyError`に
+なります。再検証失敗のretry予算（1回）も、この論理的な1回の呼び出し
+ごとに1回です。
+
+**checkpoint mode**（`wait_checkpoint`を渡した場合）：cooperativeな
+キャンセルをしながら待ちたいcallerの正式な経路です。1回の公開呼び出しが
+1つの論理的な待機操作になります。
+
+- `wait_checkpoint()`は最初の同期取得の前に1回、その後は
+  `RuntimeWaitTimeoutError`で終わった同期sliceの後ごとに呼ばれます。
+  呼ばれる時点で、この呼び出しはG/L/E/M/leaseを**一切保持していません**。
+  正常にreturnしたときだけ次のsliceが始まり、送出した例外（キャンセル、
+  失敗したprobe、`BaseException`）はそのまま伝播して操作が終わります
+- 各sliceは通常のG -> L -> E取得で、`min(now + poll_interval, 全体deadline)`
+  で束縛されます
+- `wait_timeout`は呼び出し全体のdeadline（呼び出し開始時点から計測、
+  sliceごとにリセットしない）。`None`は無期限ですが、checkpointで区切られた
+  有界sliceの繰り返しとしてのみ待ちます。`0`は1回の非blocking試行のままで、
+  polling待機にはなりません。checkpoint modeでは`None`または有限の`>= 0`
+  でなければなりません
+- model idの解決は最初のcheckpointの後に1回だけ。cloud providerのopt-in
+  guardは各sliceの前に毎回再確認します
+- 次のsliceを始めてよいのは`RuntimeWaitTimeoutError`だけです。それ以外の
+  `RuntimeBusyError`やあらゆる例外は、その時点で呼び出しを終わらせます
+- 同じ呼び出しのslice間では、自分の再検証失敗で得た資格が保持されます。
+  次のsliceの最初の試行が**同一object**のentryで
+  `_RuntimeInvalidEntryDrainingError`に当たった場合だけdrain待ちを再開し、
+  別のentry/generationなら即座に`RuntimeBusyError`です
+
+`wait_checkpoint=None`（plain mode）は従来どおり`wait_timeout`で束縛された
+1回のsliceで、`poll_interval`は値の検証のみ行い使いません。不正な
+`poll_interval`/`wait_checkpoint`（checkpoint modeでは`wait_timeout`も）は、
+model id解決やresource取得より前に`TypeError`/`ValueError`になります。
+
+Image/Video/Textの各generatorは、`GenerationContext`がある場合に
+`wait_checkpoint=context.raise_if_cancelled`を渡す1回の呼び出しで
+runtimeを取得します（generator側で公開APIを呼び直すループは持ちません）。
+
+**公開例外が内部entryを保持しないこと**：`acquire_runtime()`が送出する
+`RuntimeBusyError`/`RuntimeWaitTimeoutError`は、捕捉した内部例外と同じ
+公開型・同じmessageの新しいinstanceとして、内部例外の`except`スコープの
+外で送出されます。そのため`__cause__`/`__context__`/tracebackから、
+`.entry`でstaleな`RuntimeEntry`（とそのruntime object）を掴んだprivate
+例外に到達することはありません。
 
 **admissionの共有範囲**（Codex round 1 review, Finding 1）：
 `ModelService.__init__`が`admission`/`admission_capacity`を

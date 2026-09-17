@@ -109,9 +109,13 @@ class _RuntimeInvalidEntryDrainingError(RuntimeBusyError):
     internally, whether to wait out the drain -- bounded by the caller's
     own acquisition deadline, and only for the exact entry that caused this
     caller's own, already-observed `_RuntimeExecutionRevalidationFailed` --
-    instead of failing immediately. A caller reaching this branch with no
-    revalidation failure of its own yet (the ordinary case) still converts
-    this into the plain, public `RuntimeBusyError` on the spot; see
+    instead of failing immediately. That eligibility is owned by one
+    `acquire_runtime()` call and never outlives it. A caller reaching this
+    branch with no revalidation failure of its own yet in that call (the
+    ordinary case) still converts this into the plain, public
+    `RuntimeBusyError` on the spot -- raised outside this exception's
+    `except` scope, so the public error never chains back to this object
+    or its `entry`; see
     `docs/model-system.md`'s Runtime Safety Core section for the full
     contract.
     """

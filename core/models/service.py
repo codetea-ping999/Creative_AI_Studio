@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+import math
 import time
 from threading import Lock, Semaphore, Thread, current_thread
 from typing import Any
@@ -27,6 +29,65 @@ from .runtime_lease import (
 # classification (cloud/procedural) is PR4b+ scope, and even then the
 # default for anything unclassified stays protected ("unknown => protected").
 DEFAULT_ADMISSION_CAPACITY = 1
+
+# Upper bound on one synchronization slice of a checkpointed
+# `acquire_runtime(wait_checkpoint=...)` call -- see that method's docstring.
+DEFAULT_WAIT_POLL_INTERVAL = 0.1
+
+
+def _validate_wait_parameters(
+    wait_timeout: float | None,
+    wait_checkpoint: Callable[[], None] | None,
+    poll_interval: float,
+) -> None:
+    """Reject malformed waiting parameters before any resolution or resource.
+
+    `poll_interval` is always validated (an invalid explicit value is a
+    programming error even where it is unused). `wait_timeout` is validated
+    only in checkpoint mode: plain mode keeps its long-standing, lenient
+    semantics (a negative value is simply a non-blocking attempt).
+    """
+
+    if isinstance(poll_interval, bool) or not isinstance(poll_interval, (int, float)):
+        raise TypeError(f"poll_interval must be a number, got {poll_interval!r}.")
+    if not math.isfinite(poll_interval) or poll_interval <= 0:
+        raise ValueError(f"poll_interval must be finite and > 0, got {poll_interval!r}.")
+    if wait_checkpoint is None:
+        return
+    if not callable(wait_checkpoint):
+        raise TypeError(f"wait_checkpoint must be callable, got {wait_checkpoint!r}.")
+    if wait_timeout is None:
+        return
+    if isinstance(wait_timeout, bool) or not isinstance(wait_timeout, (int, float)):
+        raise TypeError(f"wait_timeout must be a number or None, got {wait_timeout!r}.")
+    if not math.isfinite(wait_timeout) or wait_timeout < 0:
+        raise ValueError(
+            "wait_timeout must be None or finite and >= 0 when wait_checkpoint "
+            f"is given, got {wait_timeout!r}."
+        )
+
+
+class _StaleDrainOperation:
+    """Stale-drain eligibility owned by exactly one `acquire_runtime()` call.
+
+    Created empty on public entry and cleared in that call's own `finally`
+    -- never stored on `ModelService`, never keyed by thread, never visible
+    to any other call. `entry` is armed only by this call's own post-E
+    `_RuntimeExecutionRevalidationFailed`, and is only ever compared by
+    object identity. Internal code reads it inline and never binds it to a
+    local variable, so no frame on a surfaced traceback can keep the stale
+    entry reachable once this holder is cleared.
+    """
+
+    __slots__ = ("entry",)
+
+    def __init__(self) -> None:
+        self.entry: RuntimeEntry | None = None
+
+    def armed_entry(self) -> RuntimeEntry:
+        if self.entry is None:
+            raise RuntimeError("stale-drain state was used before it was armed")
+        return self.entry
 
 
 def _acquire_with_deadline(lockable: Lock | Semaphore, deadline: float | None) -> bool:
@@ -653,66 +714,6 @@ class ModelService:
             # one -- see that function's own callers) still shares one gate.
             self._admission = get_default_admission_controller()
 
-        # Multi-waiter INVALID-entry drain continuity across cancellation-
-        # aware polling timeouts (PR #420 follow-up P2, issue #414 follow-
-        # up -- see `_acquire_entry_with_execution_lock()` and
-        # `_acquire_entry_after_revalidation_failure()` for the full
-        # mechanics and rationale). A tiny, short-lived hint, entirely
-        # internal to this instance: "the last stale `RuntimeEntry` this
-        # exact thread's own drain-wait timed out on, still unconsumed."
-        # Keyed by the calling `Thread` object itself, never
-        # `get_ident()`'s raw, recyclable integer -- same rationale as
-        # `RuntimeAdmissionController.__init__`'s own `_held_by_thread`.
-        # `_stale_drain_lock` guards nothing but this one dict, for the
-        # duration of a single dict operation -- never held while waiting
-        # on G, L, E, or the cache's own metadata lock.
-        self._stale_drain_lock = Lock()
-        self._stale_drain_continuation: dict[Thread, RuntimeEntry] = {}
-
-    def _pop_stale_drain_continuation(self) -> RuntimeEntry | None:
-        """Consume (and forget) this thread's own pending stale-drain token, if any.
-
-        Single-use by design: called exactly once, at the very top of
-        `_acquire_entry_with_execution_lock()`, on every `acquire_runtime()`
-        call -- whether or not this particular call ends up needing it. A
-        call that does not consume it still discards it, so a worker thread
-        later reused (see `core/jobs/worker_pool.py`) for a completely
-        unrelated job never inherits a forgotten token from an earlier one:
-        continuity is scoped to exactly the one call immediately following
-        the timeout that set it, never further.
-        """
-
-        with self._stale_drain_lock:
-            return self._stale_drain_continuation.pop(current_thread(), None)
-
-    def _remember_stale_drain_continuation(self, entry: RuntimeEntry) -> None:
-        """Record `entry` as this thread's own still-draining stale entry.
-
-        Called only from `_acquire_entry_after_revalidation_failure()`, only
-        at the exact point its own `wait_for_stale_entry_drain()` call
-        returns `False` -- this thread's own acquisition deadline elapsed
-        while `entry` was still blocking reacquisition, i.e. only once this
-        thread has already earned drain-eligibility on `entry` via its own
-        post-E revalidation failure (in this call or, transitively, a prior
-        one -- see below), and is about to surface `RuntimeWaitTimeoutError`
-        for a poll slice that ran out, not for a drain that actually failed.
-
-        A cancellation-aware caller's own bounded polling loop (e.g. a
-        generator's `_acquire_runtime()`, which never changes for this fix)
-        catches exactly that exception and calls the public
-        `acquire_runtime()` again -- a fresh call, on the same thread, with
-        no memory of `entry` unless this dict supplies it. Without this,
-        that fresh call's first attempt lands on the same still-INVALID,
-        still-pinned `entry` with no revalidation failure of its OWN yet in
-        that new call, and `_acquire_entry_with_execution_lock()` would
-        convert it to a plain, permanent `RuntimeBusyError` immediately --
-        silently losing retry eligibility this thread already earned,
-        purely because of where the public call boundary happened to fall.
-        """
-
-        with self._stale_drain_lock:
-            self._stale_drain_continuation[current_thread()] = entry
-
     def list_models(
         self,
         *,
@@ -838,6 +839,8 @@ class ModelService:
         task_type: str | None = None,
         *,
         wait_timeout: float | None = None,
+        wait_checkpoint: Callable[[], None] | None = None,
+        poll_interval: float = DEFAULT_WAIT_POLL_INTERVAL,
     ) -> RuntimeHandle:
         """Acquire a leased, execution-locked runtime as a context manager.
 
@@ -928,8 +931,9 @@ class ModelService:
         genuine cache miss, after G/L are both already held) -- there is no
         general loader-preemption/cancellation mechanism in PR4a, and this
         parameter makes no promise about total wall-clock time for a call
-        that ends up loading. `wait_timeout=None` (the default) blocks the
-        ordinary way on G/L/E -- see `_acquire_with_deadline()`'s own
+        that ends up loading. In plain mode, `wait_timeout=None` (the
+        default) blocks the ordinary way on G/L/E (checkpoint mode instead
+        waits in bounded slices -- see below) -- see `_acquire_with_deadline()`'s own
         docstring for why that is not the "indefinite wait" issue #414
         forbids. (Codex-review Finding 8, round 1: this parameter was
         previously named `timeout` and its docstring claimed to be "a single
@@ -940,9 +944,44 @@ class ModelService:
         not turned into a general preemption framework -- delivers.)
 
         A G/L/E wait deadline raises `RuntimeWaitTimeoutError`, a subtype
-        of `RuntimeBusyError`. Cancellation-aware callers may retry only that
-        subtype; pinned capacity and invalid-entry errors remain immediate
-        failures rather than being silently converted into indefinite waits.
+        of `RuntimeBusyError`. Only that subtype is ever waited out again
+        (see checkpoint mode below); pinned capacity and invalid-entry
+        errors remain immediate failures rather than being silently
+        converted into indefinite waits.
+
+        **Checkpoint mode** (`wait_checkpoint` given; PR #420, issue #414
+        follow-up -- the supported way to wait cooperatively). One public
+        call is one logical waiting operation:
+
+        - `wait_checkpoint()` is called once before the first
+          synchronization attempt, and again after every synchronization
+          slice that ended in `RuntimeWaitTimeoutError` -- always with no
+          G, L, E, M, or lease held by this call. Only after it returns
+          normally does another slice begin. Whatever it raises propagates
+          unchanged (a cooperative cancellation, a failing probe, a
+          `BaseException`), and the operation ends there.
+        - Each slice is the ordinary G -> L -> E acquisition bounded by
+          `min(now + poll_interval, overall deadline)`.
+        - `wait_timeout` is the overall deadline of the whole call,
+          measured from entry and never reset per slice. `None` waits
+          indefinitely, but only as repeated bounded slices separated by
+          checkpoints -- never an unbroken block. `0` stays a single
+          non-blocking attempt, never a polling wait. It must be `None` or
+          finite and `>= 0`.
+        - The model id is resolved once, after the first checkpoint; the
+          cloud-provider opt-in guard is re-checked before every slice.
+        - Only `RuntimeWaitTimeoutError` starts another slice. Every other
+          `RuntimeBusyError` (and every other exception) ends the call.
+
+        **Plain mode** (`wait_checkpoint` is `None`): exactly one slice
+        bounded by `wait_timeout` as described above; `poll_interval` is
+        validated but otherwise ignored. Separate public calls -- including
+        a caller's own hand-written retry loop of plain calls -- are always
+        independent, fresh callers: nothing carries over between them.
+
+        Invalid `poll_interval`/`wait_checkpoint` (and, in checkpoint mode,
+        `wait_timeout`) values raise `TypeError`/`ValueError` before the
+        model id is resolved or any resource is touched.
 
         Two narrow exceptions to "immediate failure", both scoped to a
         caller that has already had its own post-E revalidation failure on
@@ -990,53 +1029,137 @@ class ModelService:
            waited for by this mechanism; it fails immediately like any
            other unrelated `RuntimeBusyError`.
 
-        Polling-timeout continuity (PR #420 follow-up P2, issue #414
-        follow-up): exception #2's own `deadline` is this *one*
-        `acquire_runtime()` call's budget, never reset -- so a short
-        `wait_timeout` (e.g. a generator's own cancellation-aware poll
-        slice) can legitimately expire while the drain is still genuinely
-        in progress, surfacing `RuntimeWaitTimeoutError` exactly as
-        designed. Such a caller's own retry, however, is conventionally a
-        *fresh* `acquire_runtime()` call on the same thread (see e.g.
-        `generators/image/generator.py`'s `_acquire_runtime()`, unchanged by
-        this fix) -- which, without more, is indistinguishable from a
-        genuinely fresh caller and would fail fast under rule #2's own
-        "never on a fresh first attempt" scope guard, silently losing
-        drain-eligibility this thread already earned. This method
-        remembers, internally and per-thread (see
-        `_remember_stale_drain_continuation()`/`_pop_stale_drain_continuation()`),
-        the exact `RuntimeEntry` object a timed-out drain-wait was about --
-        never a public token, never part of this method's signature or
-        return value -- so that thread's *next* `acquire_runtime()` call, if
-        its own first attempt lands on that *exact* entry (object identity;
-        never canonical id alone -- the same generation isolation as #2
-        itself), resumes the wait instead of failing fast. A mismatched or
-        absent token still fails fast; a fresh caller (no token) is
-        unaffected; a stale token that no longer matches what the next call
-        actually encounters is simply discarded, never misapplied to a
-        different entry or a different thread.
+        Operation-scoped stale-drain ownership (PR #420, issue #414
+        follow-up): the eligibility #1 and #2 describe belongs to exactly
+        ONE public call and never survives it. It lives in a private,
+        call-local `_StaleDrainOperation` created empty on entry and
+        cleared in this method's own `finally` on every exit -- success,
+        overall timeout, checkpoint exception, any other exception. It is
+        never stored on this instance, never keyed by thread, and never
+        visible to another call, so a worker thread later reused for an
+        unrelated job can never inherit it. In checkpoint mode it is
+        preserved across slices of the same call: a slice whose first
+        attempt meets `_RuntimeInvalidEntryDrainingError` for the *exact*
+        entry (object identity) this call's own earlier revalidation
+        failure armed resumes #2's wait instead of failing fast; any other
+        entry/generation still fails fast. The #1 budget is per logical
+        call as well: once armed, a further revalidation failure in any
+        later slice raises the plain `RuntimeBusyError`.
 
         Every other cause of `RuntimeBusyError` from steps 3-6 (pinned
         eviction victim, a `LOADING`/`RETIRING` busy target, capacity
         claimed by a concurrent reservation, an INVALID-and-pinned entry
-        encountered on this call's very first attempt with no revalidation
-        failure of its own yet, ...) is never retried or waited on by this
-        method; it still fails immediately, exactly as before. If the
-        shared `deadline` is exhausted during either retry path,
-        `RuntimeWaitTimeoutError` surfaces (from the normal G/L/E-timeout
-        path for #1, or explicitly for #2's drain wait), so a
-        cancellation-aware generator's own polling loop still observes it
-        precisely as it does today -- this method has no knowledge of job
-        cancellation and does not add any. Neither exception widens what
-        `unload_model()`/`unload_all()` may act on, and neither changes the
-        G -> L -> E acquisition ordering above.
+        encountered with no revalidation failure of this call's own yet,
+        ...) is never retried or waited on by this method; it still fails
+        immediately, exactly as before. If a slice's deadline is exhausted
+        during either retry path, `RuntimeWaitTimeoutError` surfaces (from
+        the normal G/L/E-timeout path for #1, or explicitly for #2's drain
+        wait). This method has no knowledge of job cancellation; a caller
+        supplies it only through `wait_checkpoint`. Neither exception
+        widens what `unload_model()`/`unload_all()` may act on, and neither
+        changes the G -> L -> E acquisition ordering above.
+
+        Exception retention: every `RuntimeBusyError`/
+        `RuntimeWaitTimeoutError` this method surfaces is a fresh instance
+        of the same public type with the same message, raised outside the
+        scope of the internal exception it replaces -- so its
+        `__cause__`/`__context__`/traceback never keeps a private
+        stale-entry signal (whose `.entry` pins a `RuntimeEntry` and its
+        runtime) reachable after the call has ended.
         """
 
-        manifest = self.get_manifest(model_id, media_type, task_type)
-        if manifest.provider == "cloud":
-            ensure_cloud_provider_enabled(manifest.id)
+        _validate_wait_parameters(wait_timeout, wait_checkpoint, poll_interval)
+        drain = _StaleDrainOperation()
+        try:
+            if wait_checkpoint is None:
+                manifest = self.get_manifest(model_id, media_type, task_type)
+                if manifest.provider == "cloud":
+                    ensure_cloud_provider_enabled(manifest.id)
+                deadline = None if wait_timeout is None else time.monotonic() + wait_timeout
+                return self._acquire_runtime_slice(manifest, media_type, deadline, drain)
+            return self._acquire_runtime_with_checkpoints(
+                model_id, media_type, task_type,
+                wait_timeout=wait_timeout,
+                wait_checkpoint=wait_checkpoint,
+                poll_interval=poll_interval,
+                drain=drain,
+            )
+        finally:
+            drain.entry = None
 
-        deadline = None if wait_timeout is None else time.monotonic() + wait_timeout
+    def _acquire_runtime_with_checkpoints(
+        self,
+        model_id: str | None,
+        media_type: str,
+        task_type: str | None,
+        *,
+        wait_timeout: float | None,
+        wait_checkpoint: Callable[[], None],
+        poll_interval: float,
+        drain: _StaleDrainOperation,
+    ) -> RuntimeHandle:
+        """Checkpoint mode of `acquire_runtime()`: bounded slices, one operation.
+
+        `wait_checkpoint()` is only ever called here, at statement level,
+        never inside an `except` block -- so neither the checkpoint's own
+        exception nor anything it chains to ever carries a runtime-internal
+        exception as its `__context__`. Every slice has already released
+        all of G/L/E/lease (and M is never held outside the cache's own
+        short methods) before control returns to this loop.
+        """
+
+        overall_deadline = None if wait_timeout is None else time.monotonic() + wait_timeout
+        wait_checkpoint()
+        manifest = self.get_manifest(model_id, media_type, task_type)
+        while True:
+            if manifest.provider == "cloud":
+                ensure_cloud_provider_enabled(manifest.id)
+            slice_deadline = time.monotonic() + poll_interval
+            if overall_deadline is not None:
+                slice_deadline = min(slice_deadline, overall_deadline)
+            timeout_message = ""
+            try:
+                return self._acquire_runtime_slice(manifest, media_type, slice_deadline, drain)
+            except RuntimeWaitTimeoutError as exc:
+                timeout_message = str(exc)
+            if overall_deadline is not None and time.monotonic() >= overall_deadline:
+                raise RuntimeWaitTimeoutError(timeout_message)
+            wait_checkpoint()
+
+    def _acquire_runtime_slice(
+        self,
+        manifest: ModelManifest,
+        media_type: str,
+        deadline: float | None,
+        drain: _StaleDrainOperation,
+    ) -> RuntimeHandle:
+        """One G -> L -> E acquisition bounded by `deadline`.
+
+        Any busy/timeout failure is re-raised as a fresh instance of the
+        same public type, after leaving the `except` scope that caught it:
+        the internal exception (and its traceback frames, whose locals may
+        reference a `RuntimeEntry`) becomes unreachable instead of riding
+        along as `__context__`. All of G/L/E/lease this slice took are
+        already released by the time that happens.
+        """
+
+        public_type: type[RuntimeBusyError] = RuntimeBusyError
+        message = ""
+        try:
+            return self._acquire_runtime_slice_resources(manifest, media_type, deadline, drain)
+        except RuntimeWaitTimeoutError as exc:
+            public_type, message = RuntimeWaitTimeoutError, str(exc)
+        except RuntimeBusyError as exc:
+            message = str(exc)
+        raise public_type(message)
+
+    def _acquire_runtime_slice_resources(
+        self,
+        manifest: ModelManifest,
+        media_type: str,
+        deadline: float | None,
+        drain: _StaleDrainOperation,
+    ) -> RuntimeHandle:
         owner_thread = current_thread()
 
         if not self._admission.acquire(deadline):
@@ -1052,7 +1175,9 @@ class ModelService:
             # this call raises, there is nothing further to release here;
             # if it returns, `entry` carries a live lease and a held E that
             # nothing else will release except what follows below.
-            entry = self._acquire_entry_with_execution_lock(manifest, media_type, deadline)
+            entry = self._acquire_entry_with_execution_lock(
+                manifest, media_type, deadline, drain
+            )
             try:
                 return RuntimeHandle(
                     manifest=manifest,
@@ -1084,77 +1209,76 @@ class ModelService:
             raise
 
     def _acquire_entry_with_execution_lock(
-        self, manifest: ModelManifest, media_type: str, deadline: float | None
+        self,
+        manifest: ModelManifest,
+        media_type: str,
+        deadline: float | None,
+        drain: _StaleDrainOperation,
     ) -> RuntimeEntry:
         """L -> E for this manifest, with one internal retry for one
         specific, provably-safe-to-retry condition -- plus, only once that
-        condition has actually happened to this caller, a bounded wait for
-        any *other* stale lease-holder still draining the same entry.
+        condition has actually happened within this logical call, a bounded
+        wait for any *other* stale lease-holder still draining the same entry.
 
-        Called with G already held by this call's own caller
-        (`acquire_runtime()`); this method never touches G itself.
+        Called with G already held by this slice; this method never touches
+        G itself.
 
         Contract (see `acquire_runtime()`'s own docstring for the full
-        rationale): if the first attempt's `_acquire_execution_lock()` call
-        raises `_RuntimeExecutionRevalidationFailed` -- this caller won E
-        onto an entry another lease-holder's failure-unwind invalidated
-        during the wait -- `_acquire_entry_after_revalidation_failure()`
-        takes over (see its own docstring for exactly what it does and does
-        not retry). A first attempt that instead raises
-        `_RuntimeInvalidEntryDrainingError` -- this caller landed directly
-        on an already-INVALID, still-pinned entry with no revalidation
-        failure of its own yet *in this call* -- is converted to the plain,
-        public `RuntimeBusyError` immediately: the multi-waiter drain wait
-        below is only ever entered *after* this caller's own revalidation
-        failure, never on a fresh first attempt (approved contract, PR #420
-        -- keeps
-        `test_invalid_entry_still_leased_by_another_caller_denies_new_acquires`
-        true unchanged).
+        rationale), decided entirely from `drain` -- state owned by this one
+        public call, never by the thread or the instance:
 
-        Polling-continuity exception (PR #420 follow-up P2, issue #414
-        follow-up): "no revalidation failure of its own yet in this call" is
-        deliberately not the same as "no revalidation failure of its own
-        yet, ever". `_pop_stale_drain_continuation()` consumes this exact
-        thread's own single-use token -- set only when a *previous*
-        `acquire_runtime()` call on this same thread already earned
-        drain-eligibility on some entry and then timed out mid-drain-wait
-        (see `_acquire_entry_after_revalidation_failure()` and
-        `ModelService._remember_stale_drain_continuation()`'s own
-        docstrings). If the first attempt's `_RuntimeInvalidEntryDrainingError`
-        is for that *exact* entry (object identity, never canonical id
-        alone -- the same generation-isolation guarantee the intra-call
-        retry already gives), this is not a fresh caller at all: it is the
-        same logical acquisition operation resuming its already-earned wait,
-        continuing across the public call boundary a cancellation-aware
-        poll loop introduces. Any other entry -- a mismatched or absent
-        token -- still fails fast exactly as before; a genuinely fresh
-        caller (no token) is unaffected, and a token that no longer matches
-        the entry actually encountered (replaced/reloaded in the meantime)
-        is simply discarded, never transferred to the new entry.
+        - `_RuntimeExecutionRevalidationFailed` with `drain` not yet armed
+          (this caller won E onto an entry another lease-holder's
+          failure-unwind invalidated during the wait): arms `drain` with
+          that exact entry, then `_acquire_entry_after_revalidation_failure()`
+          takes over.
+        - `_RuntimeExecutionRevalidationFailed` with `drain` already armed
+          by an earlier slice of this same call: this call's one retry is
+          already spent -- plain, public `RuntimeBusyError`.
+        - `_RuntimeInvalidEntryDrainingError` for the *exact* entry `drain`
+          is armed with (an earlier slice of this call timed out waiting for
+          it): resume that drain wait.
+        - `_RuntimeInvalidEntryDrainingError` otherwise (a caller with no
+          revalidation failure of its own in this call, or a different
+          entry/generation): plain, public `RuntimeBusyError` immediately --
+          keeps `test_invalid_entry_still_leased_by_another_caller_denies_new_acquires`
+          true unchanged.
+
+        Every public exception is raised after leaving the private one's
+        `except` scope, so no private signal (whose `.entry` pins a
+        `RuntimeEntry`) is ever attached as `__context__`; the armed entry is
+        read from `drain` inline, never bound to a local of this frame.
         """
 
-        continuation_entry = self._pop_stale_drain_continuation()
+        resume = False
+        message = ""
         try:
             return self._acquire_entry_and_execution_lock(manifest, media_type, deadline)
         except _RuntimeInvalidEntryDrainingError as exc:
-            if continuation_entry is not None and exc.entry is continuation_entry:
-                return self._acquire_entry_after_revalidation_failure(
-                    manifest, media_type, deadline, exc.entry
-                )
-            raise RuntimeBusyError(str(exc)) from exc
-        except _RuntimeExecutionRevalidationFailed as first_failure:
-            return self._acquire_entry_after_revalidation_failure(
-                manifest, media_type, deadline, first_failure.entry
-            )
+            if drain.entry is not None and exc.entry is drain.entry:
+                resume = True
+            else:
+                message = str(exc)
+        except _RuntimeExecutionRevalidationFailed as exc:
+            if drain.entry is None:
+                drain.entry = exc.entry
+                resume = True
+            else:
+                message = str(exc)
+        if not resume:
+            raise RuntimeBusyError(message)
+        return self._acquire_entry_after_revalidation_failure(
+            manifest, media_type, deadline, drain
+        )
 
     def _acquire_entry_after_revalidation_failure(
         self,
         manifest: ModelManifest,
         media_type: str,
         deadline: float | None,
-        stale_entry: RuntimeEntry,
+        drain: _StaleDrainOperation,
     ) -> RuntimeEntry:
-        """Retry L -> E after this call's own revalidation failure on `stale_entry`.
+        """Retry L -> E after this call's own revalidation failure on `drain.entry`.
 
         Multi-waiter INVALID-entry drain (approved contract, PR #420): the
         single-caller "exactly one retry" rule this method used to
@@ -1169,64 +1293,47 @@ class ModelService:
 
         - `_RuntimeExecutionRevalidationFailed` (this caller wins E again,
           onto *any* entry, and it is invalid): not the bounded drain this
-          method exists for -- converted to the plain, public
-          `RuntimeBusyError` immediately. The revalidation-failure retry
-          budget therefore stays exactly one attempt beyond the first,
-          completely unchanged from before this fix (see
+          method exists for -- plain, public `RuntimeBusyError` immediately.
+          The revalidation-failure retry budget therefore stays exactly one
+          attempt beyond the first per logical call (see
           `test_invalid_handoff_retry_is_bounded_to_one_attempt`).
         - `_RuntimeInvalidEntryDrainingError` for a *different* entry than
-          `stale_entry` (a different object/generation -- e.g. `stale_entry`
-          already fully drained, was reloaded, and *that* fresh entry has
-          since, separately, also become invalid and pinned): not the same
-          stale-drain condition this caller observed -- converted to the
-          plain, public `RuntimeBusyError` immediately (scope guard;
-          generation isolation).
-        - `_RuntimeInvalidEntryDrainingError` for `stale_entry` itself: the
+          `drain.entry` (a different object/generation): plain, public
+          `RuntimeBusyError` immediately (scope guard; generation isolation).
+        - `_RuntimeInvalidEntryDrainingError` for `drain.entry` itself: the
           exact condition this method exists to wait out.
           `wait_for_stale_entry_drain()` blocks (no polling -- see that
-          method) until either `stale_entry`'s last stale lease releases or
-          it is replaced, bounded by the same `deadline` this whole
-          `acquire_runtime()` call already shares (never a fresh budget per
-          iteration); on a `False` return (deadline elapsed, still pinned),
-          this surfaces the existing public `RuntimeWaitTimeoutError` so a
-          cancellation-aware generator's own bounded polling loop retries
-          it exactly as it already does for ordinary G/L/E contention. On
-          `True`, the loop retries `_acquire_entry_and_execution_lock()`
-          immediately -- uncounted against any attempt budget, since it is
-          driven entirely by a real state change, not a guess.
+          method) until that entry's last stale lease releases or it is
+          replaced, bounded by this slice's `deadline`. On `False` (deadline
+          elapsed, still blocking) this raises `RuntimeWaitTimeoutError`;
+          `drain` stays armed, so a later slice of the same checkpointed
+          call can resume the wait -- the state never leaves the call. On
+          `True`, the loop retries immediately.
         """
 
         while True:
+            drain_hit = False
+            message = ""
             try:
                 return self._acquire_entry_and_execution_lock(manifest, media_type, deadline)
             except _RuntimeExecutionRevalidationFailed as exc:
-                raise RuntimeBusyError(str(exc)) from exc
+                message = str(exc)
             except _RuntimeInvalidEntryDrainingError as exc:
-                if exc.entry is not stale_entry:
-                    raise RuntimeBusyError(str(exc)) from exc
-                if not self.runtime_cache.wait_for_stale_entry_drain(
-                    manifest.id, stale_entry, deadline
-                ):
-                    # Polling-continuity (PR #420 follow-up P2): this
-                    # thread's own acquisition deadline ran out while
-                    # `stale_entry` was still blocking -- not a drain that
-                    # failed, just a poll slice that did. Remember it (this
-                    # exact call's `deadline` is what just elapsed, not a
-                    # process-wide budget) so that if this call's own
-                    # cancellation-aware caller retries with a fresh
-                    # `acquire_runtime()` call on this same thread, that
-                    # call's own first attempt can resume this exact wait
-                    # instead of failing fast as a "fresh" caller -- see
-                    # `_acquire_entry_with_execution_lock()` and
-                    # `ModelService._remember_stale_drain_continuation()`'s
-                    # own docstrings.
-                    self._remember_stale_drain_continuation(stale_entry)
-                    raise RuntimeWaitTimeoutError(
-                        f"Timed out waiting for stale leases on {manifest.id!r} "
-                        "to drain after a revalidation handoff."
-                    ) from exc
-                # Converged: `stale_entry` is no longer current, or no
-                # longer pinned -- retry immediately.
+                if exc.entry is drain.entry:
+                    drain_hit = True
+                else:
+                    message = str(exc)
+            if not drain_hit:
+                raise RuntimeBusyError(message)
+            if not self.runtime_cache.wait_for_stale_entry_drain(
+                manifest.id, drain.armed_entry(), deadline
+            ):
+                raise RuntimeWaitTimeoutError(
+                    f"Timed out waiting for stale leases on {manifest.id!r} "
+                    "to drain after a revalidation handoff."
+                )
+            # Converged: the armed entry is no longer current, or no longer
+            # blocks reacquisition -- retry immediately.
 
     def _acquire_entry_and_execution_lock(
         self, manifest: ModelManifest, media_type: str, deadline: float | None

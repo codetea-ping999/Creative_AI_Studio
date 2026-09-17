@@ -16,9 +16,10 @@ import pytest
 
 from core.jobs.context import GenerationCancelled, GenerationContext
 from core.models.cache import ModelRuntimeCache
-from core.models.runtime_lease import RuntimeBusyError, RuntimeState, RuntimeWaitTimeoutError
+from core.models.runtime_lease import RuntimeBusyError, RuntimeState
 from core.models.service import ModelService
 from core.schemas import GenerationRequest
+import generators.image.generator as image_generator_module
 from generators.image.generator import ImageGenerator
 from generators.image.providers import UnsupportedImageParameterError
 
@@ -344,20 +345,32 @@ def test_only_synchronization_deadlines_use_retryable_timeout(tmp_path, monkeypa
 
 
 def test_wait_timeout_retries_and_succeeds_after_admission_is_available(tmp_path, monkeypatch):
+    # Operation-scoped polling (PR #420): the contended wait happens inside
+    # ONE checkpointed acquire_runtime() call, never a generator-side loop of
+    # public calls. The generator's own wait_checkpoint is observed instead:
+    # its second invocation can only follow a timed-out slice.
     generator, service, cache, loader, pipelines = _build(tmp_path, monkeypatch)
     cancelled, timed_out, retry_allowed = Event(), Event(), Event()
     results: list[Any] = []
     errors: list[BaseException] = []
     acquire = service.acquire_runtime
     owner = acquire("owner", "image")
+    acquire_calls: list[dict[str, Any]] = []
 
     def observed_acquire(*args, **kwargs):
-        try:
-            return acquire(*args, **kwargs)
-        except RuntimeWaitTimeoutError:
-            timed_out.set()
-            assert retry_allowed.wait(3), "owner never permitted retry"
-            raise
+        acquire_calls.append(dict(kwargs))
+        checkpoint = kwargs["wait_checkpoint"]
+        checkpoints = {"n": 0}
+
+        def observed_checkpoint():
+            checkpoints["n"] += 1
+            if checkpoints["n"] == 2:
+                timed_out.set()
+                assert retry_allowed.wait(3), "owner never permitted retry"
+            checkpoint()
+
+        kwargs["wait_checkpoint"] = observed_checkpoint
+        return acquire(*args, **kwargs)
 
     monkeypatch.setattr(service, "acquire_runtime", observed_acquire)
 
@@ -383,6 +396,10 @@ def test_wait_timeout_retries_and_succeeds_after_admission_is_available(tmp_path
         assert errors == []
         assert len(results) == 1 and results[0].status == "succeeded"
         assert cache._entries["target"].lease_count == 0
+        assert len(acquire_calls) == 1
+        expected_poll_interval = image_generator_module._CANCELLATION_POLL_SECONDS
+        assert acquire_calls[0]["poll_interval"] == expected_poll_interval
+        assert "wait_timeout" not in acquire_calls[0]
     finally:
         cancelled.set()
         owner.release()

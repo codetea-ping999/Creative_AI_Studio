@@ -13,6 +13,7 @@ from core.models.cache import ModelRuntimeCache
 from core.models.runtime_lease import RuntimeBusyError, RuntimeState, RuntimeWaitTimeoutError
 from core.models.service import ModelService
 from core.schemas import GenerationRequest
+import generators.video.generator as video_generator_module
 from generators.video.generator import VideoGenerator
 from generators.video.runtime import ProceduralStoryboardRuntime, encode_frames_as_gif
 
@@ -185,19 +186,31 @@ def test_non_wait_busy_error_is_not_retried(tmp_path, monkeypatch):
 
 
 def test_wait_timeout_retries_and_renders_after_admission_is_available(tmp_path, monkeypatch):
+    # Operation-scoped polling (PR #420): the contended wait happens inside
+    # ONE checkpointed acquire_runtime() call, never a generator-side loop of
+    # public calls. The generator's own wait_checkpoint is observed instead:
+    # its second invocation can only follow a timed-out slice.
     generator, service, cache, loader, renderer = _build(tmp_path, monkeypatch)
     cancelled, timed_out, retry_allowed = Event(), Event(), Event()
     results, errors = [], []
     acquire = service.acquire_runtime
     owner = acquire("owner", "video")
+    acquire_calls: list[dict] = []
 
     def observed_acquire(*args, **kwargs):
-        try:
-            return acquire(*args, **kwargs)
-        except RuntimeWaitTimeoutError:
-            timed_out.set()
-            assert retry_allowed.wait(3), "owner never permitted retry"
-            raise
+        acquire_calls.append(dict(kwargs))
+        checkpoint = kwargs["wait_checkpoint"]
+        checkpoints = {"n": 0}
+
+        def observed_checkpoint():
+            checkpoints["n"] += 1
+            if checkpoints["n"] == 2:
+                timed_out.set()
+                assert retry_allowed.wait(3), "owner never permitted retry"
+            checkpoint()
+
+        kwargs["wait_checkpoint"] = observed_checkpoint
+        return acquire(*args, **kwargs)
 
     monkeypatch.setattr(service, "acquire_runtime", observed_acquire)
 
@@ -221,6 +234,10 @@ def test_wait_timeout_retries_and_renders_after_admission_is_available(tmp_path,
         assert len(results) == 1 and results[0].status == "succeeded"
         renderer.render.assert_called_once()
         assert cache._entries["target"].lease_count == 0
+        assert len(acquire_calls) == 1
+        expected_poll_interval = video_generator_module._CANCELLATION_POLL_SECONDS
+        assert acquire_calls[0]["poll_interval"] == expected_poll_interval
+        assert "wait_timeout" not in acquire_calls[0]
     finally:
         cancelled.set()
         owner.release()

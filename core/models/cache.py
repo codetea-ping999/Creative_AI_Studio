@@ -773,7 +773,9 @@ class ModelRuntimeCache:
         caller of this method is `ModelService`'s handling of
         `_RuntimeInvalidEntryDrainingError`, and only for a caller that
         already had its own post-E revalidation failure on this exact
-        `entry` -- see that exception's own docstring in
+        `entry` within the same `acquire_runtime()` call (that eligibility
+        is call-scoped -- see `ModelService.acquire_runtime()`) -- see that
+        exception's own docstring in
         `core/models/runtime_lease.py` for the full scope/rationale.
 
         Waits on the same `Condition` `release_lease()` notifies on every

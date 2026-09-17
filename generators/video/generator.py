@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Any
 
 from core.jobs.context import GenerationCancelled
 from core.models import ModelService
-from core.models.runtime_lease import RuntimeWaitTimeoutError
 from core.models.service import RuntimeHandle
 from core.quality import (
     enrich_quality_report,
@@ -307,18 +306,16 @@ class VideoGenerator(BaseGenerator):
             return self.model_service.acquire_runtime(
                 model_id, media_type="video", task_type=self.task_type
             )
-        while True:
-            context.raise_if_cancelled()
-            try:
-                return self.model_service.acquire_runtime(
-                    model_id, media_type="video", task_type=self.task_type,
-                    wait_timeout=_CANCELLATION_POLL_SECONDS,
-                )
-            except RuntimeWaitTimeoutError:
-                # Only synchronization waits are retryable. Cache capacity,
-                # invalid entries and loader errors must still surface. This
-                # does not preempt a synchronous loader that already started.
-                context.raise_if_cancelled()
+        # One logical, cancellation-aware wait: ModelService polls in bounded
+        # slices and calls the checkpoint between them with nothing held.
+        # Only synchronization waits are waited out; cache capacity, invalid
+        # entries and loader errors still surface. This does not preempt a
+        # synchronous loader that already started.
+        return self.model_service.acquire_runtime(
+            model_id, media_type="video", task_type=self.task_type,
+            wait_checkpoint=context.raise_if_cancelled,
+            poll_interval=_CANCELLATION_POLL_SECONDS,
+        )
 
     def cleanup(self, request: GenerationRequest) -> None:
         return None
