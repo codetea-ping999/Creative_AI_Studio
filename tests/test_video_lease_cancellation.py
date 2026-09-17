@@ -1,5 +1,6 @@
 """Cooperative cancellation at video lease boundaries, without real models."""
 
+from pathlib import Path
 from threading import Event, Thread
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -634,4 +635,46 @@ def test_render_exception_still_invalidates_used_runtime(tmp_path, monkeypatch):
 
     entry = cache._entries["target"]
     assert entry.state is RuntimeState.INVALID
+
+
+def test_learned_video_direct_output_late_cancellation_removes_produced_artifact(
+    tmp_path, monkeypatch
+):
+    # P2 finding "Learned Video: remove direct output artifact on late
+    # cancellation": a learned renderer that writes its own file and
+    # returns `output_path` directly (rather than `pending_frames`, the
+    # deferred-encode case already covered by
+    # `test_cancellation_during_deferred_gif_encode_removes_encoded_output`
+    # above) leaves that file behind once `VideoGenerator.generate()`
+    # observes late cancellation and raises `GenerationCancelled` --
+    # `VideoGenerator.cleanup()` is a no-op, so JobRunner discarding the
+    # cancelled result never removes it. `cancelled` only flips to True
+    # once the fake renderer has actually written the real file and
+    # returned, proving the check fires (and cleans up) strictly after a
+    # successful direct-output render, not before.
+    cancelled = Event()
+    created_path = {}
+
+    def fake_renderer(**kwargs):
+        output_path = Path(kwargs["output_dir"]) / "direct_output.mp4"
+        output_path.write_bytes(b"fake rendered video bytes")
+        created_path["path"] = output_path
+        cancelled.set()
+        return {"output_path": str(output_path), "output_id": "direct"}
+
+    generator, service, cache, loader = _learned_video_generator(
+        tmp_path, monkeypatch, renderer=fake_renderer
+    )
+
+    with pytest.raises(GenerationCancelled):
+        generator.run(
+            GenerationRequest(media_type="video", prompt="test", model_id="target"),
+            context=GenerationContext(is_cancelled=cancelled.is_set),
+        )
+
+    assert created_path["path"].exists() is False  # produced artifact removed
+    assert list(tmp_path.glob("*")) == []  # no unrelated files touched either
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY  # healthy runtime, not invalidated
+    assert entry.lease_count == 0
     assert entry.lease_count == 0

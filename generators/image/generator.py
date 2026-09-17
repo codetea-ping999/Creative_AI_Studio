@@ -34,6 +34,8 @@ from generators.image.providers import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from core.jobs.context import GenerationContext
     from core.models import ModelManifest
     from core.reference_capabilities import ReferenceImageInput
@@ -199,6 +201,17 @@ class ImageGenerator(BaseGenerator):
         late_cancellation = False
         progress_error: Exception | None = None
         validation_error: Exception | None = None
+
+        def _record_progress_error(exc: Exception) -> None:
+            # Retain only the first progress-publication failure: later
+            # step callbacks in the same (or a later) variation may also
+            # fail once report_progress starts erroring, but only the
+            # first is diagnostically useful and only one gets re-raised
+            # once the lease releases.
+            nonlocal progress_error
+            if progress_error is None:
+                progress_error = exc
+
         reference_capable = False
         lora_metadata: dict[str, object | None] = {"path": None, "scale": None}
         runtime_type = ""
@@ -413,6 +426,7 @@ class ImageGenerator(BaseGenerator):
                             context,
                             variation_index=variation_index,
                             variation_count=variation_count,
+                            record_progress_error=_record_progress_error,
                         )
                         if step_callback is not None:
                             generation_kwargs["callback_on_step_end"] = step_callback
@@ -459,6 +473,15 @@ class ImageGenerator(BaseGenerator):
                             except Exception as exc:
                                 progress_error = exc
                                 break
+                        elif progress_error is not None:
+                            # The step callback above already captured a
+                            # progress-publication failure mid-inference
+                            # (deferred past the lease, not raised there).
+                            # The provider call still completed successfully,
+                            # so stop starting further variations instead of
+                            # masking or repeating the failure, exactly like
+                            # `late_cancellation` above.
+                            break
 
         # No mutation or inference took place, or every started variation's
         # provider call completed successfully before cancellation was
@@ -659,6 +682,7 @@ class ImageGenerator(BaseGenerator):
         *,
         variation_index: int = 0,
         variation_count: int = 1,
+        record_progress_error: "Callable[[Exception], None]",
     ):
         if context is None or num_inference_steps <= 0:
             return None
@@ -667,9 +691,21 @@ class ImageGenerator(BaseGenerator):
 
         def _on_step_end(pipe: object, step_index: int, timestep: object, callback_kwargs: dict):
             step_fraction = (step_index + 1) / num_inference_steps
-            context.report_progress(
-                (variation_index + step_fraction) / variation_count
-            )
+            # Only a progress-publication failure (DB/event-publication, in
+            # production) is caught here -- it is bookkeeping outside the
+            # runtime fault boundary, not a provider/runtime failure, so it
+            # must not escape this callback and abort inference or cause
+            # RuntimeHandle.__exit__ to invalidate an otherwise-healthy
+            # runtime. It is deferred and re-raised once the lease has
+            # released cleanly. Cancellation is a genuine runtime-fault-
+            # boundary concern and is left to propagate un-caught, exactly
+            # as before.
+            try:
+                context.report_progress(
+                    (variation_index + step_fraction) / variation_count
+                )
+            except Exception as exc:
+                record_progress_error(exc)
             context.raise_if_cancelled()
             return callback_kwargs
 

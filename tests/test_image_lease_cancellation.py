@@ -629,3 +629,117 @@ def test_progress_callback_failure_after_successful_inference_preserves_runtime(
     assert entry.state is RuntimeState.READY
     assert entry.lease_count == 0
     assert list(tmp_path.glob("*.png")) == []  # never reached post-lease save
+
+
+def test_step_callback_progress_failure_defers_past_lease_and_reraises(
+    tmp_path, monkeypatch
+):
+    # P2 finding "Image: defer step-callback progress errors past the
+    # lease": for a pipeline that supports `callback_on_step_end`,
+    # `_on_step_end()` used to call `context.report_progress()` unguarded
+    # -- a progress-publication failure there (production: a transient
+    # JobRepository/event-publication error) would escape through the
+    # provider call still inside the active lease and cause
+    # `RuntimeHandle.__exit__` to mark an otherwise-healthy runtime
+    # INVALID, unlike the no-step-callback fallback path already covered
+    # by `test_progress_callback_failure_after_successful_inference_preserves_runtime`
+    # above. It must instead be captured, inference must be left to run to
+    # completion, and the exact error must be re-raised only once the
+    # lease has released cleanly.
+    generator, service, cache, loader, pipelines = _build(
+        tmp_path, monkeypatch, pipeline_cls=_FakeStepAwarePipeline
+    )
+    expected_error = RuntimeError("simulated job-repository write failure")
+
+    def failing_progress(fraction: float) -> None:
+        raise expected_error
+
+    with pytest.raises(RuntimeError) as exc_info:
+        generator.run(
+            _request(width=64, height=64, steps=4),
+            context=GenerationContext(
+                is_cancelled=lambda: False,
+                on_progress=failing_progress,
+                min_interval_seconds=0.0,
+                min_progress_delta=0.0,
+            ),
+        )
+
+    assert exc_info.value is expected_error  # the exact captured error
+    # Every step ran: the callback's progress failure never aborted the
+    # provider's own inference loop.
+    assert pipelines["target"].steps_invoked == 4
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY
+    assert entry.lease_count == 0
+    assert list(tmp_path.glob("*.png")) == []  # never reached post-lease save
+
+
+def test_step_callback_first_progress_error_is_retained(tmp_path, monkeypatch):
+    # "retain the first progress-publication error if multiple callbacks
+    # subsequently fail": once `report_progress()` starts failing it keeps
+    # failing for every remaining step, but only the first raised error is
+    # diagnostically useful, and only one error can be re-raised.
+    generator, service, cache, loader, pipelines = _build(
+        tmp_path, monkeypatch, pipeline_cls=_FakeStepAwarePipeline
+    )
+    calls: list[float] = []
+    first_error = RuntimeError("first simulated failure")
+
+    def failing_progress(fraction: float) -> None:
+        calls.append(fraction)
+        raise first_error if len(calls) == 1 else RuntimeError("later failure")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        generator.run(
+            _request(width=64, height=64, steps=3),
+            context=GenerationContext(
+                is_cancelled=lambda: False,
+                on_progress=failing_progress,
+                min_interval_seconds=0.0,
+                min_progress_delta=0.0,
+            ),
+        )
+
+    assert exc_info.value is first_error
+    assert len(calls) == 3  # every step's callback still ran and still tried
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY
+    assert entry.lease_count == 0
+
+
+def test_step_callback_cancellation_still_invalidates_mid_inference(
+    tmp_path, monkeypatch
+):
+    # "do not catch or defer unrelated cancellation/runtime exceptions
+    # under a broad handler" / "existing cancellation behavior must remain
+    # intact": the new try/except in `_on_step_end` wraps only
+    # `context.report_progress()`; `context.raise_if_cancelled()` stays
+    # outside it and must still unwind through the lease exactly as
+    # `test_cancellation_mid_inference_follows_conservative_invalidation`
+    # already proves for the pre-existing behavior -- this re-proves it
+    # holds with the new try/except present.
+    generator, service, cache, loader, pipelines = _build(
+        tmp_path, monkeypatch, pipeline_cls=_FakeStepAwarePipeline
+    )
+    cancellation_state = {"requested": False}
+
+    def _record_progress(fraction: float) -> None:
+        if fraction >= 0.5:
+            cancellation_state["requested"] = True
+
+    context = GenerationContext(
+        is_cancelled=lambda: cancellation_state["requested"],
+        on_progress=_record_progress,
+        min_interval_seconds=0.0,
+        min_progress_delta=0.0,
+    )
+
+    with pytest.raises(GenerationCancelled):
+        generator.run(_request(width=64, height=64, steps=4), context=context)
+
+    entry = cache._entries["target"]
+    assert pipelines["target"].steps_invoked == 2
+    assert entry.state is RuntimeState.INVALID
+    assert entry.lease_count == 0
+    assert list(tmp_path.glob("*")) == []

@@ -181,6 +181,22 @@ class VideoGenerator(BaseGenerator):
         # No inference took place, or it completed successfully: exit
         # cleanly instead of marking the cache INVALID.
         if cancelled_before_render or cancelled_before_invocation or late_cancellation:
+            # A learned renderer that writes its own file and returns
+            # `output_path` directly (rather than `pending_frames`) has
+            # already produced that artifact by the time `late_cancellation`
+            # is observed here -- the lease has already released cleanly
+            # above, so this is ordinary post-lease request cleanup, not a
+            # runtime fault, and must run before `GenerationCancelled`
+            # propagates so the artifact does not outlive the discarded
+            # result. `render_result` only carries a populated
+            # `output_path` for this direct-output case: the
+            # `pending_frames` case (procedural, or a learned adapter
+            # returning raw frames) never touches disk until the encode
+            # step below, which runs only when cancellation was not
+            # already observed here, so it is never a live file at this
+            # point.
+            if late_cancellation and isinstance(render_result, dict):
+                _discard_output_artifact(render_result.get("output_path"))
             raise GenerationCancelled()
         if procedural_param_error is not None:
             raise procedural_param_error
@@ -227,7 +243,7 @@ class VideoGenerator(BaseGenerator):
             # released above, so raising here cannot re-enter or invalidate
             # it.
             if context is not None and context.is_cancelled():
-                encoded_path.unlink(missing_ok=True)
+                _discard_output_artifact(encoded_path)
                 raise GenerationCancelled()
 
         output_path = Path(str(render_result["output_path"]))
@@ -306,6 +322,13 @@ class VideoGenerator(BaseGenerator):
 
     def cleanup(self, request: GenerationRequest) -> None:
         return None
+
+
+def _discard_output_artifact(output_path: "str | Path | None") -> None:
+    """Remove a cancelled request's own output file; always post-lease."""
+    if not output_path:
+        return
+    Path(output_path).unlink(missing_ok=True)
 
 
 def _extract_lineage_metadata(params: dict[str, Any]) -> dict[str, Any]:
