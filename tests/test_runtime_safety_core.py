@@ -18,6 +18,7 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Barrier, Condition, Event, Lock, Thread, current_thread
+import time
 import unittest
 
 from bootstrap.factories import create_default_model_service
@@ -1913,6 +1914,215 @@ class RuntimeSafetyCoreTests(unittest.TestCase):
 
         self.assertEqual(cache._entries["model-a"].lease_count, 0)
         self.assertEqual(service._admission._held_by_thread, {})
+
+    # ------------------- PR #420 follow-up P2: stale-drain-through-RETIRING
+    def test_stale_drain_converges_through_the_exact_entrys_own_retiring_window(self):
+        # Codex P2 (PR #420 follow-up): `release_lease()`'s own deferred
+        # overflow eviction (see test_release_lease_evicts_deferred_overflow_
+        # once_the_last_pin_drains above) can retire the *exact* entry a
+        # concurrent wait_for_stale_entry_drain() call is waiting on, in the
+        # very same metadata-lock transaction that drops its last lease --
+        # reachable via the legacy put() path, exactly like that test: a
+        # legacy put() overflows the (budget=1) bucket while model-a is
+        # still INVALID+pinned (pin supremacy leaves it over budget), so the
+        # moment the last stale lease releases, model-a -- now unpinned and
+        # INVALID, hence itself evictable -- is the bucket's own deferred
+        # overflow victim.
+        #
+        # Before this fix, wait_for_stale_entry_drain()'s predicate only
+        # checked `entry.is_pinned()`, so it returned success the instant
+        # lease_count reached zero -- even though, in that same instant,
+        # this exact entry had already been marked RETIRING and handed to
+        # (here, deliberately slow) cleanup. The caller's immediate retry
+        # then found RETIRING (a `_BUSY_FOR_UNLOAD_STATES` member) and
+        # failed with a plain, permanent RuntimeBusyError -- an
+        # otherwise-valid handoff lost, not merely delayed.
+        cleanup_started = Event()
+        cleanup_release = Event()
+
+        def blocking_cleanup(model_id, runtime_obj):
+            cleanup_started.set()
+            assert cleanup_release.wait(timeout=5), "cleanup release event was never set"
+
+        cache = ModelRuntimeCache(max_entries=1, on_evict=blocking_cleanup)
+
+        # Three stale leases on the same entry (mirrors an
+        # admission_capacity >= 3 multi-waiter scenario), then invalidated
+        # while all three are still outstanding.
+        entry = cache.acquire_or_reserve("model-a", "image")
+        cache.publish_ready_and_pin("model-a", entry, {"id": "model-a"})  # lease_count=1
+        second = cache.acquire_or_reserve("model-a", "image")  # READY hit -> lease_count=2
+        self.assertIs(second, entry)
+        third = cache.acquire_or_reserve("model-a", "image")  # READY hit -> lease_count=3
+        self.assertIs(third, entry)
+        cache.mark_invalid("model-a", entry)
+        self.assertEqual(entry.lease_count, 3)
+        self.assertEqual(entry.state, RuntimeState.INVALID)
+
+        # Legacy put() overflows the (budget=1, default bucket) bucket while
+        # model-a is pinned+invalid -- pin supremacy leaves the bucket
+        # deliberately over budget rather than touching a pinned entry.
+        cache.put("model-b", {"id": "model-b", "instance": object()})
+        self.assertEqual(cache._entries["model-a"].state, RuntimeState.INVALID)
+        self.assertEqual(set(cache._entries.keys()), {"model-a", "model-b"})
+
+        # Two of the three stale leases release up front -- ordinary drain,
+        # nothing under test yet (lease_count never reaches zero here).
+        cache.release_lease("model-a", entry)
+        cache.release_lease("model-a", entry)
+        self.assertEqual(entry.lease_count, 1)
+
+        # A drain-waiter parks on the exact remaining stale lease with
+        # deadline=None -- a real, non-spinning OS-level block.
+        entered_wait = Event()
+        original_condition_wait = cache._metadata_lock.wait
+
+        def signaling_wait(timeout=None):
+            entered_wait.set()
+            return original_condition_wait(timeout)
+
+        cache._metadata_lock.wait = signaling_wait
+
+        waiter_result: dict[str, object] = {}
+
+        def waiter():
+            waiter_result["converged"] = cache.wait_for_stale_entry_drain(
+                "model-a", entry, None
+            )
+
+        tw = Thread(target=waiter)
+        tw.start()
+        self.assertTrue(entered_wait.wait(timeout=5))
+        cache._metadata_lock.wait = original_condition_wait
+
+        # The final release runs on its own thread: release_lease() itself
+        # runs _finish_retirement() (and therefore the blocking cleanup)
+        # synchronously on the calling thread, so calling it inline here
+        # would deadlock this test thread against its own blocked cleanup.
+        # This is still the real, production release_lease()/on_evict path
+        # -- just invoked from a thread that can afford to block on it,
+        # exactly as a real worker thread would.
+        releaser_errors: list[BaseException] = []
+
+        def releaser():
+            try:
+                cache.release_lease("model-a", entry)
+            except BaseException as exc:  # noqa: BLE001
+                releaser_errors.append(exc)
+
+        tr = Thread(target=releaser)
+        tr.start()
+        self.assertTrue(cleanup_started.wait(timeout=5))
+
+        # While cleanup is still blocked, the entry is RETIRING and still
+        # current -- deterministic, since `cleanup_started` can only have
+        # been set (by `blocking_cleanup`, on the releaser thread) after
+        # `release_lease()`'s own metadata-lock transaction -- the one that
+        # marks this exact entry RETIRING -- already completed on that same
+        # thread, sequentially, before `_finish_retirement()` ever calls it.
+        self.assertIs(cache._entries.get("model-a"), entry)
+        self.assertEqual(entry.state, RuntimeState.RETIRING)
+        # A retry attempted right now (mirroring what the old, buggy
+        # premature-success return would have let the caller do
+        # immediately) must see the same plain, permanent RuntimeBusyError
+        # the lost-handoff bug produced -- proving the RETIRING window is
+        # genuinely observable and genuinely busy, not a test artifact.
+        with self.assertRaises(RuntimeBusyError) as premature:
+            cache.acquire_or_reserve("model-a", "image")
+        self.assertIs(type(premature.exception), RuntimeBusyError)
+
+        # The drain-waiter itself must NOT have converged yet either: a
+        # bounded join on a thread parked in a genuine, timeout-less
+        # `Condition.wait()` is a real synchronization check, not a sleep
+        # guess -- under a correct fix this thread cannot return before
+        # `cleanup_release` (below) is ever set, no matter how long we wait,
+        # so still-alive after a modest bound is conclusive, not a race.
+        tw.join(timeout=0.3)
+        self.assertTrue(tw.is_alive())
+        self.assertNotIn("converged", waiter_result)
+
+        # Let cleanup finish -- this must be what finally wakes the waiter;
+        # nothing else in this test could cause it to converge.
+        cleanup_release.set()
+        tr.join(timeout=5)
+        tw.join(timeout=5)
+        self.assertFalse(tr.is_alive())
+        self.assertFalse(tw.is_alive())
+        self.assertEqual(releaser_errors, [])
+        self.assertTrue(waiter_result.get("converged"))
+        self.assertNotIn("model-a", cache._entries)
+
+        # Convergence: a retry now succeeds immediately -- the
+        # otherwise-valid handoff is no longer lost.
+        fresh = cache.acquire_or_reserve("model-a", "image")
+        self.assertEqual(fresh.state, RuntimeState.LOADING)
+        self.assertIsNot(fresh, entry)
+        self.assertGreater(fresh.generation, entry.generation)
+        cache.abort_reservation("model-a", fresh)
+
+    def test_stale_drain_deadline_expires_while_entry_is_retiring(self):
+        # Same RETIRING window as above, but the waiter's own deadline
+        # elapses while cleanup is still blocked -- must still surface the
+        # existing, bounded RuntimeWaitTimeoutError-shaped `False` return
+        # rather than hanging or spuriously succeeding, and must never
+        # reset/extend the deadline because it happened to observe an
+        # intermediate RETIRING state.
+        cleanup_started = Event()
+        cleanup_release = Event()
+
+        def blocking_cleanup(model_id, runtime_obj):
+            cleanup_started.set()
+            assert cleanup_release.wait(timeout=5), "cleanup release event was never set"
+
+        cache = ModelRuntimeCache(max_entries=1, on_evict=blocking_cleanup)
+
+        entry = cache.acquire_or_reserve("model-a", "image")
+        cache.publish_ready_and_pin("model-a", entry, {"id": "model-a"})
+        cache.acquire_or_reserve("model-a", "image")
+        cache.mark_invalid("model-a", entry)
+        self.assertEqual(entry.lease_count, 2)
+
+        cache.put("model-b", {"id": "model-b", "instance": object()})
+
+        cache.release_lease("model-a", entry)  # lease_count=1, still pinned;
+        # not the last lease, so no eviction/cleanup is triggered by this
+        # call -- safe to run inline on this thread.
+
+        deadline = time.monotonic() + 0.2
+        result = cache.wait_for_stale_entry_drain("model-a", entry, deadline)
+        # Still pinned at this point (nothing released the last lease) --
+        # the ordinary pinned-timeout path, proved unchanged by this fix.
+        self.assertFalse(result)
+
+        # Now let the last lease release on its own thread (see the test
+        # above for why this cannot run inline: it synchronously drives the
+        # blocking cleanup), entering the RETIRING window.
+        releaser_errors: list[BaseException] = []
+
+        def releaser():
+            try:
+                cache.release_lease("model-a", entry)  # lease_count=0 -> RETIRING
+            except BaseException as exc:  # noqa: BLE001
+                releaser_errors.append(exc)
+
+        tr = Thread(target=releaser)
+        tr.start()
+        self.assertTrue(cleanup_started.wait(timeout=5))
+        self.assertEqual(entry.state, RuntimeState.RETIRING)
+
+        retiring_deadline = time.monotonic() + 0.2
+        result = cache.wait_for_stale_entry_drain("model-a", entry, retiring_deadline)
+        self.assertFalse(result)
+        # Still RETIRING, still current, cleanup still blocked -- the
+        # timeout came from the deadline, not from the entry resolving.
+        self.assertIs(cache._entries.get("model-a"), entry)
+        self.assertEqual(entry.state, RuntimeState.RETIRING)
+
+        cleanup_release.set()
+        tr.join(timeout=5)
+        self.assertFalse(tr.is_alive())
+        self.assertEqual(releaser_errors, [])
+        self.assertNotIn("model-a", cache._entries)
 
     # ---------------------------------------------------- Finding 3 (P2)
     def test_capacity_reservation_is_atomic_for_racing_misses_into_an_empty_bucket(self):

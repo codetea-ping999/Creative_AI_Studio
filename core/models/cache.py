@@ -766,38 +766,75 @@ class ModelRuntimeCache:
     def wait_for_stale_entry_drain(
         self, canonical_id: str, entry: RuntimeEntry, deadline: float | None
     ) -> bool:
-        """Block until `entry` is no longer `canonical_id`'s pinned, current entry.
+        """Block until `entry` no longer blocks `canonical_id`'s reacquisition.
 
-        Multi-waiter INVALID-entry drain (approved contract, PR #420). The
-        *only* caller of this method is `ModelService`'s handling of
+        Multi-waiter INVALID-entry drain (approved contract, PR #420,
+        strengthened by PR #420's own follow-up P2 fix below). The *only*
+        caller of this method is `ModelService`'s handling of
         `_RuntimeInvalidEntryDrainingError`, and only for a caller that
         already had its own post-E revalidation failure on this exact
         `entry` -- see that exception's own docstring in
         `core/models/runtime_lease.py` for the full scope/rationale.
 
         Waits on the same `Condition` `release_lease()` notifies on every
-        lease-count decrement (see that method), so this returns as soon as
-        possible after either:
+        lease-count decrement, and `_finish_retirement()` notifies once
+        `entry` is actually removed (see both methods), so this returns as
+        soon as possible after either:
 
-        - `entry.is_pinned()` becomes `False` (its last stale lease
-          released) -- the caller should retry `acquire_or_reserve()`,
-          which will now retire and reload it, or
+        - `entry` is current, and neither pinned nor `RETIRING` -- the
+          caller should retry `acquire_or_reserve()`, which will now
+          retire and reload it, or
         - `entry` is no longer `self._entries[canonical_id]` at all (a
           different caller already resolved the drain and installed a
-          fresh entry first) -- the caller should retry
-          `acquire_or_reserve()`, which will see whatever is current now.
+          fresh entry first, or this exact entry was itself fully removed)
+          -- the caller should retry `acquire_or_reserve()`, which will see
+          whatever is current now.
+
+        P2 follow-up (PR #420): the first bullet above used to read only
+        "`entry.is_pinned()` becomes `False`". That is insufficient --
+        `release_lease()`'s own deferred overflow eviction (see that
+        method) can mark this *exact* entry `RETIRING` in the very same
+        metadata-lock transaction that drops its last lease (an unpinned,
+        `INVALID` entry is itself a legal eviction candidate the instant it
+        stops being pinned). The old predicate would then return success
+        while `entry` was still current but mid-cleanup, still
+        `RETIRING` -- the caller's immediate retry would find that same
+        `RETIRING` entry and fail with a plain, permanent `RuntimeBusyError`
+        (`_BUSY_FOR_UNLOAD_STATES`), losing an otherwise-valid handoff
+        instead of converging. `RuntimeState` only ever transitions
+        forward and never re-enters a state it left (see that enum's own
+        docstring) -- for one already-`INVALID` entry never seen `READY`
+        again, the only states it can still take before removal are
+        `INVALID` (unpinned or pinned) and `RETIRING`, and `RETIRING` only
+        ever resolves by the entry being removed from `self._entries`
+        (`_finish_retirement()`) -- never back to `INVALID`. So "still
+        blocks reacquisition" is exactly "current AND (pinned OR
+        RETIRING)"; waiting on that instead is still bounded, for the same
+        reason the original contract was: `entry.lease_count` was already
+        monotonically non-increasing, and once it hits zero this exact
+        entry can only ever be marked `RETIRING` (if at all) once, by
+        whichever single caller's overflow/eviction/unload transaction gets
+        there first -- from which point only that one, already-in-flight
+        `_finish_retirement()` call, not a fresh unbounded chain of
+        transitions, decides when this wait finally converges.
 
         Returns `True` once either condition holds (the caller should
         retry immediately); `False` if `deadline` elapsed first with
-        `entry` still current and pinned (the caller should surface
-        `RuntimeWaitTimeoutError`). `deadline is None` waits without a
-        timeout -- a real, non-spinning OS-level block, never a poll loop
-        -- exactly like `_acquire_with_deadline()`'s own `deadline is None`
-        case elsewhere in this codebase; it still terminates because
-        `entry.lease_count` is monotonically non-increasing and bounded
-        (see `_RuntimeInvalidEntryDrainingError`'s docstring), so every
+        `entry` still current and still blocking (the caller should
+        surface `RuntimeWaitTimeoutError`) -- the deadline is never reset
+        or extended on account of observing an intermediate `RETIRING`
+        state; it is the same single deadline this whole wait has always
+        been bounded by. `deadline is None` waits without a timeout -- a
+        real, non-spinning OS-level block, never a poll loop -- exactly
+        like `_acquire_with_deadline()`'s own `deadline is None` case
+        elsewhere in this codebase; it still terminates because every
         remaining stale lease-holder's own O(1) unwind eventually notifies
-        this wait awake.
+        this wait awake (`release_lease()`), and -- now that waiting can
+        extend into the `RETIRING` window -- because `_finish_retirement()`
+        itself also notifies once cleanup has actually finished and the
+        entry is removed, so this can never sleep through that final
+        transition waiting for a notification that would otherwise never
+        come.
 
         Must be called *without* holding `self._metadata_lock`, `L`
         (`lock_for(canonical_id)`), or `entry.execution_lock` ("E") -- by
@@ -808,11 +845,19 @@ class ModelRuntimeCache:
         never touches. This method acquires and releases M itself, several
         times, exactly like every other public method on this class; it
         never holds M while genuinely blocked (see the class docstring's
-        "M" section).
+        "M" section) -- cleanup itself (if this wait's own convergence
+        happens to be the thing waiting on it) still runs entirely outside
+        M, on whichever thread is actually retiring the entry, exactly as
+        every other retirement path in this class already requires.
         """
 
+        def _still_blocks(current: RuntimeEntry | None) -> bool:
+            return current is entry and (
+                entry.is_pinned() or entry.state is RuntimeState.RETIRING
+            )
+
         with self._metadata_lock:
-            while self._entries.get(canonical_id) is entry and entry.is_pinned():
+            while _still_blocks(self._entries.get(canonical_id)):
                 if deadline is None:
                     self._metadata_lock.wait()
                     continue
@@ -1042,6 +1087,23 @@ class ModelRuntimeCache:
         attempted, whatever it raised; the exception (if any) still
         propagates to this method's own caller once metadata is consistent
         again.
+
+        PR #420 follow-up P2: this removal now also calls
+        `self._metadata_lock.notify_all()`, unconditionally, in the same
+        transaction as the `del` -- required once
+        `wait_for_stale_entry_drain()` waits through this exact entry's own
+        `RETIRING` window (see that method's own docstring), since removal
+        here is the *only* transition that can ever end that window for an
+        entry that was already unpinned when it was marked `RETIRING`
+        (`release_lease()`'s own notify only fires on the lease-count
+        decrement, which already happened by the time this method is even
+        reachable). Without this, a waiter parked past the `RETIRING`
+        extension with `deadline=None` would have nothing left to ever wake
+        it once cleanup actually finished -- a permanent hang, not merely a
+        slow convergence. Called while holding M, as `Condition.notify_all()`
+        requires; cleanup itself has already fully completed by this point,
+        entirely outside M, exactly as every other retirement path in this
+        class already requires.
         """
 
         try:
@@ -1052,6 +1114,7 @@ class ModelRuntimeCache:
                 current = self._entries.get(canonical_id)
                 if current is entry:
                     del self._entries[canonical_id]
+                self._metadata_lock.notify_all()
 
     def _run_cleanup(self, model_id: str, runtime_obj: Any) -> None:
         """Call `self._on_evict`, if any -- see `OnEvictCallback`'s own
