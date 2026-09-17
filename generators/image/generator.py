@@ -23,7 +23,7 @@ from core.quality import (
 from core.reference_capabilities import MissingReferenceAssetError, validate_reference_inputs
 from core.schemas import GenerationRequest, GenerationResult
 from generators.base import BaseGenerator
-from generators.common import resolve_generation_prompt
+from generators.common import resolve_generation_prompt, safe_is_cancelled
 from generators.image.providers import (
     ImageGenerationSpec,
     LocalDiffusersImageProvider,
@@ -196,7 +196,23 @@ class ImageGenerator(BaseGenerator):
         # lease is gone. Once LoRA mutation actually begins, every failure
         # past that point is a genuine runtime-use failure and is left to
         # propagate, which conservatively marks the entry INVALID.
+        # P2-A: `context.is_cancelled()` itself can raise (JobRepository I/O
+        # -- see `generators/common/cancellation.py`). Called this early,
+        # before any pipeline inspection or LoRA mutation, that is a
+        # bookkeeping failure, not a runtime fault; `safe_is_cancelled()`
+        # keeps it from propagating through the `with` block below and
+        # marking a healthy, never-used runtime INVALID. `mutation_probe_error`
+        # is raised only after the lease has already exited cleanly.
         cancelled_before_mutation = False
+        mutation_probe_error: Exception | None = None
+        # P2-B: cancellation may become visible during the capability/
+        # signature/request inspection between the check above and
+        # `_apply_lora()` -- the first actual runtime mutation. A second
+        # `safe_is_cancelled()` probe immediately before that call closes
+        # the gap the same way, without ever wrapping `_apply_lora()` or
+        # the inference calls that follow it in a broad catch.
+        cancelled_before_lora = False
+        lora_probe_error: Exception | None = None
         late_cancellation = False
         progress_error: Exception | None = None
         validation_error: Exception | None = None
@@ -226,8 +242,8 @@ class ImageGenerator(BaseGenerator):
             runtime_obj = handle.runtime
             pipeline = runtime_obj["pipeline"]
 
-            cancelled_before_mutation = context is not None and context.is_cancelled()
-            if not cancelled_before_mutation:
+            cancelled_before_mutation, mutation_probe_error = safe_is_cancelled(context)
+            if not cancelled_before_mutation and mutation_probe_error is None:
                 # A reference is only actually honored when a dedicated
                 # img2img-shaped runtime exists and its own call signature
                 # takes image/strength (#201: one supported conditioning
@@ -362,6 +378,20 @@ class ImageGenerator(BaseGenerator):
                         )
 
                 if validation_error is None:
+                    # P2-B: cancellation may have become observable during
+                    # the inspection above (reference/capability signature
+                    # checks, validate_capabilities()) -- none of which
+                    # mutates the runtime. Re-probe immediately before the
+                    # first actual mutation (`_apply_lora()`) so a stop
+                    # request arriving in that window still exits cleanly
+                    # instead of mutating LoRA state or invoking inference.
+                    cancelled_before_lora, lora_probe_error = safe_is_cancelled(context)
+                mutation_ready = (
+                    validation_error is None
+                    and not cancelled_before_lora
+                    and lora_probe_error is None
+                )
+                if mutation_ready:
                     # Runtime mutation begins here. Every failure from this
                     # point on (a bad LoRA file diffusers itself rejects, a
                     # provider/inference error, mid-render cancellation) is a
@@ -482,13 +512,21 @@ class ImageGenerator(BaseGenerator):
                             # `late_cancellation` above.
                             break
 
+        # P2-A/P2-B: either probe raising is a bookkeeping failure, not a
+        # runtime fault -- the lease has already exited cleanly above (no
+        # mutation happened in either case), so these are re-raised verbatim
+        # before anything below ever touches `lora_metadata`/inference state.
+        if mutation_probe_error is not None:
+            raise mutation_probe_error
+        if lora_probe_error is not None:
+            raise lora_probe_error
         # No mutation or inference took place, or every started variation's
         # provider call completed successfully before cancellation was
         # observed: exit cleanly instead of marking the cache INVALID. A
         # `GenerationCancelled` raised from *inside* a provider call (a
         # genuine mid-use interruption) is not caught above and still
         # unwinds as unsafe.
-        if cancelled_before_mutation or late_cancellation:
+        if cancelled_before_mutation or cancelled_before_lora or late_cancellation:
             raise GenerationCancelled()
         # A boundary progress-publication failure observed only after a
         # variation's runtime use already completed successfully -- the

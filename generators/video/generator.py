@@ -15,6 +15,7 @@ from core.quality import (
 )
 from core.schemas import GenerationRequest, GenerationResult
 from generators.base import BaseGenerator
+from generators.common import safe_is_cancelled
 
 if TYPE_CHECKING:
     from core.jobs.context import GenerationContext
@@ -138,7 +139,16 @@ class VideoGenerator(BaseGenerator):
         # renderer/adapter observing cancellation once its own callable is
         # already running) is not caught here and still conservatively
         # invalidates.
+        # P2-A: `context.is_cancelled()` itself can raise (JobRepository I/O
+        # -- see `generators/common/cancellation.py`). Called this early,
+        # before `runtime.render()` has ever been invoked, that is a
+        # bookkeeping failure, not a runtime fault; `safe_is_cancelled()`
+        # keeps it from propagating through the `with` block below and
+        # marking a healthy, never-used runtime INVALID.
+        # `render_cancellation_probe_error` is raised only after the lease
+        # has already exited cleanly.
         cancelled_before_render = False
+        render_cancellation_probe_error: Exception | None = None
         cancelled_before_invocation = False
         late_cancellation = False
         procedural_param_error: Exception | None = None
@@ -156,8 +166,10 @@ class VideoGenerator(BaseGenerator):
                 except (ValueError, TypeError) as exc:
                     procedural_param_error = exc
             if procedural_param_error is None:
-                cancelled_before_render = context is not None and context.is_cancelled()
-                if not cancelled_before_render:
+                cancelled_before_render, render_cancellation_probe_error = (
+                    safe_is_cancelled(context)
+                )
+                if not cancelled_before_render and render_cancellation_probe_error is None:
                     render_result = runtime.render(
                         request=request,
                         manifest=manifest,
@@ -179,6 +191,12 @@ class VideoGenerator(BaseGenerator):
 
         # No inference took place, or it completed successfully: exit
         # cleanly instead of marking the cache INVALID.
+        if render_cancellation_probe_error is not None:
+            # `runtime.render()` was never called -- the lease has already
+            # exited cleanly above -- so `render_result` does not exist yet;
+            # this must be checked and raised before anything below ever
+            # references it.
+            raise render_cancellation_probe_error
         if cancelled_before_render or cancelled_before_invocation or late_cancellation:
             # A learned renderer that writes its own file and returns
             # `output_path` directly (rather than `pending_frames`) has

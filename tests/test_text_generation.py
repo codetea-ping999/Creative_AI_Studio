@@ -390,6 +390,105 @@ class TextGeneratorTests(unittest.TestCase):
 
 
 class TextGeneratorLeaseTests(unittest.TestCase):
+    def test_precancellation_before_generation_exits_cleanly_and_preserves_runtime(
+        self,
+    ) -> None:
+        # PR4b P2-A proof (ordinary case): cancellation observed by the
+        # pre-use `context.is_cancelled()` probe, before `generate_text` is
+        # ever invoked, must exit the lease cleanly (not invalidate) and
+        # raise GenerationCancelled only once the lease is gone.
+        with tempfile.TemporaryDirectory() as root:
+            manifest = _template_manifest()
+            real_runtime = _template_runtime()
+            generate_calls: list[object] = []
+
+            def spy_generate(*args, **kwargs):
+                generate_calls.append((args, kwargs))
+                return real_runtime["generate"](*args, **kwargs)
+
+            runtime_obj = {**real_runtime, "generate": spy_generate}
+            loader = Mock()
+            loader.load.side_effect = lambda item: runtime_obj
+            cache = ModelRuntimeCache()
+            service = ModelService(
+                registry=None,
+                resolver=SimpleNamespace(resolve=lambda *args: manifest),
+                loader_registry=SimpleNamespace(get=lambda name: loader),
+                runtime_cache=cache,
+                admission_capacity=1,
+            )
+            generator = TextGenerator(service, output_dir=Path(root))
+            with service.acquire_runtime("template-writer", "text") as handle:
+                cached_runtime = handle.runtime
+
+            with self.assertRaises(GenerationCancelled):
+                generator.run(
+                    _request("logline"),
+                    context=GenerationContext(is_cancelled=lambda: True),
+                )
+
+            self.assertEqual(generate_calls, [])
+            entry = cache._entries[manifest.id]
+            self.assertIs(entry.state, RuntimeState.READY)
+            self.assertEqual(entry.lease_count, 0)
+            with service.acquire_runtime("template-writer", "text") as handle:
+                self.assertIs(handle.runtime, cached_runtime)  # never reloaded
+            self.assertEqual(loader.load.call_count, 1)
+
+    def test_precancellation_probe_error_does_not_invalidate_or_reload_runtime(
+        self,
+    ) -> None:
+        # PR4b P2-A proof (fallible-probe case): production
+        # `GenerationContext.is_cancelled()` reads JobRepository and can
+        # raise (e.g. a transient DB failure). Observed here, before
+        # `generate_text` is ever invoked, that is external bookkeeping, not
+        # a runtime fault -- the lease must exit cleanly (not invalidate)
+        # and the exact external exception must be re-raised once it is
+        # gone, never a runtime callable that was never touched.
+        with tempfile.TemporaryDirectory() as root:
+            manifest = _template_manifest()
+            real_runtime = _template_runtime()
+            generate_calls: list[object] = []
+
+            def spy_generate(*args, **kwargs):
+                generate_calls.append((args, kwargs))
+                return real_runtime["generate"](*args, **kwargs)
+
+            runtime_obj = {**real_runtime, "generate": spy_generate}
+            loader = Mock()
+            loader.load.side_effect = lambda item: runtime_obj
+            cache = ModelRuntimeCache()
+            service = ModelService(
+                registry=None,
+                resolver=SimpleNamespace(resolve=lambda *args: manifest),
+                loader_registry=SimpleNamespace(get=lambda name: loader),
+                runtime_cache=cache,
+                admission_capacity=1,
+            )
+            generator = TextGenerator(service, output_dir=Path(root))
+            with service.acquire_runtime("template-writer", "text") as handle:
+                cached_runtime = handle.runtime
+
+            probe_error = RuntimeError("job repository unavailable")
+
+            def failing_is_cancelled() -> bool:
+                raise probe_error
+
+            with self.assertRaises(RuntimeError) as caught:
+                generator.run(
+                    _request("logline"),
+                    context=GenerationContext(is_cancelled=failing_is_cancelled),
+                )
+
+            self.assertIs(caught.exception, probe_error)
+            self.assertEqual(generate_calls, [])
+            entry = cache._entries[manifest.id]
+            self.assertIs(entry.state, RuntimeState.READY)
+            self.assertEqual(entry.lease_count, 0)
+            with service.acquire_runtime("template-writer", "text") as handle:
+                self.assertIs(handle.runtime, cached_runtime)  # never reloaded
+            self.assertEqual(loader.load.call_count, 1)
+
     def test_bad_numeric_input_does_not_invalidate_or_reload_runtime(self) -> None:
         for parameter in ("max_tokens", "temperature", "top_p"):
             with self.subTest(parameter=parameter), tempfile.TemporaryDirectory() as root:

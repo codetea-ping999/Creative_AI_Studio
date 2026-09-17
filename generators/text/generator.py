@@ -13,6 +13,7 @@ from core.models.text_runtimes import extract_json_object
 from core.quality import evaluate_text_output
 from core.schemas import GenerationRequest, GenerationResult
 from generators.base import BaseGenerator
+from generators.common import safe_is_cancelled
 
 from .tasks import STORY_TASKS, StoryTask, get_story_task
 
@@ -221,7 +222,15 @@ class TextGenerator(BaseGenerator):
         # also re-samples cancellation, so a stop that only becomes
         # observable once *both* attempts have completed (repair included)
         # is caught too.
+        # P2-A: `context.is_cancelled()` itself can raise (JobRepository I/O
+        # -- see `generators/common/cancellation.py`). Called this early,
+        # before `generate_text` has ever been invoked, that is a bookkeeping
+        # failure, not a runtime fault; `safe_is_cancelled()` keeps it from
+        # propagating through the `with` block below and marking a healthy,
+        # never-used runtime INVALID. `cancellation_probe_error` is raised
+        # only after the lease has already exited cleanly.
         cancelled_before_generation = False
+        cancellation_probe_error: Exception | None = None
         late_cancellation = False
         schema_error: StorySchemaValidationError | None = None
         with self._acquire_runtime(requested_model_id, context) as handle:
@@ -229,8 +238,10 @@ class TextGenerator(BaseGenerator):
             runtime_obj = handle.runtime
             generate_text = runtime_obj["generate"]
 
-            cancelled_before_generation = context is not None and context.is_cancelled()
-            if not cancelled_before_generation:
+            cancelled_before_generation, cancellation_probe_error = safe_is_cancelled(
+                context
+            )
+            if not cancelled_before_generation and cancellation_probe_error is None:
                 try:
                     structured, raw_text, attempts = self._generate_structured(
                         generate_text,
@@ -272,6 +283,8 @@ class TextGenerator(BaseGenerator):
         # failed-response diagnostic (`_write_raw_response()` below) when
         # both became true from the same completed attempt(s) -- this
         # `raise` exits the function before that write ever happens.
+        if cancellation_probe_error is not None:
+            raise cancellation_probe_error
         if cancelled_before_generation or late_cancellation:
             raise GenerationCancelled()
         if schema_error is not None:

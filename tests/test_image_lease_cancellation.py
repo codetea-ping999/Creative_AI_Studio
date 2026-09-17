@@ -276,6 +276,124 @@ def test_precancellation_does_not_invalidate_an_unused_runtime(tmp_path, monkeyp
     assert loader.load.call_count == 1
 
 
+def test_precancellation_probe_error_does_not_invalidate_an_unused_runtime(
+    tmp_path, monkeypatch
+):
+    # PR4b P2-A proof (fallible-probe case): production
+    # `GenerationContext.is_cancelled()` reads JobRepository and can raise
+    # (e.g. a transient DB failure). Observed here, before any pipeline
+    # inspection or LoRA mutation, that is external bookkeeping, not a
+    # runtime fault -- the lease must exit cleanly (not invalidate) and the
+    # exact external exception must be re-raised once it is gone, with the
+    # pipeline never invoked.
+    generator, service, cache, loader, pipelines = _build(tmp_path, monkeypatch)
+    with service.acquire_runtime("target", "image") as handle:
+        cached_runtime = handle.runtime
+
+    probe_error = RuntimeError("job repository unavailable")
+
+    def failing_is_cancelled() -> bool:
+        raise probe_error
+
+    with pytest.raises(RuntimeError) as caught:
+        generator.run(
+            _request(width=64, height=64, steps=1),
+            context=GenerationContext(is_cancelled=failing_is_cancelled),
+        )
+    assert caught.value is probe_error
+    assert pipelines["target"].calls == []
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY
+    assert entry.lease_count == 0
+    with service.acquire_runtime("target", "image", wait_timeout=0) as handle:
+        assert handle.runtime is cached_runtime  # never reloaded
+    assert loader.load.call_count == 1
+
+
+def test_cancellation_before_lora_mutation_prevents_mutation_and_preserves_runtime(
+    tmp_path, monkeypatch
+):
+    # PR4b P2-B proof (ordinary case): cancellation may become observable
+    # during the capability/signature/request inspection between the first
+    # probe and `_apply_lora()` -- the first actual runtime mutation. A
+    # second probe immediately before that call must catch it, skip LoRA
+    # mutation and inference entirely, release the still-healthy lease
+    # cleanly, and raise GenerationCancelled only once it is gone.
+    generator, service, cache, loader, pipelines = _build(tmp_path, monkeypatch)
+    with service.acquire_runtime("target", "image"):
+        pass
+    assert cache._entries["target"].state is RuntimeState.READY
+
+    lora_file = tmp_path / "style.safetensors"
+    lora_file.write_bytes(b"fake-lora")
+
+    probe_calls = {"count": 0}
+
+    def is_cancelled() -> bool:
+        probe_calls["count"] += 1
+        # First probe (`cancelled_before_mutation`, before inspection) sees
+        # not-yet-cancelled; the second probe (P2-B, immediately before
+        # `_apply_lora()`) is where cancellation becomes observable.
+        return probe_calls["count"] >= 2
+
+    with pytest.raises(GenerationCancelled):
+        generator.run(
+            _request(width=64, height=64, steps=1, lora_path=str(lora_file)),
+            context=GenerationContext(is_cancelled=is_cancelled),
+        )
+
+    assert probe_calls["count"] == 2
+    assert pipelines["target"].load_lora_calls == []
+    assert pipelines["target"].calls == []
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY
+    assert entry.lease_count == 0
+    assert loader.load.call_count == 1
+
+
+def test_lora_mutation_probe_error_preserves_runtime_and_skips_mutation(
+    tmp_path, monkeypatch
+):
+    # PR4b P2-B proof (fallible-probe case): the second probe immediately
+    # before `_apply_lora()` can itself raise the same way the first one
+    # can. That must also skip LoRA mutation/inference, release the
+    # still-healthy lease cleanly, and re-raise the exact external
+    # exception once it is gone -- keeping the runtime READY/reusable.
+    generator, service, cache, loader, pipelines = _build(tmp_path, monkeypatch)
+    with service.acquire_runtime("target", "image"):
+        pass
+    assert cache._entries["target"].state is RuntimeState.READY
+
+    lora_file = tmp_path / "style.safetensors"
+    lora_file.write_bytes(b"fake-lora")
+
+    probe_error = RuntimeError("job repository unavailable")
+    probe_calls = {"count": 0}
+
+    def is_cancelled() -> bool:
+        probe_calls["count"] += 1
+        if probe_calls["count"] >= 2:
+            raise probe_error
+        return False
+
+    with pytest.raises(RuntimeError) as caught:
+        generator.run(
+            _request(width=64, height=64, steps=1, lora_path=str(lora_file)),
+            context=GenerationContext(is_cancelled=is_cancelled),
+        )
+
+    assert caught.value is probe_error
+    assert probe_calls["count"] == 2
+    assert pipelines["target"].load_lora_calls == []
+    assert pipelines["target"].calls == []
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY
+    assert entry.lease_count == 0
+    with service.acquire_runtime("target", "image", wait_timeout=0):
+        pass
+    assert loader.load.call_count == 1
+
+
 class _ObservedSemaphore:
     def __init__(self, semaphore, attempted):
         self._semaphore = semaphore
@@ -534,9 +652,11 @@ def test_late_cancellation_after_successful_provider_return_preserves_runtime(
         call_count["n"] += 1
         # call #1: _acquire_runtime()'s own pre-acquisition check (False)
         # call #2: cancelled_before_mutation (False)
-        # call #3: top-of-loop check for variation 0 (False)
-        # call #4: the check right after the provider call returns (True)
-        return call_count["n"] > 3
+        # call #3: P2-B's cancelled_before_lora probe, immediately before
+        #          _apply_lora() (False)
+        # call #4: top-of-loop check for variation 0 (False)
+        # call #5: the check right after the provider call returns (True)
+        return call_count["n"] > 4
 
     with pytest.raises(GenerationCancelled):
         generator.run(
@@ -564,15 +684,15 @@ def test_post_processing_cancellation_removes_partial_outputs(tmp_path, monkeypa
 
     def is_cancelled() -> bool:
         call_count["n"] += 1
-        # calls 1-6: _acquire_runtime()'s pre-acquisition check,
-        # cancelled_before_mutation, and top-of-loop/after-provider for
-        # both variations -- all inside the (uncancelled) lease.
-        # call #7: post-lease loop's own check for the *first* variation
-        # (False -- it gets written and scored normally).
-        # call #8: post-lease loop's own check for the *second* variation,
-        # reached only after the first variation's file was already
-        # written and scored.
-        return call_count["n"] > 7
+        # calls 1-7: _acquire_runtime()'s pre-acquisition check,
+        # cancelled_before_mutation, P2-B's cancelled_before_lora probe, and
+        # top-of-loop/after-provider for both variations -- all inside the
+        # (uncancelled) lease.
+        # call #8: post-lease loop's own first check for the first
+        # variation (False -- it gets written and scored normally).
+        # call #9: post-lease loop's own second check, reached only after
+        # the first variation's file was already written and scored.
+        return call_count["n"] > 8
 
     with pytest.raises(GenerationCancelled):
         generator.run(

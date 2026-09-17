@@ -108,6 +108,40 @@ def test_cancelled_after_acquisition_reuses_healthy_runtime(tmp_path, monkeypatc
     assert loader.load.call_count == 1
 
 
+def test_precall_cancellation_probe_error_preserves_runtime_and_skips_render(
+    tmp_path, monkeypatch
+):
+    # PR4b P2-A proof (fallible-probe case): production
+    # `GenerationContext.is_cancelled()` reads JobRepository and can raise
+    # (e.g. a transient DB failure). Observed here, before `runtime.render()`
+    # is ever invoked, that is external bookkeeping, not a runtime fault --
+    # the lease must exit cleanly (not invalidate) and the exact external
+    # exception must be re-raised once it is gone, with render() never
+    # called.
+    generator, service, cache, loader, renderer = _build(tmp_path, monkeypatch)
+    original_acquire = service.acquire_runtime
+    with original_acquire("target", "video") as handle:
+        cached_runtime = handle.runtime
+
+    probe_error = RuntimeError("job repository unavailable")
+
+    def failing_is_cancelled() -> bool:
+        raise probe_error
+
+    with pytest.raises(RuntimeError) as caught:
+        generator.run(
+            _request(), context=GenerationContext(is_cancelled=failing_is_cancelled)
+        )
+    assert caught.value is probe_error
+    renderer.render.assert_not_called()
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY
+    assert entry.lease_count == 0
+    with original_acquire("target", "video", wait_timeout=0) as handle:
+        assert handle.runtime is cached_runtime  # never reloaded
+    assert loader.load.call_count == 1
+
+
 class _ObservedSemaphore:
     def __init__(self, semaphore, attempted):
         self._semaphore = semaphore
