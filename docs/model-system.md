@@ -169,9 +169,24 @@ runtime が evict される」といった race を型として塞いでいま�
 - 既存の `get()` / `put()` / `unload()` / `unload_all()` / `resolve_runtime()`
   / `get_runtime()` は外部からの挙動を変えていません（PR4a はキャッシュの
   内部表現を `RuntimeEntry` に統一しただけ）。ただし **lease を取らない**
-  ため concurrency-safe ではなく、legacy / transitional API です。PR4b で
-  generator 側をすべて `acquire_runtime()` へ移行するまでの互換維持用と
-  位置づけます。新規呼び出しをここへ追加しないでください
+  ため concurrency-safe ではありません
+- **PR4b 完了時点の契約**：`resolve_runtime()` / `get_runtime()` は
+  **test / diagnostic 専用**です。production の 5 generator はすべて
+  `acquire_runtime()` へ移行済みで、closure audit の結果 production 側に
+  安全な call site は 1 件も見つかりませんでした（`get_runtime()` が
+  `resolve_runtime()` へ委譲する内部 1 箇所のみが allowlist 対象）。
+  これらの API は lease / 実行排他（`E`）/ admission（`G`）/ INVALID 参加の
+  **いずれも提供しません**。返り値の runtime を実行・変更・
+  「unload/evict/replace しうる他の操作をまたいで保持」する用途は禁止です。
+  互換性のため削除も `DeprecationWarning` 追加も行っていません（後者は
+  正当な test だけを騒がせるため）。詳細な契約は
+  `ModelService.resolve_runtime()` の docstring を参照
+- 再発防止は静的 guard で機械的に担保します：
+  `tests/test_runtime_surface_guard.py` が AST で `apps/` `bootstrap/`
+  `core/` `generators/` `scripts/` 全体を走査し、bare API 呼び出し・
+  `getattr()` 経由の間接呼び出し・`runtime_cache` / `loader` への
+  直接アクセス・`with` を伴わない generator の runtime 取得を検出します
+  （定義・docstring・同名の無関係 method は誤検知しません）
 - 新しい `ModelService.acquire_runtime(model_id, media_type, task_type=None,
   *, wait_timeout=None, wait_checkpoint=None, poll_interval=0.1) -> RuntimeHandle`
   が安全な取得経路です（`wait_checkpoint`/`poll_interval`は後述の
@@ -381,12 +396,38 @@ cleanupされ、leakしません（Finding 4）。
   `acquire_or_reserve()`/`unload()`/`unload_all()`が恒久的に
   `RuntimeBusyError`になる）ことはありません。
 
-### 未解決のscope（PR4b）
+### semantic judge の admission 参加（PR4b）
 
-productionの5generator移行、semantic classifier、legacy raw-runtime
-APIの利用制限、generator側のcancellation/error統合、PR3との
-end-to-end回帰確認はPR4bのscopeです。PR4a完了時点でも
-production WorkerPoolと`JOB_LANES`のproduction活用は無効のままです。
+`core/quality/semantic.py` の CLIP / CLAP backend は、PR4a と**同一の**
+process-wide `RuntimeAdmissionController`（`get_default_admission_controller()`）
+を共有します。新しい semaphore / admission domain は追加していません。
+`SemanticJudge(config, admission=None)` は未指定時のみ default controller を
+使い、test だけが private controller を注入できます。
+
+- lock 順序は **`G` -> backend lock** に固定。逆順は存在せず、backend lock を
+  保持したまま `G` を待つ経路もありません
+- `G` は cold load（`from_pretrained()`）と warm inference の**両方**を保護
+  します。「既に load 済みだから `G` を取らない」は不可
+- backend lock は `G` の capacity が 1 より大きい場合でも、同一 CLIP / CLAP
+  model object の lazy load と推論が重ならないことを保証します
+- semantic score の disk cache hit / 設定検証 / cache JSON 書き込みは `G` の
+  外で行い、不要な admission を消費しません
+- video semantics は frame ごとに image backend の通常の admitted path を
+  通ります。video 側で独自に `G` を取得しないため、PR4a が禁止する
+  same-thread nested acquisition は構造的に発生しません
+- generator は runtime lease を解放した**後**に semantic scoring へ進みます。
+  lease 保持中に semantic `G` を取ろうとした場合は、PR4a の
+  nested-acquisition ban がそのまま fail-fast します
+
+決定論的な証拠は `tests/test_semantic_admission.py` を参照してください。
+
+### 未解決のscope（PR4b 完了後）
+
+PR4bのscopeであったproductionの5generator移行、semantic judgeのadmission
+統合、legacy raw-runtime APIの利用制限、generator側のcancellation/error
+統合は完了しています。production WorkerPoolと`JOB_LANES`のproduction活用は
+引き続き無効で、PR5のgateのままです（dynamic capacity policy、process
+isolation、semantic runtimeの`ModelRuntimeCache`統合も同様に範囲外）。
 
 ## Image Provider Credentials（Issue #257）
 

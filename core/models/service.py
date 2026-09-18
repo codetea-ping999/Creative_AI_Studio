@@ -749,10 +749,9 @@ class ModelService:
         media_type: str,
         task_type: str | None = None,
     ) -> Any:
-        """Legacy raw-runtime API. Not concurrency-safe; transitional only.
-
-        See `resolve_runtime()`'s own docstring -- this is a thin wrapper
-        that discards the manifest half of its return value.
+        """Legacy raw-runtime API. Test/diagnostic use only -- see
+        `resolve_runtime()` for the full contract; this is a thin wrapper that
+        discards the manifest half of its return value.
         """
 
         _, runtime_obj = self.resolve_runtime(model_id, media_type, task_type)
@@ -764,14 +763,51 @@ class ModelService:
         media_type: str,
         task_type: str | None = None,
     ) -> tuple[ModelManifest, Any]:
-        """Legacy raw-runtime API. Not concurrency-safe; transitional only.
+        """Legacy raw-runtime API. **Test/diagnostic use only.**
 
-        The returned runtime object carries no lease: nothing stops a
-        concurrent `unload_model()` call, or an `acquire_runtime()`-driven
-        eviction, from retiring it while this caller is still using it.
-        Kept, unchanged in external behavior, until PR4b migrates every
-        generator onto `acquire_runtime()` (issue #414) -- do not add new
-        callers of this method or `get_runtime()`; use `acquire_runtime()`.
+        PR4b (issue #414) is complete: every production generator -- text,
+        image, video, music and speech -- now obtains runtimes through
+        `acquire_runtime()`, and the semantic CLIP/CLAP judge participates in
+        the same process-wide admission domain. A repo-wide static guard
+        (`tests/test_runtime_surface_guard.py`) asserts that no module under
+        `apps/`, `bootstrap/`, `core/`, `generators/` or `scripts/` calls this
+        method or `get_runtime()`; the single allowlisted exception is
+        `get_runtime()`'s own delegation just above.
+
+        This method is retained for backwards compatibility, not because a
+        safe production use was found -- the audit that closed PR4b found
+        none. What it does **not** give you, in contrast to
+        `acquire_runtime()`:
+
+        - no lease: the entry is not pinned, so cache-pressure eviction, a
+          concurrent `unload_model()`/`unload_all()`, or an
+          `acquire_runtime()` caller's own replacement may retire this exact
+          runtime object while you still hold the reference;
+        - no execution exclusion (`E`): another caller may be executing
+          against this same mutable runtime -- including LoRA mutation --
+          concurrently;
+        - no admission (`G`): the heavyweight `loader.load()` this may
+          trigger is not counted against the process-wide local-heavy budget,
+          so it can run alongside a generator's own load/inference;
+        - no INVALID-state participation: a runtime another caller has
+          already deemed unsafe may still be returned from cache here.
+
+        Permitted: tests and diagnostics that deliberately exercise this
+        legacy path itself (its cache reuse, its cloud opt-in guard, its
+        publication-rejection disposal), where the caller accepts the absence
+        of every guarantee above.
+
+        Forbidden: any production path, and in particular any caller that
+        would execute the returned runtime, mutate it, or retain it across
+        another operation that can unload, evict or replace it.
+
+        Deliberately not deprecated with a runtime `DeprecationWarning` (it
+        would fire only in the tests that legitimately exercise this path) and
+        deliberately not renamed to a private symbol (that would break
+        external compatibility for no additional safety, since the static
+        guard already prevents reintroduction inside this repo). Making it
+        private remains a future option once no out-of-tree caller is a
+        concern.
         """
 
         manifest = self.get_manifest(model_id, media_type, task_type)

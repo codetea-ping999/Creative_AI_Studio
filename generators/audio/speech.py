@@ -100,11 +100,11 @@ class SpeechGenerator(BaseGenerator):
         if "postprocess" in request.params:
             _coerce_postprocess_flag(request.params["postprocess"])
         # Best-effort: a manifest that cannot be resolved here (unknown model,
-        # disabled, wrong task type) is left for resolve_runtime() to reject
-        # at generation time as before, so this stays scoped to catching an
-        # invalid postprocess *default* and an unsupported cloud capability
-        # on an otherwise-valid manifest, instead of moving model-availability
-        # checks earlier.
+        # disabled, wrong task type) is left for generate()'s own
+        # `acquire_runtime()` call to reject at generation time, so this stays
+        # scoped to catching an invalid postprocess *default* and an
+        # unsupported cloud capability on an otherwise-valid manifest, instead
+        # of moving model-availability checks earlier.
         try:
             manifest = self.model_service.get_manifest(
                 request.model_id.strip() or None,
