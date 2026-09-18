@@ -98,6 +98,7 @@ class AgentBrokerTests(unittest.TestCase):
         codex: Path,
         claude: Path,
         *,
+        opencode: Path | None = None,
         extra_env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
@@ -111,6 +112,8 @@ class AgentBrokerTests(unittest.TestCase):
                 "ANTHROPIC_AUTH_TOKEN": "ANTHROPIC_AUTH_SECRET_SENTINEL",
             }
         )
+        if opencode is not None:
+            env["AGENT_BROKER_OPENCODE_BIN"] = str(opencode)
         if extra_env:
             env.update(extra_env)
         return subprocess.run(
@@ -1142,6 +1145,318 @@ class AgentBrokerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         payload = json.loads(result.stdout)
         self.assertEqual(payload["error"]["code"], "invalid_task")
+
+    def test_opencode_success_prompt_is_only_on_stdin(self) -> None:
+        opencode_record = self.root / "opencode-record.json"
+        opencode = self._fake(
+            "opencode",
+            f"""
+            import json, os, pathlib, sys
+            record = {{
+                "argv": sys.argv[1:],
+                "stdin": sys.stdin.read(),
+                "env": {{
+                    k: os.environ[k]
+                    for k in sorted(os.environ)
+                    if k.startswith("OPENCODE_")
+                }},
+                "secret_env": sorted(k for k in os.environ if k in {{
+                    "OPENAI_API_KEY", "CODEX_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"
+                }}),
+            }}
+            pathlib.Path({str(opencode_record)!r}).write_text(json.dumps(record))
+            print(json.dumps({{
+                "type": "text",
+                "timestamp": 1,
+                "sessionID": "opencode-session",
+                "part": {{"type": "text", "text": "opencode completed"}},
+            }}))
+            """,
+        )
+        codex = self._fake("codex", "raise SystemExit(99)\n")
+        claude = self._fake("claude", "raise SystemExit(99)\n")
+        task = self._task(providers=["opencode"])
+
+        result = self._run_broker(task, codex, claude, opencode=opencode)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["provider"], "opencode")
+        self.assertEqual([item["reason"] for item in payload["attempts"]], ["success"])
+        self.assertEqual(payload["session_id"], "opencode-session")
+        self.assertEqual(payload["output"], "opencode completed")
+
+        result_path = Path(payload["result_path"])
+        self.assertEqual(stat.S_IMODE(result_path.stat().st_mode), 0o600)
+
+        data = json.loads(opencode_record.read_text())
+        self.assertNotIn("PROMPT_SECRET_SENTINEL", " ".join(data["argv"]))
+        self.assertIn("PROMPT_SECRET_SENTINEL", data["stdin"])
+        self.assertIn("Agent Broker Worker Policy", data["stdin"])
+        self.assertIn("five-part operator report", data["stdin"])
+        self.assertIn("what could break", data["stdin"])
+        self.assertEqual(data["secret_env"], [])
+
+        self.assertEqual(data["argv"][0], "run")
+        self.assertEqual(data["argv"][data["argv"].index("--format") + 1], "json")
+        self.assertEqual(
+            data["argv"][data["argv"].index("--agent") + 1], "broker"
+        )
+        self.assertEqual(data["argv"][-1], "broker")
+
+        self.assertEqual(data["env"].get("OPENCODE_DISABLE_PROJECT_CONFIG"), "1")
+        self.assertEqual(data["env"].get("OPENCODE_DISABLE_AUTOUPDATE"), "1")
+        agent_config = json.loads(data["env"]["OPENCODE_CONFIG_CONTENT"])
+        broker = agent_config["agent"]["broker"]
+        self.assertEqual(broker["mode"], "primary")
+        self.assertEqual(broker["steps"], 5)
+        permission = broker["permission"]
+        self.assertEqual(permission["*"], "deny")
+        self.assertNotIn("edit", permission)
+        self.assertEqual(permission["read"]["*"], "allow")
+        self.assertEqual(permission["read"]["*.env"], "deny")
+
+    def test_opencode_quota_error_falls_back_to_claude(self) -> None:
+        opencode = self._fake(
+            "opencode",
+            """
+            import json, sys
+            sys.stdin.read()
+            print(json.dumps({
+                "type": "error",
+                "timestamp": 1,
+                "sessionID": "opencode-limited",
+                "error": {
+                    "name": "LLMQuotaError",
+                    "message": "MALICIOUS You've hit your usage limit",
+                },
+            }))
+            raise SystemExit(1)
+            """,
+        )
+        claude_record = self.root / "claude-fallback-record.json"
+        claude = self._fake(
+            "claude",
+            f"""
+            import json, pathlib, sys
+            record = {{"stdin": sys.stdin.read()}}
+            pathlib.Path({str(claude_record)!r}).write_text(json.dumps(record))
+            print(json.dumps({{
+                "type": "result", "subtype": "success", "is_error": False,
+                "session_id": "claude-session", "result": "fallback completed"
+            }}))
+            """,
+        )
+        codex = self._fake("codex", "raise SystemExit(99)\n")
+        task = self._task(providers=["opencode", "claude"])
+
+        result = self._run_broker(task, codex, claude, opencode=opencode)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["provider"], "claude")
+        self.assertEqual([item["reason"] for item in payload["attempts"]], ["quota", "success"])
+        self.assertEqual(payload["session_id"], "claude-session")
+        claude_stdin = json.loads(claude_record.read_text())["stdin"]
+        self.assertIn("previous provider stopped", claude_stdin)
+        self.assertNotIn("MALICIOUS", claude_stdin)
+
+    def test_opencode_worker_error_does_not_fall_back(self) -> None:
+        opencode = self._fake(
+            "opencode",
+            """
+            import json, sys
+            sys.stdin.read()
+            print(json.dumps({
+                "type": "error",
+                "timestamp": 1,
+                "sessionID": "opencode-broken",
+                "error": {"name": "GenericFailure", "message": "something internal broke"},
+            }))
+            raise SystemExit(1)
+            """,
+        )
+        claude_marker = self.root / "claude-called"
+        claude = self._fake(
+            "claude",
+            f"""
+            import pathlib
+            pathlib.Path({str(claude_marker)!r}).write_text("called")
+            raise SystemExit(99)
+            """,
+        )
+        codex = self._fake("codex", "raise SystemExit(99)\n")
+        task = self._task(providers=["opencode", "claude"])
+
+        result = self._run_broker(task, codex, claude, opencode=opencode)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["reason"], "worker_error")
+        self.assertEqual(payload["provider"], "opencode")
+        self.assertEqual(len(payload["attempts"]), 1)
+        self.assertFalse(claude_marker.exists())
+
+    def test_opencode_unavailable_falls_back_and_persists_result(self) -> None:
+        opencode = self._fake("opencode", "raise SystemExit(99)\n")
+        opencode.chmod(0o644)
+        claude = self._fake(
+            "claude",
+            """
+            import json, sys
+            sys.stdin.read()
+            print(json.dumps({
+                "type": "result", "subtype": "success", "is_error": False,
+                "session_id": "claude-fallback", "result": "completed"
+            }))
+            """,
+        )
+        codex = self._fake("codex", "raise SystemExit(99)\n")
+        task = self._task(providers=["opencode", "claude"])
+
+        result = self._run_broker(task, codex, claude, opencode=opencode)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["provider"], "claude")
+        self.assertEqual(
+            [item["reason"] for item in payload["attempts"]], ["unavailable", "success"]
+        )
+        self.assertTrue(Path(payload["result_path"]).is_file())
+
+    def test_opencode_read_only_cannot_modify_workspace(self) -> None:
+        opencode = self._fake(
+            "opencode",
+            """
+            import json, pathlib, sys
+            sys.stdin.read()
+            pathlib.Path("ROGUE.txt").write_text("tampered", encoding="utf-8")
+            print(json.dumps({
+                "type": "text",
+                "timestamp": 1,
+                "sessionID": "opencode-session",
+                "part": {"type": "text", "text": "read-only completed"},
+            }))
+            """,
+        )
+        codex = self._fake("codex", "raise SystemExit(99)\n")
+        claude = self._fake("claude", "raise SystemExit(99)\n")
+        task = self._task(providers=["opencode"])
+
+        result = self._run_broker(task, codex, claude, opencode=opencode)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["reason"], "workspace_changed")
+        self.assertEqual([item["reason"] for item in payload["attempts"]], ["workspace_changed"])
+
+    def test_opencode_write_mode_allows_untracked_change_in_worktree(self) -> None:
+        worktree = self.root / "wt"
+        self._git("worktree", "add", "-q", str(worktree), "HEAD")
+        opencode = self._fake(
+            "opencode",
+            """
+            import json, pathlib, sys
+            sys.stdin.read()
+            pathlib.Path("notes.txt").write_text("worker wrote this", encoding="utf-8")
+            print(json.dumps({
+                "type": "text",
+                "timestamp": 1,
+                "sessionID": "opencode-write",
+                "part": {"type": "text", "text": "wrote notes.txt"},
+            }))
+            """,
+        )
+        codex = self._fake("codex", "raise SystemExit(99)\n")
+        claude = self._fake("claude", "raise SystemExit(99)\n")
+        task = self._task(workspace=worktree, mode="workspace-write", providers=["opencode"])
+
+        result = self._run_broker(task, codex, claude, opencode=opencode)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["provider"], "opencode")
+        self.assertEqual([item["reason"] for item in payload["attempts"]], ["success"])
+        self.assertEqual((worktree / "notes.txt").read_text(), "worker wrote this")
+
+    def test_opencode_failed_write_never_falls_back_when_tree_changed(self) -> None:
+        worktree = self.root / "wt"
+        self._git("worktree", "add", "-q", str(worktree), "HEAD")
+        opencode = self._fake(
+            "opencode",
+            """
+            import json, pathlib, sys
+            sys.stdin.read()
+            pathlib.Path("dirty.txt").write_text("changed before failing", encoding="utf-8")
+            print(json.dumps({
+                "type": "error",
+                "timestamp": 1,
+                "sessionID": "opencode-failed",
+                "error": {"name": "LLMQuotaError", "message": "You've hit your usage limit"},
+            }))
+            raise SystemExit(1)
+            """,
+        )
+        claude_marker = self.root / "claude-called"
+        claude = self._fake(
+            "claude",
+            f"""
+            import pathlib
+            pathlib.Path({str(claude_marker)!r}).write_text("called")
+            raise SystemExit(99)
+            """,
+        )
+        codex = self._fake("codex", "raise SystemExit(99)\n")
+        task = self._task(
+            workspace=worktree, mode="workspace-write", providers=["opencode", "claude"]
+        )
+
+        result = self._run_broker(task, codex, claude, opencode=opencode)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual([item["reason"] for item in payload["attempts"]], ["workspace_changed"])
+        self.assertEqual(payload["provider"], "opencode")
+        self.assertFalse(claude_marker.exists())
+
+    def test_doctor_includes_opencode_checks(self) -> None:
+        opencode = self._fake(
+            "opencode",
+            """
+            import sys
+            if sys.argv[1] == "--version":
+                print("opencode 1.18.28")
+            elif sys.argv[1] == "auth":
+                print("Credentials found")
+            """,
+        )
+        codex = self._fake("codex", 'print("codex ok")\n')
+        claude = self._fake("claude", 'print("claude ok")\n')
+        env = os.environ.copy()
+        env.update(
+            {
+                "AGENT_BROKER_CODEX_BIN": str(codex),
+                "AGENT_BROKER_CLAUDE_BIN": str(claude),
+                "AGENT_BROKER_OPENCODE_BIN": str(opencode),
+            }
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(BROKER),
+                "--json",
+                "--state-dir",
+                str(self.state_dir),
+                "doctor",
+                "--workspace",
+                str(self.repo),
+            ],
+            cwd=REPOSITORY_ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["checks"]["opencode_cli"]["ok"])
+        self.assertTrue(payload["checks"]["opencode_auth"]["ok"])
 
 
 if __name__ == "__main__":
