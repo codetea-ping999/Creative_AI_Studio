@@ -1,5 +1,13 @@
 # Repository Agent Instructions
 
+## AI development operating model
+
+Follow `docs/ai-development-operating-model.md` for role assignment, risk-based routing,
+OpenCode stop/escalation conditions, human-review budget, and release-mode scope
+control. It defines the default responsibility split between the human operator,
+OpenCode, Claude/Codex, and CI. More specific repository safety rules below still
+apply.
+
 ## Working as one of several parallel agents
 
 When you are a subagent in a fan-out (see `.claude/workflows/issue-fleet.js`),
