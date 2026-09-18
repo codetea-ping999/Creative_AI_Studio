@@ -8,12 +8,18 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from threading import Lock, current_thread
+from typing import TYPE_CHECKING, Any, Callable
 import wave
-from typing import Any
 
 from PIL import Image, ImageSequence
 
+from core.models import get_default_admission_controller
+
 from .evaluators import decode_pcm_samples
+
+if TYPE_CHECKING:
+    from core.models import RuntimeAdmissionController
 
 
 @dataclass(slots=True)
@@ -58,9 +64,24 @@ class ScoreCache:
 
 
 class _ClipImageBackend:
-    def __init__(self, config: SemanticJudgeConfig, cache: ScoreCache) -> None:
+    def __init__(
+        self,
+        config: SemanticJudgeConfig,
+        cache: ScoreCache,
+        admission: "RuntimeAdmissionController",
+    ) -> None:
         self.config = config
         self.cache = cache
+        self._admission = admission
+        # Backend-local execution/load lock: G bounds how many *different*
+        # backends/generators may run heavy work across the whole process at
+        # once, but does not by itself stop two threads from both landing
+        # inside admission concurrently when `capacity > 1` and racing to
+        # both lazy-load and both call this exact CLIP model object at the
+        # same time. This lock, always taken *after* G (never before -- see
+        # `_run_admitted()`), serializes this one backend's own load and
+        # inference so that never happens, independent of G's capacity.
+        self._lock = Lock()
         self._runtime: tuple[Any, Any] | None = None
         self._error: str | None = None
 
@@ -86,8 +107,18 @@ class _ClipImageBackend:
             cached["cache_hit"] = True
             return cached
 
-        runtime = self._load_runtime()
-        if runtime is None:
+        def _run(processor: Any, model: Any) -> dict[str, Any]:
+            with Image.open(resolved_output_path) as image:
+                return self._score_image(
+                    image.convert("RGB"),
+                    prompt=prompt,
+                    negative_prompt=negative_prompt,
+                    processor=processor,
+                    model=model,
+                )
+
+        result = self._run_admitted(_run)
+        if result is None:
             return {
                 "status": "unavailable",
                 "media_type": "image",
@@ -98,16 +129,9 @@ class _ClipImageBackend:
                 "cache_hit": False,
             }
 
-        processor, model = runtime
-        with Image.open(resolved_output_path) as image:
-            result = self._score_image(
-                image.convert("RGB"),
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                processor=processor,
-                model=model,
-            )
         result["cache_hit"] = False
+        # Disk-cache write is pure I/O on an already-scored result -- no
+        # runtime involved, so it belongs outside G, after it has released.
         self.cache.put(cache_key, result)
         return result
 
@@ -121,8 +145,17 @@ class _ClipImageBackend:
         if not self.config.enabled or not self.config.image_enabled:
             return _disabled_report("image")
 
-        runtime = self._load_runtime()
-        if runtime is None:
+        def _run(processor: Any, model: Any) -> dict[str, Any]:
+            return self._score_image(
+                image.convert("RGB"),
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                processor=processor,
+                model=model,
+            )
+
+        result = self._run_admitted(_run)
+        if result is None:
             return {
                 "status": "unavailable",
                 "media_type": "image",
@@ -133,16 +166,51 @@ class _ClipImageBackend:
                 "cache_hit": False,
             }
 
-        processor, model = runtime
-        result = self._score_image(
-            image.convert("RGB"),
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            processor=processor,
-            model=model,
-        )
         result["cache_hit"] = False
         return result
+
+    def _run_admitted(
+        self, fn: "Callable[[Any, Any], dict[str, Any]]"
+    ) -> dict[str, Any] | None:
+        """Run `fn(processor, model)` under G -> backend lock -> load/inference.
+
+        Fixed lock order, always acquired in this direction and released in
+        reverse: G (the process-wide admission domain shared with every
+        `ModelService`, PR4a's `RuntimeAdmissionController`) is acquired
+        first, then this backend's own private execution/load lock, only
+        *inside* which the lazy runtime load and the actual inference run.
+        Never the other way around -- taking the backend lock before G would
+        let a thread block waiting on G while holding this lock, forcing any
+        other thread contending for it to wait behind a G acquisition it has
+        no way to influence.
+
+        `RuntimeAdmissionController.acquire()` itself enforces PR4a's
+        existing same-thread nested-acquisition ban unchanged: a thread that
+        still holds an open generator `RuntimeHandle` gets an immediate,
+        loud `RuntimeError` here instead of silently reentering G -- this
+        method does not catch or soften that.
+
+        Returns `fn`'s result, or `None` if the lazy load failed (see
+        `_load_runtime()`; the caller builds the "unavailable" report from
+        `self._error` in that case). G is released in a `finally`
+        regardless of which of those happens, or of `fn` raising -- a load
+        or inference failure still releases G exactly like any other
+        runtime-use failure; it is `RuntimeAdmissionController`/`Semaphore`
+        state, not a `ModelRuntimeCache` entry, so there is nothing here for
+        a failure to conservatively invalidate.
+        """
+
+        owner_thread = current_thread()
+        self._admission.acquire(None)
+        try:
+            with self._lock:
+                runtime = self._load_runtime()
+                if runtime is None:
+                    return None
+                processor, model = runtime
+                return fn(processor, model)
+        finally:
+            self._admission.release(owner_thread)
 
     def _score_image(
         self,
@@ -222,9 +290,18 @@ class _ClipImageBackend:
 
 
 class _ClapAudioBackend:
-    def __init__(self, config: SemanticJudgeConfig, cache: ScoreCache) -> None:
+    def __init__(
+        self,
+        config: SemanticJudgeConfig,
+        cache: ScoreCache,
+        admission: "RuntimeAdmissionController",
+    ) -> None:
         self.config = config
         self.cache = cache
+        self._admission = admission
+        # Same backend-local execution/load lock as _ClipImageBackend (see
+        # that class's own docstring): always taken after G, never before.
+        self._lock = Lock()
         self._runtime: tuple[Any, Any] | None = None
         self._error: str | None = None
 
@@ -249,8 +326,13 @@ class _ClapAudioBackend:
             cached["cache_hit"] = True
             return cached
 
-        runtime = self._load_runtime()
-        if runtime is None:
+        def _run(processor: Any, model: Any) -> dict[str, Any]:
+            return self._score_audio(
+                resolved_output_path, prompt=prompt, processor=processor, model=model
+            )
+
+        result = self._run_admitted(_run)
+        if result is None:
             return {
                 "status": "unavailable",
                 "media_type": "audio",
@@ -261,7 +343,20 @@ class _ClapAudioBackend:
                 "cache_hit": False,
             }
 
-        processor, model = runtime
+        result["cache_hit"] = False
+        # Disk-cache write is pure I/O on an already-scored result -- no
+        # runtime involved, so it belongs outside G, after it has released.
+        self.cache.put(cache_key, result)
+        return result
+
+    def _score_audio(
+        self,
+        resolved_output_path: Path,
+        *,
+        prompt: str,
+        processor: Any,
+        model: Any,
+    ) -> dict[str, Any]:
         import torch
 
         samples, source_sample_rate = _read_wav_samples(resolved_output_path)
@@ -293,7 +388,7 @@ class _ClapAudioBackend:
         positive_cosine = float((audio_embeds[0] * text_embeds[0]).sum().detach().cpu())
         semantic_score = _compose_semantic_score(positive_cosine, None)
 
-        result = {
+        return {
             "status": "scored",
             "media_type": "audio",
             "mode": "local_transformers",
@@ -306,10 +401,24 @@ class _ClapAudioBackend:
                 "source_sample_rate": source_sample_rate,
                 "sample_rate": sample_rate,
             },
-            "cache_hit": False,
         }
-        self.cache.put(cache_key, result)
-        return result
+
+    def _run_admitted(
+        self, fn: "Callable[[Any, Any], dict[str, Any]]"
+    ) -> dict[str, Any] | None:
+        """G -> backend lock -> load/inference. See _ClipImageBackend._run_admitted()."""
+
+        owner_thread = current_thread()
+        self._admission.acquire(None)
+        try:
+            with self._lock:
+                runtime = self._load_runtime()
+                if runtime is None:
+                    return None
+                processor, model = runtime
+                return fn(processor, model)
+        finally:
+            self._admission.release(owner_thread)
 
     def _load_runtime(self) -> tuple[Any, Any] | None:
         if self._runtime is not None:
@@ -470,11 +579,29 @@ class _VideoFrameBackend:
 class SemanticJudge:
     """Lazy semantic judge backed by optional local transformer models."""
 
-    def __init__(self, config: SemanticJudgeConfig) -> None:
+    def __init__(
+        self,
+        config: SemanticJudgeConfig,
+        *,
+        admission: "RuntimeAdmissionController | None" = None,
+    ) -> None:
+        """`admission` defaults to the process-wide `RuntimeAdmissionController`
+        (`get_default_admission_controller()`, `core/models/service.py`) --
+        the exact same "G" domain a default-constructed `ModelService`
+        shares -- so production CLIP/CLAP load and inference compete for the
+        same process-wide heavy-work budget as generator runtimes. Pass an
+        explicit controller (a private `RuntimeAdmissionController(capacity=N)`)
+        to test the admission-sharing mechanism itself in isolation, exactly
+        like `ModelService`'s own `admission`/`admission_capacity`
+        constructor arguments (see `tests/test_runtime_safety_core.py`'s
+        `_build_service()` helper for the equivalent pattern there).
+        """
+
         self.config = config
         self.cache = ScoreCache(config.cache_dir)
-        self.image_backend = _ClipImageBackend(config, self.cache)
-        self.audio_backend = _ClapAudioBackend(config, self.cache)
+        self.admission = admission if admission is not None else get_default_admission_controller()
+        self.image_backend = _ClipImageBackend(config, self.cache, self.admission)
+        self.audio_backend = _ClapAudioBackend(config, self.cache, self.admission)
         self.video_backend = _VideoFrameBackend(config, self.cache, self.image_backend)
 
     def evaluate_image(

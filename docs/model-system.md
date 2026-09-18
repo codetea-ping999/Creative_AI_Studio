@@ -169,11 +169,28 @@ runtime が evict される」といった race を型として塞いでいま�
 - 既存の `get()` / `put()` / `unload()` / `unload_all()` / `resolve_runtime()`
   / `get_runtime()` は外部からの挙動を変えていません（PR4a はキャッシュの
   内部表現を `RuntimeEntry` に統一しただけ）。ただし **lease を取らない**
-  ため concurrency-safe ではなく、legacy / transitional API です。PR4b で
-  generator 側をすべて `acquire_runtime()` へ移行するまでの互換維持用と
-  位置づけます。新規呼び出しをここへ追加しないでください
+  ため concurrency-safe ではありません
+- **PR4b 完了時点の契約**：`resolve_runtime()` / `get_runtime()` は
+  **test / diagnostic 専用**です。production の 5 generator はすべて
+  `acquire_runtime()` へ移行済みで、closure audit の結果 production 側に
+  安全な call site は 1 件も見つかりませんでした（`get_runtime()` が
+  `resolve_runtime()` へ委譲する内部 1 箇所のみが allowlist 対象）。
+  これらの API は lease / 実行排他（`E`）/ admission（`G`）/ INVALID 参加の
+  **いずれも提供しません**。返り値の runtime を実行・変更・
+  「unload/evict/replace しうる他の操作をまたいで保持」する用途は禁止です。
+  互換性のため削除も `DeprecationWarning` 追加も行っていません（後者は
+  正当な test だけを騒がせるため）。詳細な契約は
+  `ModelService.resolve_runtime()` の docstring を参照
+- 再発防止は静的 guard で機械的に担保します：
+  `tests/test_runtime_surface_guard.py` が AST で `apps/` `bootstrap/`
+  `core/` `generators/` `scripts/` 全体を走査し、bare API 呼び出し・
+  `getattr()` 経由の間接呼び出し・`runtime_cache` / `loader` への
+  直接アクセス・`with` を伴わない generator の runtime 取得を検出します
+  （定義・docstring・同名の無関係 method は誤検知しません）
 - 新しい `ModelService.acquire_runtime(model_id, media_type, task_type=None,
-  *, wait_timeout=None) -> RuntimeHandle` が安全な取得経路です
+  *, wait_timeout=None, wait_checkpoint=None, poll_interval=0.1) -> RuntimeHandle`
+  が安全な取得経路です（`wait_checkpoint`/`poll_interval`は後述の
+  「checkpoint mode」を参照）
 
 ```python
 with model_service.acquire_runtime(model_id, media_type, task_type) as handle:
@@ -211,6 +228,95 @@ INVALID化・削除・差し替えのいずれかが起きていた場合はEを
 即座に解放し直し、handleをuser codeへは絶対に渡さず
 `RuntimeBusyError`を送出します。この順序が崩れない限り、
 この4資源の組み合わせで自己deadlockは起きません。
+
+**INVALID entryのhandoff retryとmulti-waiter drain**（issue #414
+follow-up, PR #420）：上記の再検証に失敗した caller（＝E獲得直後に
+対象entryがINVALIDだったcaller）は、L -> Eの取得シーケンスを
+同じ`acquire_runtime()`呼び出しの中で、同じ`deadline`に束縛された
+まま内部的にretryします。これ自体は「自分自身の stale lease を
+既に解放済み」という前提があるため安全です（他のcallerの将来の
+行動を待つのではなく、自分自身がすでに行った解放が entry を
+evict/reload可能にしている）。
+
+ただし `admission_capacity >= 2` では、同じ READY entry を複数の
+caller が pin した状態で invalidate されうるため、retryした
+caller が同じ entry を再度 `acquire_or_reserve()` した際に
+「INVALIDのままだが**別の** stale lease 保持者がまだ pin している」
+状態に出会うことがあります。この状態は最小限、かつ厳密に scope された
+条件下でのみ内部的に retry 可能な唯一の `RuntimeBusyError` 原因です：
+
+> post-E revalidation に失敗した caller は、その失敗の原因となった
+> **まさにその** entry/generation が stale lease の drain 待ちである
+> 間に限り、caller 自身の acquisition deadline の範囲内で内部的に
+> 待機・retry してよい。それ以外の busy/capacity 状態
+> （健全な entry が genuinely busy、LOADING/RETIRING、別の
+> entry/generation、容量競合など）は引き続き即座に非retryの
+> `RuntimeBusyError`のままです。
+
+この待機は `ModelRuntimeCache.wait_for_stale_entry_drain()` が
+`threading.Condition`（`_metadata_lock`をLockではなくConditionに
+した上で、`release_lease()`が lease 減算のたびに`notify_all()`する）
+で実装しており、poll/busy-spinは一切行いません。deadlineが尽きれば
+既存の公開`RuntimeWaitTimeoutError`が送出されます。この仕組みはG/L/E
+順序・`RuntimeEntry`の構造・publicな例外taxonomyを一切変更しません
+（`core/models/runtime_lease.py`の`_RuntimeInvalidEntryDrainingError`は
+privateなtype変更のみで、message・timing・「ここでは待たず即決定する」
+という`acquire_or_reserve()`自体の挙動は不変です）。
+
+**stale-drain資格の所有権：1回の公開呼び出しに限定**（PR #420）：
+上記の「再検証失敗の原因となった**まさにその** entry を待ってよい」
+という資格は、**1回の`acquire_runtime()`呼び出し**だけが所有し、その
+呼び出しを越えて生き残ることはありません。資格は呼び出しローカルな
+private holder に保持され、成功・timeout・checkpoint例外・その他
+あらゆる例外のいずれで終わっても`finally`で破棄されます。
+`ModelService`のfieldにも、threadをkeyにしたdict/thread-localにも
+保存しません。したがって別々の公開呼び出し（callerが自前で書いた
+plainな呼び出しのretryループを含む）は常に独立したfresh callerであり、
+WorkerPoolのworker threadが後で別jobに再利用されても資格は引き継がれず、
+INVALIDかつpin中のentryに対しては即座に非retryの`RuntimeBusyError`に
+なります。再検証失敗のretry予算（1回）も、この論理的な1回の呼び出し
+ごとに1回です。
+
+**checkpoint mode**（`wait_checkpoint`を渡した場合）：cooperativeな
+キャンセルをしながら待ちたいcallerの正式な経路です。1回の公開呼び出しが
+1つの論理的な待機操作になります。
+
+- `wait_checkpoint()`は最初の同期取得の前に1回、その後は
+  `RuntimeWaitTimeoutError`で終わった同期sliceの後ごとに呼ばれます。
+  呼ばれる時点で、この呼び出しはG/L/E/M/leaseを**一切保持していません**。
+  正常にreturnしたときだけ次のsliceが始まり、送出した例外（キャンセル、
+  失敗したprobe、`BaseException`）はそのまま伝播して操作が終わります
+- 各sliceは通常のG -> L -> E取得で、`min(now + poll_interval, 全体deadline)`
+  で束縛されます
+- `wait_timeout`は呼び出し全体のdeadline（呼び出し開始時点から計測、
+  sliceごとにリセットしない）。`None`は無期限ですが、checkpointで区切られた
+  有界sliceの繰り返しとしてのみ待ちます。`0`は1回の非blocking試行のままで、
+  polling待機にはなりません。checkpoint modeでは`None`または有限の`>= 0`
+  でなければなりません
+- model idの解決は最初のcheckpointの後に1回だけ。cloud providerのopt-in
+  guardは各sliceの前に毎回再確認します
+- 次のsliceを始めてよいのは`RuntimeWaitTimeoutError`だけです。それ以外の
+  `RuntimeBusyError`やあらゆる例外は、その時点で呼び出しを終わらせます
+- 同じ呼び出しのslice間では、自分の再検証失敗で得た資格が保持されます。
+  次のsliceの最初の試行が**同一object**のentryで
+  `_RuntimeInvalidEntryDrainingError`に当たった場合だけdrain待ちを再開し、
+  別のentry/generationなら即座に`RuntimeBusyError`です
+
+`wait_checkpoint=None`（plain mode）は従来どおり`wait_timeout`で束縛された
+1回のsliceで、`poll_interval`は値の検証のみ行い使いません。不正な
+`poll_interval`/`wait_checkpoint`（checkpoint modeでは`wait_timeout`も）は、
+model id解決やresource取得より前に`TypeError`/`ValueError`になります。
+
+Image/Video/Textの各generatorは、`GenerationContext`がある場合に
+`wait_checkpoint=context.raise_if_cancelled`を渡す1回の呼び出しで
+runtimeを取得します（generator側で公開APIを呼び直すループは持ちません）。
+
+**公開例外が内部entryを保持しないこと**：`acquire_runtime()`が送出する
+`RuntimeBusyError`/`RuntimeWaitTimeoutError`は、捕捉した内部例外と同じ
+公開型・同じmessageの新しいinstanceとして、内部例外の`except`スコープの
+外で送出されます。そのため`__cause__`/`__context__`/tracebackから、
+`.entry`でstaleな`RuntimeEntry`（とそのruntime object）を掴んだprivate
+例外に到達することはありません。
 
 **admissionの共有範囲**（Codex round 1 review, Finding 1）：
 `ModelService.__init__`が`admission`/`admission_capacity`を
@@ -290,12 +396,38 @@ cleanupされ、leakしません（Finding 4）。
   `acquire_or_reserve()`/`unload()`/`unload_all()`が恒久的に
   `RuntimeBusyError`になる）ことはありません。
 
-### 未解決のscope（PR4b）
+### semantic judge の admission 参加（PR4b）
 
-productionの5generator移行、semantic classifier、legacy raw-runtime
-APIの利用制限、generator側のcancellation/error統合、PR3との
-end-to-end回帰確認はPR4bのscopeです。PR4a完了時点でも
-production WorkerPoolと`JOB_LANES`のproduction活用は無効のままです。
+`core/quality/semantic.py` の CLIP / CLAP backend は、PR4a と**同一の**
+process-wide `RuntimeAdmissionController`（`get_default_admission_controller()`）
+を共有します。新しい semaphore / admission domain は追加していません。
+`SemanticJudge(config, admission=None)` は未指定時のみ default controller を
+使い、test だけが private controller を注入できます。
+
+- lock 順序は **`G` -> backend lock** に固定。逆順は存在せず、backend lock を
+  保持したまま `G` を待つ経路もありません
+- `G` は cold load（`from_pretrained()`）と warm inference の**両方**を保護
+  します。「既に load 済みだから `G` を取らない」は不可
+- backend lock は `G` の capacity が 1 より大きい場合でも、同一 CLIP / CLAP
+  model object の lazy load と推論が重ならないことを保証します
+- semantic score の disk cache hit / 設定検証 / cache JSON 書き込みは `G` の
+  外で行い、不要な admission を消費しません
+- video semantics は frame ごとに image backend の通常の admitted path を
+  通ります。video 側で独自に `G` を取得しないため、PR4a が禁止する
+  same-thread nested acquisition は構造的に発生しません
+- generator は runtime lease を解放した**後**に semantic scoring へ進みます。
+  lease 保持中に semantic `G` を取ろうとした場合は、PR4a の
+  nested-acquisition ban がそのまま fail-fast します
+
+決定論的な証拠は `tests/test_semantic_admission.py` を参照してください。
+
+### 未解決のscope（PR4b 完了後）
+
+PR4bのscopeであったproductionの5generator移行、semantic judgeのadmission
+統合、legacy raw-runtime APIの利用制限、generator側のcancellation/error
+統合は完了しています。production WorkerPoolと`JOB_LANES`のproduction活用は
+引き続き無効で、PR5のgateのままです（dynamic capacity policy、process
+isolation、semantic runtimeの`ModelRuntimeCache`統合も同様に範囲外）。
 
 ## Image Provider Credentials（Issue #257）
 

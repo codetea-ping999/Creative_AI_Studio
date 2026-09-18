@@ -63,6 +63,68 @@ class RuntimeBusyError(RuntimeError):
     """
 
 
+class RuntimeWaitTimeoutError(RuntimeBusyError):
+    """A G/L/E synchronization deadline expired; a cancellable caller may retry.
+
+    Other busy conditions retain their immediate-failure contract rather than
+    being mistaken for temporary lock contention.
+    """
+
+
+class _RuntimeInvalidEntryDrainingError(RuntimeBusyError):
+    """Private signal: `entry` is INVALID and still pinned by draining stale leases.
+
+    Raised only by ``ModelRuntimeCache.acquire_or_reserve()``'s own
+    INVALID-and-still-pinned branch, for *every* caller that reaches it --
+    this is a type change at that one raise site only. The message, the
+    timing, and the "never wait, decide immediately" behavior of that
+    branch are all unchanged from the plain `RuntimeBusyError` it used to
+    raise; every existing `except RuntimeBusyError:` still catches this
+    identically.
+
+    Every lease on an `INVALID` entry is provably stale: `entry.state` only
+    ever transitions `READY -> INVALID` (see `RuntimeState`'s own
+    docstring), and `acquire_or_reserve()` only ever increments
+    `lease_count` on its `READY` branch -- so an `INVALID` entry can never
+    acquire a *new* lease, and every lease it still carries belongs to a
+    caller from back when it was `READY`, each committed to an O(1)
+    release-and-unwind (`RuntimeHandle.release()` marks INVALID and
+    releases E; `ModelService._acquire_execution_lock()` releases E and
+    this caller's own lease the moment it observes that invalidation).
+    `lease_count` on an `INVALID` entry is therefore monotonically
+    non-increasing and drains to zero without needing G or L -- the exact
+    resources a caller reaching this branch already holds (or has already
+    released, by the time it could reach here a second time).
+
+    `entry` is the exact `RuntimeEntry` object this raise was about --
+    carried so `ModelService` can tell "the same stale drain I already
+    observed once, via my own post-E revalidation failure" apart from "an
+    unrelated INVALID entry" (a different object/generation) by identity,
+    never by canonical id alone.
+
+    Deliberately never exported (not in this module's `__all__`, not
+    re-exported from `core.models`): the only code allowed to catch it by
+    name is `ModelService._acquire_entry_with_execution_lock()` /
+    `_acquire_entry_after_revalidation_failure()`, which use it to decide,
+    internally, whether to wait out the drain -- bounded by the caller's
+    own acquisition deadline, and only for the exact entry that caused this
+    caller's own, already-observed `_RuntimeExecutionRevalidationFailed` --
+    instead of failing immediately. That eligibility is owned by one
+    `acquire_runtime()` call and never outlives it. A caller reaching this
+    branch with no revalidation failure of its own yet in that call (the
+    ordinary case) still converts this into the plain, public
+    `RuntimeBusyError` on the spot -- raised outside this exception's
+    `except` scope, so the public error never chains back to this object
+    or its `entry`; see
+    `docs/model-system.md`'s Runtime Safety Core section for the full
+    contract.
+    """
+
+    def __init__(self, message: str, *, entry: "RuntimeEntry") -> None:
+        super().__init__(message)
+        self.entry = entry
+
+
 class RuntimeEntry:
     """Cache-slot metadata for one canonical runtime id.
 
@@ -164,4 +226,4 @@ class RuntimeEntry:
         )
 
 
-__all__ = ["RuntimeBusyError", "RuntimeEntry", "RuntimeState"]
+__all__ = ["RuntimeBusyError", "RuntimeWaitTimeoutError", "RuntimeEntry", "RuntimeState"]

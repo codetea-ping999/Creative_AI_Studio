@@ -25,8 +25,13 @@ from .loader import (
 from .manifest import ModelManifest
 from .registry import ModelRegistry
 from .resolver import ModelResolver
-from .runtime_lease import RuntimeBusyError, RuntimeEntry, RuntimeState
-from .service import ModelService, RuntimeAdmissionController, RuntimeHandle
+from .runtime_lease import RuntimeBusyError, RuntimeEntry, RuntimeState, RuntimeWaitTimeoutError
+from .service import (
+    ModelService,
+    RuntimeAdmissionController,
+    RuntimeHandle,
+    get_default_admission_controller,
+)
 
 __all__ = [
     "AudioCraftMusicgenLoader",
@@ -49,12 +54,14 @@ __all__ = [
     "RuntimeEntry",
     "RuntimeHandle",
     "RuntimeState",
+    "RuntimeWaitTimeoutError",
     "TransformersMusicgenLoader",
     "VoicevoxHttpLoader",
     "create_default_loader_registry",
     "ensure_cloud_provider_enabled",
     "evaluate_manifest_payload",
     "evaluate_manifest_readiness",
+    "get_default_admission_controller",
     "release_runtime",
     "resolve_media_cache_limits",
 ]

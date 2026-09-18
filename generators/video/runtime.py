@@ -12,8 +12,10 @@ from uuid import uuid4
 
 from PIL import Image, ImageDraw, ImageFont
 
+from core.jobs.context import GenerationCancelled
 from core.models import ModelManifest
 from core.schemas import GenerationRequest
+from generators.common import safe_is_cancelled
 
 if TYPE_CHECKING:
     from core.jobs.context import GenerationContext
@@ -40,6 +42,39 @@ class BaseVideoRuntime(ABC):
         """Render a video asset and return its file paths and metadata."""
 
 
+def coerce_procedural_render_params(effective_params: dict[str, Any]) -> dict[str, Any]:
+    """Coerce and pop the procedural runtime's own request-owned numeric params.
+
+    Codex P2 finding "Video: restrict deferred procedural parameter
+    failures": `width`/`height`/`fps`/`duration_seconds`/`num_frames` are
+    the only inputs to `ProceduralStoryboardRuntime.render()` that come
+    from the request/manifest defaults rather than the loaded runtime
+    itself (contrast `runtime_obj.get("palette")`, coerced by
+    `_hex_to_rgb()` inside `render()` -- a malformed value there is a
+    genuine runtime defect, not a request error). Extracted to a
+    standalone function so `VideoGenerator.generate()` can wrap *only*
+    this conversion in a narrow `try/except`, immediately before calling
+    `render()`, instead of a broad `except (ValueError, TypeError)` around
+    the entire render call -- which used to also catch a bad palette and
+    incorrectly treat it as a harmless input error instead of invalidating
+    the runtime that produced it. Raises `ValueError`/`TypeError` exactly
+    as the original inline coercion did.
+    """
+
+    width = max(256, int(effective_params.pop("width", 576)))
+    height = max(256, int(effective_params.pop("height", 320)))
+    fps = max(4, int(effective_params.pop("fps", 8)))
+    duration_seconds = max(2, int(effective_params.pop("duration_seconds", 4)))
+    num_frames = max(12, int(effective_params.pop("num_frames", duration_seconds * fps)))
+    return {
+        "width": width,
+        "height": height,
+        "fps": fps,
+        "duration_seconds": duration_seconds,
+        "num_frames": num_frames,
+    }
+
+
 class ProceduralStoryboardRuntime(BaseVideoRuntime):
     """Generate lightweight animated storyboard previews as gif assets."""
 
@@ -53,11 +88,17 @@ class ProceduralStoryboardRuntime(BaseVideoRuntime):
         effective_params: dict[str, Any],
         context: "GenerationContext | None" = None,
     ) -> dict[str, Any]:
-        width = max(256, int(effective_params.pop("width", 576)))
-        height = max(256, int(effective_params.pop("height", 320)))
-        fps = max(4, int(effective_params.pop("fps", 8)))
-        duration_seconds = max(2, int(effective_params.pop("duration_seconds", 4)))
-        num_frames = max(12, int(effective_params.pop("num_frames", duration_seconds * fps)))
+        # Already coerced by `VideoGenerator.generate()` via
+        # `coerce_procedural_render_params()` before this call, on any
+        # path reached through the real router -- re-coercing here is a
+        # harmless no-op on already-valid ints, and keeps this method
+        # self-sufficient for any caller that skips that step.
+        coerced = coerce_procedural_render_params(effective_params)
+        width = coerced["width"]
+        height = coerced["height"]
+        fps = coerced["fps"]
+        duration_seconds = coerced["duration_seconds"]
+        num_frames = coerced["num_frames"]
         camera_motion = (
             str(effective_params.pop("camera_motion", "push-in")).strip() or "push-in"
         )
@@ -71,9 +112,31 @@ class ProceduralStoryboardRuntime(BaseVideoRuntime):
         rng = random.Random(request.seed if request.seed is not None else hash(request.prompt))
 
         frames = []
+        progress_error: Exception | None = None
         for frame_index in range(num_frames):
             if context is not None:
-                context.raise_if_cancelled()
+                # PR4b Lane B: `context.is_cancelled()` itself can raise
+                # (JobRepository I/O -- see
+                # `generators/common/cancellation.py`), the same fault mode
+                # `VideoGenerator.generate()`'s own pre-render probe already
+                # guards against, one call frame up. That is external
+                # bookkeeping, not a rendering fault, so it must not
+                # propagate through this `render()` call and invalidate a
+                # runtime that is rendering frames correctly -- captured and
+                # handed back via the same `probe_error` sentinel as a
+                # `report_progress()` failure below, so `VideoGenerator`
+                # raises it only once its lease has already released.
+                # A genuine cancellation request (`cancelled` true, no probe
+                # exception) still raises `GenerationCancelled` here exactly
+                # as `context.raise_if_cancelled()` used to -- mid-render
+                # cancellation keeps its existing conservative invalidation
+                # behavior; only the probe's own external exception is
+                # isolated.
+                cancelled, frame_probe_error = safe_is_cancelled(context)
+                if frame_probe_error is not None:
+                    return {"probe_error": frame_probe_error}
+                if cancelled:
+                    raise GenerationCancelled()
             frames.append(
                 self._render_frame(
                     index=frame_index,
@@ -89,24 +152,43 @@ class ProceduralStoryboardRuntime(BaseVideoRuntime):
                 )
             )
             if context is not None:
-                context.report_progress((frame_index + 1) / num_frames)
+                # Codex P2 finding "Video: progress publication must not
+                # invalidate procedural runtime": `report_progress()`
+                # writes through JobRepository/event publication in
+                # production -- external bookkeeping, not a rendering
+                # fault (see this module's fault-boundary note, mirroring
+                # Image). A transient DB/event failure here must not
+                # escape through this render() call and invalidate a
+                # runtime that is rendering frames correctly. Captured
+                # (the first one; never swallowed) and frame rendering
+                # keeps going -- retaining progress updates for any later
+                # frame whose report succeeds -- instead of aborting an
+                # otherwise-healthy render over a boundary hiccup.
+                # `VideoGenerator.generate()` re-raises it only once this
+                # lease has already exited cleanly.
+                try:
+                    context.report_progress((frame_index + 1) / num_frames)
+                except Exception as exc:
+                    if progress_error is None:
+                        progress_error = exc
 
-        output_id = f"vid_{uuid4().hex}"
-        output_path = output_dir / f"{output_id}.gif"
+        # Deliberately no GIF encoding (filesystem I/O) here: frame
+        # generation above is the actual runtime-use interval this
+        # method is responsible for. `pending_frames` hands the raw,
+        # already-rendered frames back to `VideoGenerator.generate()`,
+        # which encodes them via `encode_frames_as_gif()` only *after* its
+        # runtime lease has released -- an output-filesystem failure
+        # (disk-full, permission denial) during encoding is then no longer
+        # able to invalidate a runtime that finished rendering correctly.
         frame_duration_ms = max(50, int(1000 / fps))
-        frames[0].save(
-            output_path,
-            save_all=True,
-            append_images=frames[1:],
-            duration=frame_duration_ms,
-            loop=0,
-            disposal=2,
-        )
         return {
-            "output_id": output_id,
-            "output_path": str(output_path),
-            "preview_paths": [str(output_path)],
+            "pending_frames": frames,
+            "pending_frame_duration_ms": frame_duration_ms,
             "output_format": "gif",
+            # `None` when every `report_progress()` call succeeded (or no
+            # `context` was supplied). `VideoGenerator.generate()` raises
+            # this itself, only once this lease has already released.
+            "progress_error": progress_error,
             "params": {
                 "width": width,
                 "height": height,
@@ -270,7 +352,6 @@ class LearnedVideoRuntime(BaseVideoRuntime):
             **effective_params,
         }
         if context is not None:
-            context.raise_if_cancelled()
             # The loaded model's own callable is opaque third-party code (see
             # LearnedVideoLoader), so step-level cancellation only happens if
             # the adapter itself opts in: it can pop this kwarg and call it
@@ -278,10 +359,36 @@ class LearnedVideoRuntime(BaseVideoRuntime):
             # adapter under models/video/learned-runtime/runtime.py).
             # `_callable_accepts_kwarg` guards against a fixed-signature
             # renderer (no **kwargs) raising TypeError on this extra
-            # argument -- an adapter that can't take it still gets the
-            # boundary check above, exactly as before this feature existed.
+            # argument.
             if _callable_accepts_kwarg(callable_runtime, "raise_if_cancelled"):
                 generation_kwargs["raise_if_cancelled"] = context.raise_if_cancelled
+            # Codex P2 finding "learned-video pre-call cancellation":
+            # VideoGenerator.generate() samples cancellation once, before
+            # calling `render()` at all (`cancelled_before_render`), but
+            # resolving the runtime router and building `generation_kwargs`
+            # above is enough intervening work for cancellation to land in
+            # that window. A *second* boundary check belongs immediately
+            # before this actually-expensive call so an already-cancelled
+            # job never starts inference. It must not raise
+            # `GenerationCancelled` here, though: that would unwind through
+            # `VideoGenerator.generate()`'s `with` block and conservatively
+            # invalidate a runtime this call never touched. A boolean check
+            # plus a sentinel return lets `VideoGenerator` observe the
+            # cancellation, let the lease exit cleanly, and raise only once
+            # the runtime is no longer under active use.
+            #
+            # PR4b Lane B: `context.is_cancelled()` itself can raise
+            # (JobRepository I/O). Observed here, before the loaded model
+            # (potentially GPU-weight-resident) is ever invoked, that is a
+            # bookkeeping failure, not a runtime fault -- `safe_is_cancelled()`
+            # keeps it from propagating and hands it back the same way as
+            # the `cancelled` sentinel, so `VideoGenerator` raises it only
+            # once this lease has already released.
+            cancelled, probe_error = safe_is_cancelled(context)
+            if probe_error is not None:
+                return {"probe_error": probe_error}
+            if cancelled:
+                return {"cancelled_before_invocation": True}
         generated = callable_runtime(**generation_kwargs)
         return self._normalize_generated_output(
             generated=generated,
@@ -344,20 +451,26 @@ class LearnedVideoRuntime(BaseVideoRuntime):
             and generated
             and all(isinstance(frame, Image.Image) for frame in generated)
         ):
-            output_id = f"vid_{uuid4().hex}"
-            output_path = output_dir / f"{output_id}.gif"
-            generated[0].save(
-                output_path,
-                save_all=True,
-                append_images=generated[1:],
-                duration=max(50, int(1000 / max(1, int(effective_params.get("fps", 8))))),
-                loop=0,
-                disposal=2,
-            )
+            # Same reasoning as ProceduralStoryboardRuntime.render(): no GIF
+            # encoding (filesystem I/O) here -- the adapter already
+            # finished its own runtime-use interval by returning these
+            # frames. `pending_frames` defers the actual encode to
+            # `VideoGenerator.generate()`, after its lease has released.
+            #
+            # Codex P2 finding "learned-video request parameter parsing":
+            # unlike ProceduralStoryboardRuntime (which coerces its own
+            # `fps` before rendering a single frame), `fps` here is a
+            # request-owned value this adapter never validates itself.
+            # Converting it to a duration eagerly, right here, would still
+            # be inside the active lease -- a malformed value (e.g.
+            # `fps="bad"`) would raise `ValueError` after inference already
+            # completed successfully and incorrectly invalidate a healthy
+            # runtime. The raw value is instead passed through unconverted;
+            # `VideoGenerator.generate()` parses it only once its lease has
+            # released, via `frame_duration_ms_from_fps()`.
             return {
-                "output_id": output_id,
-                "output_path": str(output_path),
-                "preview_paths": [str(output_path)],
+                "pending_frames": generated,
+                "pending_frame_fps": effective_params.get("fps", 8),
                 "output_format": "gif",
                 "params": dict(effective_params),
                 "runtime_metadata": {
@@ -371,6 +484,47 @@ class LearnedVideoRuntime(BaseVideoRuntime):
             "Learned video runtime returned an unsupported payload. "
             "Use output_path, frames, or a saved file path."
         )
+
+
+def encode_frames_as_gif(
+    frames: list[Image.Image], output_dir: Path, frame_duration_ms: int
+) -> tuple[str, Path]:
+    """Encode already-rendered `frames` to a GIF file. Pure filesystem I/O.
+
+    Deliberately standalone (not a method on either runtime class) so
+    `VideoGenerator.generate()` can call it itself, *after* its runtime
+    lease has released, for a `render()` result carrying `pending_frames`
+    -- see `ProceduralStoryboardRuntime.render()` and
+    `LearnedVideoRuntime._normalize_generated_output()`. A disk-full or
+    permission failure here is an output-filesystem fault, never a
+    runtime fault.
+    """
+
+    output_id = f"vid_{uuid4().hex}"
+    output_path = output_dir / f"{output_id}.gif"
+    frames[0].save(
+        output_path,
+        save_all=True,
+        append_images=frames[1:],
+        duration=frame_duration_ms,
+        loop=0,
+        disposal=2,
+    )
+    return output_id, output_path
+
+
+def frame_duration_ms_from_fps(fps: Any) -> int:
+    """Convert a request-owned, possibly-unvalidated `fps` value to a GIF frame duration.
+
+    Kept standalone so `VideoGenerator.generate()` can parse `fps` itself,
+    after a `pending_frames` runtime lease has already released -- a
+    malformed value (e.g. `fps="bad"`) then raises `ValueError` with no
+    runtime involved at all, instead of raising from inside
+    `LearnedVideoRuntime.render()`'s active lease. See
+    `LearnedVideoRuntime._normalize_generated_output()`.
+    """
+
+    return max(50, int(1000 / max(1, int(fps))))
 
 
 def _callable_accepts_kwarg(callable_obj: Any, name: str) -> bool:
@@ -415,4 +569,7 @@ __all__ = [
     "ProceduralStoryboardRuntime",
     "SUPPORTED_VIDEO_OUTPUT_FORMATS",
     "VideoRuntimeRouter",
+    "coerce_procedural_render_params",
+    "encode_frames_as_gif",
+    "frame_duration_ms_from_fps",
 ]
