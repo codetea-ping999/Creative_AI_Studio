@@ -1535,4 +1535,9 @@ class ModelService:
         self.runtime_cache.unload_all()
 
 
-__all__ = ["ModelService", "RuntimeAdmissionController", "RuntimeHandle"]
+__all__ = [
+    "ModelService",
+    "RuntimeAdmissionController",
+    "RuntimeHandle",
+    "get_default_admission_controller",
+]
