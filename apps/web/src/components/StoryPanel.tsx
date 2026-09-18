@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 import {
   applyStoryResult,
   assembleStory,
@@ -6,6 +6,7 @@ import {
   createStory,
   generateSceneMedia,
   isReadyToAssemble,
+  missingAudioCount,
   resolveSceneTarget,
   sceneRoleLabels,
   sceneScopedStages,
@@ -16,11 +17,19 @@ import {
   storyStages,
   updateStory,
   type SceneRole,
+  type SceneVisualMediaType,
   type StoryDetail,
   type StoryDocument,
   type StoryScene,
   type StorySummary,
 } from "../lib/storyApi";
+
+/** The scene role (and, for `visual`, how) a generation request is in flight for. */
+type BusyScene = {
+  sceneId: string;
+  role: SceneRole;
+  mediaType?: SceneVisualMediaType;
+};
 
 export type StoryPanelProps = {
   /** Text model to write with; empty falls back to the API default. */
@@ -108,8 +117,12 @@ function StoryScenes({
   detail: StoryDetail;
   onGenerateSceneImage?: (scene: StoryScene) => void;
   onGenerateSceneNarration?: (scene: StoryScene) => void;
-  onGenerateRole?: (scene: StoryScene, role: SceneRole) => void;
-  busyScene?: { sceneId: string; role: SceneRole } | null;
+  onGenerateRole?: (
+    scene: StoryScene,
+    role: SceneRole,
+    mediaType?: SceneVisualMediaType,
+  ) => void;
+  busyScene?: BusyScene | null;
 }) {
   const scenes = [...detail.story.scenes].sort(
     (left, right) => left.order - right.order,
@@ -225,7 +238,8 @@ function StoryScenes({
                           (role) => {
                             const isBusy =
                               busyScene?.sceneId === scene.id &&
-                              busyScene.role === role;
+                              busyScene.role === role &&
+                              busyScene.mediaType !== "video";
                             const hasSource =
                               role === "visual"
                                 ? Boolean(scene.image_prompt.trim())
@@ -233,28 +247,53 @@ function StoryScenes({
                                   ? Boolean(scene.narration.trim())
                                   : Boolean(scene.bgm_mood.trim());
                             const isFilled = Boolean(scene.asset_ids[role]);
+                            const isProceduralBusy =
+                              busyScene?.sceneId === scene.id &&
+                              busyScene.role === "visual" &&
+                              busyScene.mediaType === "video";
                             return (
-                              <button
-                                key={role}
-                                type="button"
-                                className="secondary-button"
-                                onClick={() => onGenerateRole(scene, role)}
-                                disabled={!hasSource || Boolean(busyScene)}
-                                aria-busy={isBusy}
-                                title={
-                                  hasSource
-                                    ? isFilled
-                                      ? `${sceneRoleLabels[role]}を作り直す`
-                                      : `${sceneRoleLabels[role]}を生成してこのシーンに紐付ける`
-                                    : `${sceneRoleLabels[role]}のもとになるテキストがありません`
-                                }
-                              >
-                                {isBusy
-                                  ? `${sceneRoleLabels[role]}…`
-                                  : isFilled
-                                    ? `${sceneRoleLabels[role]}を再生成`
-                                    : `${sceneRoleLabels[role]}を生成`}
-                              </button>
+                              <Fragment key={role}>
+                                <button
+                                  type="button"
+                                  className="secondary-button"
+                                  onClick={() => onGenerateRole(scene, role)}
+                                  disabled={!hasSource || Boolean(busyScene)}
+                                  aria-busy={isBusy}
+                                  title={
+                                    hasSource
+                                      ? isFilled
+                                        ? `${sceneRoleLabels[role]}を作り直す`
+                                        : `${sceneRoleLabels[role]}を生成してこのシーンに紐付ける`
+                                      : `${sceneRoleLabels[role]}のもとになるテキストがありません`
+                                  }
+                                >
+                                  {isBusy
+                                    ? `${sceneRoleLabels[role]}…`
+                                    : isFilled
+                                      ? `${sceneRoleLabels[role]}を再生成`
+                                      : `${sceneRoleLabels[role]}を生成`}
+                                </button>
+                                {role === "visual" ? (
+                                  <button
+                                    type="button"
+                                    className="secondary-button"
+                                    onClick={() =>
+                                      onGenerateRole(scene, "visual", "video")
+                                    }
+                                    disabled={!hasSource || Boolean(busyScene)}
+                                    aria-busy={isProceduralBusy}
+                                    title={
+                                      hasSource
+                                        ? "モデル不要の手続き型ストーリーボード動画（Stable）を生成してこのシーンに紐付ける"
+                                        : "ビジュアルのもとになる画像プロンプトがありません"
+                                    }
+                                  >
+                                    {isProceduralBusy
+                                      ? "手続き型ビジュアル…"
+                                      : "手続き型ビジュアルを生成（Stable）"}
+                                  </button>
+                                ) : null}
+                              </Fragment>
                             );
                           },
                         )
@@ -325,10 +364,7 @@ export function StoryPanel({
   const [isCreating, setIsCreating] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [pending, setPending] = useState<PendingStage>(null);
-  const [busyScene, setBusyScene] = useState<{
-    sceneId: string;
-    role: SceneRole;
-  } | null>(null);
+  const [busyScene, setBusyScene] = useState<BusyScene | null>(null);
   const [isAssembling, setIsAssembling] = useState(false);
   const [scriptSceneId, setScriptSceneId] = useState("");
   const [error, setError] = useState("");
@@ -437,15 +473,24 @@ export function StoryPanel({
     }
   }
 
-  async function handleGenerateRole(scene: StoryScene, role: SceneRole) {
+  async function handleGenerateRole(
+    scene: StoryScene,
+    role: SceneRole,
+    mediaType?: SceneVisualMediaType,
+  ) {
     if (!story) return;
+    const label =
+      mediaType === "video" ? "手続き型ビジュアル" : sceneRoleLabels[role];
     setError("");
     setNotice("");
-    setBusyScene({ sceneId: scene.id, role });
+    setBusyScene({ sceneId: scene.id, role, mediaType });
     try {
       const { job_id: jobId } = await generateSceneMedia(story.id, scene.id, {
         role,
-        model_id: sceneModelIds?.[role] ?? "",
+        // The procedural clip always uses the server's Stable model default; a
+        // still-image model choice must not leak into it.
+        model_id: mediaType === "video" ? "" : (sceneModelIds?.[role] ?? ""),
+        ...(mediaType ? { media_type: mediaType } : {}),
       });
       const status = await awaitJob(jobId);
       // The server binds the finished asset to the scene, so the panel only has
@@ -453,11 +498,11 @@ export function StoryPanel({
       setDetail(await getStory(story.id));
       setNotice(
         status === "succeeded"
-          ? `${sceneRoleLabels[role]}を ${scene.heading || scene.id} に紐付けました。`
-          : `${sceneRoleLabels[role]}の生成が ${status} で終了しました。`,
+          ? `${label}を ${scene.heading || scene.id} に紐付けました。`
+          : `${label}の生成が ${status} で終了しました。`,
       );
       if (status !== "succeeded") {
-        setError(`${sceneRoleLabels[role]}の生成に失敗しました（${status}）。`);
+        setError(`${label}の生成に失敗しました（${status}）。`);
       }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -874,8 +919,8 @@ export function StoryPanel({
             detail={detail}
             onGenerateSceneImage={onGenerateSceneImage}
             onGenerateSceneNarration={onGenerateSceneNarration}
-            onGenerateRole={(scene, role) => {
-              void handleGenerateRole(scene, role);
+            onGenerateRole={(scene, role, mediaType) => {
+              void handleGenerateRole(scene, role, mediaType);
             }}
             busyScene={busyScene}
           />
@@ -891,7 +936,7 @@ export function StoryPanel({
               title={
                 isReadyToAssemble(detail)
                   ? "シーンを 1 本の MP4 に書き出す"
-                  : "すべてのシーンに素材が揃うと書き出せます"
+                  : "すべてのシーンにビジュアルが揃うと書き出せます"
               }
             >
               {isAssembling ? "書き出し中…" : "動画を書き出す"}
@@ -900,8 +945,15 @@ export function StoryPanel({
               {isReadyToAssemble(detail)
                 ? `${detail.story.scenes.length} シーン / ${detail.story.scenes
                     .reduce((total, scene) => total + scene.duration_seconds, 0)
-                    .toFixed(1)} 秒を 1920x1080 で書き出します。`
-                : `素材が ${detail.missing_assets.length} 件不足しています。`}
+                    .toFixed(1)} 秒を 1920x1080 で書き出します。${
+                    missingAudioCount(detail) > 0
+                      ? `ナレーション/BGM が ${missingAudioCount(detail)} 件未生成のため、その部分は無音になります。`
+                      : ""
+                  }`
+                : `ビジュアルが ${
+                    detail.missing_assets.filter((entry) => entry.role === "visual")
+                      .length
+                  } 件不足しています。`}
             </p>
           </div>
 

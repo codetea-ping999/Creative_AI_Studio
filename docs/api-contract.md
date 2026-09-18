@@ -139,17 +139,30 @@ Web 側は `detail` 配列から `body.prompt: Field required` のような構�
 ### シーンへの自動紐付け
 
 `POST /stories/{id}/scenes/{scene_id}/generate` は `role`（`visual` / `narration` /
-`music`）だけを受け取り、必要な request を scene から組み立てます。
+`music`）と、`visual` のときだけ任意の `media_type`（`image` / `video`）を受け取り、
+必要な request を scene から組み立てます。
 
 | role | 生成対象 | 入力に使う scene のフィールド |
 | --- | --- | --- |
 | `visual` | image | `image_prompt` / `image_negative` / `bible_refs` |
+| `visual` + `media_type: "video"` | video（`text-to-video`、既定モデル `storyboard-video`） | `image_prompt` / `image_negative` / `duration_seconds` |
 | `narration` | audio（`text-to-speech`） | `narration` |
 | `music` | audio（`text-to-music`） | `bgm_mood` / `duration_seconds` |
 
 request の params には `story_id` / `scene_id` / `scene_role` が入り、job が成功すると
 `SceneBinder` が生成物を `Scene.asset_ids[role]` へ結びつけます。UI は job 完了後に
 story を読み直すだけで、素材の紐付けを自分で管理する必要がありません。
+
+`media_type: "video"` は v1.0 Stable の visual 経路です。手続き型 `storyboard-video`
+runtime（GIF、モデル重み不要）を通常の job lifecycle で実行し、生成された GIF を
+`visual` role にそのまま紐付けます。`model_id` を省略すると `storyboard-video` を明示的に
+選ぶため、後から学習済み video モデルを置いても Stable の既定は変わりません。seed 省略時は
+`story_id` / `scene_id` / prompt から決定的に導出し、サーバ再起動をまたいで同じクリップに
+なります。SDXL などの image 経路（`media_type` 省略 / `image`）は Preview のままで、Stable の
+依存にはなりません。`media_type` を `visual` 以外の role に付けると 400 です。
+
+Assembly（`POST /stories/{id}/assemble`）が必須とするのは全 scene の `visual` だけです。
+narration / music が未生成の scene は無音で書き出されます。
 
 紐付けが行われない正常系:
 
