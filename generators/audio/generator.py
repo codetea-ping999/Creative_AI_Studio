@@ -82,46 +82,6 @@ class LongFormGenerationCancelled(RuntimeError):
     """Raised after a completed AudioCraft segment when cancellation was requested."""
 
 
-class _LongFormBookkeepingProbeError(Exception):
-    """Private signal: the long-form progress callback's own probe raised.
-
-    PR4b Music lane: `cancel_requested()` -- wired by `JobRunner.process_job()`
-    (`core/jobs/runner.py`) to `self._is_cancelled(job_id)`, real
-    `JobRepository` I/O -- can raise instead of returning a bool.
-    `report_token_progress()` (inside `_generate_long_form()`) calls it via
-    `_safe_cancel_requested()` on every segment boundary, *while*
-    `model.generate()` is genuinely running -- a bookkeeping failure there
-    is not the same as a provider/runtime fault, but the only way to stop
-    an in-progress AudioCraft generation from this callback is to raise
-    something through it, exactly as `LongFormGenerationCancelled` already
-    does for a genuine, acknowledged cancellation.
-
-    Raising `LongFormGenerationCancelled` here instead would conflate the
-    two: JobRunner/`_finalize_cancellation()` treat that exception (and any
-    exception observed while `cancel_requested()` is independently true) as
-    an acknowledged stop, which is correct for a real cancellation but wrong
-    for "the bookkeeping check itself is broken" -- and, more importantly,
-    letting either exception type unwind straight through
-    `with self._acquire_runtime(...)` would mark a runtime `INVALID`
-    whenever this fires, even though nothing about the model/runtime itself
-    failed. `_generate_long_form()` catches only this type around
-    `model.generate()`, lets the lease exit cleanly, and re-raises the
-    wrapped `probe_error` verbatim once it is gone -- mirroring
-    `generators/text/generator.py`'s `_StructuredGenerationProbeError`
-    exactly. A genuine `LongFormGenerationCancelled` (raised because
-    `cancel_requested()` returned `True`, not because it raised) is not
-    caught here and keeps its existing conservative-invalidation behavior
-    unchanged: a cancellation *request* is not proof inference has actually
-    stopped cleanly.
-
-    Never exported; not a new public exception taxonomy.
-    """
-
-    def __init__(self, probe_error: Exception) -> None:
-        super().__init__("cancellation probe failed during long-form generation")
-        self.probe_error = probe_error
-
-
 class AudioGenerator(BaseGenerator):
     """Generate music with the resolved model runtime."""
 
@@ -639,18 +599,19 @@ class AudioGenerator(BaseGenerator):
         # before the lease releases. `cancellation_probe_error` covers the
         # pre-use probe (before `set_generation_params()`, the first
         # mutation); `callback_probe_error` covers `cancel_requested()`
-        # itself raising from *inside* `report_token_progress()`, isolated
-        # via `_LongFormBookkeepingProbeError` (see that class's own
-        # docstring for why it cannot be `LongFormGenerationCancelled` or
-        # the raw probe exception); `late_cancellation_probe_error` covers
-        # the post-generation recheck. All three are raised only after the
-        # lease has already exited cleanly. A genuine
-        # `LongFormGenerationCancelled` -- `cancel_requested()` itself
-        # returning `True` mid-generation -- is not caught anywhere in this
-        # method and keeps its existing conservative-invalidation behavior:
-        # a cancellation request is not proof inference has actually
-        # stopped, so it still unwinds through the lease and invalidates,
-        # exactly as before this migration.
+        # itself raising from *inside* `report_token_progress()`, which is
+        # recorded (first failure wins) and never raised through the running
+        # `model.generate()`; `late_cancellation_probe_error` covers the
+        # post-generation recheck. All three are raised only after the lease
+        # has already exited cleanly, and none of them interrupts inference.
+        #
+        # A genuine `LongFormGenerationCancelled` -- `cancel_requested()`
+        # returning `True` mid-generation -- is deliberately different: it is
+        # not caught anywhere in this method, so it interrupts generation and
+        # keeps its conservative-invalidation behavior, because a cancellation
+        # request is not proof inference stopped cleanly. That asymmetry is
+        # the point: only an interruption we cannot avoid invalidates, and a
+        # broken bookkeeping read is never allowed to become one.
         cancelled_before_generation = False
         cancellation_probe_error: Exception | None = None
         callback_probe_error: Exception | None = None
@@ -697,6 +658,7 @@ class AudioGenerator(BaseGenerator):
                     generated_tokens: int, _tokens_to_generate: int
                 ) -> None:
                     nonlocal completed_segments, progress_publication_error
+                    nonlocal callback_probe_error
                     generated_seconds = generated_tokens / max(1, frame_rate)
                     while (
                         completed_segments < segment_count
@@ -724,8 +686,26 @@ class AudioGenerator(BaseGenerator):
                                     progress_publication_error = exc
                         cancelled, probe_error = _safe_cancel_requested(cancel_requested)
                         if probe_error is not None:
-                            raise _LongFormBookkeepingProbeError(probe_error)
-                        if cancelled:
+                            # External bookkeeping, exactly like the
+                            # `progress_callback()` failure above: the
+                            # JobRepository read behind `cancel_requested()`
+                            # broke, which says nothing about the model. Do
+                            # NOT raise through the running
+                            # `model.generate()`. Aborting an in-flight
+                            # AudioCraft generation is indistinguishable, from
+                            # the model's point of view, from the genuine
+                            # mid-execution cancellation below -- and that one
+                            # deliberately invalidates the runtime, because a
+                            # half-unwound generation is not proof the model
+                            # is still clean. Interrupting here and then
+                            # declaring the runtime healthy would be the one
+                            # combination this generator must not produce.
+                            # Record the first failure, let generation run to
+                            # completion, and re-raise verbatim after the
+                            # lease has exited cleanly.
+                            if callback_probe_error is None:
+                                callback_probe_error = probe_error
+                        elif cancelled:
                             raise LongFormGenerationCancelled(
                                 "Long-form generation cancelled at segment boundary "
                                 f"{completed_segments}/{segment_count}."
@@ -735,30 +715,34 @@ class AudioGenerator(BaseGenerator):
                 try:
                     with self._seeded_generation(request.seed, device, torch):
                         audio_values = model.generate([conditioning_prompt], progress=True)
-                except _LongFormBookkeepingProbeError as exc:
-                    callback_probe_error = exc.probe_error
                 finally:
-                    # Callback teardown, still inside the lease -- before
-                    # it is released below, regardless of which branch
-                    # above was taken.
+                    # Callback teardown, still inside the lease -- before it
+                    # is released below, whether generation completed, was
+                    # interrupted by a genuine mid-execution cancellation, or
+                    # failed inside the model itself.
                     model.set_custom_progress_callback(None)
 
-                if callback_probe_error is None:
-                    audio_tensor = audio_values[0].detach().cpu()
-                    late_cancellation, late_cancellation_probe_error = _safe_cancel_requested(
-                        cancel_requested
-                    )
+                # Generation ran to completion: a recorded bookkeeping probe
+                # failure never interrupts it, so the result is always a real
+                # one here. Detach to a plain CPU tensor while the lease is
+                # still held, exactly as the short-form path does.
+                audio_tensor = audio_values[0].detach().cpu()
+                late_cancellation, late_cancellation_probe_error = _safe_cancel_requested(
+                    cancel_requested
+                )
 
             sampling_rate = int(runtime_obj["sampling_rate"])
             model_class_name = type(model).__name__
             runtime_type_name = type(runtime_obj).__name__
 
-        # No inference took place, it was interrupted by a bookkeeping
-        # probe failure, or it completed successfully: exit cleanly instead
-        # of marking the cache INVALID. A `LongFormGenerationCancelled`
-        # raised from *inside* `model.generate()` because `cancel_requested()`
-        # genuinely returned `True` (a real mid-use interruption) is not
-        # caught above and still unwinds as unsafe.
+        # No inference took place, or it ran to completion: exit cleanly
+        # instead of marking the cache INVALID. Nothing above ever aborts a
+        # running generation for a bookkeeping reason, so reaching this point
+        # never means the model was left half-unwound. A
+        # `LongFormGenerationCancelled` raised from *inside*
+        # `model.generate()` because `cancel_requested()` genuinely returned
+        # `True` (a real mid-use interruption) is not caught above and still
+        # unwinds as unsafe, as does any failure from the model itself.
         if cancellation_probe_error is not None:
             raise cancellation_probe_error
         if callback_probe_error is not None:
