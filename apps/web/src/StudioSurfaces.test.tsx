@@ -6,6 +6,7 @@ import { StoryPanel } from "./components/StoryPanel";
 import {
   availableStages,
   isReadyToAssemble,
+  missingAudioCount,
   loglineCandidates,
   missingRolesForScene,
   resolveSceneTarget,
@@ -286,6 +287,99 @@ describe("StoryPanel", () => {
     expect(onGenerate).toHaveBeenCalledWith(
       expect.objectContaining({ id: "scene_01", image_prompt: "rooftop at dawn" }),
     );
+  });
+
+  it("generates a scene's visual as a procedural clip and can then assemble without audio", async () => {
+    const scene = makeScene({
+      narration: "朝の光が街を照らしていた。",
+      image_prompt: "rooftop at dawn",
+      bgm_mood: "hopeful",
+    });
+    const bound = makeScene({
+      ...scene,
+      asset_ids: { visual: "asset_visual_1" },
+    });
+    const calls = stubFetch([
+      [
+        "/stories/story_1/scenes/scene_01/generate",
+        { job_id: "job_1", status: "queued" },
+        "POST",
+      ],
+      // After the job, the server has bound the visual; narration and music
+      // are still missing (no TTS/MusicGen weights) but must not block export.
+      [
+        "/stories/story_1",
+        {
+          story: makeStory({ scenes: [bound] }),
+          missing_assets: [
+            { scene_id: "scene_01", role: "narration" },
+            { scene_id: "scene_01", role: "music" },
+          ],
+        },
+      ],
+      ["/stories", { items: [{ id: "story_1", title: "Rewind", scene_count: 1 }] }],
+    ]);
+
+    const user = userEvent.setup();
+    render(<StoryPanel modelId="" awaitJob={async () => "succeeded"} />);
+    await waitFor(() => {
+      expect(screen.getByRole("option", { name: /Rewind/ })).toBeTruthy();
+    });
+    await user.selectOptions(screen.getByLabelText("編集中のストーリー"), "story_1");
+
+    await user.click(
+      await screen.findByRole("button", { name: "手続き型ビジュアルを生成（Stable）" }),
+    );
+
+    const generate = calls.find((call) => call.url.includes("/scenes/scene_01/generate"));
+    expect(generate?.body).toMatchObject({
+      role: "visual",
+      model_id: "",
+      media_type: "video",
+    });
+    await waitFor(() => {
+      expect(screen.getByText(/に紐付けました/)).toBeTruthy();
+    });
+
+    const assemble = screen.getByRole("button", { name: "動画を書き出す" });
+    expect(assemble.hasAttribute("disabled")).toBe(false);
+    expect(screen.getByText(/無音になります/)).toBeTruthy();
+  });
+
+  it("keeps the still-image visual button on the image path", async () => {
+    const calls = stubFetch([
+      [
+        "/stories/story_1/scenes/scene_01/generate",
+        { job_id: "job_1", status: "queued" },
+        "POST",
+      ],
+      [
+        "/stories/story_1",
+        {
+          story: makeStory({
+            scenes: [makeScene({ image_prompt: "rooftop at dawn" })],
+          }),
+          missing_assets: [{ scene_id: "scene_01", role: "visual" }],
+        },
+      ],
+      ["/stories", { items: [{ id: "story_1", title: "Rewind", scene_count: 1 }] }],
+    ]);
+
+    const user = userEvent.setup();
+    render(<StoryPanel modelId="" awaitJob={async () => "succeeded"} />);
+    await waitFor(() => {
+      expect(screen.getByRole("option", { name: /Rewind/ })).toBeTruthy();
+    });
+    await user.selectOptions(screen.getByLabelText("編集中のストーリー"), "story_1");
+    expect(
+      screen
+        .getByRole("button", { name: "動画を書き出す" })
+        .hasAttribute("disabled"),
+    ).toBe(true);
+
+    await user.click(await screen.findByRole("button", { name: "画像を生成" }));
+    const generate = calls.find((call) => call.url.includes("/scenes/scene_01/generate"));
+    expect(generate?.body).not.toHaveProperty("media_type");
   });
 
   it("disables stages whose input has not been written yet", async () => {
@@ -603,7 +697,7 @@ describe("scene generation helpers", () => {
     expect(missingRolesForScene(null, "scene_01")).toEqual([]);
   });
 
-  it("is ready to assemble only when scenes exist and nothing is missing", () => {
+  it("is ready to assemble once every scene has a visual, even without audio", () => {
     expect(isReadyToAssemble(null)).toBe(false);
     // Scenes present but incomplete.
     expect(
@@ -622,5 +716,18 @@ describe("scene generation helpers", () => {
         missing_assets: [],
       } as never),
     ).toBe(true);
+    // Narration/music are optional to assemble (a silent scene is legitimate),
+    // so the weight-free journey — procedural visuals, no TTS/MusicGen — can
+    // still export. It is surfaced as a count, not a blocker.
+    const audioOnlyMissing = {
+      story: makeStory({ scenes: [makeScene()] }),
+      missing_assets: [
+        { scene_id: "scene_01", role: "narration" },
+        { scene_id: "scene_01", role: "music" },
+      ],
+    } as never;
+    expect(isReadyToAssemble(audioOnlyMissing)).toBe(true);
+    expect(missingAudioCount(audioOnlyMissing)).toBe(2);
+    expect(missingAudioCount(null)).toBe(0);
   });
 });

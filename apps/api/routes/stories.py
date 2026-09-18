@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+import zlib
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field
@@ -48,6 +49,12 @@ CONTINUITY_INJECTED_TASKS: frozenset[str] = frozenset({"prose"})
 
 # The tracks whose entries reference an asset the UI may want to preview.
 _PREVIEWABLE_TRACKS = ("visual", "narration", "music")
+
+# The weight-free Stable visual path: a scene's ``visual`` role can be filled by
+# the procedural storyboard runtime (a GIF, no model weights) instead of a still.
+# Named explicitly rather than left to the manifest default so a learned video
+# model installed later can never silently become the Stable journey's default.
+PROCEDURAL_VISUAL_MODEL_ID = "storyboard-video"
 
 # Job statuses that mean "still working on it" for a scene asset role — every
 # non-terminal state a job can hold before it either succeeds (and binds) or
@@ -834,6 +841,10 @@ class GenerateSceneRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     role: str
+    # Only meaningful for the ``visual`` role. ``None``/``"image"`` keeps the
+    # still-image path; ``"video"`` requests a procedural storyboard clip
+    # (``PROCEDURAL_VISUAL_MODEL_ID`` unless ``model_id`` names another model).
+    media_type: Literal["image", "video"] | None = None
     model_id: str = ""
     seed: int | None = None
     output_format: str | None = None
@@ -864,6 +875,15 @@ def _scene_generation_request(
     binding = scene_binding_params(story.id, scene.id, request.role)
     params: dict[str, Any] = {**binding, **request.params}
 
+    if request.media_type is not None and request.role != "visual":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "media_type only applies to the visual role; "
+                f"the {request.role} role has a fixed media type."
+            ),
+        )
+
     if request.role == "visual":
         prompt = str(request.params.get("prompt") or scene.image_prompt).strip()
         if not prompt:
@@ -872,6 +892,28 @@ def _scene_generation_request(
                 detail=f"Scene {scene.id} has no image prompt to generate from.",
             )
         params.pop("prompt", None)
+        if request.media_type == "video":
+            # Procedural storyboard clip. It still travels the ordinary job
+            # lifecycle and binds through the same scene params as a still; the
+            # runtime renders no Bible references, so none are forwarded.
+            params.setdefault("duration_seconds", max(1, round(scene.duration_seconds)))
+            return GenerationRequest(
+                media_type="video",
+                task_type="text-to-video",
+                prompt=prompt,
+                negative_prompt=scene.image_negative or None,
+                model_id=request.model_id.strip() or PROCEDURAL_VISUAL_MODEL_ID,
+                # The procedural runtime falls back to the per-process
+                # ``hash(prompt)`` without a seed, which differs between server
+                # restarts. A stable seed keeps a scene's clip reproducible.
+                seed=(
+                    request.seed
+                    if request.seed is not None
+                    else zlib.crc32(f"{story.id}:{scene.id}:{prompt}".encode())
+                ),
+                output_format=request.output_format,
+                params=params,
+            )
         if scene.bible_refs and "bible_refs" not in params:
             params["bible_refs"] = list(scene.bible_refs)
         return GenerationRequest(
