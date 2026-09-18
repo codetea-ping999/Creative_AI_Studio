@@ -880,3 +880,244 @@ def test_learned_video_direct_output_late_cancellation_removes_produced_artifact
     assert entry.state is RuntimeState.READY  # healthy runtime, not invalidated
     assert entry.lease_count == 0
     assert entry.lease_count == 0
+
+
+def test_learned_video_direct_output_late_cancellation_removes_distinct_previews(
+    tmp_path, monkeypatch
+):
+    # Video artifact cleanup lane: a direct-output renderer can return
+    # `preview_paths` distinct from `output_path` (e.g. thumbnails) --
+    # `_discard_render_artifacts()` must remove every one of them, not just
+    # `output_path`, and must leave an unrelated file in the same directory
+    # untouched.
+    cancelled = Event()
+    created = {}
+
+    def fake_renderer(**kwargs):
+        output_dir = Path(kwargs["output_dir"])
+        output_path = output_dir / "direct_output.mp4"
+        output_path.write_bytes(b"fake rendered video bytes")
+        preview_a = output_dir / "preview_a.jpg"
+        preview_a.write_bytes(b"fake preview a")
+        preview_b = output_dir / "preview_b.jpg"
+        preview_b.write_bytes(b"fake preview b")
+        unrelated = output_dir / "unrelated.txt"
+        unrelated.write_bytes(b"do not touch")
+        created["output"] = output_path
+        created["previews"] = [preview_a, preview_b]
+        created["unrelated"] = unrelated
+        cancelled.set()
+        return {
+            "output_path": str(output_path),
+            "preview_paths": [str(preview_a), str(preview_b)],
+            "output_id": "direct",
+        }
+
+    generator, service, cache, loader = _learned_video_generator(
+        tmp_path, monkeypatch, renderer=fake_renderer
+    )
+
+    with pytest.raises(GenerationCancelled):
+        generator.run(
+            GenerationRequest(media_type="video", prompt="test", model_id="target"),
+            context=GenerationContext(is_cancelled=cancelled.is_set),
+        )
+
+    assert created["output"].exists() is False
+    for preview in created["previews"]:
+        assert preview.exists() is False
+    assert created["unrelated"].exists() is True  # unrelated file left alone
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY
+    assert entry.lease_count == 0
+    with service.acquire_runtime("target", "video", wait_timeout=0):
+        pass
+    assert loader.load.call_count == 1  # never reloaded
+
+
+def test_learned_video_direct_output_late_cancellation_deduplicates_main_path(
+    tmp_path, monkeypatch
+):
+    # Video artifact cleanup lane: a renderer whose `preview_paths` include
+    # `output_path` itself (the main output re-listed as its own preview,
+    # or `LearnedVideoRuntime._normalize_generated_output()`'s own
+    # `preview_paths` default) must not raise or double-unlink -- the same
+    # path appearing twice across the two fields is collapsed before any
+    # `unlink()` call.
+    cancelled = Event()
+    created = {}
+
+    def fake_renderer(**kwargs):
+        output_dir = Path(kwargs["output_dir"])
+        output_path = output_dir / "direct_output.mp4"
+        output_path.write_bytes(b"fake rendered video bytes")
+        created["output"] = output_path
+        cancelled.set()
+        return {
+            "output_path": str(output_path),
+            "preview_paths": [str(output_path), str(output_path)],
+            "output_id": "direct",
+        }
+
+    generator, service, cache, loader = _learned_video_generator(
+        tmp_path, monkeypatch, renderer=fake_renderer
+    )
+
+    with pytest.raises(GenerationCancelled):
+        generator.run(
+            GenerationRequest(media_type="video", prompt="test", model_id="target"),
+            context=GenerationContext(is_cancelled=cancelled.is_set),
+        )
+
+    assert created["output"].exists() is False
+    assert list(tmp_path.glob("*")) == []
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY
+    assert entry.lease_count == 0
+
+
+def test_learned_video_direct_output_post_render_probe_error_removes_all_artifacts(
+    tmp_path, monkeypatch
+):
+    # Video artifact cleanup lane: the post-render recheck's own
+    # `context.is_cancelled()` call can raise (JobRepository I/O) instead
+    # of returning a bool -- observed after a direct-output renderer has
+    # already written its file(s), the exact original probe error must
+    # still be re-raised, but only after every returned artifact
+    # (`output_path` and `preview_paths`) has been removed, exactly like an
+    # ordinary late cancellation. `cancelled` only flips (to raising, not
+    # to True) once the renderer has actually written the files and
+    # returned, proving this fires strictly after a successful
+    # direct-output render.
+    cancelled = Event()
+    probe_error = RuntimeError("job repository unavailable")
+    created = {}
+
+    def fake_renderer(**kwargs):
+        output_dir = Path(kwargs["output_dir"])
+        output_path = output_dir / "direct_output.mp4"
+        output_path.write_bytes(b"fake rendered video bytes")
+        preview_a = output_dir / "preview_a.jpg"
+        preview_a.write_bytes(b"fake preview a")
+        created["output"] = output_path
+        created["previews"] = [preview_a]
+        cancelled.set()
+        return {
+            "output_path": str(output_path),
+            "preview_paths": [str(preview_a)],
+            "output_id": "direct",
+        }
+
+    generator, service, cache, loader = _learned_video_generator(
+        tmp_path, monkeypatch, renderer=fake_renderer
+    )
+
+    def is_cancelled() -> bool:
+        if cancelled.is_set():
+            raise probe_error
+        return False
+
+    with pytest.raises(RuntimeError) as caught:
+        generator.run(
+            GenerationRequest(media_type="video", prompt="test", model_id="target"),
+            context=GenerationContext(is_cancelled=is_cancelled),
+        )
+
+    assert caught.value is probe_error
+    assert created["output"].exists() is False
+    for preview in created["previews"]:
+        assert preview.exists() is False
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY
+    assert entry.lease_count == 0
+    with service.acquire_runtime("target", "video", wait_timeout=0):
+        pass
+    assert loader.load.call_count == 1  # never reloaded
+
+
+def test_deferred_gif_encode_probe_error_removes_encoded_output(tmp_path, monkeypatch):
+    # Video artifact cleanup lane: the deferred-GIF-encode post-encode
+    # recheck's own `context.is_cancelled()` call can raise instead of
+    # returning a bool -- the freshly encoded GIF must still be removed
+    # before the exact original probe error is re-raised, exactly like the
+    # existing ordinary-cancellation case
+    # (test_cancellation_during_deferred_gif_encode_removes_encoded_output
+    # above). `encoded` only flips (to raising) once the real encode has
+    # actually written the file, proving this fires strictly after
+    # encoding, not before.
+    generator, service, cache, loader, renderer = _build(tmp_path, monkeypatch)
+    generator.runtime_router = SimpleNamespace(
+        resolve=lambda runtime_obj: ProceduralStoryboardRuntime()
+    )
+    encoded = Event()
+    probe_error = RuntimeError("job repository unavailable")
+
+    def encode_then_flag(frames, output_dir, frame_duration_ms):
+        result = encode_frames_as_gif(frames, output_dir, frame_duration_ms)
+        encoded.set()
+        return result
+
+    monkeypatch.setattr(
+        "generators.video.generator.encode_frames_as_gif", encode_then_flag
+    )
+
+    def is_cancelled() -> bool:
+        if encoded.is_set():
+            raise probe_error
+        return False
+
+    with pytest.raises(RuntimeError) as caught:
+        generator.run(
+            GenerationRequest(
+                media_type="video", prompt="test", model_id="target",
+                params={"duration_seconds": 2, "fps": 4},
+            ),
+            context=GenerationContext(is_cancelled=is_cancelled),
+        )
+
+    assert caught.value is probe_error
+    assert list(tmp_path.glob("*.gif")) == []  # encoded output removed
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY
+    assert entry.lease_count == 0
+
+
+def test_learned_video_direct_output_success_retains_all_artifacts(tmp_path, monkeypatch):
+    # Video artifact cleanup lane: a successful, non-cancelled request must
+    # never trigger `_discard_render_artifacts()` -- every returned
+    # artifact (main output and every preview) survives, and the runtime
+    # stays healthy and reusable.
+    created = {}
+
+    def fake_renderer(**kwargs):
+        output_dir = Path(kwargs["output_dir"])
+        output_path = output_dir / "direct_output.mp4"
+        output_path.write_bytes(b"fake rendered video bytes")
+        preview_a = output_dir / "preview_a.jpg"
+        preview_a.write_bytes(b"fake preview a")
+        created["output"] = output_path
+        created["preview"] = preview_a
+        return {
+            "output_path": str(output_path),
+            "preview_paths": [str(preview_a)],
+            "output_id": "direct",
+        }
+
+    generator, service, cache, loader = _learned_video_generator(
+        tmp_path, monkeypatch, renderer=fake_renderer
+    )
+
+    result = generator.run(
+        GenerationRequest(media_type="video", prompt="test", model_id="target"),
+        context=GenerationContext(is_cancelled=lambda: False),
+    )
+
+    assert result.status == "succeeded"
+    assert created["output"].exists() is True
+    assert created["preview"].exists() is True
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY
+    assert entry.lease_count == 0
+    with service.acquire_runtime("target", "video", wait_timeout=0):
+        pass
+    assert loader.load.call_count == 1  # never reloaded

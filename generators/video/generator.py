@@ -226,24 +226,33 @@ class VideoGenerator(BaseGenerator):
             # so this must also be checked before anything below reads it.
             raise render_probe_error
         if post_render_probe_error is not None:
+            # render() already returned successfully, so `render_result`
+            # may carry a real, already-written direct-output artifact --
+            # see the `late_cancellation` branch below for why. It must not
+            # outlive this discarded result any more than an ordinary late
+            # cancellation's does. A `pending_frames` result (procedural, or
+            # a learned adapter returning raw frames) has not touched disk
+            # yet, so this is a safe no-op for that case.
+            _discard_render_artifacts(render_result)
             raise post_render_probe_error
         if cancelled_before_render or cancelled_before_invocation or late_cancellation:
             # A learned renderer that writes its own file and returns
             # `output_path` directly (rather than `pending_frames`) has
-            # already produced that artifact by the time `late_cancellation`
+            # already produced that artifact -- and possibly distinct
+            # `preview_paths` alongside it -- by the time `late_cancellation`
             # is observed here -- the lease has already released cleanly
             # above, so this is ordinary post-lease request cleanup, not a
             # runtime fault, and must run before `GenerationCancelled`
-            # propagates so the artifact does not outlive the discarded
+            # propagates so no returned artifact outlives the discarded
             # result. `render_result` only carries a populated
-            # `output_path` for this direct-output case: the
+            # `output_path`/`preview_paths` for this direct-output case: the
             # `pending_frames` case (procedural, or a learned adapter
             # returning raw frames) never touches disk until the encode
             # step below, which runs only when cancellation was not
             # already observed here, so it is never a live file at this
             # point.
-            if late_cancellation and isinstance(render_result, dict):
-                _discard_output_artifact(render_result.get("output_path"))
+            if late_cancellation:
+                _discard_render_artifacts(render_result)
             raise GenerationCancelled()
         if procedural_param_error is not None:
             raise procedural_param_error
@@ -288,10 +297,26 @@ class VideoGenerator(BaseGenerator):
             # JobRunner discards the cancelled result afterwards, leaving
             # the file just written above as an orphan. The lease already
             # released above, so raising here cannot re-enter or invalidate
-            # it.
-            if context is not None and context.is_cancelled():
-                _discard_output_artifact(encoded_path)
-                raise GenerationCancelled()
+            # it. `render_result["output_path"]`/`["preview_paths"]` were
+            # just updated above to the freshly encoded path, so
+            # `_discard_render_artifacts()` removes exactly that file
+            # (deduplicated, since both keys point at it here).
+            #
+            # Video artifact cleanup lane: `context.is_cancelled()` itself
+            # can raise (JobRepository I/O) the same as every other probe
+            # site in this generator -- this recheck runs entirely after
+            # the runtime lease has already released, so a probe failure
+            # here was never a runtime-invalidation risk, but it must still
+            # not leave the just-encoded GIF behind as an orphan when the
+            # exact original probe error is re-raised.
+            if context is not None:
+                gif_cancelled, gif_probe_error = safe_is_cancelled(context)
+                if gif_probe_error is not None:
+                    _discard_render_artifacts(render_result)
+                    raise gif_probe_error
+                if gif_cancelled:
+                    _discard_render_artifacts(render_result)
+                    raise GenerationCancelled()
 
         output_path = Path(str(render_result["output_path"]))
         quality_report = evaluate_video_output(output_path)
@@ -369,11 +394,34 @@ class VideoGenerator(BaseGenerator):
         return None
 
 
-def _discard_output_artifact(output_path: "str | Path | None") -> None:
-    """Remove a cancelled request's own output file; always post-lease."""
-    if not output_path:
+def _discard_render_artifacts(render_result: "dict[str, Any] | None") -> None:
+    """Remove every request-owned artifact a discarded render produced.
+
+    Collects `output_path` and every entry of `preview_paths` from
+    `render_result` -- the only two fields a renderer ever uses to report
+    files it wrote for this request -- deduplicates them (the main output
+    commonly reappears as its own preview, or a renderer that skips
+    `preview_paths` entirely defaults to `[output_path]`, see
+    `LearnedVideoRuntime._normalize_generated_output()`), and unlinks each
+    exactly once. Always called post-lease. A missing path is silently
+    ignored (never a runtime fault); nothing outside these two fields is
+    ever touched, so an unrelated file in the same output directory is
+    never at risk. A no-op when `render_result` is `None`/not a dict, or
+    carries neither field (e.g. a `pending_frames` result discarded before
+    the deferred GIF/file encode ever ran -- nothing has touched disk yet).
+    """
+
+    if not isinstance(render_result, dict):
         return
-    Path(output_path).unlink(missing_ok=True)
+    paths: set[str] = set()
+    output_path = render_result.get("output_path")
+    if output_path:
+        paths.add(str(output_path))
+    for preview_path in render_result.get("preview_paths") or []:
+        if preview_path:
+            paths.add(str(preview_path))
+    for path in paths:
+        Path(path).unlink(missing_ok=True)
 
 
 def _extract_lineage_metadata(params: dict[str, Any]) -> dict[str, Any]:
