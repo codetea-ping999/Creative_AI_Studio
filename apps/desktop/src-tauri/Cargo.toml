@@ -1,0 +1,32 @@
+[package]
+name = "creative-ai-studio-desktop"
+version = "0.1.0"
+description = "Creative AI Studio desktop shell (Tauri 2)"
+authors = ["Creative AI Studio contributors"]
+edition = "2021"
+rust-version = "1.77.2"
+
+# The UI is the existing apps/web React/Vite build. Keep the Rust core a
+# thin shell that owns only resident-desktop concerns (tray, single-instance,
+# global shortcut, autostart, window lifecycle). It never spawns Python,
+# FastAPI, CUDA, or model runtimes.
+[lib]
+name = "creative_ai_studio_desktop"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-single-instance = "2"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-autostart = "2"
+serde = { version = "1", features = ["derive"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

@@ -142,6 +142,21 @@ Browser runtime resolves the configured web API URL. Desktop runtime resolves th
 
 The v0.1 integration is not accepted until a packaged WebView can perform both a simple read and a preflighted JSON write against an already-running backend, including when the backend uses a supported non-default port.
 
+### 7a. Desktop Shell v0.1 runtime wiring (review follow-up)
+
+The desktop shell resolves the backend endpoint with the following precedence, all resolved at runtime (never baked into the web bundle):
+
+1. `STUDIO_BACKEND_URL` — explicit full-URL override for the desktop shell;
+2. `API_PORT` from the launch environment — the existing development backend knob (e.g. `API_PORT=8123` with `scripts/run_api_dev.sh`);
+3. `API_PORT` from the project root `.env` — the configuration file the development scripts source, so a normally launched packaged app follows the same set port without rebuilding or exporting overrides;
+4. loopback default `http://127.0.0.1:8000`.
+
+Precedence 1–3 produce an exact (non-probing) loopback endpoint. Enabling a non-default port never starts the backend; the shell only connects to an already-running instance.
+
+The global shortcut is registered after plugin initialization and a registration refusal is non-fatal: it is logged and the shell, tray, Studio window, and backend connection remain usable without the shortcut.
+
+OS autostart is disabled by default and controlled only through an explicit tray menu toggle. Flipping it never implies starting the API or model runtime.
+
 ### 8. Use OSS bricolage for infrastructure
 
 CreativeStudio-specific user experience should be implemented locally. Commodity desktop infrastructure should be adapted from audited OSS instead of rewritten without reason.

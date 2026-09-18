@@ -1,6 +1,6 @@
 PYTHON ?= ./venv/bin/python
 
-.PHONY: verify verify-lite setup-check web-build test web-test npm-audit lint typecheck test-coverage web-test-coverage api-smoke calibration-report cogvideox-smoke musicgen-smoke
+.PHONY: verify verify-lite setup-check web-build test web-test npm-audit lint typecheck test-coverage web-test-coverage api-smoke calibration-report cogvideox-smoke musicgen-smoke desktop-smoke
 
 verify:
 	$(PYTHON) scripts/verify_local_stack.py --start-api
@@ -46,3 +46,7 @@ cogvideox-smoke:
 
 musicgen-smoke:
 	$(PYTHON) scripts/smoke_musicgen.py
+
+# Desktop Shell packaged-app smoke. Requires `cargo tauri build` first.
+desktop-smoke:
+	./scripts/desktop_smoke.sh

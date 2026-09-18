@@ -43,6 +43,53 @@ class ApiExtensionTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.headers["access-control-allow-origin"], "http://127.0.0.1:5174")
 
+    def test_api_cors_allows_packaged_tauri_webview_origins(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            services = create_application_services(
+                db_path=root / "jobs.db",
+                output_dir=root / "outputs" / "images",
+            )
+            client = TestClient(create_app(services, start_job_runner=False))
+
+        allowed_origins = {
+            "tauri://localhost",
+            "http://tauri.localhost",
+        }
+        for origin in allowed_origins:
+            with self.subTest(origin=origin):
+                response = client.options(
+                    "/health",
+                    headers={
+                        "Origin": origin,
+                        "Access-Control-Request-Method": "GET",
+                    },
+                )
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.headers["access-control-allow-origin"], origin)
+
+    def test_api_cors_allows_preflighted_json_write_from_tauri_webview(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            services = create_application_services(
+                db_path=root / "jobs.db",
+                output_dir=root / "outputs" / "images",
+            )
+            client = TestClient(create_app(services, start_job_runner=False))
+
+        response = client.options(
+            "/generate/image",
+            headers={
+                "Origin": "tauri://localhost",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "content-type",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["access-control-allow-origin"], "tauri://localhost")
+        self.assertIn("content-type", response.headers.get("access-control-allow-headers", "").lower())
+        self.assertIn("POST", response.headers.get("access-control-allow-methods", ""))
+
     def test_generate_image_and_audio_accept_project_binding(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
