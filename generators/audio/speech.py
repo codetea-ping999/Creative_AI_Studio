@@ -4,17 +4,20 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 import wave
 
 import numpy as np
 
 from core.audio import SPEECH_PRESET, process_audio, skipped_processing_report
+from core.jobs.context import GenerationCancelled
 from core.models import ModelService
+from core.models.service import RuntimeHandle
 from core.quality import evaluate_audio_output
 from core.schemas import GenerationRequest, GenerationResult
 from generators.base import BaseGenerator
+from generators.common import safe_is_cancelled
 
 # Reused rather than copied so the lineage keys recorded by the music generator and
 # the narration generator cannot drift apart.
@@ -25,7 +28,11 @@ from .providers import (
     manifest_declared_capabilities,
 )
 
+if TYPE_CHECKING:
+    from core.jobs.context import GenerationContext
+
 _MAX_INT16 = 32_767
+_CANCELLATION_POLL_SECONDS = 0.1
 
 # Characters per synthesis call. Chosen to stay inside the context of small local
 # TTS models while still holding two or three full sentences.
@@ -134,33 +141,32 @@ class SpeechGenerator(BaseGenerator):
     def prepare(self, request: GenerationRequest) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Intentionally omits `context`: BaseGenerator.run() introspects generate()'s
-    # signature (see generators/base.py) and calls context-free generators without
-    # it, so cancellation is only honored at the job-boundary for this generator.
-    def generate(self, request: GenerationRequest) -> GenerationResult:  # type: ignore[override]
+    def generate(
+        self,
+        request: GenerationRequest,
+        context: "GenerationContext | None" = None,
+    ) -> GenerationResult:
         requested_model_id = request.model_id.strip() or None
-        manifest, runtime_obj = self.model_service.resolve_runtime(
-            requested_model_id,
-            media_type="audio",
-            task_type=self.task_type,
+        # PR4b Speech lane / FP-001 + FP-002: manifest resolution reads the
+        # registry only -- it never touches the runtime cache/loader -- so
+        # it is safe to do before any lease, exactly like every other
+        # generator's preflight `get_manifest()` call.
+        manifest = self.model_service.get_manifest(
+            requested_model_id, media_type="audio", task_type=self.task_type
         )
-        synthesize = runtime_obj.get("synthesize")
-        if not callable(synthesize):
-            raise RuntimeError(
-                f"Model {manifest.public_model_id!r} exposes no synthesize() runtime; "
-                f"loader {manifest.loader!r} must return one for text-to-speech."
-            )
-
         effective_params = {**manifest.default_params, **request.params}
-        voice = effective_params.pop("voice", None) or runtime_obj.get("default_voice")
-        speed = _coerce_float_control(
-            "speed",
-            effective_params.pop("speed", runtime_obj.get("default_speed", 1.0)),
-        )
-        pitch = _coerce_float_control(
-            "pitch",
-            effective_params.pop("pitch", 0.0),
-        )
+
+        # Preflight: control parameters that never depend on the runtime.
+        # `voice`/`speed` are the two exceptions -- their fallback default
+        # comes from the loaded runtime's own declared `default_voice`/
+        # `default_speed` (`runtime_obj.get(...)`), so they can only be
+        # fully resolved once a runtime is in hand. Popped here as
+        # `requested_voice`/`requested_speed` (whatever the request/manifest
+        # already supplied, or `None`) so the in-lease step below only ever
+        # needs to know "was one already provided."
+        requested_voice = effective_params.pop("voice", None)
+        requested_speed = effective_params.pop("speed", None)
+        pitch = _coerce_float_control("pitch", effective_params.pop("pitch", 0.0))
         max_chunk_characters = _coerce_int_control(
             "max_chunk_characters",
             effective_params.pop(
@@ -178,12 +184,6 @@ class SpeechGenerator(BaseGenerator):
         postprocess_enabled = _coerce_postprocess_flag(
             effective_params.pop("postprocess", True)
         )
-        _validate_generation_controls(
-            speed=speed,
-            pitch=pitch,
-            max_chunk_characters=max_chunk_characters,
-            chunk_gap_seconds=chunk_gap_seconds,
-        )
         # Consumed by the loader, not by synthesis; dropped so they do not look like
         # per-request generation parameters in the job record.
         for loader_key in (
@@ -196,6 +196,11 @@ class SpeechGenerator(BaseGenerator):
         ):
             effective_params.pop(loader_key, None)
 
+        # Preflight: chunk splitting and the chunk-count guard are pure text
+        # processing -- no runtime needed. The duration/sample-rate budget
+        # checks stay in-lease (below): the former needs the resolved
+        # `speed`, the latter needs the runtime's own advertised sample
+        # rate, neither of which is known yet here.
         chunks = split_into_chunks(request.prompt, max_characters=max_chunk_characters)
         if not chunks:
             raise ValueError("Narration text contains no speakable characters.")
@@ -205,30 +210,132 @@ class SpeechGenerator(BaseGenerator):
                 f"{_MAX_CHUNKS} chunk limit. Increase max_chunk_characters or "
                 "split the narration into separate jobs."
             )
-        _validate_estimated_duration_budget(
-            chunks,
-            speed=speed,
-            chunk_gap_seconds=chunk_gap_seconds,
-        )
 
-        advertised_sample_rate = runtime_obj.get("sample_rate")
-        if advertised_sample_rate is not None:
-            _validate_estimated_sample_budget(
-                chunks,
-                _coerce_sample_rate(advertised_sample_rate, manifest.public_model_id),
-                speed=speed,
-                chunk_gap_seconds=chunk_gap_seconds,
+        # PR4b Speech lane / FP-001 + FP-002: one `acquire_runtime()` lease
+        # protects every chunk's `synthesize()` call, start to finish -- no
+        # per-chunk (re)acquisition. `cancellation_probe_error`/
+        # `late_cancellation_probe_error` isolate `context.is_cancelled()`
+        # itself raising (JobRepository I/O) from a genuine runtime fault,
+        # matching Text/Image/Video's established pre-/post-use probe
+        # convention (`generators/common/cancellation.py`, reused here
+        # unchanged, not modified). `validation_error` covers a bad
+        # request-owned control value (speed/pitch/chunk controls, or an
+        # over-budget duration estimate) discovered only once the runtime's
+        # own `default_speed` fallback is available -- inspection, not
+        # mutation, so it is deferred past the lease exactly like Image's
+        # own `validation_error` pattern, and never invalidates. A malformed
+        # *runtime-owned* advertised sample rate is, by contrast, a genuine
+        # runtime defect (mirrors Video's malformed-runtime-owned-palette
+        # precedent) and is left unguarded so it propagates and invalidates.
+        cancelled_before_synthesis = False
+        cancellation_probe_error: Exception | None = None
+        late_cancellation = False
+        late_cancellation_probe_error: Exception | None = None
+        validation_error: Exception | None = None
+        voice: str | None = None
+        speed = 1.0
+        segments: list[np.ndarray] = []
+        sample_rate = 0
+
+        with self._acquire_runtime(requested_model_id, context) as handle:
+            manifest = handle.manifest
+            runtime_obj = handle.runtime
+
+            cancelled_before_synthesis, cancellation_probe_error = safe_is_cancelled(
+                context
             )
+            if not cancelled_before_synthesis and cancellation_probe_error is None:
+                synthesize = runtime_obj.get("synthesize")
+                if not callable(synthesize):
+                    raise RuntimeError(
+                        f"Model {manifest.public_model_id!r} exposes no synthesize() "
+                        f"runtime; loader {manifest.loader!r} must return one for "
+                        "text-to-speech."
+                    )
+                voice = (
+                    str(requested_voice)
+                    if requested_voice is not None
+                    else runtime_obj.get("default_voice")
+                )
+                speed_source = (
+                    requested_speed
+                    if requested_speed is not None
+                    else runtime_obj.get("default_speed", 1.0)
+                )
+                try:
+                    speed = _coerce_float_control("speed", speed_source)
+                    _validate_generation_controls(
+                        speed=speed,
+                        pitch=pitch,
+                        max_chunk_characters=max_chunk_characters,
+                        chunk_gap_seconds=chunk_gap_seconds,
+                    )
+                    _validate_estimated_duration_budget(
+                        chunks, speed=speed, chunk_gap_seconds=chunk_gap_seconds
+                    )
+                except ValueError as exc:
+                    validation_error = exc
 
-        segments, sample_rate = self._synthesize_chunks(
-            synthesize,
-            chunks,
-            voice=str(voice) if voice is not None else None,
-            speed=speed,
-            pitch=pitch,
-            chunk_gap_seconds=chunk_gap_seconds,
-            model_label=manifest.public_model_id,
-        )
+                if validation_error is None:
+                    advertised_sample_rate = runtime_obj.get("sample_rate")
+                    if advertised_sample_rate is not None:
+                        _validate_estimated_sample_budget(
+                            chunks,
+                            _coerce_sample_rate(
+                                advertised_sample_rate, manifest.public_model_id
+                            ),
+                            speed=speed,
+                            chunk_gap_seconds=chunk_gap_seconds,
+                        )
+
+                    # Runtime mutation/use begins here: every chunk shares
+                    # this one lease.
+                    segments, sample_rate = self._synthesize_chunks(
+                        synthesize,
+                        chunks,
+                        voice=voice,
+                        speed=speed,
+                        pitch=pitch,
+                        chunk_gap_seconds=chunk_gap_seconds,
+                        model_label=manifest.public_model_id,
+                    )
+                    late_cancellation, late_cancellation_probe_error = (
+                        safe_is_cancelled(context)
+                    )
+
+            # Snapshot every runtime-derived value the post-lease metadata
+            # needs -- `runtime_obj` must never be read again once this
+            # `with` block exits.
+            runtime_type_name = type(runtime_obj).__name__
+            runtime_status = runtime_obj.get("runtime_status", "ready")
+            device = runtime_obj.get("device")
+            endpoint_base_url = runtime_obj.get("endpoint_base_url")
+            available_voices = [
+                str(item) for item in runtime_obj.get("voices", []) if str(item).strip()
+            ]
+            supports_pitch = bool(runtime_obj.get("supports_pitch", False))
+            language_code = runtime_obj.get("language_code")
+            default_params_snapshot = dict(manifest.default_params)
+            model_public_id = manifest.public_model_id
+            model_manifest_id = manifest.id
+            model_display_name = manifest.display_name
+            model_runtime = manifest.runtime
+            model_provider = manifest.provider
+            model_loader = manifest.loader
+
+        # No synthesis took place, or it completed successfully: exit
+        # cleanly instead of marking the cache INVALID. A genuine exception
+        # raised directly by `synthesize()` or anything else once mutation
+        # begins is not caught above and still unwinds as unsafe.
+        if cancellation_probe_error is not None:
+            raise cancellation_probe_error
+        if late_cancellation_probe_error is not None:
+            raise late_cancellation_probe_error
+        if cancelled_before_synthesis or late_cancellation:
+            raise GenerationCancelled()
+        if validation_error is not None:
+            raise validation_error
+
         estimated_samples = _estimate_joined_samples(
             chunks,
             sample_rate,
@@ -273,25 +380,21 @@ class SpeechGenerator(BaseGenerator):
                 "task_type": self.task_type,
                 "prompt": request.prompt,
                 "requested_model_id": requested_model_id,
-                "model_id": manifest.public_model_id,
-                "manifest_id": manifest.id,
-                "model_display_name": manifest.display_name,
-                "model_runtime": manifest.runtime,
-                "model_provider": manifest.provider,
-                "loader": manifest.loader,
-                "runtime_type": type(runtime_obj).__name__,
-                "runtime_status": runtime_obj.get("runtime_status", "ready"),
-                "device": runtime_obj.get("device"),
+                "model_id": model_public_id,
+                "manifest_id": model_manifest_id,
+                "model_display_name": model_display_name,
+                "model_runtime": model_runtime,
+                "model_provider": model_provider,
+                "loader": model_loader,
+                "runtime_type": runtime_type_name,
+                "runtime_status": runtime_status,
+                "device": device,
                 # Recorded so a run against an HTTP engine always shows where the
                 # narration text was sent.
-                "endpoint_base_url": runtime_obj.get("endpoint_base_url"),
-                "available_voices": [
-                    str(item)
-                    for item in runtime_obj.get("voices", [])
-                    if str(item).strip()
-                ],
-                "supports_pitch": bool(runtime_obj.get("supports_pitch", False)),
-                "language_code": runtime_obj.get("language_code"),
+                "endpoint_base_url": endpoint_base_url,
+                "available_voices": available_voices,
+                "supports_pitch": supports_pitch,
+                "language_code": language_code,
                 "seed": request.seed,
                 "output_format": "wav",
                 "sample_rate": sample_rate,
@@ -306,7 +409,7 @@ class SpeechGenerator(BaseGenerator):
                 "estimated_samples": estimated_samples,
                 "max_output_seconds": _MAX_OUTPUT_SECONDS,
                 "audio_postprocess": postprocess_applied,
-                "default_params": dict(manifest.default_params),
+                "default_params": default_params_snapshot,
                 "quality_report": quality_report,
                 **_extract_lineage_metadata(request.params),
                 "params": {
@@ -321,6 +424,24 @@ class SpeechGenerator(BaseGenerator):
                 "duration_seconds_generated": float(processed.size / sample_rate),
             },
             error_message=None,
+        )
+
+    def _acquire_runtime(
+        self, model_id: str | None, context: "GenerationContext | None"
+    ) -> RuntimeHandle:
+        if context is None:
+            return self.model_service.acquire_runtime(
+                model_id, media_type="audio", task_type=self.task_type
+            )
+        # One logical, cancellation-aware wait: ModelService polls in bounded
+        # slices and calls the checkpoint between them with nothing held.
+        # Only synchronization waits are waited out; cache capacity, invalid
+        # entries and loader errors still surface. This does not preempt a
+        # synchronous loader that already started.
+        return self.model_service.acquire_runtime(
+            model_id, media_type="audio", task_type=self.task_type,
+            wait_checkpoint=context.raise_if_cancelled,
+            poll_interval=_CANCELLATION_POLL_SECONDS,
         )
 
     def cleanup(self, request: GenerationRequest) -> None:
