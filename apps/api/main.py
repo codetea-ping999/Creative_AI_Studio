@@ -71,10 +71,22 @@ def _local_web_origins() -> list[str]:
     ]
 
 
+def _default_web_dist_dir() -> Path:
+    """Return the prebuilt web UI directory for this repository layout.
+
+    The frozen v1.0 artifact ships the source tree with ``apps/web/dist``
+    already built, so this path is the same in a checkout and in the release
+    tarball.
+    """
+
+    return Path(__file__).resolve().parents[2] / "apps" / "web" / "dist"
+
+
 def create_app(
     services: ApplicationServices | None = None,
     *,
     start_job_runner: bool = True,
+    web_dist_dir: str | os.PathLike[str] | None = None,
 ) -> FastAPI:
     # Keep the default service graph lazy.  JobRepository creates and migrates
     # SQLite during construction, so it must not run until this process owns
@@ -230,6 +242,20 @@ def create_app(
     app.include_router(bible_router)
     app.include_router(batches_router)
     app.include_router(stories_router)
+
+    # Serve the prebuilt web UI from the same origin as the API once a release
+    # build exists, so the frozen artifact needs no Node and no Vite at
+    # runtime. Mounted after every API router (and after the /outputs mount):
+    # Starlette resolves routes in registration order, so no API path can be
+    # shadowed by this root catch-all. Source checkouts without a web build
+    # must stay runnable, so the mount is skipped unless index.html exists.
+    dist_root = (
+        Path(web_dist_dir)
+        if web_dist_dir is not None
+        else _default_web_dist_dir()
+    )
+    if (dist_root / "index.html").is_file():
+        app.mount("/", StaticFiles(directory=dist_root, html=True), name="web")
 
     return app
 
