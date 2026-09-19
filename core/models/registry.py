@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 from .cloud_guard import cloud_provider_env_flag
@@ -24,9 +25,12 @@ class ModelRegistry:
         manifest_sources: dict[str, Path] = {}
         if self.manifest_root.exists():
             for path in sorted(self.manifest_root.rglob("*.json")):
-                manifest = ModelManifest.model_validate_json(
-                    path.read_text(encoding="utf-8")
-                )
+                try:
+                    text = path.read_text(encoding="utf-8")
+                except UnicodeDecodeError as e:
+                    print(f"UTF-8 decode error in {path}: {e}", file=sys.stderr)
+                    raise
+                manifest = ModelManifest.model_validate_json(text)
                 if manifest.id in manifests:
                     if self._is_duplicate_equivalent(manifests[manifest.id], manifest):
                         continue
