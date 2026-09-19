@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
 
 from .cloud_guard import cloud_provider_env_flag
@@ -28,12 +27,9 @@ class ModelRegistry:
                 # Skip macOS AppleDouble resource fork files (._*)
                 if path.name.startswith("._"):
                     continue
-                try:
-                    text = path.read_text(encoding="utf-8")
-                except UnicodeDecodeError as e:
-                    print(f"UTF-8 decode error in {path}: {e}", file=sys.stderr)
-                    raise
-                manifest = ModelManifest.model_validate_json(text)
+                manifest = ModelManifest.model_validate_json(
+                    path.read_text(encoding="utf-8")
+                )
                 if manifest.id in manifests:
                     if self._is_duplicate_equivalent(manifests[manifest.id], manifest):
                         continue
