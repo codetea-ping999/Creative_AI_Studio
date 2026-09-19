@@ -89,7 +89,6 @@ def wait_for_server(base_url: str, timeout: float = 60.0) -> bool:
 def http_get(url: str, timeout: float = 30.0) -> tuple[int, bytes, dict]:
     import urllib.request
     import urllib.error
-    import json
     req = urllib.request.Request(url)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
