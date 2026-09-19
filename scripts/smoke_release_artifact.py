@@ -22,6 +22,7 @@ import subprocess
 import tarfile
 import tempfile
 import signal
+import re
 from pathlib import Path
 import httpx
 
@@ -52,7 +53,15 @@ def run_cmd(cmd: list[str], cwd: Path, env: dict | None = None, timeout: int = 3
         print(f"CMD FAILED: {' '.join(cmd)}")
         print(f"stdout: {result.stdout[-500:]}")
         print(f"stderr: {result.stderr[-500:]}")
+        raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
     return result
+
+
+def extract_asset_paths(index_html: str) -> tuple[str | None, str | None]:
+    """Extract JS and CSS asset paths from index.html."""
+    js_match = re.search(r'<script type="module" src="(/assets/index-[^"]+\.js)"></script>', index_html)
+    css_match = re.search(r'<link rel="stylesheet" href="(/assets/index-[^"]+\.css)">', index_html)
+    return js_match.group(1) if js_match else None, css_match.group(1) if css_match else None
 
 
 def poll_job(client: httpx.Client, job_id: str, timeout: float = 180.0) -> dict:
@@ -88,16 +97,23 @@ def verify_ui(client: httpx.Client, artifact_root: Path) -> None:
     check("/health json ok", r.json().get("status") == "ok")
 
     # /
-    r = client.get(BASE_URL)
-    check("/ serves index.html", r.status_code == 200)
-    check("/ index.html has doctype", "<!doctype html>" in r.text.lower())
+    root_resp = client.get(BASE_URL)
+    check("/ serves index.html", root_resp.status_code == 200)
+    check("/ index.html has doctype", "<!doctype html>" in root_resp.text.lower())
 
-    # asset
-    r = client.get(f"{BASE_URL}/assets/index-98kc7GM3.js")
-    check("/assets JS 200", r.status_code == 200)
+    # Extract asset paths from served index.html
+    js_path, css_path = extract_asset_paths(root_resp.text)
+    check("index.html has JS asset", js_path is not None)
+    check("index.html has CSS asset", css_path is not None)
 
-    r = client.get(f"{BASE_URL}/assets/index-BVa3cqfy.css")
-    check("/assets CSS 200", r.status_code == 200)
+    # asset - use dynamic paths
+    if js_path:
+        r = client.get(f"{BASE_URL}{js_path}")
+        check("/assets JS 200", r.status_code == 200, js_path)
+
+    if css_path:
+        r = client.get(f"{BASE_URL}{css_path}")
+        check("/assets CSS 200", r.status_code == 200, css_path)
 
     # /models - should 200 with empty or manifest
     r = client.get(f"{BASE_URL}/models")
@@ -105,9 +121,9 @@ def verify_ui(client: httpx.Client, artifact_root: Path) -> None:
 
     # byte-identical to dist
     dist_index = artifact_root / "apps/web/dist/index.html"
-    served_hash = r.content
-    dist_hash = dist_index.read_bytes()
-    check("served index == dist index", served_hash == dist_hash)
+    served_bytes = root_resp.content
+    dist_bytes = dist_index.read_bytes()
+    check("served index == dist index", served_bytes == dist_bytes)
 
 
 def run_stable_journey(client: httpx.Client, artifact_root: Path) -> tuple[str, str]:
@@ -268,61 +284,63 @@ def main() -> int:
         run_cmd([str(venv_pip), "install", "--upgrade", "pip", "-q"], cwd=artifact_root, timeout=120)
 
         print("=== Installing requirements ===")
-        # This is the heavy step - long timeout
         run_cmd([str(venv_pip), "install", "-r", "requirements.txt", "--disable-pip-version-check", "-q"], cwd=artifact_root, timeout=2400)
 
         # Verify imports
         run_cmd([str(venv_python), "-c", "import torch, imageio_ffmpeg, uvicorn, fastapi, httpx; print('imports ok')"], cwd=artifact_root)
 
         print("=== Starting server on port {API_PORT} (Node-free) ===")
-        # Sanitized PATH without node
         clean_path = "/bin:/usr/bin:/usr/sbin:/sbin"
         env = {"PATH": clean_path, "API_PORT": str(API_PORT)}
         log_file = artifact_root / "smoke-server.log"
-        # Run in background
-        server_proc = subprocess.Popen(
-            ["bash", "scripts/run_studio.sh"],
-            cwd=artifact_root,
-            env={**os.environ, **env},
-            stdout=open(log_file, "w"),
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-
+        log_fh = open(log_file, "w")
         try:
-            print("=== Waiting for server ===")
-            if not wait_for_server(BASE_URL):
-                print("Server did not start in time")
-                with open(log_file) as f:
-                    print(f.read()[-2000:])
-                return 1
+            server_proc = subprocess.Popen(
+                ["bash", "scripts/run_studio.sh"],
+                cwd=artifact_root,
+                env={**os.environ, **env},
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
 
-            print("=== Verifying UI endpoints ===")
-            with httpx.Client(timeout=30.0) as client:
-                verify_ui(client, artifact_root)
-
-                print("=== Running Stable Journey ===")
-                run_stable_journey(client, artifact_root)
-
-            print("=== Running reliability proofs ===")
-            run_reliability_proofs(artifact_root, venv_python)
-
-        finally:
-            print("=== Shutting down server (SIGTERM) ===")
-            server_proc.send_signal(signal.SIGTERM)
             try:
-                server_proc.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                server_proc.kill()
-                server_proc.wait(timeout=5)
+                print("=== Waiting for server ===")
+                if not wait_for_server(BASE_URL):
+                    print("Server did not start in time")
+                    log_fh.flush()
+                    with open(log_file) as f:
+                        print(f.read()[-2000:])
+                    return 1
 
-            # Verify port released
-            time.sleep(1)
-            import socket
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            result = sock.connect_ex(("127.0.0.1", API_PORT))
-            sock.close()
-            check("port released after SIGTERM", result != 0)
+                print("=== Verifying UI endpoints ===")
+                with httpx.Client(timeout=30.0) as client:
+                    verify_ui(client, artifact_root)
+
+                    print("=== Running Stable Journey ===")
+                    run_stable_journey(client, artifact_root)
+
+                print("=== Running reliability proofs ===")
+                run_reliability_proofs(artifact_root, venv_python)
+
+            finally:
+                print("=== Shutting down server (SIGTERM) ===")
+                server_proc.send_signal(signal.SIGTERM)
+                try:
+                    server_proc.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    server_proc.kill()
+                    server_proc.wait(timeout=5)
+
+                # Verify port released
+                time.sleep(1)
+                import socket
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                result = sock.connect_ex(("127.0.0.1", API_PORT))
+                sock.close()
+                check("port released after SIGTERM", result != 0)
+        finally:
+            log_fh.close()
 
     if FAILURES:
         print(f"\n=== SMOKE TEST FAILED: {len(FAILURES)} failure(s) ===")

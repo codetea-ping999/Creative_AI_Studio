@@ -13,6 +13,7 @@ VERSION="v1.0.0"
 ARTIFACT_NAME="creative-ai-studio-${VERSION}"
 OUT_DIR="${ROOT_DIR}/artifacts"
 STAGE_DIR="$(mktemp -d)"
+STAGE_ROOT="${STAGE_DIR}/${ARTIFACT_NAME}"
 
 cleanup() {
   rm -rf "${STAGE_DIR}"
@@ -21,28 +22,35 @@ trap cleanup EXIT
 
 mkdir -p "${OUT_DIR}"
 
+echo "=== Checking working tree clean ==="
+if ! git -C "${ROOT_DIR}" diff --quiet || ! git -C "${ROOT_DIR}" diff --cached --quiet; then
+  echo "ERROR: working tree has uncommitted changes. Commit or stash before building artifact." >&2
+  exit 1
+fi
+
 echo "=== Building web UI (VITE_API_BASE_URL=\"\") ==="
 VITE_API_BASE_URL="" npm --prefix "${ROOT_DIR}/apps/web" run build
 
 echo "=== Staging source tree from HEAD ==="
-git -C "${ROOT_DIR}" archive HEAD | tar -x -C "${STAGE_DIR}"
+mkdir -p "${STAGE_ROOT}"
+git -C "${ROOT_DIR}" archive HEAD | tar -x -C "${STAGE_ROOT}"
 
 echo "=== Removing Desktop app from staging ==="
-rm -rf "${STAGE_DIR}/apps/desktop"
+rm -rf "${STAGE_ROOT}/apps/desktop"
 
 echo "=== Copying prebuilt web dist ==="
-cp -R "${ROOT_DIR}/apps/web/dist" "${STAGE_DIR}/apps/web/dist"
+cp -R "${ROOT_DIR}/apps/web/dist" "${STAGE_ROOT}/apps/web/dist"
 
 echo "=== Verifying exclusions ==="
 for p in venv apps/web/node_modules data outputs .env apps/desktop; do
-  if [[ -e "${STAGE_DIR}/${p}" ]]; then
+  if [[ -e "${STAGE_ROOT}/${p}" ]]; then
     echo "ERROR: excluded path present: ${p}" >&2
     exit 1
   fi
 done
 
 echo "=== Creating tarball ==="
-tar -czf "${OUT_DIR}/${ARTIFACT_NAME}.tar.gz" -C "${STAGE_DIR}" .
+tar -czf "${OUT_DIR}/${ARTIFACT_NAME}.tar.gz" -C "${STAGE_DIR}" "${ARTIFACT_NAME}"
 
 echo "=== Computing SHA256 ==="
 shasum -a 256 "${OUT_DIR}/${ARTIFACT_NAME}.tar.gz" > "${OUT_DIR}/SHA256SUMS"
@@ -62,12 +70,12 @@ if tar -tzf "${OUT_DIR}/${ARTIFACT_NAME}.tar.gz" | rg -i '\.(safetensors|ckpt|gg
 fi
 
 echo "=== Required paths present ==="
-if ! tar -tzf "${OUT_DIR}/${ARTIFACT_NAME}.tar.gz" | rg 'apps/web/dist/index\.html' >/dev/null; then
-  echo "ERROR: apps/web/dist/index.html missing" >&2
+if ! tar -tzf "${OUT_DIR}/${ARTIFACT_NAME}.tar.gz" | rg "${ARTIFACT_NAME}/apps/web/dist/index\.html" >/dev/null; then
+  echo "ERROR: ${ARTIFACT_NAME}/apps/web/dist/index.html missing" >&2
   exit 1
 fi
-if ! tar -tvzf "${OUT_DIR}/${ARTIFACT_NAME}.tar.gz" | rg 'scripts/run_studio\.sh$' | rg '^-rwx' >/dev/null; then
-  echo "ERROR: scripts/run_studio.sh missing or not executable" >&2
+if ! tar -tvzf "${OUT_DIR}/${ARTIFACT_NAME}.tar.gz" | rg "${ARTIFACT_NAME}/scripts/run_studio\.sh$" | rg '^-rwx' >/dev/null; then
+  echo "ERROR: ${ARTIFACT_NAME}/scripts/run_studio.sh missing or not executable" >&2
   exit 1
 fi
 
