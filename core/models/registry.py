@@ -24,9 +24,6 @@ class ModelRegistry:
         manifest_sources: dict[str, Path] = {}
         if self.manifest_root.exists():
             for path in sorted(self.manifest_root.rglob("*.json")):
-                # Skip macOS AppleDouble resource fork files (._*)
-                if path.name.startswith("._"):
-                    continue
                 manifest = ModelManifest.model_validate_json(
                     path.read_text(encoding="utf-8")
                 )
