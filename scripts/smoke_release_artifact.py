@@ -19,7 +19,6 @@ from __future__ import annotations
 import os
 import sys
 import time
-import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -63,18 +62,6 @@ def extract_asset_paths(index_html: str) -> tuple[str | None, str | None]:
     js_match = re.search(r'<script type="module"[^>]*src="(/assets/index-[^"]+\.js)"', index_html)
     css_match = re.search(r'<link rel="stylesheet"[^>]*href="(/assets/index-[^"]+\.css)"', index_html)
     return js_match.group(1) if js_match else None, css_match.group(1) if css_match else None
-
-
-def poll_job(client: httpx.Client, job_id: str, timeout: float = 180.0) -> dict:
-    deadline = time.time() + timeout
-    last = {}
-    while time.time() < deadline:
-        r = client.get(f"{BASE_URL}/jobs/{job_id}")
-        last = r.json()
-        if last.get("status") in ("succeeded", "failed", "cancelled"):
-            return last
-        time.sleep(0.5)
-    return last
 
 
 def wait_for_server(base_url: str, timeout: float = 60.0) -> bool:
@@ -156,9 +143,18 @@ def verify_ui(artifact_root: Path) -> None:
         status, _, _ = http_get(f"{BASE_URL}{css_path}")
         check("/assets CSS 200", status == 200, css_path)
 
-    # /models - should respond (200 with manifest, or 500 if no models configured)
-    status, _, _ = http_get(f"{BASE_URL}/models")
-    check("/models responds", status in (200, 500), f"status={status}")
+    # /models - strict: HTTP 200, valid JSON dict with a "models" list
+    models_status, models_body, _ = http_get(f"{BASE_URL}/models")
+    check("/models status 200", models_status == 200, f"status={models_status}")
+    if models_status == 200:
+        try:
+            models_payload = json.loads(models_body)
+        except json.JSONDecodeError:
+            models_payload = None
+        check(
+            "/models payload is dict with models list",
+            isinstance(models_payload, dict) and isinstance(models_payload.get("models"), list),
+        )
 
     # byte-identical to dist
     dist_index = artifact_root / "apps/web/dist/index.html"

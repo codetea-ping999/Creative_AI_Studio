@@ -27,6 +27,13 @@ if ! git -C "${ROOT_DIR}" diff --quiet || ! git -C "${ROOT_DIR}" diff --cached -
   echo "ERROR: working tree has uncommitted changes. Commit or stash before building artifact." >&2
   exit 1
 fi
+if [[ -n "$(git -C "${ROOT_DIR}" status --porcelain --untracked-files=all)" ]]; then
+  echo "ERROR: working tree has untracked files. Add, commit, or remove them before building artifact." >&2
+  exit 1
+fi
+
+echo "=== Installing web UI dependencies (npm ci) ==="
+npm ci --prefix "${ROOT_DIR}/apps/web"
 
 echo "=== Building web UI (VITE_API_BASE_URL=\"\") ==="
 VITE_API_BASE_URL="" npm --prefix "${ROOT_DIR}/apps/web" run build
@@ -50,7 +57,7 @@ for p in venv apps/web/node_modules data outputs .env apps/desktop; do
 done
 
 echo "=== Creating tarball ==="
-tar -czf "${OUT_DIR}/${ARTIFACT_NAME}.tar.gz" -C "${STAGE_DIR}" "${ARTIFACT_NAME}"
+COPYFILE_DISABLE=1 tar -czf "${OUT_DIR}/${ARTIFACT_NAME}.tar.gz" -C "${STAGE_DIR}" "${ARTIFACT_NAME}"
 
 echo "=== Computing SHA256 ==="
 shasum -a 256 "${OUT_DIR}/${ARTIFACT_NAME}.tar.gz" > "${OUT_DIR}/SHA256SUMS"
@@ -66,6 +73,11 @@ fi
 
 if tar -tzf "${OUT_DIR}/${ARTIFACT_NAME}.tar.gz" | rg -i '\.(safetensors|ckpt|gguf|onnx|pth|pt|bin|model)$' >/dev/null; then
   echo "ERROR: weight files found in artifact" >&2
+  exit 1
+fi
+
+if tar -tzf "${OUT_DIR}/${ARTIFACT_NAME}.tar.gz" | rg '(^|/)\._' >/dev/null; then
+  echo "ERROR: AppleDouble (._*) entries found in artifact" >&2
   exit 1
 fi
 
