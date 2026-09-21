@@ -88,31 +88,41 @@ echo "=== Computing SHA256 ==="
 sha256_file "${OUT_DIR}/${ARTIFACT_NAME}.tar.gz" > "${OUT_DIR}/SHA256SUMS"
 
 echo "=== Verifying artifact contents ==="
+# Write the listings to files and assert against those. Piping `tar` into
+# `grep -q` lets grep exit on the first match, which SIGPIPEs tar; under
+# `set -o pipefail` that non-zero status would make a *matching* forbidden
+# path look like "no match" and silently pass the exclusion assertions.
+VERBOSE_LISTING="${OUT_DIR}/artifact-listing.txt"
 tar -tzf "${OUT_DIR}/${ARTIFACT_NAME}.tar.gz" | sort > "${OUT_DIR}/artifact-manifest.txt"
+tar -tvzf "${OUT_DIR}/${ARTIFACT_NAME}.tar.gz" > "${VERBOSE_LISTING}"
 
 echo "=== Exclusion assertions ==="
-if tar -tzf "${OUT_DIR}/${ARTIFACT_NAME}.tar.gz" | grep -Eq '(^|/)(venv|node_modules|data|outputs)/|(^|/)\.env($|/)|apps/desktop'; then
+if grep -Eq '(^|/)(venv|node_modules|data|outputs)/|(^|/)\.env($|/)|apps/desktop' "${OUT_DIR}/artifact-manifest.txt"; then
   echo "ERROR: forbidden paths found in artifact" >&2
   exit 1
 fi
 
-if tar -tzf "${OUT_DIR}/${ARTIFACT_NAME}.tar.gz" | grep -Eqi '\.(safetensors|ckpt|gguf|onnx|pth|pt|bin|model)$'; then
+if grep -Eqi '\.(safetensors|ckpt|gguf|onnx|pth|pt|bin|model)$' "${OUT_DIR}/artifact-manifest.txt"; then
   echo "ERROR: weight files found in artifact" >&2
   exit 1
 fi
 
-if tar -tzf "${OUT_DIR}/${ARTIFACT_NAME}.tar.gz" | grep -Eq '(^|/)\._'; then
+if grep -Eq '(^|/)\._' "${OUT_DIR}/artifact-manifest.txt"; then
   echo "ERROR: AppleDouble (._*) entries found in artifact" >&2
   exit 1
 fi
 
 echo "=== Required paths present ==="
-if ! tar -tzf "${OUT_DIR}/${ARTIFACT_NAME}.tar.gz" | grep -Fqx "${ARTIFACT_NAME}/apps/web/dist/index.html"; then
+if ! grep -Fqx "${ARTIFACT_NAME}/apps/web/dist/index.html" "${OUT_DIR}/artifact-manifest.txt"; then
   echo "ERROR: ${ARTIFACT_NAME}/apps/web/dist/index.html missing" >&2
   exit 1
 fi
-if ! tar -tvzf "${OUT_DIR}/${ARTIFACT_NAME}.tar.gz" | grep -E " ${ARTIFACT_NAME}/scripts/run_studio\.sh$" | grep -q '^-rwx'; then
+if ! grep -Eq "^-rwx.* ${ARTIFACT_NAME}/scripts/run_studio\.sh$" "${VERBOSE_LISTING}"; then
   echo "ERROR: ${ARTIFACT_NAME}/scripts/run_studio.sh missing or not executable" >&2
+  exit 1
+fi
+if ! grep -Fqx "${ARTIFACT_NAME}/VERSION" "${OUT_DIR}/artifact-manifest.txt"; then
+  echo "ERROR: ${ARTIFACT_NAME}/VERSION missing; /version cannot report the release" >&2
   exit 1
 fi
 
