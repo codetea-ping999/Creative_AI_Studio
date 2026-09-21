@@ -52,4 +52,25 @@ def get_release_tag() -> str:
     return f"v{get_version()}"
 
 
-__all__ = ["VERSION_FILE", "get_release_tag", "get_version"]
+def get_base_version() -> str:
+    """Return the version without its pre-release suffix.
+
+    ``1.0.0-rc.1`` and ``1.0.0`` share the base version ``1.0.0``. The release
+    *identity* — the tag, the artifact name, ``GET /version`` — carries the
+    suffix, because those must name the exact thing that was cut. Everything
+    that describes the release *contents* tracks the base version instead: the
+    changelog section and the package metadata are the same for a candidate and
+    for the release it is a candidate for. That is what lets a release
+    candidate be cut by editing ``VERSION`` alone, however many candidates
+    there are.
+    """
+
+    return get_version().split("-", 1)[0]
+
+
+__all__ = [
+    "VERSION_FILE",
+    "get_base_version",
+    "get_release_tag",
+    "get_version",
+]

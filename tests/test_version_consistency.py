@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 import unittest
 
-from core.version import get_release_tag, get_version
+from core.version import get_base_version, get_release_tag, get_version
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -38,18 +38,25 @@ class VersionSourceOfTruthTests(unittest.TestCase):
     def test_release_tag_is_the_v_prefixed_version(self) -> None:
         self.assertEqual(get_release_tag(), f"v{get_version()}")
 
+    def test_base_version_drops_the_pre_release_suffix(self) -> None:
+        self.assertEqual(get_base_version(), get_version().split("-", 1)[0])
+
     def test_web_package_version_matches(self) -> None:
+        # The base version, so cutting 1.0.0-rc.1 does not require editing
+        # package.json and its lockfile: nothing at release time reads them.
         package = json.loads(WEB_PACKAGE_JSON.read_text(encoding="utf-8"))
         self.assertEqual(
             package["version"],
-            get_version(),
+            get_base_version(),
             "apps/web/package.json is out of sync with VERSION",
         )
 
     def test_web_lockfile_version_matches(self) -> None:
         lock = json.loads(WEB_PACKAGE_LOCK.read_text(encoding="utf-8"))
-        self.assertEqual(lock.get("version"), get_version())
-        self.assertEqual(lock.get("packages", {}).get("", {}).get("version"), get_version())
+        self.assertEqual(lock.get("version"), get_base_version())
+        self.assertEqual(
+            lock.get("packages", {}).get("", {}).get("version"), get_base_version()
+        )
 
     def test_desktop_bundle_version_matches_when_present(self) -> None:
         # The desktop shell lands separately (PR #409); assert only when it is
@@ -57,7 +64,7 @@ class VersionSourceOfTruthTests(unittest.TestCase):
         if not DESKTOP_CONFIG.exists():
             self.skipTest("desktop shell is not part of this tree")
         config = json.loads(DESKTOP_CONFIG.read_text(encoding="utf-8"))
-        self.assertEqual(config["version"], get_version())
+        self.assertEqual(config["version"], get_base_version())
 
 
 class ReleaseToolingUsesTheVersionFileTests(unittest.TestCase):
@@ -78,9 +85,11 @@ class ChangelogTests(unittest.TestCase):
         # is in the tree so this gate does not depend on merge order.
         if not CHANGELOG.exists():
             self.skipTest("CHANGELOG.md is not part of this tree yet")
+        # The base version: a release candidate documents the same contents as
+        # the release it is a candidate for, so 1.0.0-rc.1 looks for "## [1.0.0]".
         body = CHANGELOG.read_text(encoding="utf-8")
         self.assertIn(
-            f"## [{get_version()}]",
+            f"## [{get_base_version()}]",
             body,
             "CHANGELOG.md has no section for the version in VERSION",
         )

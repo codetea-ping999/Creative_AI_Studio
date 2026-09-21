@@ -1,6 +1,6 @@
 PYTHON ?= ./venv/bin/python
 
-.PHONY: verify verify-lite setup-check web-build test web-test npm-audit lint typecheck test-coverage web-test-coverage api-smoke calibration-report cogvideox-smoke musicgen-smoke release-artifact release-smoke
+.PHONY: verify verify-lite setup-check web-build test web-test npm-audit lint typecheck test-coverage web-test-coverage api-smoke calibration-report cogvideox-smoke musicgen-smoke release-artifact release-smoke third-party-notices
 
 verify:
 	$(PYTHON) scripts/verify_local_stack.py --start-api
@@ -56,3 +56,9 @@ release-artifact:
 # Stable journey against it, and verify clean shutdown.
 release-smoke:
 	$(PYTHON) scripts/smoke_release_artifact.py
+
+# Regenerate THIRD_PARTY_NOTICES.md from the installed dependencies. Requires a
+# venv built from requirements.txt and apps/web/node_modules (npm ci), because
+# it reads real package metadata rather than restating requirements.txt.
+third-party-notices:
+	$(PYTHON) scripts/collect_third_party_notices.py
