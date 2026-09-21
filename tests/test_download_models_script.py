@@ -46,6 +46,18 @@ class DownloadModelsScriptTests(unittest.TestCase):
         binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         binary.chmod(0o755)
 
+    def _install_fake_df(self, fake_bin: Path, available_kib: int) -> None:
+        """Pin reported free space so the runner's real disk cannot decide a test."""
+        fake_df = fake_bin / "df"
+        fake_df.unlink(missing_ok=True)
+        fake_df.write_text(
+            "#!/bin/sh\n"
+            "printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\\n'\n"
+            f"printf '/dev/fake 209715200 1024 {available_kib} 50%% /\\n'\n",
+            encoding="utf-8",
+        )
+        fake_df.chmod(0o755)
+
     def _run(self, root: Path, fake_bin: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         environment["PATH"] = str(fake_bin)
@@ -71,6 +83,7 @@ class DownloadModelsScriptTests(unittest.TestCase):
     def test_modern_cli_omits_the_removed_symlink_flag(self) -> None:
         root, fake_bin = self._prepare_root()
         self._install_fake_cli(fake_bin, "hf")
+        self._install_fake_df(fake_bin, 104857600)
 
         result = self._run(root, fake_bin, "--dry-run")
 
@@ -82,6 +95,7 @@ class DownloadModelsScriptTests(unittest.TestCase):
     def test_legacy_cli_keeps_the_symlink_flag(self) -> None:
         root, fake_bin = self._prepare_root()
         self._install_fake_cli(fake_bin, "huggingface-cli")
+        self._install_fake_df(fake_bin, 104857600)
 
         result = self._run(root, fake_bin, "--dry-run")
 
@@ -94,6 +108,7 @@ class DownloadModelsScriptTests(unittest.TestCase):
         venv_bin = root / "venv" / "bin"
         venv_bin.mkdir(parents=True)
         self._install_fake_cli(venv_bin, "hf")
+        self._install_fake_df(fake_bin, 104857600)
 
         result = self._run(root, fake_bin, "--dry-run")
 
@@ -104,6 +119,7 @@ class DownloadModelsScriptTests(unittest.TestCase):
     def test_audio_download_excludes_duplicate_and_optional_weights(self) -> None:
         root, fake_bin = self._prepare_root()
         self._install_fake_cli(fake_bin, "hf")
+        self._install_fake_df(fake_bin, 104857600)
 
         result = self._run(root, fake_bin, "--only", "audio", "--dry-run")
 
@@ -115,6 +131,7 @@ class DownloadModelsScriptTests(unittest.TestCase):
     def test_long_form_keeps_the_audiocraft_state_dicts_and_adds_t5(self) -> None:
         root, fake_bin = self._prepare_root()
         self._install_fake_cli(fake_bin, "hf")
+        self._install_fake_df(fake_bin, 104857600)
 
         result = self._run(root, fake_bin, "--only", "audio", "--with-long-form", "--dry-run")
 
@@ -127,6 +144,7 @@ class DownloadModelsScriptTests(unittest.TestCase):
     def test_unknown_target_is_rejected(self) -> None:
         root, fake_bin = self._prepare_root()
         self._install_fake_cli(fake_bin, "hf")
+        self._install_fake_df(fake_bin, 104857600)
 
         result = self._run(root, fake_bin, "--only", "bogus")
 
@@ -136,15 +154,7 @@ class DownloadModelsScriptTests(unittest.TestCase):
     def test_insufficient_disk_space_aborts_before_downloading(self) -> None:
         root, fake_bin = self._prepare_root()
         self._install_fake_cli(fake_bin, "hf")
-        fake_df = fake_bin / "df"
-        fake_df.unlink()
-        fake_df.write_text(
-            "#!/bin/sh\n"
-            "printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\\n'\n"
-            "printf '/dev/fake 100000000 99000000 1048576 99%% /\\n'\n",
-            encoding="utf-8",
-        )
-        fake_df.chmod(0o755)
+        self._install_fake_df(fake_bin, 1048576)
 
         result = self._run(root, fake_bin, "--dry-run")
 
