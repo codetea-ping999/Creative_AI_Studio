@@ -41,6 +41,10 @@ DEVELOPMENT_ONLY = frozenset(
     {"pytest", "pytest-asyncio", "pytest-cov", "ruff", "mypy"}
 )
 
+#: Packages every virtualenv bootstraps. They come with the interpreter's
+#: tooling rather than with this project, and are not dependencies of it.
+ENVIRONMENT_BOOTSTRAP = frozenset({"pip", "setuptools", "wheel", "pkg-resources"})
+
 UNKNOWN_LICENSE = "UNKNOWN"
 
 
@@ -128,9 +132,10 @@ def python_packages() -> list[Package]:
             "Run this inside an environment built from requirements.txt."
         )
 
+    excluded = {_normalize(n) for n in (*DEVELOPMENT_ONLY, *ENVIRONMENT_BOOTSTRAP)}
     packages = []
     for normalized, dist in installed.items():
-        if normalized in {_normalize(n) for n in DEVELOPMENT_ONLY}:
+        if normalized in excluded:
             continue
         meta = dist.metadata
         packages.append(
@@ -142,6 +147,22 @@ def python_packages() -> list[Package]:
             )
         )
     return sorted(packages)
+
+
+def _is_package_root(relative: Path) -> bool:
+    """True when ``relative`` is a package's own manifest inside node_modules.
+
+    A package root is ``<name>/package.json`` or ``@scope/<name>/package.json``,
+    optionally under any number of nested ``node_modules`` directories (npm
+    installs a conflicting version beside its dependent rather than hoisting it).
+    """
+
+    parts = relative.parts
+    if parts[-1] != "package.json":
+        return False
+    if "node_modules" in parts:
+        parts = parts[len(parts) - parts[::-1].index("node_modules") :]
+    return len(parts) == 2 or (len(parts) == 3 and parts[0].startswith("@"))
 
 
 def _node_license(manifest: dict) -> str:
@@ -166,10 +187,10 @@ def node_packages() -> list[Package]:
 
     packages = []
     for manifest_path in NODE_MODULES.glob("**/package.json"):
-        # Skip nested fixtures and a package's own node_modules duplicates are
-        # kept: a hoisted tree can legitimately hold two versions of one name.
-        relative = manifest_path.relative_to(NODE_MODULES)
-        if relative.parts[-2:-1] == ("dist",) or "test" in relative.parts:
+        # Only package roots. Packages also ship package.json files inside
+        # subdirectories (an "esm/package.json" holding {"type": "module"}, a
+        # test fixture), and those are not dependencies of anything.
+        if not _is_package_root(manifest_path.relative_to(NODE_MODULES)):
             continue
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
