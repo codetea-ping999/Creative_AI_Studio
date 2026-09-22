@@ -25,6 +25,7 @@ from apps.api.routes.projects import router as projects_router
 from apps.api.routes.stories import router as stories_router
 from core.remote import AgentProtocol
 from core.storage.ownership import DataDirectoryOwnership
+from core.version import get_version
 
 logger = logging.getLogger(__name__)
 
@@ -212,7 +213,14 @@ def create_app(
             else:
                 ownership.release()
 
-    app = FastAPI(title="Creative AI Studio API", lifespan=lifespan)
+    # The OpenAPI schema carries the release version too, so /openapi.json and
+    # the Swagger UI agree with GET /version instead of reporting FastAPI's
+    # default "0.1.0".
+    app = FastAPI(
+        title="Creative AI Studio API",
+        version=get_version(),
+        lifespan=lifespan,
+    )
     if resolved_services is not None:
         app.state.services = resolved_services
     app.state.agent_protocol = AgentProtocol()
