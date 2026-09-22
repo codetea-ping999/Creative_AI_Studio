@@ -67,6 +67,38 @@ class VersionSourceOfTruthTests(unittest.TestCase):
         self.assertEqual(config["version"], get_base_version())
 
 
+class ApiReportsTheVersionTests(unittest.TestCase):
+    """Every version an API client can read agrees with VERSION.
+
+    ``GET /version`` is the explicit one, but the OpenAPI schema carries a
+    version too, and FastAPI defaults it to "0.1.0" when none is passed. A
+    client reading /openapi.json or the Swagger UI would then see a different
+    release than the one actually running.
+    """
+
+    def _client(self):
+        from fastapi.testclient import TestClient
+
+        from apps.api.main import create_app
+
+        return TestClient(create_app(start_job_runner=False))
+
+    def test_version_endpoint_reports_the_version_file(self) -> None:
+        with self._client() as client:
+            payload = client.get("/version").json()
+        self.assertEqual(payload["version"], get_version())
+        self.assertEqual(payload["release_tag"], get_release_tag())
+
+    def test_openapi_schema_reports_the_same_version(self) -> None:
+        with self._client() as client:
+            schema = client.get("/openapi.json").json()
+        self.assertEqual(
+            schema["info"]["version"],
+            get_version(),
+            "/openapi.json and the Swagger UI would report a different release",
+        )
+
+
 class ReleaseToolingUsesTheVersionFileTests(unittest.TestCase):
     """The build and smoke scripts must derive the version, not restate it."""
 
