@@ -74,21 +74,46 @@ Ollama / LM Studio / vLLM をすでに動かしている場合は、weight を�
 
 ## ダウンロード方法
 
+### まとめて取得するスクリプト
+
+`learned-video` (CogVideoX-2B) と `musicgen-small` の weight は
+`scripts/download_models.py` でまとめて取得できます。空き容量を先に確認し、
+取得後に対象 manifest の readiness を検証します。
+
+```bash
+make download-models                                        # 両方（約 15.1GiB）
+./venv/bin/python scripts/download_models.py --only audio   # MusicGen Small だけ（約 2.2GiB）
+./venv/bin/python scripts/download_models.py --only video   # CogVideoX-2B だけ（約 12.8GiB）
+./venv/bin/python scripts/download_models.py --dry-run      # 実行されるコマンドの確認だけ
+./venv/bin/python scripts/download_models.py --with-long-form  # optional な長尺 MusicGen 用資材も配置
+```
+
+保存先は manifest の `local_path` / `pipeline_path` から解決するので、`MODELS_ROOT` や
+`MODELS_MANIFEST_ROOT` で配置を移した環境でも、その環境の manifest が指すディレクトリへ
+取得します。空き容量の確認は、すでに取得済みのファイル分を差し引いた残りに対して行うため、
+中断した取得を同じコマンドで再開できます。取得後の readiness 確認は、選んだ manifest だけを
+`core/model_readiness.py` で評価します。
+
 ### Hugging Face CLI を使う例
 
 事前に Hugging Face へログインします。
 
 ```bash
 pip install "huggingface_hub[cli]"
-huggingface-cli login
+hf auth login
 ```
+
+CLI 名に注意してください。`huggingface_hub` v1.0 で `huggingface-cli` は `hf` へ
+統合され、`--local-dir-use-symlinks` は削除されました。このドキュメントは新しい
+`hf` 前提で書いています。`./venv/bin/hf version` が通らない古い環境では、
+`hf download` を `huggingface-cli download ... --local-dir-use-symlinks False`
+に読み替えてください。`scripts/download_models.py` はどちらの CLI でも動きます（新 CLI は `--exclude` を繰り返し、旧 CLI は 1 つの `--exclude` にまとめる、という差も吸収します）。
 
 モデルを配置します。
 
 ```bash
-huggingface-cli download stabilityai/stable-diffusion-xl-base-1.0 \
-  --local-dir ./models/image/sdxl \
-  --local-dir-use-symlinks False
+hf download stabilityai/stable-diffusion-xl-base-1.0 \
+  --local-dir ./models/image/sdxl
 ```
 
 ### Git LFS を使う例
@@ -101,9 +126,8 @@ git clone https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0 ./mode
 ### MusicGen Small を配置する例
 
 ```bash
-huggingface-cli download facebook/musicgen-small \
-  --local-dir ./models/audio/musicgen-small \
-  --local-dir-use-symlinks False
+hf download facebook/musicgen-small \
+  --local-dir ./models/audio/musicgen-small
 ```
 
 ### MusicGen long-form を配置する例
@@ -119,9 +143,8 @@ cp ./models/audio/musicgen-small/state_dict.bin \
 cp ./models/audio/musicgen-small/compression_state_dict.bin \
   ./models/audio/musicgen-long-form/compression_state_dict.bin
 
-huggingface-cli download google-t5/t5-base \
-  --local-dir ./models/audio/musicgen-long-form/t5-base \
-  --local-dir-use-symlinks False
+hf download google-t5/t5-base \
+  --local-dir ./models/audio/musicgen-long-form/t5-base
 ```
 
 既存 checkpoint を重複コピーしたくない開発環境では、2つの `.bin` を
@@ -162,9 +185,8 @@ dependency または相対ファイル名が表示されます。
 CogVideoXはoptionalです。Diffusers形式のweightを次の場所へ配置します。
 
 ```bash
-huggingface-cli download THUDM/CogVideoX-2b \
-  --local-dir ./models/video/cogvideox-2b \
-  --local-dir-use-symlinks False
+hf download THUDM/CogVideoX-2b \
+  --local-dir ./models/video/cogvideox-2b
 ```
 
 `model_index.json`はリポジトリに含まれますが、それだけではavailableになりません。
@@ -192,13 +214,11 @@ semantic judge は生成モデルとは別の評価用 model です。
 `QUALITY_SEMANTIC_LOCAL_ONLY=true` の運用では、事前に local path へ配置してから path override を設定してください。
 
 ```bash
-huggingface-cli download openai/clip-vit-base-patch32 \
-  --local-dir ./models/judges/clip-vit-base-patch32 \
-  --local-dir-use-symlinks False
+hf download openai/clip-vit-base-patch32 \
+  --local-dir ./models/judges/clip-vit-base-patch32
 
-huggingface-cli download laion/clap-htsat-unfused \
-  --local-dir ./models/judges/clap-htsat-unfused \
-  --local-dir-use-symlinks False
+hf download laion/clap-htsat-unfused \
+  --local-dir ./models/judges/clap-htsat-unfused
 ```
 
 `.env` の例:
