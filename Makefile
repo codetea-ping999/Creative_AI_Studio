@@ -42,7 +42,7 @@ calibration-report:
 	$(PYTHON) scripts/build_calibration_report.py
 
 download-models:
-	./scripts/download_models.sh
+	$(PYTHON) scripts/download_models.py
 
 cogvideox-smoke:
 	$(PYTHON) scripts/smoke_cogvideox.py

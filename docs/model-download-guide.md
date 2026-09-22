@@ -77,18 +77,22 @@ Ollama / LM Studio / vLLM をすでに動かしている場合は、weight を�
 ### まとめて取得するスクリプト
 
 `learned-video` (CogVideoX-2B) と `musicgen-small` の weight は
-`scripts/download_models.sh` でまとめて取得できます。空き容量を先に確認し、
-取得後に `scripts/check_local_setup.py` で readiness を検証します。
+`scripts/download_models.py` でまとめて取得できます。空き容量を先に確認し、
+取得後に対象 manifest の readiness を検証します。
 
 ```bash
-make download-models                            # 両方（約 15.5GiB）
-./scripts/download_models.sh --only audio       # MusicGen Small だけ（約 2.3GiB）
-./scripts/download_models.sh --only video       # CogVideoX-2B だけ（約 13.2GiB）
-./scripts/download_models.sh --dry-run          # 実行されるコマンドの確認だけ
-./scripts/download_models.sh --with-long-form   # optional な長尺 MusicGen 用資材も配置
+make download-models                                        # 両方（約 15.1GiB）
+./venv/bin/python scripts/download_models.py --only audio   # MusicGen Small だけ（約 2.2GiB）
+./venv/bin/python scripts/download_models.py --only video   # CogVideoX-2B だけ（約 12.8GiB）
+./venv/bin/python scripts/download_models.py --dry-run      # 実行されるコマンドの確認だけ
+./venv/bin/python scripts/download_models.py --with-long-form  # optional な長尺 MusicGen 用資材も配置
 ```
 
-完了済みファイルは再実行時にスキップされるため、中断しても同じコマンドで再開できます。
+保存先は manifest の `local_path` / `pipeline_path` から解決するので、`MODELS_ROOT` や
+`MODELS_MANIFEST_ROOT` で配置を移した環境でも、その環境の manifest が指すディレクトリへ
+取得します。空き容量の確認は、すでに取得済みのファイル分を差し引いた残りに対して行うため、
+中断した取得を同じコマンドで再開できます。取得後の readiness 確認は、選んだ manifest だけを
+`core/model_readiness.py` で評価します。
 
 ### Hugging Face CLI を使う例
 
@@ -103,7 +107,7 @@ CLI 名に注意してください。`huggingface_hub` v1.0 で `huggingface-cli
 統合され、`--local-dir-use-symlinks` は削除されました。このドキュメントは新しい
 `hf` 前提で書いています。`./venv/bin/hf version` が通らない古い環境では、
 `hf download` を `huggingface-cli download ... --local-dir-use-symlinks False`
-に読み替えてください。`scripts/download_models.sh` はどちらの CLI でも動きます。
+に読み替えてください。`scripts/download_models.py` はどちらの CLI でも動きます（新 CLI は `--exclude` を繰り返し、旧 CLI は 1 つの `--exclude` にまとめる、という差も吸収します）。
 
 モデルを配置します。
 
