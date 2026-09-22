@@ -1,7 +1,17 @@
 # Creative AI Studio
 
-ローカルで動作する Creative AI Studio。  
-現在は Image Generation、Storyboard Video Generation、Music Loop Generation / Playback を同じ Studio UI とジョブ基盤で扱います。
+ローカルで動作する Creative AI Studio。Story / Image / Video / Music を同じ Studio UI と
+ジョブ基盤で扱います。機能ごとに v1.0 で約束する範囲が異なるため、まず
+[v1.0 で約束する範囲](#v10-で約束する範囲) を確認してください。
+
+v1.0 の主要ジャーニーはモデル weight を必要としません。
+
+```text
+Project -> Template Story -> Procedural Visual / Storyboard -> Gallery / Reuse -> Assembly MP4
+```
+
+ナレーション（TTS）と BGM（音楽生成）は任意の追加ステップであり、この主要ジャーニーの
+必須要素ではありません。
 
 ## Goals
 
@@ -29,47 +39,117 @@
 ./scripts/start_studio.sh
 ```
 
+これは開発用の起動です（API と Vite dev server を別々に立ち上げます）。
+配布物から起動する場合は、ビルド済み Web UI を FastAPI が配信する本番用パスを使います。
+
+```bash
+./scripts/run_studio.sh
+```
+
+`run_studio.sh` は Node を実行時に必要としません。既定では loopback にのみ bind します。
+配布された tarball から導入する手順は
+[docs/release/install-from-artifact.md](docs/release/install-from-artifact.md) にあります。
+
 起動スクリプトはルートの `.env` にある `API_PORT` と `WEB_PORT` をそろえて
 利用し、ブラウザを開きます。失敗時は表示された API / Web ログを確認してください。
 すでに API または Vite を別の port / API URL で起動している場合は、先にそのプロセスを
 停止してから実行してください。起動スクリプトは設定不一致を検出して再起動方法を案内します。
 
-## Current Status
+## v1.0 で約束する範囲
 
-### ✅ 実装済み機能
+v1.0 は機能を 3 段階に分けて提供します。**コードが存在することは Stable を意味しません。**
 
-- **Core Infrastructure**: ジョブキューシステム、イベントバス（購読可能）、モデルレジストリ、ストレージレイヤー
-- **API (FastAPI)**: `/health`, `/models`, `/jobs`, `/generate/{image,audio,video,text}`, `/gallery`, `/projects`, `/feedback`, `/metrics/summary`, `/metrics/calibration`, `/catalog/loras`, `/bible`, `/batches`, `/stories`
-- **Story Engine (text)**: ローカル LLM による logline / beat sheet / scene list / 本文 / 台本 / prompt pack / character sheet 生成。weight 未配置でも動く決定的な template runtime を既定とし、GGUF（llama.cpp）とローカル endpoint に差し替え可能
-- **Creative Bible**: キャラクター / スタイル / ブランド / 場所 / 小道具を再利用可能な設定として保持し、決定的・監査可能に prompt へ合成（seed lock、LoRA、参照画像、locked field の衝突検知つき）
-- **Variation Matrix**: 軸展開による多重生成と probe → refine の 2 段階選抜。ロゴ 30 構造 / サムネ 30 構造 / トーン 10 種のカタログを同梱
-- **StoryDocument**: beats / scenes / chapters と生成素材の紐付けを保持し、assembly 用 timeline を導出
-- **Web UI (React + TypeScript)**: Composer / Stage / Session History を持つ Studio UI、image / video / song surface 切り替え、モデル選択ガード、LoRA カタログ選択、品質スコア表示、音楽再生
-- **Image Generator**: ローカル SDXL と optional LoRA を使った画像生成
-- **Audio Generator**: ローカル MusicGen runtime を使った text-to-music、
-  Melody conditioning、optional AudioCraft 31〜120秒長尺フロー
-- **Video Generator**: procedural storyboard GIF と optional なローカル CogVideoX-2B MP4生成
-- **Project / Feedback / Gallery**: project grouping、feedback 集計、asset detail、reuse、export、project bind を含む asset workflow
-- **Quality Evaluation**: image / audio / video 出力に対するローカル heuristic quality report と運用メトリクス集計
-- **Semantic Judge Scaffold**: optional な local CLIP / CLAP による prompt alignment 採点
-- **Operational Quality**: `pytest`、`scripts/check_local_setup.py`、GitHub Actions CI による基本検証
-- **Studio Asset Actions**: Web UI から asset detail の確認、composer への再投入、reuse rerun、export、project bind が可能
-- **Calibration Dataset**: feedbackと自動quality scoreを結合するJSONL/相関レポートをローカル生成可能
+### Stable
 
-### 🚧 進行中 / 計画中機能
+サポート対象。ここでの回帰はリリースブロッカーとして扱います。
 
-v0.3「構想から完成動画まで」の残作業は [docs/multimedia-content-generation-plan.md](docs/multimedia-content-generation-plan.md)
-と GitHub issue #31（親 Epic）で管理しています。
+| 機能 | 内容 |
+|---|---|
+| Runtime Safety | モデル runtime の所有権・load/unload の基盤。起動時に意図しないモデル / CUDA ロードを行いません |
+| Job Lifecycle（単一レーン） | ジョブの作成・状態遷移・実行。v1.0 は単一の job runner スレッドで動作します |
+| キャンセル / 起動時リカバリ | キュー済みジョブの協調的キャンセルと、再起動後の状態収束 |
+| 永続化（v1 フローが必要とする範囲） | ジョブ DB と JSON データの読み書き。対応する引き継ぎ範囲は下記のとおりです |
+| Template Text / Story | 決定的な template runtime による logline / beat sheet / scene list / 本文生成。weight 不要 |
+| Procedural Visual / Storyboard | 手続き型のシーンビジュアル生成（`storyboard-video`）。weight 不要 |
+| 決定的 Assembly | timeline から MP4 を書き出す工程 |
+| Gallery / Reuse | 生成結果の一覧、詳細確認、再投入、export、project への紐付け |
 
-- ナレーション（TTS）と共通の音声後処理
-- timeline から MP4 を書き出す assembly 工程
-- Story surface / Matrix 比較グリッドの Web UI
-- 実 GGUF weight を使った Story Engine の通し検証
-- 参照画像条件付けによるキャラクター同一性の強化
-- semantic judge を含む品質評価の高度化
-- anime checkpoint の実配置とプリセット拡充
-- CogVideoX-2B weightの実配置とM1 MaxでのMP4 smoke
-- human feedback sample蓄積後のcalibration review
+heuristic quality score（`heuristic_local_v1`）は Stable 出力に付随しますが、その契約は
+**技術品質の proxy 採点のみ**です。意味的な正しさや芸術性の判定は含みません。
+
+### Preview
+
+動作しますが、UX / API の安定性を v1.0 では約束しません。
+
+| 機能 | 補足 |
+|---|---|
+| SDXL Image | ローカル配置した SDXL 系 checkpoint と optional LoRA が必要です。Apple Silicon では MPS 実行時に安定性優先で `float32` を使います |
+| Variation Matrix / Batch | 軸展開による多重生成。既知の問題は下記 [既知の問題](#既知の問題) を参照 |
+| Feedback / Calibration / metrics | 人手評価の記録と集計。較正用サンプルはまだ十分に蓄積されていません |
+
+### Experimental
+
+opt-in の開発者向け機能です。安定性の約束はありません。
+
+| 機能 | 補足 |
+|---|---|
+| MusicGen（音楽生成） | 実 weight の配置が必要。weight 未配置では利用できません |
+| CogVideoX / learned video | 実 weight の配置が必要。**learned runtime はモデルディレクトリ内の `runtime.py` / `adapter.py` を実行します。信頼できるバンドルのみ `MODELS_ROOT` に置いてください** |
+| 実 TTS（kokoro / VOICEVOX / cloud） | ローカルパッケージまたは別プロセスの endpoint が必要 |
+| 実 LLM（GGUF / OpenAI 互換 endpoint） | 既定の Story Engine は template runtime です。実 LLM への差し替えは Experimental |
+| Semantic Judge | `QUALITY_ENABLE_SEMANTIC_JUDGE=true` のときだけ動作します（既定 false） |
+| WorkerPool / `JOB_LANES` | v1.0 では production に配線されていません。設定しても shipped runtime には影響しません |
+| cloud / remote provider | `ALLOW_REMOTE_TEXT_ENDPOINTS` / `ALLOW_REMOTE_AUDIO_ENDPOINTS` / `ALLOW_CLOUD_PROVIDERS` はすべて既定 false です |
+| Creative Bible | API から利用できますが、完結した UI は提供しません |
+| Agent handshake / broker | 開発者向けの scaffold です |
+
+Desktop Shell は v1.0 の成果物にも約束にも含みません（v1.1 へ延期）。
+
+### バージョン
+
+リポジトリルートの `VERSION` が唯一の版数です。`core/version.py` がこれを読み、
+`GET /version` と `/openapi.json`、リリース成果物のファイル名、成果物スモークが
+すべて同じ値から導出されます。実行中のインスタンスがどのリリースかは次で確認できます。
+
+```bash
+curl -s http://127.0.0.1:8000/version
+```
+
+版数の上げ方とタグの切り方は [docs/release/runbook.md](docs/release/runbook.md) を参照してください。
+
+### ライセンス
+
+本体は MIT License（[LICENSE](LICENSE)）です。依存パッケージのライセンスは
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) にまとめています
+（`scripts/collect_third_party_notices.py` で生成）。
+
+### 用語の定義
+
+- **リカバリ**は「再起動後に状態とデータが収束すること」を指します。中断された実行中ジョブを
+  再開することではありません。
+- **永続データの引き継ぎ**は、main の `55c4127` が生成した永続データ形式からの更新を回帰テスト
+  しています。v1.0 は汎用的なマイグレーション基盤を導入しません。それより古い履歴上のスキーマは
+  暗黙には保証しません。
+
+### 検証済みプラットフォーム
+
+- Ubuntu: CI 検証済み
+- macOS Apple Silicon: 手動検証
+
+これらは検証状況の表明であり、最終的なエンドユーザー向けサポート宣言ではありません。
+
+### 既知の問題
+
+| 参照 | 内容 |
+|---|---|
+| [#390](https://github.com/codetea-ping999/Creative_AI_Studio/issues/390) | Matrix パネルが batch の stage-advance エラーを表示しない（Preview 機能） |
+| [#421](https://github.com/codetea-ping999/Creative_AI_Studio/issues/421) | CogVideoX-2B と MusicGen の実 weight が未取得（Experimental 機能。Stable ジャーニーには影響しません） |
+| [#422](https://github.com/codetea-ping999/Creative_AI_Studio/issues/422) | runtime-surface AST guard の alias / dataflow 迂回の余地 |
+| [#405](https://github.com/codetea-ping999/Creative_AI_Studio/issues/405) | `JOB_LANES` / WorkerPool は production 未配線 |
+| [#7](https://github.com/codetea-ping999/Creative_AI_Studio/issues/7) / [#10](https://github.com/codetea-ping999/Creative_AI_Studio/issues/10) | SDXL の実 weight を使った通し検証とドッグフードが未完了（SDXL は Preview） |
+
+リリース範囲の管理点は
+[Issue #425](https://github.com/codetea-ping999/Creative_AI_Studio/issues/425) です。
 
 ## 企画メモ
 
@@ -171,8 +251,11 @@ creative-ai-studio/
 - [Setup Guide](docs/setup-guide.md) - セットアップと起動確認
 - [Model System](docs/model-system.md) - manifest、resolver、runtime cache の構成
 - [Model Download Guide](docs/model-download-guide.md) - モデル配置と manifest 管理
-- [Issue Execution Plan](docs/issue-execution-plan.md) - open issue 全体の着手順（次に何をするかはここが正）
-- [Next Tasks](docs/next-tasks.md) - 現在の到達点と v0.3 トラックの内訳
+- [Release Runbook](docs/release/runbook.md) - 版数の扱いとリリース手順
+- [Install from Artifact](docs/release/install-from-artifact.md) - 配布物からの導入手順
+- [CHANGELOG](CHANGELOG.md) - リリースごとの利用者向け変更点
+- [Issue Execution Plan](docs/issue-execution-plan.md) - v0.3 期の着手順（履歴。v1.0 の正は Issue #425）
+- [Next Tasks](docs/next-tasks.md) - v0.3 トラックの内訳（履歴）
 - [Initial Issues](docs/initial_issues.md) - 初期段階での課題
 
 補足:
@@ -328,13 +411,19 @@ cd ../..
 
 #### ステップ 6: ローカルモデルを配置
 
-モデル本体は Git に含まれていないため、生成機能を使う場合は別途配置が必要です。
+**Stable の主要ジャーニーに weight の配置は不要です。** Template Story（`./models/text/template-writer`）と
+Procedural Visual（`./models/video/procedural`）はリポジトリに含まれる weight 不要の runtime です。
 
-- image: `./models/image/sdxl`
-- audio: `./models/audio/musicgen-small`
-- video: `./models/video/procedural`
+実モデル本体は Git に含まれていないため、Preview / Experimental の機能を使う場合だけ別途配置します。
+
+- image（Preview / SDXL）: `./models/image/sdxl`
+- audio（Experimental / MusicGen）: `./models/audio/musicgen-small`
+- video（Experimental / CogVideoX・learned）: `./models/video/cogvideox-2b`、`./models/video/learned-runtime`
 
 詳細は [docs/model-download-guide.md](docs/model-download-guide.md) を参照してください。
+
+learned video runtime はモデルディレクトリ内の `runtime.py` / `adapter.py` を実行します。
+信頼できるバンドルだけを `MODELS_ROOT` に配置してください。
 
 ## 起動手順
 
@@ -371,7 +460,7 @@ npm run dev
 ```
 
 Web UI が起動し、http://localhost:5173 でアクセスできます。
-Web UI の接続先変更は [apps/web/.env.example](/Users/toyoharukohyama/Documents/Creative_AI_Studio/apps/web/.env.example) を参考に `apps/web/.env` で行います。
+Web UI の接続先変更は [apps/web/.env.example](apps/web/.env.example) を参考に `apps/web/.env` で行います。
 
 Job runner は API プロセス内で自動起動します。追加のターミナルは不要です。
 
@@ -464,7 +553,7 @@ cp apps/web/.env.example apps/web/.env
 
 - API / bootstrap の設定は `./.env`
 - Web UI の設定は `apps/web/.env`
-- モデルと runtime の詳細は [docs/model-system.md](/Users/toyoharukohyama/Documents/Creative_AI_Studio/docs/model-system.md) を参照
+- モデルと runtime の詳細は [docs/model-system.md](docs/model-system.md) を参照
 
 | 変数名 | デフォルト値 | 説明 |
 |--------|-------------|------|
@@ -535,21 +624,6 @@ npm run dev
 
 # ブラウザで http://localhost:5173 を開く
 ```
-
-## MVP チェックリスト
-
-- [x] ジョブキューシステム
-- [x] APIエンドポイント（基本）
-- [x] Web UI フレームワーク
-- [x] Image Generator 実ランタイム統合
-- [x] checkpoint 選択 / LoRA 入力 UI
-- [x] ジョブランナー実装（API プロセス内で自動起動）
-- [x] 履歴・ギャラリー表示
-- [ ] Web UI 完全実装
-
-補足:
-
-- 現時点の画像生成はローカル配置した SDXL 系 checkpoint を使います。Apple Silicon では安定性優先で MPS 実行時に `float32` を使います。
 
 ## 開発ガイド
 
