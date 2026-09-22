@@ -10,18 +10,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from tempfile import TemporaryDirectory
 import unittest
 
 from core.version import get_base_version, get_release_tag, get_version
-
-IMPORT_ERROR: Exception | None = None
-
-try:
-    from apps.api.main import create_app
-    from bootstrap import create_application_services
-except ModuleNotFoundError as exc:  # pragma: no cover - environment guard
-    IMPORT_ERROR = exc
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -102,22 +93,6 @@ class ChangelogTests(unittest.TestCase):
             body,
             "CHANGELOG.md has no section for the version in VERSION",
         )
-
-
-@unittest.skipIf(IMPORT_ERROR is not None, f"missing dependency: {IMPORT_ERROR}")
-class ApiVersionTests(unittest.TestCase):
-    """The served API contract reports the release, not FastAPI's default."""
-
-    def test_openapi_version_matches_the_version_file(self) -> None:
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            services = create_application_services(
-                db_path=root / "jobs.db",
-                output_dir=root / "outputs" / "images",
-            )
-            app = create_app(services, start_job_runner=False)
-        self.assertEqual(app.version, get_version())
-        self.assertEqual(app.openapi()["info"]["version"], get_version())
 
 
 if __name__ == "__main__":
