@@ -47,6 +47,8 @@ Project -> Template Story -> Procedural Visual / Storyboard -> Gallery / Reuse -
 ```
 
 `run_studio.sh` は Node を実行時に必要としません。既定では loopback にのみ bind します。
+配布された tarball から導入する手順は
+[docs/release/install-from-artifact.md](docs/release/install-from-artifact.md) にあります。
 
 起動スクリプトはルートの `.env` にある `API_PORT` と `WEB_PORT` をそろえて
 利用し、ブラウザを開きます。失敗時は表示された API / Web ログを確認してください。
@@ -102,6 +104,24 @@ opt-in の開発者向け機能です。安定性の約束はありません。
 | Agent handshake / broker | 開発者向けの scaffold です |
 
 Desktop Shell は v1.0 の成果物にも約束にも含みません（v1.1 へ延期）。
+
+### バージョン
+
+リポジトリルートの `VERSION` が唯一の版数です。`core/version.py` がこれを読み、
+`GET /version` と `/openapi.json`、リリース成果物のファイル名、成果物スモークが
+すべて同じ値から導出されます。実行中のインスタンスがどのリリースかは次で確認できます。
+
+```bash
+curl -s http://127.0.0.1:8000/version
+```
+
+版数の上げ方とタグの切り方は [docs/release/runbook.md](docs/release/runbook.md) を参照してください。
+
+### ライセンス
+
+本体は MIT License（[LICENSE](LICENSE)）です。依存パッケージのライセンスは
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) にまとめています
+（`scripts/collect_third_party_notices.py` で生成）。
 
 ### 用語の定義
 
@@ -231,6 +251,9 @@ creative-ai-studio/
 - [Setup Guide](docs/setup-guide.md) - セットアップと起動確認
 - [Model System](docs/model-system.md) - manifest、resolver、runtime cache の構成
 - [Model Download Guide](docs/model-download-guide.md) - モデル配置と manifest 管理
+- [Release Runbook](docs/release/runbook.md) - 版数の扱いとリリース手順
+- [Install from Artifact](docs/release/install-from-artifact.md) - 配布物からの導入手順
+- [CHANGELOG](CHANGELOG.md) - リリースごとの利用者向け変更点
 - [Issue Execution Plan](docs/issue-execution-plan.md) - v0.3 期の着手順（履歴。v1.0 の正は Issue #425）
 - [Next Tasks](docs/next-tasks.md) - v0.3 トラックの内訳（履歴）
 - [Initial Issues](docs/initial_issues.md) - 初期段階での課題

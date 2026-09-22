@@ -44,6 +44,18 @@ opt-in の開発者向け機能であり、安定性の約束はありません�
 
 Desktop Shell は v1.0 の成果物にも約束にも含みません。
 
+### リリース運用
+
+- リポジトリルートの `VERSION` が唯一の版数です。`core/version.py` がこれを読み、
+  `GET /version`、`/openapi.json`、リリース成果物のファイル名、成果物スモークが
+  すべて同じ値から導出されます。
+- `GET /version` を追加しました。実行中のインスタンスがどのリリースから切り出されたかを
+  確認できます。
+- 配布物は tarball（ビルド済み Web UI を同梱、モデルの重みは非同梱）です。導入手順は
+  `docs/release/install-from-artifact.md`、リリースを切る手順は `docs/release/runbook.md`
+  にあります。
+- 依存パッケージのライセンスを `THIRD_PARTY_NOTICES.md` にまとめました。
+
 ### 永続データの引き継ぎ
 
 main の `55c4127` が生成した永続データ形式からの更新を回帰テストしています。v1.0 は汎用的な
