@@ -14,6 +14,7 @@ http://127.0.0.1:8000
 | 分類 | メソッド | パス | Web UI の主用途 |
 | --- | --- | --- | --- |
 | System | `GET` | `/health` | dev stack 疎通確認 |
+| System | `GET` | `/version` | 実行中のリリース版数（`VERSION` と一致） |
 | System | `GET` | `/openapi.json` | 開発時の契約確認 |
 | Models | `GET` | `/models` | メディア別モデル一覧 |
 | Catalog | `GET` | `/catalog/loras` | LoRA 候補一覧 |

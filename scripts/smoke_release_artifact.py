@@ -26,7 +26,13 @@ import signal
 import re
 from pathlib import Path
 
-ARTIFACT_VERSION = "v1.0.0"
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from core.version import get_release_tag  # noqa: E402  (needs the path above)
+
+# The repository-root VERSION file is the single source of truth; the builder
+# names the tarball from the same value, so the two cannot drift apart.
+ARTIFACT_VERSION = get_release_tag()
 ARTIFACT_NAME = f"creative-ai-studio-{ARTIFACT_VERSION}.tar.gz"
 SCENE_COUNT = 2
 API_PORT = 8123
@@ -115,12 +121,23 @@ def http_post(url: str, json_data: dict, timeout: float = 30.0) -> tuple[int, by
 
 
 def verify_ui(artifact_root: Path) -> None:
-    """Verify /, /health, assets, /models endpoints."""
+    """Verify /, /health, /version, assets, /models endpoints."""
     import json
     # /health
     status, body, _ = http_get(f"{BASE_URL}/health")
     check("/health 200", status == 200, body[:100])
     check("/health json ok", json.loads(body).get("status") == "ok")
+
+    # /version — the running artifact must report the version it was cut from,
+    # which is what makes tag/artifact/version consistency checkable.
+    status, body, _ = http_get(f"{BASE_URL}/version")
+    check("/version 200", status == 200, body[:100])
+    reported = json.loads(body).get("release_tag")
+    check(
+        "/version matches artifact",
+        reported == ARTIFACT_VERSION,
+        f"reported={reported} expected={ARTIFACT_VERSION}",
+    )
 
     # /
     status, body, _ = http_get(BASE_URL)
