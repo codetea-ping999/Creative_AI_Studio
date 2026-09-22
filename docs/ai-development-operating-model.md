@@ -51,6 +51,37 @@ Typical uses:
 
 For high-risk work, the final reviewer should be independent from the implementation lane whenever practical.
 
+### Technical-lead mechanical closure exception
+
+Claude / Codex technical leads are reviewers and decision-makers by default, not
+a substitute implementation lane.
+
+After a bounded OpenCode implementation, a technical lead may directly close a
+worker-identified leftover only when **all** of the following are true:
+
+1. the resulting patch is at most 3 changed lines;
+2. the exact change was already identified and justified by the worker's own
+   deterministic tooling or diagnostics;
+3. the change has zero behavioral or semantic effect and is limited to
+   mechanical cleanup such as removing a proven-unused import, dead code,
+   whitespace, or equivalent non-functional residue;
+4. the lead independently re-runs the relevant deterministic verification before
+   committing the change;
+5. the lead explicitly discloses the direct edit in the completion report.
+
+This exception must not be used for changes to logic, defaults, comparisons,
+control flow, error behavior, public APIs, persistence, concurrency, security,
+release scope, or other contract-bearing behavior, even when the patch is only
+one line.
+
+If any condition above is not satisfied, the lead must not implement the fix
+directly. Return the work to a bounded implementation lane or escalate to the
+human operator.
+
+The purpose of this exception is to avoid spending a full worker invocation or
+human decision cycle on already-diagnosed non-semantic residue without allowing
+the technical lead to quietly become the implementation lane.
+
 ### CI — Deterministic quality gate
 
 Anything that can be checked mechanically should move to CI instead of consuming human or model judgment repeatedly.
@@ -147,6 +178,10 @@ Every implementation task must end with a short operator-facing report containin
 3. **What could break** — realistic regression surface and remaining uncertainty.
 4. **Evidence** — tests/checks actually observed, including failures if any.
 5. **Human decision needed** — merge/review/scope question; write `none` when no human judgment is required beyond the normal merge gate.
+
+If a technical lead used the mechanical closure exception, the report must name
+the exact direct edit, why the exception applied, and the independent verification
+performed afterward.
 
 For higher-risk work also include:
 
