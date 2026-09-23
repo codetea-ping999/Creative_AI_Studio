@@ -70,7 +70,15 @@ type AssetReuseOptions = {
   action?: "rerun" | "variation" | "melody";
   issueTags?: QuickReviewIssueTag[];
   sourceAsset?: GalleryAssetDetailResponse;
-  useSourceSnapshot?: boolean;
+  /**
+   * Where the new request's generation fields come from:
+   * - "source-request": nowhere; the reuse route fills every field from the
+   *   asset's saved request, so the rerun is exactly that request.
+   * - "source-snapshot": the asset's saved request, edited here (quick review).
+   * - "composer": the composer draft when it is on the asset's media lane,
+   *   otherwise the saved request.
+   */
+  basis?: "source-request" | "source-snapshot" | "composer";
 };
 
 function App() {
@@ -95,6 +103,12 @@ function App() {
     audio: defaultSubmitValues.audio,
     video: defaultSubmitValues.video,
   });
+  // The gallery asset each composer lane's draft was loaded from. Only such a
+  // draft stands in for its asset on "Reuse and rerun"; any other draft may be
+  // empty or belong to something else entirely.
+  const [composerAssetIds, setComposerAssetIds] = useState<
+    Partial<Record<MediaType, string>>
+  >({});
   const [projects, setProjects] = useState<ProjectResponse[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState("");
   const [newProjectName, setNewProjectName] = useState("");
@@ -228,6 +242,7 @@ function App() {
           mediaType: targetMedia,
         },
       }));
+      setComposerAssetIds((current) => ({ ...current, [targetMedia]: undefined }));
       setMediaType(targetMedia);
       setComposerRevision((current) => current + 1);
     },
@@ -740,7 +755,7 @@ function App() {
         action: kind === "rerun" ? "rerun" : "variation",
         issueTags: applicableIssueTags,
         sourceAsset: reviewedAsset,
-        useSourceSnapshot: true,
+        basis: "source-snapshot",
       });
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : "Failed to save review.");
@@ -765,6 +780,10 @@ function App() {
           ...nextDraft,
         },
       }));
+      setComposerAssetIds((current) => ({
+        ...current,
+        [composerMediaType]: selectedAssetDetail.asset_id,
+      }));
       setSelectedProjectId(selectedAssetDetail.project_id ?? "");
       setMediaType(composerMediaType);
       setComposerRevision((current) => current + 1);
@@ -781,7 +800,7 @@ function App() {
     const {
       action = "variation",
       issueTags = [],
-      useSourceSnapshot = false,
+      basis = "composer",
     } = options;
 
     setIsAssetBusy(true);
@@ -789,22 +808,38 @@ function App() {
     setAssetMessage(null);
 
     const sourceMediaType = toComposerMediaType(sourceAsset.media_type);
-    const snapshotValues = mergeDraftWithDefaults(
-      sourceMediaType,
-      createDraftFromRequestSnapshot(sourceAsset.request_snapshot),
-    );
-    const sourceValues =
-      useSourceSnapshot || mediaType !== sourceMediaType
-        ? snapshotValues
-        : mergeDraftWithDefaults(sourceMediaType, drafts[sourceMediaType]);
-    const reuseValues = {
-      ...sourceValues,
-      prompt: buildQuickReviewPrompt(sourceValues.prompt, issueTags),
-      seed: action === "rerun" ? null : sourceValues.seed,
-    };
+    const useSourceSnapshot = basis === "source-snapshot";
     const projectId = useSourceSnapshot
       ? sourceAsset.project_id
       : selectedProjectId || sourceAsset.project_id || null;
+    let requestBody: Record<string, unknown>;
+    if (basis === "source-request") {
+      requestBody = { action, project_id: projectId };
+    } else {
+      const snapshotValues = mergeDraftWithDefaults(
+        sourceMediaType,
+        createDraftFromRequestSnapshot(sourceAsset.request_snapshot),
+      );
+      const sourceValues =
+        useSourceSnapshot || mediaType !== sourceMediaType
+          ? snapshotValues
+          : mergeDraftWithDefaults(sourceMediaType, drafts[sourceMediaType]);
+      const reuseValues = {
+        ...sourceValues,
+        prompt: buildQuickReviewPrompt(sourceValues.prompt, issueTags),
+        seed: action === "rerun" ? null : sourceValues.seed,
+      };
+      requestBody = buildReusePayload(reuseValues, projectId, {
+        action,
+        params:
+          issueTags.length > 0
+            ? {
+                review_issue_tags: issueTags,
+                review_source: "quick-review",
+              }
+            : undefined,
+      });
+    }
 
     try {
       const payload = await requestJson<ReuseAssetResponse>(
@@ -814,18 +849,7 @@ function App() {
           headers: {
             "Content-Type": "application/json",
           },
-          body: JSON.stringify(
-            buildReusePayload(reuseValues, projectId, {
-              action,
-              params:
-                issueTags.length > 0
-                  ? {
-                      review_issue_tags: issueTags,
-                      review_source: "quick-review",
-                    }
-                  : undefined,
-            }),
-          ),
+          body: JSON.stringify(requestBody),
         },
       );
 
@@ -1284,7 +1308,16 @@ function App() {
               onOpenQuickReview={() => setErrorMessage(null)}
               onQuickReview={handleQuickReview}
               onReuse={() => {
-                void handleAssetReuse();
+                // Edits made after "Load into composer" go out as a variation;
+                // otherwise the asset's own saved request reruns with a new seed.
+                const loadedIntoComposer =
+                  composerAssetIds[toComposerMediaType(selectedAssetDetail.media_type)] ===
+                  selectedAssetDetail.asset_id;
+                void handleAssetReuse(
+                  loadedIntoComposer
+                    ? { basis: "composer" }
+                    : { action: "rerun", basis: "source-request" },
+                );
               }}
               canConditionMelody={canConditionMelody}
               melodyConditioningMessage={melodyConditioningMessage}
