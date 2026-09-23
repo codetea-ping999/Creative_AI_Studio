@@ -22,6 +22,7 @@ cd creative-ai-studio-v<VERSION>
 
 # 3. Python 環境を用意する
 python3 -m venv venv
+./venv/bin/pip install --upgrade pip   # venv 同梱の pip は古いことがあるため
 ./venv/bin/pip install -r requirements.txt
 
 # 4. 起動する（ビルド済み UI を API と同じ origin で配信）
