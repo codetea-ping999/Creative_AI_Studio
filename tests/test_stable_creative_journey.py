@@ -282,10 +282,46 @@ class StableCreativeJourneyTests(unittest.TestCase):
 
         rerun = self.client.get(f"/jobs/{reuse.json()['job_id']}").json()
         self.assertEqual(rerun["status"], "succeeded", rerun.get("error_message"))
+        source = self.client.get(f"/jobs/{first_job}").json()
+        self.assertTrue(source["request"]["prompt"].strip())
+        self.assertEqual(rerun["request"]["prompt"], source["request"]["prompt"])
         scene = next(s for s in self._scenes(story_id) if s["id"] == scene_id)
         # Newest attempt wins under the existing binding semantics.
         self.assertNotEqual(scene["asset_ids"]["visual"], first_asset)
         self.assertIn(reuse.json()["job_id"], scene["job_ids"])
+
+    def test_gallery_reuse_with_a_blank_prompt_keeps_the_scene_prompt(self) -> None:
+        """RC1 blocker: "Reuse and rerun" sent the composer's empty prompt.
+
+        The Web UI posted the composer draft, whose prompt is still empty after
+        a Story-driven journey, and the job failed with "Video prompt must not
+        be empty." A blank prompt now falls back to the source asset's prompt.
+        """
+        _, story_id = self._project_story_with_template_scenes()
+        scene_id = self._scenes(story_id)[0]["id"]
+        first_job = self._generate_procedural_visual(story_id, scene_id)
+        self._drain()
+        first_asset = next(
+            scene["asset_ids"]["visual"]
+            for scene in self._scenes(story_id)
+            if scene["id"] == scene_id
+        )
+        source_prompt = self.client.get(f"/jobs/{first_job}").json()["request"][
+            "prompt"
+        ]
+
+        for blank in ("", "   "):
+            with self.subTest(prompt=blank):
+                reuse = self.client.post(
+                    f"/gallery/{first_asset}/reuse",
+                    json={"action": "variation", "prompt": blank},
+                )
+                self.assertEqual(reuse.status_code, 201, reuse.text)
+                self._drain()
+
+                job = self.client.get(f"/jobs/{reuse.json()['job_id']}").json()
+                self.assertEqual(job["status"], "succeeded", job.get("error_message"))
+                self.assertEqual(job["request"]["prompt"], source_prompt)
 
     def test_unavailable_procedural_model_fails_and_binds_nothing(self) -> None:
         _, story_id = self._project_story_with_template_scenes()
