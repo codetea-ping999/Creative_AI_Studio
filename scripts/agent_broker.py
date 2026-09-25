@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded, provider-neutral broker for Codex and Claude Code workers.
+"""Bounded, provider-neutral broker for Codex, Claude Code, and OpenCode workers.
 
 The broker intentionally owns routing outside either model process. It records a
 durable run, invokes at most two providers, and only falls back for availability
@@ -46,8 +46,10 @@ MAX_CAPTURE_BYTES = 8 * 1024 * 1024
 MAX_PERSISTED_STREAM_BYTES = 4 * 1024 * 1024
 MAX_PROJECT_CONFIG_BYTES = 1024 * 1024
 FALLBACK_REASONS = frozenset({"quota", "auth", "unavailable", "budget"})
-PROVIDERS = frozenset({"codex", "claude"})
+PROVIDERS = frozenset({"codex", "claude", "opencode"})
 MODES = frozenset({"read-only", "workspace-write"})
+OPENCODE_AGENT_NAME = "broker"
+OPENCODE_AGENT_DESCRIPTION = "Broker-managed bounded worker agent."
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
@@ -314,7 +316,9 @@ def _redact_text(text: str, inherited_env: Mapping[str, str] | None = None) -> s
     return redacted
 
 
-def _safe_environment(provider: str) -> dict[str, str]:
+def _safe_environment(
+    provider: str, task: Mapping[str, Any] | None = None
+) -> dict[str, str]:
     inherited = os.environ
     env = {key: value for key, value in inherited.items() if key in SAFE_ENV_KEYS}
     env["NO_COLOR"] = "1"
@@ -324,6 +328,14 @@ def _safe_environment(provider: str) -> dict[str, str]:
         env["CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH"] = "0"
         env["CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS"] = "1"
         env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
+    if provider == "opencode":
+        env["OPENCODE_CONFIG_CONTENT"] = _opencode_agent_config(task)
+        env["OPENCODE_DISABLE_PROJECT_CONFIG"] = "1"
+        env["OPENCODE_DISABLE_AUTOUPDATE"] = "1"
+        env["OPENCODE_DISABLE_DEFAULT_PLUGINS"] = "1"
+        env["OPENCODE_DISABLE_CLAUDE_CODE"] = "1"
+        env["OPENCODE_DISABLE_CLAUDE_CODE_SKILLS"] = "1"
+        env["OPENCODE_DISABLE_EXTERNAL_SKILLS"] = "1"
     return env
 
 
@@ -766,6 +778,58 @@ def _claude_command(task: Mapping[str, Any]) -> list[str]:
     ]
 
 
+OPENCODE_AGENT_PERMISSION_READ_ONLY = {
+    "*": "deny",
+    "read": {"*": "allow", "*.env": "deny", "*.env.*": "deny", "*.env.example": "allow"},
+    "glob": {"*": "allow"},
+    "grep": {"*": "allow"},
+    "list": {"*": "allow"},
+}
+
+OPENCODE_AGENT_PERMISSION_WRITE = {
+    **OPENCODE_AGENT_PERMISSION_READ_ONLY,
+    "edit": {
+        "*": "deny",
+        "**": "allow",
+        "*.env": "deny",
+        "*.env.*": "deny",
+        "*.env.example": "deny",
+    },
+}
+
+
+def _opencode_agent_config(task: Mapping[str, Any] | None) -> str:
+    """Define the worker agent; local-scope rules cannot be loosened by user config."""
+
+    permission = (
+        OPENCODE_AGENT_PERMISSION_READ_ONLY
+        if task is None or task.get("mode", "read-only") == "read-only"
+        else OPENCODE_AGENT_PERMISSION_WRITE
+    )
+    config = {
+        "agent": {
+            OPENCODE_AGENT_NAME: {
+                "description": OPENCODE_AGENT_DESCRIPTION,
+                "mode": "primary",
+                "permission": permission,
+                "steps": int(task["max_turns"]) if task is not None else 24,
+            }
+        }
+    }
+    return json.dumps(config)
+
+
+def _opencode_command(task: Mapping[str, Any]) -> list[str]:
+    return [
+        _provider_binary("opencode"),
+        "run",
+        "--format",
+        "json",
+        "--agent",
+        OPENCODE_AGENT_NAME,
+    ]
+
+
 def _terminate_process(process: subprocess.Popen[Any]) -> None:
     if os.name == "nt":  # pragma: no cover
         process.send_signal(signal.SIGINT)
@@ -814,13 +878,19 @@ def _terminate_process(process: subprocess.Popen[Any]) -> None:
 
 
 def _invoke(
-    argv: Sequence[str], *, cwd: Path, prompt: str, timeout: int, provider: str
+    argv: Sequence[str],
+    *,
+    cwd: Path,
+    prompt: str,
+    timeout: int,
+    provider: str,
+    task: Mapping[str, Any] | None = None,
 ) -> ProcessResult:
     try:
         process = subprocess.Popen(
             list(argv),
             cwd=cwd,
-            env=_safe_environment(provider),
+            env=_safe_environment(provider, task),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1154,6 +1224,75 @@ def _classify_claude(process: ProcessResult) -> ClassifiedResult:
     return ClassifiedResult(True, "success", session_id, output)
 
 
+def _opencode_failure_reason(
+    events: Sequence[Mapping[str, Any]], *, exit_code: int | None, stderr: str
+) -> str:
+    """Classify opencode failures from stabilized error events and stderr text."""
+
+    messages: list[str] = []
+    for event in events:
+        if event.get("type") != "error":
+            continue
+        error = event.get("error")
+        if not isinstance(error, Mapping):
+            continue
+        for field in ("message", "name"):
+            value = error.get(field)
+            if isinstance(value, str) and value:
+                messages.append(value)
+        data = error.get("data")
+        if isinstance(data, Mapping):
+            value = data.get("message")
+            if isinstance(value, str) and value:
+                messages.append(value)
+    message_text = "\n".join(messages)
+    if message_text.strip():
+        reason = _reason_from_text(message_text, exit_code=exit_code)
+        if reason != "worker_error":
+            return reason
+    if stderr.strip():
+        reason = _reason_from_text(stderr, exit_code=exit_code)
+        if reason != "worker_error":
+            return reason
+    if exit_code == 2:
+        return "protocol_error"
+    return "worker_error"
+
+
+def _classify_opencode(process: ProcessResult) -> ClassifiedResult:
+    if process.timed_out:
+        return ClassifiedResult(False, "timeout", None, None)
+    if process.unavailable:
+        return ClassifiedResult(False, "unavailable", None, None)
+    if process.output_overflow:
+        return ClassifiedResult(False, "protocol_error", None, None)
+    events, malformed = _json_lines(process.stdout)
+    session_id: str | None = None
+    output_parts: list[str] = []
+    for event in events:
+        if not isinstance(event.get("sessionID"), str):
+            continue
+        if session_id is None:
+            session_id = event["sessionID"]
+        if event.get("type") == "text":
+            part = event.get("part")
+            if isinstance(part, Mapping) and isinstance(part.get("text"), str):
+                output_parts.append(part["text"])
+    output = "\n".join(output_parts).strip()
+    if process.exit_code != 0:
+        return ClassifiedResult(
+            False,
+            _opencode_failure_reason(
+                events, exit_code=process.exit_code, stderr=process.stderr
+            ),
+            session_id,
+            None,
+        )
+    if malformed:
+        return ClassifiedResult(False, "protocol_error", session_id, None)
+    return ClassifiedResult(True, "success", session_id, output)
+
+
 def _attempt(
     provider: str,
     task: Mapping[str, Any],
@@ -1165,7 +1304,12 @@ def _attempt(
     _mkdir_private(attempt_dir)
     stdout_path = attempt_dir / "stdout.jsonl"
     stderr_path = attempt_dir / "stderr.log"
-    command = _codex_command(task, attempt_dir) if provider == "codex" else _claude_command(task)
+    if provider == "codex":
+        command = _codex_command(task, attempt_dir)
+    elif provider == "claude":
+        command = _claude_command(task)
+    else:
+        command = _opencode_command(task)
     started_at = _now()
     process = _invoke(
         command,
@@ -1173,15 +1317,19 @@ def _attempt(
         prompt=prompt,
         timeout=int(task["timeout_seconds"]),
         provider=provider,
+        task=task,
     )
     inherited_env = dict(os.environ)
     clean_stdout = _truncate_stream(_redact_text(process.stdout, inherited_env))
     clean_stderr = _truncate_stream(_redact_text(process.stderr, inherited_env))
     _atomic_write_text(stdout_path, clean_stdout)
     _atomic_write_text(stderr_path, clean_stderr)
-    classified = (
-        _classify_codex(process, attempt_dir) if provider == "codex" else _classify_claude(process)
-    )
+    if provider == "codex":
+        classified = _classify_codex(process, attempt_dir)
+    elif provider == "claude":
+        classified = _classify_claude(process)
+    else:
+        classified = _classify_opencode(process)
     if classified.output is not None:
         classified = ClassifiedResult(
             classified.ok,
@@ -1535,6 +1683,12 @@ def _doctor(workspace: Path, *, explicit_state_dir: str | None) -> dict[str, Any
         [_provider_binary("claude"), "plugin", "details", "codex@openai-codex"],
         workspace,
     )
+    checks["opencode_cli"] = _probe(
+        "opencode", [_provider_binary("opencode"), "--version"], workspace
+    )
+    checks["opencode_auth"] = _probe(
+        "opencode auth", [_provider_binary("opencode"), "auth", "list"], workspace
+    )
     info: WorkspaceInfo | None = None
     try:
         resolved = workspace.resolve(strict=True)
@@ -1594,7 +1748,7 @@ def _status(run_id: str, workspace: Path, *, explicit_state_dir: str | None) -> 
 def _build_parser() -> argparse.ArgumentParser:
     parser = JsonArgumentParser(
         prog="agent-broker",
-        description="Run one bounded Codex/Claude task with safe provider fallback.",
+        description="Run one bounded Codex, Claude, or OpenCode task with safe provider fallback.",
     )
     parser.add_argument("--json", action="store_true", help="emit stable JSON on stdout")
     parser.add_argument(
