@@ -99,6 +99,8 @@ git push origin "v$(cat VERSION)"
 公開前に確認すること:
 
 - ドラフトに `creative-ai-studio-v<VERSION>.tar.gz` と `SHA256SUMS` が付いている
+- 両方をダウンロードして同じディレクトリに置き、`sha256sum -c SHA256SUMS` が通る
+- rc など接尾辞付きのタグでは、ドラフトが pre-release として印されている
 - タグが意図した SHA を指している
 - `CHANGELOG.md` の既知の問題が最新である
 

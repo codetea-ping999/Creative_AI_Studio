@@ -111,6 +111,29 @@ class ReleaseToolingUsesTheVersionFileTests(unittest.TestCase):
         self.assertIn("from core.version import get_release_tag", body)
 
 
+class ChecksumFileTests(unittest.TestCase):
+    """SHA256SUMS must be verifiable by whoever downloads the release."""
+
+    def test_checksum_names_the_artifact_not_the_build_machines_path(self) -> None:
+        # docs/release/install-from-artifact.md tells the downloader to run
+        # `sha256sum -c SHA256SUMS` next to the tarball. sha256sum resolves the
+        # name in the file against the current directory, so a line naming the
+        # build runner's absolute path fails with "No such file or directory"
+        # for everyone but the runner.
+        body = BUILD_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn(
+            '(cd "${OUT_DIR}" && sha256_file "${ARTIFACT_NAME}.tar.gz")',
+            body,
+            "SHA256SUMS must be written from inside the artifacts directory "
+            "so it records a bare filename",
+        )
+        self.assertNotIn(
+            'sha256_file "${OUT_DIR}/${ARTIFACT_NAME}.tar.gz"',
+            body,
+            "passing an absolute path to sha256_file puts that path in SHA256SUMS",
+        )
+
+
 class ChangelogTests(unittest.TestCase):
     def test_changelog_documents_the_current_version(self) -> None:
         # The changelog itself lands in PR #433; assert against it only once it
