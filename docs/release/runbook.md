@@ -66,6 +66,10 @@ make release-smoke      # 展開 → venv → 起動 → 通し生成 → SIGTER
 `smoke_release_artifact.py` は開発用チェックアウトではなく展開した成果物に対して
 走ります。これが Gate 3 の「リリース相当の成果物からインストールする」要件です。
 
+RC（`-rc.N`）を切ったあとは、公開や本番版への昇格の前に
+[validation-window.md](validation-window.md) の検証期間を実手元環境で実施します。
+Cloud / CI の green だけでは、このゲートを満たしません。
+
 ### 3. third-party notices を再生成する
 
 ```bash

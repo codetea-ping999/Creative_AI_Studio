@@ -71,6 +71,11 @@ main の `55c4127` が生成した永続データ形式からの更新を回帰�
 - Matrix パネルが batch の stage-advance エラーを表示しません（#390）。
 - CogVideoX-2B と MusicGen の実 weight は未取得です（#421）。Stable ジャーニーには影響しません。
 - SDXL の実 weight を使った通し検証とドッグフードは未完了です（#7、#10）。
+- Preview / Experimental 用の ML 依存（`torch` 2.10、`diffusers` 0.37、`transformers` 4.57）に
+  公開済みの脆弱性情報があります（2026-09-23 の pip-audit）。Stable ジャーニーは `diffusers` と
+  `transformers` を読み込まず、`torch` はモデル runtime 解放時のアクセラレータキャッシュ
+  解放にのみ使います。SDXL などの実モデルを使う場合は、信頼できる配布元のモデルファイル
+  だけを置いてください。依存の更新は v1.1 で扱います。
 
 ### 検証済みプラットフォーム
 

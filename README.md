@@ -253,6 +253,7 @@ creative-ai-studio/
 - [Model Download Guide](docs/model-download-guide.md) - モデル配置と manifest 管理
 - [Release Runbook](docs/release/runbook.md) - 版数の扱いとリリース手順
 - [Install from Artifact](docs/release/install-from-artifact.md) - 配布物からの導入手順
+- [Validation Window](docs/release/validation-window.md) - RC を実機で検証する手順と所見の記録
 - [CHANGELOG](CHANGELOG.md) - リリースごとの利用者向け変更点
 - [Issue Execution Plan](docs/issue-execution-plan.md) - v0.3 期の着手順（履歴。v1.0 の正は Issue #425）
 - [Next Tasks](docs/next-tasks.md) - v0.3 トラックの内訳（履歴）
