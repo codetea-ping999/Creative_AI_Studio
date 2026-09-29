@@ -341,6 +341,12 @@ export function isVideoAsset(pathValue: string | null | undefined): boolean {
   return Boolean(pathValue && /\.(gif|mp4|webm|mov)$/i.test(pathValue));
 }
 
+// GIF is a video-media asset (storyboard output) but browsers cannot play it in <video>;
+// previews must render it with <img>.
+export function isPlayableVideoAsset(pathValue: string | null | undefined): boolean {
+  return Boolean(pathValue && /\.(mp4|webm|mov)$/i.test(pathValue));
+}
+
 export function isTextAsset(pathValue: string | null | undefined): boolean {
   return Boolean(pathValue && /\.(md|markdown|txt)$/i.test(pathValue));
 }
