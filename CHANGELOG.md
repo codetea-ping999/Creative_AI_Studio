@@ -76,10 +76,18 @@ main の `55c4127` が生成した永続データ形式からの更新を回帰�
   `transformers` を読み込まず、`torch` はモデル runtime 解放時のアクセラレータキャッシュ
   解放にのみ使います。SDXL などの実モデルを使う場合は、信頼できる配布元のモデルファイル
   だけを置いてください。依存の更新は v1.1 で扱います。
+- macOS の Safari は既定でダウンロードした `.tar.gz` を自動で展開するため、tarball を
+  `SHA256SUMS` で照合できないことがあります。照合する場合は `curl -LO` で取得するか、
+  Safari の「ダウンロード後、"安全な"ファイルを開く」を無効にしてからダウンロードしてください。
+- Storyboard の GIF は Gallery で繰り返し再生され、OS の「視差効果を減らす」
+  （`prefers-reduced-motion`）設定でも止まりません。静止表示への切り替えは v1.1 で扱います。
 
 ### 検証済みプラットフォーム
 
-- Ubuntu: CI 検証済み
-- macOS Apple Silicon: 手動検証
+- Ubuntu: CI（`ubuntu-latest`、Python 3.10）で `make verify` とリリース成果物のスモークを検証
+- macOS Apple Silicon: macOS 27.0 / arm64、Python 3.14.4、Chrome で、ダウンロードした
+  リリース成果物のクリーンインストール、Stable ジャーニー、キャンセル、強制終了後の再起動、
+  二重起動の拒否、port 衝突、SIGTERM を手動検証
+- Windows: 未検証
 
 いずれも検証状況の表明であり、最終的なエンドユーザー向けサポート宣言ではありません。
