@@ -115,6 +115,93 @@ class TemplateRuntimeTests(unittest.TestCase):
         self.assertIn("少女", text)
 
 
+class TemplateScenePromptTests(unittest.TestCase):
+    """Issue #450: template scenes must not all share the premise as their prompt."""
+
+    _PREMISES = (
+        "嵐の夜、年老いた灯台守が遭難船を導くために最後の灯りをともす",
+        "A baker opens her stall at dawn and meets a lost child who changes her day",
+    )
+
+    def _scene_prompts(self, premise: str, scene_count: int = 5) -> list[str]:
+        task = get_story_task("scene_list")
+        raw = _template_runtime()["generate"](
+            task.build_prompt(
+                {"premise": premise, "subject": premise, "scene_count": scene_count}
+            ),
+            system=task.system_prompt,
+            seed=1,
+            json_schema=task.json_schema(),
+        )
+        payload = task.response_model.model_validate(extract_json_object(raw))
+        return [
+            scene["image_prompt"] for scene in payload.model_dump(mode="json")["scenes"]
+        ]
+
+    def test_five_scenes_get_pairwise_distinct_prompts_anchored_on_the_subject(
+        self,
+    ) -> None:
+        for premise in self._PREMISES:
+            with self.subTest(premise=premise):
+                prompts = self._scene_prompts(premise)
+                self.assertEqual(len(prompts), 5)
+                self.assertEqual(len(set(prompts)), 5, prompts)
+                for prompt in prompts:
+                    # The template subject is the premise capped at 48 chars.
+                    self.assertIn(premise[:48], prompt)
+
+    def test_five_scene_prompts_follow_the_story_arc(self) -> None:
+        prompts = self._scene_prompts(self._PREMISES[0])
+        for prompt, cue in zip(
+            prompts,
+            ("establishing", "inciting", "rising tension", "climax", "resolution"),
+        ):
+            self.assertIn(cue, prompt)
+
+    def test_scene_prompts_are_deterministic(self) -> None:
+        self.assertEqual(
+            self._scene_prompts(self._PREMISES[0]),
+            self._scene_prompts(self._PREMISES[0]),
+        )
+
+    def test_prompts_stay_distinct_for_every_supported_scene_count(self) -> None:
+        for scene_count in range(1, 25):
+            with self.subTest(scene_count=scene_count):
+                prompts = self._scene_prompts("p", scene_count=scene_count)
+                self.assertEqual(len(prompts), scene_count)
+                self.assertEqual(len(set(prompts)), scene_count)
+
+    def test_regenerated_template_scenes_keep_asset_lineage(self) -> None:
+        from core.storage.json_files import utc_now
+        from core.story import Scene, StoryDocument, apply_text_result
+
+        now = utc_now()
+        story = StoryDocument(
+            id="story_450",
+            created_at=now,
+            updated_at=now,
+            scenes=[
+                Scene(
+                    id="scene_01",
+                    order=0,
+                    asset_ids={"visual": "asset_a"},
+                    job_ids=["job_old"],
+                )
+            ],
+        )
+        prompts = self._scene_prompts(self._PREMISES[0])
+        payload = {
+            "scenes": [
+                {"heading": f"h{index}", "image_prompt": prompt}
+                for index, prompt in enumerate(prompts)
+            ]
+        }
+        merged = apply_text_result(story, "scene_list", payload)
+        self.assertEqual([scene.image_prompt for scene in merged.scenes], prompts)
+        self.assertEqual(merged.scenes[0].asset_ids, {"visual": "asset_a"})
+        self.assertEqual(merged.scenes[0].job_ids, ["job_old"])
+
+
 class StoryTaskTests(unittest.TestCase):
     def test_every_task_round_trips_through_the_template_runtime(self) -> None:
         runtime = _template_runtime()

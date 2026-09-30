@@ -42,7 +42,6 @@ _FIELD_PHRASES: dict[str, str] = {
     "heading": "{subject} — 場面{index}",
     "summary": "{subject}が{mood}の中で状況を進める場面{index}。",
     "narration": "{subject}は{mood}の気配を感じながら、次の一歩を選んだ。",
-    "image_prompt": "{subject}, {mood}, cinematic composition, detailed lighting",
     "image_negative": "blurry, low quality, distorted anatomy, watermark",
     "bgm_mood": "{mood}",
     "camera": "ken_burns_in",
@@ -69,6 +68,31 @@ _FIELD_PHRASES: dict[str, str] = {
 
 _DEFAULT_SUBJECT = "主人公"
 _DEFAULT_MOOD = "静かな緊張"
+
+# Story-arc roles a scene can play, in order, each with the visual cues a
+# storyboard frame for that role would carry (issue #450). ``image_prompt`` is
+# the one scene field the studio sends verbatim to image/video generation, so a
+# prompt built from subject and mood alone gave every scene the same picture.
+_SCENE_ARC_CUES: tuple[str, ...] = (
+    "establishing scene, calm before the story begins, soft morning light",
+    "inciting incident, the moment everything changes, dramatic side light",
+    "rising tension, obstacles close in, overcast dusk light",
+    "climax, the decisive moment, intense high-contrast light",
+    "resolution, quiet aftermath, warm golden hour glow",
+)
+
+# Shot types cycle independently of the arc role so that stories with more
+# scenes than roles still get a distinct frame per scene. Seven entries exceed
+# the widest run of scenes that can share one role at the 24-scene maximum.
+_SCENE_SHOTS: tuple[str, ...] = (
+    "wide establishing shot",
+    "medium shot",
+    "close-up",
+    "low-angle shot",
+    "over-the-shoulder shot",
+    "high-angle shot",
+    "extreme close-up",
+)
 
 
 def build_template_runtime(*, seed_salt: str = "") -> TextGenerateCallable:
@@ -313,6 +337,8 @@ def _string_value(
     template = _FIELD_PHRASES.get(field_name)
     subject = _subject(context)
     mood = _mood(context)
+    if field_name == "image_prompt":
+        return _scene_image_prompt(subject, mood, index, _scene_total(context))
     if template is not None:
         return template.format(subject=subject, mood=mood, index=index)
 
@@ -320,6 +346,39 @@ def _string_value(
     # the quality evaluator would (correctly) flag as an incomplete payload.
     digest = hashlib.sha1(f"{rng_key}:{field_name}:{index}".encode("utf-8")).hexdigest()
     return f"{field_name.replace('_', ' ')} {index} [{digest[:6]}]"
+
+
+def _scene_total(context: dict[str, str]) -> int:
+    for key in ("scene_count", "count"):
+        raw_value = context.get(key)
+        if raw_value:
+            try:
+                return max(1, int(float(raw_value)))
+            except ValueError:
+                continue
+    return len(_SCENE_ARC_CUES)
+
+
+def _scene_image_prompt(subject: str, mood: str, index: int, total: int) -> str:
+    """Compose a scene-specific visual prompt from the scene's place in the arc.
+
+    The scene's position is mapped onto setup -> inciting -> rising -> climax ->
+    resolution, and paired with a shot type, so each scene of one story gets a
+    different frame while the subject still anchors every prompt. Pure function
+    of its inputs, so the same story always yields the same prompts.
+    """
+
+    position = max(0, index - 1)
+    last_role = len(_SCENE_ARC_CUES) - 1
+    if total <= 1:
+        role = 0
+    else:
+        role = round(min(position, total - 1) * last_role / (total - 1))
+    shot = _SCENE_SHOTS[position % len(_SCENE_SHOTS)]
+    return (
+        f"{subject}, {shot}, {_SCENE_ARC_CUES[role]}, {mood}, "
+        "cinematic composition, detailed lighting"
+    )
 
 
 # --------------------------------------------------------------------------
