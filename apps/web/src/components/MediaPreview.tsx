@@ -1,5 +1,13 @@
+import { useEffect, useRef, useState } from "react";
 import { createOutputUrl } from "../studioClient";
-import { isAudioAsset, isPlayableVideoAsset, isTextAsset, type GalleryMediaType } from "../studio";
+import {
+  isAudioAsset,
+  isGifAsset,
+  isPlayableVideoAsset,
+  isTextAsset,
+  type GalleryMediaType,
+} from "../studio";
+import { usePrefersReducedMotion } from "../hooks/usePrefersReducedMotion";
 import { excerptFromMarkdown, useTextAssetContent } from "../lib/textAssetPreview";
 import { renderMarkdownLite } from "../lib/markdownLite";
 
@@ -58,10 +66,88 @@ export function StagePreview({
     return <TextStagePreview src={src} title={title} subtitle={subtitle} />;
   }
 
+  if (isGifAsset(outputPath)) {
+    return (
+      <div className="stage-surface stage-surface--hero">
+        <MotionSafeGif key={src} src={src} alt={title} allowPlayback />
+      </div>
+    );
+  }
+
   return (
     <div className="stage-surface stage-surface--hero">
       <img src={src} alt={title} loading="lazy" />
     </div>
+  );
+}
+
+/**
+ * Renders an animated GIF, but under `prefers-reduced-motion: reduce` shows a
+ * still first frame instead (#448). Storyboard GIFs have no separate still
+ * preview, so the first frame is drawn to a canvas. `allowPlayback` adds an
+ * explicit control to opt into the animation.
+ */
+function MotionSafeGif({
+  src,
+  alt,
+  allowPlayback = false,
+}: {
+  src: string;
+  alt: string;
+  allowPlayback?: boolean;
+}) {
+  const prefersReducedMotion = usePrefersReducedMotion();
+  const [isPlaying, setIsPlaying] = useState(false);
+
+  if (!prefersReducedMotion) {
+    return <img src={src} alt={alt} loading="lazy" />;
+  }
+
+  return (
+    <>
+      {isPlaying ? (
+        <img src={src} alt={alt} loading="lazy" />
+      ) : (
+        <GifStillFrame src={src} alt={alt} />
+      )}
+      {allowPlayback ? (
+        <button
+          type="button"
+          className="secondary-button stage-surface__motion-toggle"
+          onClick={() => setIsPlaying((current) => !current)}
+        >
+          {isPlaying ? "Show still frame" : "Play animation"}
+        </button>
+      ) : null}
+    </>
+  );
+}
+
+function GifStillFrame({ src, alt }: { src: string; alt: string }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  useEffect(() => {
+    const image = new Image();
+    image.onload = () => {
+      const canvas = canvasRef.current;
+      if (!canvas) {
+        return;
+      }
+      canvas.width = image.naturalWidth;
+      canvas.height = image.naturalHeight;
+      // drawImage uses the GIF's first (default) frame, never an animation frame.
+      canvas.getContext("2d")?.drawImage(image, 0, 0);
+    };
+    image.src = src;
+    return () => {
+      image.onload = null;
+    };
+  }, [src]);
+
+  return alt ? (
+    <canvas ref={canvasRef} role="img" aria-label={alt} />
+  ) : (
+    <canvas ref={canvasRef} aria-hidden="true" />
   );
 }
 
@@ -131,6 +217,14 @@ export function OutputThumbnail({ mediaType, outputPath }: OutputThumbnailProps)
 
   if (mediaType === "text" || isTextAsset(outputPath)) {
     return <TextThumbnail src={src} />;
+  }
+
+  if (isGifAsset(outputPath)) {
+    return (
+      <div className="gallery-item__thumb">
+        <MotionSafeGif key={src} src={src} alt="" />
+      </div>
+    );
   }
 
   return (

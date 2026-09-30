@@ -672,12 +672,19 @@ pre,
 }
 
 .stage-surface img,
-.stage-surface video {
+.stage-surface video,
+.stage-surface canvas {
   display: block;
   width: 100%;
   height: 100%;
   object-fit: contain;
   background: #0b0b0c;
+}
+
+.stage-surface__motion-toggle {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
 }
 
 .stage-surface--audio {
@@ -874,7 +881,8 @@ pre,
 }
 
 .gallery-item__thumb img,
-.gallery-item__thumb video {
+.gallery-item__thumb video,
+.gallery-item__thumb canvas {
   display: block;
   width: 100%;
   height: 100%;

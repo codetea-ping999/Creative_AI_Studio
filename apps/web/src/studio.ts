@@ -347,6 +347,12 @@ export function isPlayableVideoAsset(pathValue: string | null | undefined): bool
   return Boolean(pathValue && /\.(mp4|webm|mov)$/i.test(pathValue));
 }
 
+// Animated GIF (storyboard output). Previews show a still first frame under
+// prefers-reduced-motion instead of autoplaying it.
+export function isGifAsset(pathValue: string | null | undefined): boolean {
+  return Boolean(pathValue && /\.gif$/i.test(pathValue));
+}
+
 export function isTextAsset(pathValue: string | null | undefined): boolean {
   return Boolean(pathValue && /\.(md|markdown|txt)$/i.test(pathValue));
 }
