@@ -469,6 +469,18 @@ text runtime の `api_key_env` 規約（`core/models/text_runtimes.py`）と同�
   `ImageProviderResult.metadata` など、job/asset/request へ永続化されうる
   フィールド）へ絶対に置かないこと
 
+## Procedural Storyboard のフォント選択
+
+- `storyboard-video`（`procedural_video_loader`）のテキストカードは Pillow の既定フォントで描画します。
+  既定フォントは ASCII のみを収録しているため、描画できない文字（日本語など）を含む行だけ
+  CJK 対応のシステムフォントへ切り替えます（`generators/video/fonts.py`、#449）
+- 探索順: `STORYBOARD_FONT_PATH`（存在するファイルのみ）→ macOS のヒラギノ角ゴシック W3 /
+  Hiragino Sans GB / Arial Unicode → Linux の Noto Sans CJK → Windows の msgothic / YuGothM / meiryo
+- フォントファイルは同梱しません（ライセンスのため）。どれも見つからない場合は従来どおり既定フォントで
+  描画し（該当文字は □ になります）、エラーにはしません
+- 解決結果はプロセス内でキャッシュされるため、同じマシン・同じ入力なら出力は決定的です。
+  `STORYBOARD_FONT_PATH` を変更したら API を再起動してください
+
 ## Learned Video Runtime Contract
 
 - `models/video/learned-runtime/runtime.py` は `load_runtime(manifest)` を公開します
