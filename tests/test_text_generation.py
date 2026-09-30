@@ -115,6 +115,48 @@ class TemplateRuntimeTests(unittest.TestCase):
         self.assertIn("少女", text)
 
 
+class TemplateSubjectClippingTests(unittest.TestCase):
+    """A long premise must not be cut mid-word in template output (#450)."""
+
+    def _logline_text(self, premise: str) -> str:
+        task = get_story_task("logline")
+        raw = build_template_runtime()(
+            task.build_prompt({"premise": premise, "count": 1}),
+            json_schema=task.json_schema(),
+        )
+        return extract_json_object(raw)["loglines"][0]["text"]
+
+    def test_an_ordinary_premise_survives_whole(self) -> None:
+        premise = (
+            "A baker opens her stall at dawn and meets a lost child who changes her day"
+        )
+        self.assertIn(premise, self._logline_text(premise))
+
+    def test_a_long_english_premise_is_clipped_at_a_clause_boundary(self) -> None:
+        premise = (
+            "A retired lighthouse keeper, haunted by the wreck he failed to prevent, "
+            "climbs the tower one last time on a stormy night to guide a lost ship home "
+            "while the village below sleeps"
+        )
+        text = self._logline_text(premise)
+        self.assertIn(
+            "A retired lighthouse keeper, haunted by the wreck he failed to prevent",
+            text,
+        )
+        self.assertNotIn("climbs the tower", text)
+
+    def test_a_long_japanese_premise_is_clipped_at_a_phrase_boundary(self) -> None:
+        sentence = "嵐の夜、年老いた灯台守が遭難船を導くために最後の灯りをともす"
+        premise = "。".join([sentence] * 4)
+        text = self._logline_text(premise)
+        # Three whole sentences fit; the fourth is dropped rather than cut.
+        self.assertTrue(text.startswith("。".join([sentence] * 3) + "が"), text)
+
+    def test_text_without_any_boundary_is_marked_as_clipped(self) -> None:
+        text = self._logline_text("x" * 300)
+        self.assertIn("x" * 119 + "…", text)
+
+
 class TemplateScenePromptTests(unittest.TestCase):
     """Issue #450: template scenes must not all share the premise as their prompt."""
 
@@ -123,7 +165,7 @@ class TemplateScenePromptTests(unittest.TestCase):
         "A baker opens her stall at dawn and meets a lost child who changes her day",
     )
 
-    def _scene_prompts(self, premise: str, scene_count: int = 5) -> list[str]:
+    def _scenes(self, premise: str, scene_count: int = 5) -> list[dict]:
         task = get_story_task("scene_list")
         raw = _template_runtime()["generate"](
             task.build_prompt(
@@ -134,9 +176,10 @@ class TemplateScenePromptTests(unittest.TestCase):
             json_schema=task.json_schema(),
         )
         payload = task.response_model.model_validate(extract_json_object(raw))
-        return [
-            scene["image_prompt"] for scene in payload.model_dump(mode="json")["scenes"]
-        ]
+        return payload.model_dump(mode="json")["scenes"]
+
+    def _scene_prompts(self, premise: str, scene_count: int = 5) -> list[str]:
+        return [scene["image_prompt"] for scene in self._scenes(premise, scene_count)]
 
     def test_five_scenes_get_pairwise_distinct_prompts_anchored_on_the_subject(
         self,
@@ -147,8 +190,14 @@ class TemplateScenePromptTests(unittest.TestCase):
                 self.assertEqual(len(prompts), 5)
                 self.assertEqual(len(set(prompts)), 5, prompts)
                 for prompt in prompts:
-                    # The template subject is the premise capped at 48 chars.
-                    self.assertIn(premise[:48], prompt)
+                    self.assertIn(premise, prompt)
+
+    def test_five_scene_narrations_are_distinct(self) -> None:
+        narrations = [
+            scene["narration"] for scene in self._scenes(self._PREMISES[0])
+        ]
+        self.assertEqual(len(set(narrations)), 5, narrations)
+        self.assertIn(self._PREMISES[0], narrations[0])
 
     def test_five_scene_prompts_follow_the_story_arc(self) -> None:
         prompts = self._scene_prompts(self._PREMISES[0])
