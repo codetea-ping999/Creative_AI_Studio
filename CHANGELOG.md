@@ -5,7 +5,7 @@
 ## [Unreleased]
 
 v1.1 に持ち越した項目は [#458](https://github.com/codetea-ping999/Creative_AI_Studio/issues/458) に集約しています。
-v1.0.0 の既知の制限（下記）のうち、次のものを v1.1 で扱う予定です。
+v1.0.0 の既知の制限と検証の所見のうち、次のものを v1.1 で扱う予定です。
 
 - Storyboard GIF の静止表示（`prefers-reduced-motion` 対応）
 - 日本語 Storyboard overlay の文字が MP4 で表示されない問題
