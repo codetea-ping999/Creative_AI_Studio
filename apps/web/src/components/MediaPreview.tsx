@@ -8,6 +8,8 @@ type StagePreviewProps = {
   outputPath: string | null;
   title: string;
   subtitle: string;
+  /** Still frame shown before a playable video starts (e.g. an Assembly `*_preview.png`). */
+  posterPath?: string | null;
 };
 
 export function StagePreview({
@@ -15,6 +17,7 @@ export function StagePreview({
   outputPath,
   title,
   subtitle,
+  posterPath = null,
 }: StagePreviewProps) {
   const src = createOutputUrl(outputPath);
 
@@ -47,9 +50,18 @@ export function StagePreview({
   }
 
   if (isPlayableVideoAsset(outputPath)) {
+    const poster = isPlayableVideoAsset(posterPath) ? null : createOutputUrl(posterPath);
     return (
       <div className="stage-surface stage-surface--hero">
-        <video controls muted playsInline preload="metadata" src={src} />
+        <video
+          controls
+          muted
+          playsInline
+          preload="metadata"
+          src={src}
+          poster={poster ?? undefined}
+          aria-label={title}
+        />
       </div>
     );
   }

@@ -49,4 +49,20 @@ describe("MediaPreview", () => {
     expect(container.querySelector("video")).not.toBeNull();
     expect(container.querySelector("img")).toBeNull();
   });
+
+  it("uses a still preview as the poster of a playable video", () => {
+    const { container } = render(
+      <StagePreview
+        mediaType="video"
+        outputPath="outputs/videos/assembly.mp4"
+        posterPath="outputs/videos/assembly_preview.png"
+        title="Assembly"
+        subtitle="assembly"
+      />,
+    );
+
+    const video = container.querySelector("video");
+    expect(video?.getAttribute("src")).toMatch(/\/outputs\/videos\/assembly\.mp4$/);
+    expect(video?.getAttribute("poster")).toMatch(/\/outputs\/videos\/assembly_preview\.png$/);
+  });
 });
