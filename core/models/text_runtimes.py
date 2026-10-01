@@ -82,10 +82,10 @@ _BOUNDARY_TIERS: tuple[tuple[str, ...], ...] = (
 # track of a template story does not repeat one sentence for every scene.
 _SCENE_ARC_NARRATION: tuple[str, ...] = (
     "{subject}。{mood}の中、物語が静かに幕を開ける。",
-    "その瞬間、{mood}の空気が一変した。もう後戻りはできない。",
-    "{mood}の気配が濃くなり、行く手を阻むものがひとつ、またひとつと迫ってくる。",
-    "ついに決断の時が訪れる。{mood}の中、すべてはこの一瞬にかかっていた。",
-    "やがて静けさが戻り、{mood}の余韻だけが残った。",
+    "{anchor}。その瞬間、{mood}の空気が一変した。もう後戻りはできない。",
+    "{anchor}。{mood}の気配が濃くなり、行く手を阻むものがひとつ、またひとつと迫ってくる。",
+    "{anchor}。ついに決断の時が訪れる。{mood}の中、すべてはこの一瞬にかかっていた。",
+    "{anchor}。やがて静けさが戻り、{mood}の余韻だけが残った。",
 )
 
 # Story-arc roles a scene can play, in order, each with the visual cues a
@@ -105,6 +105,7 @@ _SCENE_ARC_CUES: tuple[str, ...] = (
 # A one-scene story has no later scenes to carry the turn, climax or outcome,
 # so its single frame and narration stand for the whole arc instead of only
 # the opening.
+_SUBJECT_ANCHOR_MAX_CHARS = 24
 _SINGLE_SCENE_CUE = "key moment of the whole story, the decisive action, dramatic light"
 _SINGLE_SCENE_NARRATION = "{subject}。{mood}の中、物語は決定的な瞬間を迎える。"
 
@@ -220,6 +221,21 @@ def _clip_at_boundary(value: str, limit: int) -> str:
     if space >= floor:
         return window[:space].rstrip(" ,;:")
     return window[: limit - 1] + "…"
+
+
+def _subject_anchor(subject: str) -> str:
+    """A short lead phrase of the subject for scenes after the opening.
+
+    Later narrations need something story-specific even when no mood/tone was
+    given, without repeating the whole (up to 120-char) subject every scene.
+    """
+
+    lead = subject
+    for mark in ("。", "、", "，", "．", ". ", ", ", "; "):
+        head = lead.split(mark, 1)[0].strip()
+        if head:
+            lead = head
+    return _clip_at_boundary(lead, _SUBJECT_ANCHOR_MAX_CHARS)
 
 
 def _mood(context: dict[str, str]) -> str:
@@ -394,7 +410,9 @@ def _string_value(
         if total <= 1:
             return _SINGLE_SCENE_NARRATION.format(subject=subject, mood=mood)
         role = _scene_arc_role(index, total)
-        return _SCENE_ARC_NARRATION[role].format(subject=subject, mood=mood)
+        return _SCENE_ARC_NARRATION[role].format(
+            subject=subject, mood=mood, anchor=_subject_anchor(subject)
+        )
     if template is not None:
         return template.format(subject=subject, mood=mood, index=index)
 

@@ -213,6 +213,16 @@ class TemplateScenePromptTests(unittest.TestCase):
         for scene in scenes:
             self.assertIn("凍てつく静寂", scene.narration)
 
+    def test_later_narrations_differ_between_stories_without_a_tone(self) -> None:
+        first, second = (
+            [scene["narration"] for scene in self._scenes(premise)]
+            for premise in self._PREMISES
+        )
+        for index in range(1, 5):
+            with self.subTest(scene=index + 1):
+                self.assertNotEqual(first[index], second[index])
+        self.assertTrue(first[1].startswith("嵐の夜。"), first[1])
+
     def test_a_single_scene_stands_for_the_whole_arc(self) -> None:
         scenes = self._scenes(self._PREMISES[0], scene_count=1)
         self.assertEqual(len(scenes), 1)
