@@ -41,8 +41,6 @@ TextGenerateCallable = Callable[..., str]
 _FIELD_PHRASES: dict[str, str] = {
     "heading": "{subject} — 場面{index}",
     "summary": "{subject}が{mood}の中で状況を進める場面{index}。",
-    "narration": "{subject}は{mood}の気配を感じながら、次の一歩を選んだ。",
-    "image_prompt": "{subject}, {mood}, cinematic composition, detailed lighting",
     "image_negative": "blurry, low quality, distorted anatomy, watermark",
     "bgm_mood": "{mood}",
     "camera": "ken_burns_in",
@@ -69,6 +67,60 @@ _FIELD_PHRASES: dict[str, str] = {
 
 _DEFAULT_SUBJECT = "主人公"
 _DEFAULT_MOOD = "静かな緊張"
+
+# Long enough that an ordinary one- or two-sentence premise survives whole; a
+# longer one is clipped at a phrase boundary by ``_clip_at_boundary``.
+_SUBJECT_MAX_CHARS = 120
+# Tried in order: a whole sentence reads better than a clause, which reads
+# better than a word boundary.
+_BOUNDARY_TIERS: tuple[tuple[str, ...], ...] = (
+    ("。", "．", "！", "？", ". ", "! ", "? "),
+    ("、", "，", "; ", ", "),
+)
+
+# Narration per story-arc role, parallel to ``_SCENE_ARC_CUES``, so the spoken
+# track of a template story does not repeat one sentence for every scene.
+_SCENE_ARC_NARRATION: tuple[str, ...] = (
+    "{subject}。{mood}の中、物語が静かに幕を開ける。",
+    "{anchor}。その瞬間、{mood}の空気が一変した。もう後戻りはできない。",
+    "{anchor}。{mood}の気配が濃くなり、行く手を阻むものがひとつ、またひとつと迫ってくる。",
+    "{anchor}。ついに決断の時が訪れる。{mood}の中、すべてはこの一瞬にかかっていた。",
+    "{anchor}。やがて静けさが戻り、{mood}の余韻だけが残った。",
+)
+
+# Story-arc roles a scene can play, in order, each with the visual cues a
+# storyboard frame for that role would carry (issue #450). ``image_prompt`` is
+# the one scene field the studio sends verbatim to image/video generation, so a
+# prompt built from subject and mood alone gave every scene the same picture.
+# Lighting cues deliberately name no time of day or weather, which would
+# contradict a premise such as "a stormy night".
+_SCENE_ARC_CUES: tuple[str, ...] = (
+    "establishing scene, calm before the story begins, soft ambient light",
+    "inciting incident, the moment everything changes, dramatic side light",
+    "rising tension, obstacles close in, low-key moody light",
+    "climax, the decisive moment, intense high-contrast light",
+    "resolution, quiet aftermath, gentle diffused light",
+)
+
+# A one-scene story has no later scenes to carry the turn, climax or outcome,
+# so its single frame and narration stand for the whole arc instead of only
+# the opening.
+_SUBJECT_ANCHOR_MAX_CHARS = 24
+_SINGLE_SCENE_CUE = "key moment of the whole story, the decisive action, dramatic light"
+_SINGLE_SCENE_NARRATION = "{subject}。{mood}の中、物語は決定的な瞬間を迎える。"
+
+# Shot types cycle independently of the arc role so that stories with more
+# scenes than roles still get a distinct frame per scene. Seven entries exceed
+# the widest run of scenes that can share one role at the 24-scene maximum.
+_SCENE_SHOTS: tuple[str, ...] = (
+    "wide establishing shot",
+    "medium shot",
+    "close-up",
+    "low-angle shot",
+    "over-the-shoulder shot",
+    "high-angle shot",
+    "extreme close-up",
+)
 
 
 def build_template_runtime(*, seed_salt: str = "") -> TextGenerateCallable:
@@ -144,8 +196,46 @@ def _subject(context: dict[str, str]) -> str:
     for key in ("subject", "premise", "logline", "brief", "title", "scene"):
         value = context.get(key, "").strip()
         if value:
-            return value[:48]
+            return _clip_at_boundary(value, _SUBJECT_MAX_CHARS)
     return _DEFAULT_SUBJECT
+
+
+def _clip_at_boundary(value: str, limit: int) -> str:
+    """Shorten ``value`` to at most ``limit`` chars without cutting mid-phrase.
+
+    A hard slice turned a long premise into a logline that stopped mid-word
+    ("...meets a lost c"). Prefer the last sentence end, then the last clause
+    boundary, then the last word boundary, and only hard-cut text with none of
+    them (marked with "…").
+    """
+
+    if len(value) <= limit:
+        return value
+    window = value[:limit]
+    floor = limit // 3
+    for marks in _BOUNDARY_TIERS:
+        boundary = max(window.rfind(mark) for mark in marks)
+        if boundary >= floor:
+            return window[:boundary].rstrip()
+    space = window.rfind(" ")
+    if space >= floor:
+        return window[:space].rstrip(" ,;:")
+    return window[: limit - 1] + "…"
+
+
+def _subject_anchor(subject: str) -> str:
+    """A short lead phrase of the subject for scenes after the opening.
+
+    Later narrations need something story-specific even when no mood/tone was
+    given, without repeating the whole (up to 120-char) subject every scene.
+    """
+
+    lead = subject
+    for mark in ("。", "、", "，", "．", ". ", ", ", "; "):
+        head = lead.split(mark, 1)[0].strip()
+        if head:
+            lead = head
+    return _clip_at_boundary(lead, _SUBJECT_ANCHOR_MAX_CHARS)
 
 
 def _mood(context: dict[str, str]) -> str:
@@ -313,6 +403,16 @@ def _string_value(
     template = _FIELD_PHRASES.get(field_name)
     subject = _subject(context)
     mood = _mood(context)
+    if field_name == "image_prompt":
+        return _scene_image_prompt(subject, mood, index, _scene_total(context))
+    if field_name == "narration":
+        total = _scene_total(context)
+        if total <= 1:
+            return _SINGLE_SCENE_NARRATION.format(subject=subject, mood=mood)
+        role = _scene_arc_role(index, total)
+        return _SCENE_ARC_NARRATION[role].format(
+            subject=subject, mood=mood, anchor=_subject_anchor(subject)
+        )
     if template is not None:
         return template.format(subject=subject, mood=mood, index=index)
 
@@ -320,6 +420,47 @@ def _string_value(
     # the quality evaluator would (correctly) flag as an incomplete payload.
     digest = hashlib.sha1(f"{rng_key}:{field_name}:{index}".encode("utf-8")).hexdigest()
     return f"{field_name.replace('_', ' ')} {index} [{digest[:6]}]"
+
+
+def _scene_total(context: dict[str, str]) -> int:
+    for key in ("scene_count", "count"):
+        raw_value = context.get(key)
+        if raw_value:
+            try:
+                return max(1, int(float(raw_value)))
+            except ValueError:
+                continue
+    return len(_SCENE_ARC_CUES)
+
+
+def _scene_arc_role(index: int, total: int) -> int:
+    """Map a 1-based scene index onto an index into ``_SCENE_ARC_CUES``."""
+
+    if total <= 1:
+        return 0
+    position = min(max(0, index - 1), total - 1)
+    return round(position * (len(_SCENE_ARC_CUES) - 1) / (total - 1))
+
+
+def _scene_image_prompt(subject: str, mood: str, index: int, total: int) -> str:
+    """Compose a scene-specific visual prompt from the scene's place in the arc.
+
+    The scene's position is mapped onto setup -> inciting -> rising -> climax ->
+    resolution, and paired with a shot type, so each scene of one story gets a
+    different frame while the subject still anchors every prompt. Pure function
+    of its inputs, so the same story always yields the same prompts.
+
+    The scene-specific shot and arc cue come first: CLIP-based image encoders
+    (SDXL) only read the first 77 tokens, and a long Japanese subject alone
+    can exceed that, which would cut off everything that tells scenes apart.
+    """
+
+    shot = _SCENE_SHOTS[max(0, index - 1) % len(_SCENE_SHOTS)]
+    cue = _SINGLE_SCENE_CUE if total <= 1 else _SCENE_ARC_CUES[_scene_arc_role(index, total)]
+    return (
+        f"{shot}, {cue}, {subject}, {mood}, "
+        "cinematic composition, detailed lighting"
+    )
 
 
 # --------------------------------------------------------------------------

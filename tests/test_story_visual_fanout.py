@@ -302,15 +302,20 @@ class SceneVisualFanoutResultTests(unittest.TestCase):
             self.job_repository, self.job_queue, self.event_bus
         )
 
+    def _succeed(self, job_id: str, outputs: list[str]) -> None:
+        for status in ("preparing", "running", "postprocessing"):
+            assert self.job_repository.update_status(job_id, status) is not None
+        self.job_service.mark_succeeded(
+            job_id,
+            GenerationResult(job_id=job_id, status="succeeded", outputs=outputs),
+        )
+
     def test_refresh_reads_live_status_without_mutating_the_original(self) -> None:
         result = fan_out_scene_visuals(
             _THREE_SCENES, self.job_service, _FULL_CAPABILITIES, _STRATEGY_MODELS
         )
         first_job_id = result.items[0].job_id
-        self.job_service.mark_succeeded(
-            first_job_id,
-            GenerationResult(job_id=first_job_id, status="succeeded", outputs=["a.mp4"]),
-        )
+        self._succeed(first_job_id, ["a.mp4"])
 
         refreshed = result.refresh(self.job_repository)
 
@@ -326,10 +331,7 @@ class SceneVisualFanoutResultTests(unittest.TestCase):
         self.assertFalse(result.refresh(self.job_repository).is_complete())
 
         for item in result.items:
-            self.job_service.mark_succeeded(
-                item.job_id,
-                GenerationResult(job_id=item.job_id, status="succeeded", outputs=["x"]),
-            )
+            self._succeed(item.job_id, ["x"])
 
         self.assertTrue(result.refresh(self.job_repository).is_complete())
 
@@ -344,10 +346,7 @@ class SceneVisualFanoutResultTests(unittest.TestCase):
             _THREE_SCENES, self.job_service, _FULL_CAPABILITIES, _STRATEGY_MODELS
         )
         succeeding, failing, _ = result.items
-        self.job_service.mark_succeeded(
-            succeeding.job_id,
-            GenerationResult(job_id=succeeding.job_id, status="succeeded", outputs=["x"]),
-        )
+        self._succeed(succeeding.job_id, ["x"])
         self.job_service.mark_failed(failing.job_id, "stub render failure")
 
         refreshed = result.refresh(self.job_repository)

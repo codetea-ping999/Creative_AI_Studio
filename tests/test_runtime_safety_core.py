@@ -1,0 +1,4974 @@
+"""PR4a (issue #414): deterministic concurrency proofs for the runtime-safety
+core -- lease/pin, per-runtime execution exclusion, process-wide admission,
+load-before-capacity safety, canonical acquire/unload, and atomic
+unload_all.
+
+No sleep-based concurrency assertions anywhere in this file: every ordering
+claim is proved either by a real mutual-exclusion primitive (the code under
+test genuinely blocking one thread on another) combined with
+`threading.Event`/`threading.Barrier` handoffs, or by a recorded event
+*sequence* asserted only after every thread has fully joined -- never by a
+short wait-then-check race. See `docs/model-system.md` for the production
+contract this suite exists to hold in place.
+"""
+
+from __future__ import annotations
+
+import gc
+import json
+import math
+import os
+from pathlib import Path
+import queue
+from tempfile import TemporaryDirectory
+from threading import Barrier, Condition, Event, Lock, Thread, current_thread
+import time
+import unittest
+from unittest import mock
+import weakref
+
+from bootstrap.factories import create_default_model_service
+from core.models.cache import ModelRuntimeCache
+import core.models.cache as cache_module
+from core.models.loader import LoaderRegistry
+from core.models.registry import ModelRegistry
+from core.models.resolver import ModelResolver
+from core.models.runtime_lease import (
+    RuntimeBusyError,
+    RuntimeEntry,
+    RuntimeState,
+    RuntimeWaitTimeoutError,
+)
+from core.models.service import ModelService, RuntimeAdmissionController
+import core.models.service as service_module
+from core.models.cloud_guard import CloudProviderDisabledError, cloud_provider_env_flag
+
+
+class _FakeCancellation(BaseException):
+    """A stand-in for a non-`Exception` interruption (a custom cancellation
+    signal, e.g.) -- deliberately not literal `KeyboardInterrupt`/`SystemExit`
+    so raising it in a test never actually interrupts the test runner, while
+    still exercising the same "escapes a bare `except Exception:`" property
+    that matters for Codex-review Finding 6 (round 1)."""
+
+
+class _PausingReleaseGuard:
+    """Test-only stand-in for `RuntimeHandle._release_guard`.
+
+    The real guard is a plain `threading.Lock`, which forbids arbitrary
+    attribute assignment (a C extension type with no `__dict__`) -- so a
+    test cannot monkeypatch its `acquire`/`release` directly the way it can
+    a plain Python object's methods. Swapping the whole `_release_guard`
+    attribute for one of these (perfectly legal -- `__slots__` restricts
+    attribute *names*, not the values assigned to them) lets a test pause a
+    thread precisely *while it still holds the guard*, right before it
+    would otherwise release it -- a genuine synchronization point, not a
+    timing guess. A second thread contending for the guard in the meantime
+    genuinely blocks on the same real `Lock` underneath, exactly as it
+    would against the real guard.
+    """
+
+    def __init__(self) -> None:
+        self._real_lock = Lock()
+        self.paused = Event()
+        self.let_continue = Event()
+
+    def __enter__(self) -> "_PausingReleaseGuard":
+        self._real_lock.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self.paused.set()
+        try:
+            self.let_continue.wait(timeout=5.0)
+        finally:
+            # Always release, even if the wait above times out (e.g. a
+            # test assertion elsewhere already failed and will never call
+            # `let_continue.set()`) -- otherwise the real lock stays held
+            # forever, hanging any thread still contending for it (and,
+            # transitively, the whole test process at interpreter
+            # shutdown, which waits for every non-daemon thread).
+            self._real_lock.release()
+        return False
+
+
+# --------------------------------------------------------------------------
+# Shared fakes -- deliberately decoupled from any real loader/torch code so
+# every test here proves cache/service concurrency semantics, never a real
+# model's own behavior.
+# --------------------------------------------------------------------------
+
+
+class _FakeManifest:
+    """Minimal stand-in satisfying every attribute `ModelService`/`ModelRuntimeCache`
+    actually read off a manifest (see `core/models/service.py`'s own call sites)."""
+
+    def __init__(self, model_id: str, *, loader: str = "fake", provider: str = "local"):
+        self.id = model_id
+        self.loader = loader
+        self.provider = provider
+        self.public_model_id = model_id
+
+
+class _FakeResolver:
+    """`.resolve()` returns a fixed manifest per requested id; `.resolve_manifest_id()`
+    maps a public id/alias to its canonical id, falling back to identity (a
+    manifest id, or an unknown id) -- the same contract `ModelResolver.resolve_manifest_id()`
+    documents."""
+
+    def __init__(
+        self,
+        manifests: dict[str, _FakeManifest],
+        *,
+        alias_map: dict[str, str] | None = None,
+    ):
+        self._manifests = manifests
+        self._alias_map = alias_map or {}
+
+    def resolve(self, model_id, media_type, task_type=None):
+        canonical = self.resolve_manifest_id(model_id)
+        return self._manifests[canonical]
+
+    def resolve_manifest_id(self, model_id: str) -> str:
+        return self._alias_map.get(model_id, model_id)
+
+
+class _FakeLoaderRegistry:
+    def __init__(self, loaders: dict[str, object]):
+        self._loaders = loaders
+
+    def get(self, name):
+        return self._loaders[name]
+
+
+class _ImmediateLoader:
+    """Returns a fresh, distinct runtime object synchronously; counts calls."""
+
+    def __init__(self):
+        self.load_calls = 0
+
+    def load(self, manifest):
+        self.load_calls += 1
+        return {"id": manifest.id, "instance": object()}
+
+
+class _ControllableLoader:
+    """Blocks inside `load()` until released -- for forcing a real in-flight window."""
+
+    def __init__(
+        self,
+        *,
+        started: Event | None = None,
+        release: Event | None = None,
+        sequence=None,
+        seq_lock=None,
+    ):
+        self.load_calls = 0
+        self.started = started or Event()
+        self.release = release or Event()
+        self._sequence = sequence
+        self._seq_lock = seq_lock
+
+    def _record(self, label: str) -> None:
+        if self._sequence is not None:
+            with self._seq_lock:
+                self._sequence.append(label)
+
+    def load(self, manifest):
+        self.load_calls += 1
+        self._record(f"{manifest.id}-load-start")
+        self.started.set()
+        assert self.release.wait(timeout=5), "release event was never set"
+        self._record(f"{manifest.id}-load-end")
+        return {"id": manifest.id, "instance": object()}
+
+
+class _SecondCallBlocksLoader:
+    """Immediate on every `load()` call except the 2nd, which blocks until
+    released -- lets a test pin down the exact moment a *retried* load (the
+    2nd call for one canonical id) is in flight, for real lock-contention
+    synchronization rather than a sleep-based guess."""
+
+    def __init__(self, *, started: Event, release: Event):
+        self.load_calls = 0
+        self.started = started
+        self.release = release
+
+    def load(self, manifest):
+        self.load_calls += 1
+        if self.load_calls == 2:
+            self.started.set()
+            assert self.release.wait(timeout=5), "release event was never set"
+        return {"id": manifest.id, "instance": object()}
+
+
+class _RecordingImmediateLoader:
+    """Like `_ImmediateLoader`, but appends to a shared, lock-protected sequence."""
+
+    def __init__(self, sequence: list, seq_lock: Lock):
+        self.load_calls = 0
+        self._sequence = sequence
+        self._seq_lock = seq_lock
+
+    def load(self, manifest):
+        self.load_calls += 1
+        with self._seq_lock:
+            self._sequence.append(f"{manifest.id}-load-start")
+            self._sequence.append(f"{manifest.id}-load-end")
+        return {"id": manifest.id, "instance": object()}
+
+
+class _FailNTimesLoader:
+    """Raises `RuntimeError` on the first `fail_count` calls, then succeeds."""
+
+    def __init__(self, fail_count: int = 1):
+        self.load_calls = 0
+        self.fail_count = fail_count
+
+    def load(self, manifest):
+        self.load_calls += 1
+        if self.load_calls <= self.fail_count:
+            raise RuntimeError(f"injected: load failure #{self.load_calls}")
+        return {"id": manifest.id, "instance": object()}
+
+
+class _RecordingCleanup:
+    """`on_evict` hook: records every call; optionally blocks on an Event."""
+
+    def __init__(self, *, block: Event | None = None, sequence=None, seq_lock=None):
+        self.calls: list[str] = []
+        self._block = block
+        self._sequence = sequence
+        self._seq_lock = seq_lock
+
+    def __call__(self, model_id: str, runtime_obj: object) -> None:
+        if self._sequence is not None:
+            with self._seq_lock:
+                self._sequence.append(f"{model_id}-cleanup-start")
+        self.calls.append(model_id)
+        if self._block is not None:
+            assert self._block.wait(timeout=5), "cleanup release event was never set"
+        if self._sequence is not None:
+            with self._seq_lock:
+                self._sequence.append(f"{model_id}-cleanup-end")
+
+
+class _Cancelled(Exception):
+    """Stand-in for `GenerationCancelled` (an ordinary `Exception`) raised by a
+    `wait_checkpoint` -- kept local so this suite never imports job code."""
+
+
+class _WeakrefRuntime:
+    """A runtime object that supports weak references, so a test can prove
+    nothing still strongly retains it -- or the `RuntimeEntry` that owns it
+    (`RuntimeEntry` itself has `__slots__` without `__weakref__`)."""
+
+
+class _WeakrefTrackingLoader:
+    def __init__(self):
+        self.load_calls = 0
+        self.refs: list[weakref.ref] = []
+
+    def load(self, manifest):
+        self.load_calls += 1
+        runtime_obj = _WeakrefRuntime()
+        self.refs.append(weakref.ref(runtime_obj))
+        return runtime_obj
+
+
+class _SingleWorker:
+    """WorkerPool-like executor: ONE persistent thread runs submitted jobs
+    sequentially (see `core/jobs/worker_pool.py::WorkerPool._run_worker()`),
+    so a test can prove what a later, logically unrelated job on the very
+    same `Thread` object can or cannot inherit from an earlier one."""
+
+    def __init__(self, name: str):
+        self._jobs: queue.Queue = queue.Queue()
+        self.thread = Thread(target=self._run, name=name, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        while True:
+            job = self._jobs.get()
+            if job is None:
+                return
+            fn, done, box = job
+            try:
+                box["thread"] = current_thread()
+                box["result"] = fn()
+            except BaseException as exc:  # noqa: BLE001
+                box["error"] = exc
+            finally:
+                done.set()
+
+    def submit(self, fn):
+        done: Event = Event()
+        box: dict = {}
+        self._jobs.put((fn, done, box))
+        return done, box
+
+    def stop(self):
+        self._jobs.put(None)
+        self.thread.join(timeout=5)
+
+
+def _build_service(
+    manifests: dict[str, _FakeManifest],
+    loaders: dict[str, object],
+    *,
+    alias_map: dict[str, str] | None = None,
+    max_entries: int = 1,
+    media_limits: dict[str, int] | None = None,
+    on_evict=None,
+    admission_capacity: int = 1,
+) -> tuple[ModelService, ModelRuntimeCache]:
+    cache = ModelRuntimeCache(max_entries=max_entries, media_limits=media_limits, on_evict=on_evict)
+    service = ModelService(
+        registry=None,
+        resolver=_FakeResolver(manifests, alias_map=alias_map),
+        loader_registry=_FakeLoaderRegistry(loaders),
+        runtime_cache=cache,
+        admission_capacity=admission_capacity,
+    )
+    return service, cache
+
+
+def _write_manifest(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+class RuntimeSafetyCoreTests(unittest.TestCase):
+    # ---------------------------------------------------------------- 1
+    def test_pinned_eviction_returns_busy_without_touching_the_pinned_entry(self):
+        # PR4a v1 final-convergence pass: model-a's handle must now be held
+        # by a genuinely different thread -- G unconditionally rejects any
+        # nested acquire_runtime() call from a thread that already holds an
+        # open handle, so a same-thread second call here would never even
+        # reach the cache-level "no eligible eviction victim" busy path
+        # this test actually targets. A generous admission capacity still
+        # isolates that mechanism from process-wide admission itself (G),
+        # which would otherwise block the second thread's acquire attempt
+        # before it ever reached the cache-capacity check at all (production
+        # defaults to admission_capacity=1, where both mechanisms would
+        # normally be exercised together; see
+        # test_uncached_loads_of_different_models_serialize_through_admission
+        # for that one).
+        manifest_a = _FakeManifest("model-a")
+        manifest_b = _FakeManifest("model-b")
+        loader_a = _ImmediateLoader()
+        loader_b = _ImmediateLoader()
+        cleanup = _RecordingCleanup()
+        service, cache = _build_service(
+            {"model-a": manifest_a, "model-b": manifest_b},
+            {"fake": loader_a},  # model-b uses a different loader name below
+            max_entries=1,
+            on_evict=cleanup,
+            admission_capacity=10,
+        )
+        # Route model-b through its own loader instance.
+        service.loader_registry._loaders["fake-b"] = loader_b
+        manifest_b.loader = "fake-b"
+
+        entered = Event()
+        release = Event()
+        holder_handle = []
+        worker_errors: list[BaseException] = []
+
+        def hold_model_a():
+            try:
+                holder_handle.append(service.acquire_runtime("model-a", "image"))
+                entered.set()
+                release.wait(timeout=5.0)
+            except BaseException as exc:  # pragma: no cover - failure path only
+                worker_errors.append(exc)
+
+        holder = Thread(target=hold_model_a)
+        holder.start()
+        self.assertTrue(entered.wait(timeout=5.0))
+        try:
+            with self.assertRaises(RuntimeBusyError):
+                service.acquire_runtime("model-b", "image")
+
+            self.assertEqual(loader_b.load_calls, 0)
+            self.assertEqual(cleanup.calls, [])
+            self.assertEqual(cache.loaded_ids(), ["model-a"])
+            self.assertIs(holder_handle[0].runtime, cache._entries["model-a"].runtime)
+        finally:
+            release.set()
+            holder.join(timeout=5.0)
+            holder_handle[0].release()
+        self.assertEqual(worker_errors, [])
+
+    # ---------------------------------------------------------------- 2
+    def test_unload_model_refuses_a_leased_runtime_via_any_identifier(self):
+        manifest_a = _FakeManifest("stable-diffusion-xl")
+        loader = _ImmediateLoader()
+        service, cache = _build_service(
+            {"stable-diffusion-xl": manifest_a},
+            {"fake": loader},
+            alias_map={"sdxl": "stable-diffusion-xl", "sdxl-local": "stable-diffusion-xl"},
+        )
+
+        handle = service.acquire_runtime("sdxl", "image")
+        self.addCleanup(handle.release)
+
+        for identifier in ("sdxl", "sdxl-local", "stable-diffusion-xl"):
+            with self.subTest(identifier=identifier):
+                with self.assertRaises(RuntimeBusyError):
+                    service.unload_model(identifier)
+
+        entry = cache._entries["stable-diffusion-xl"]
+        self.assertEqual(entry.state, RuntimeState.READY)
+        self.assertEqual(entry.lease_count, 1)
+        self.assertIs(entry.runtime, handle.runtime)
+
+    # ---------------------------------------------------------------- 3
+    def test_replacement_of_a_leased_entry_is_refused_without_cleanup(self):
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        cleanup = _RecordingCleanup()
+        service, cache = _build_service(
+            {"model-a": manifest_a}, {"fake": loader}, on_evict=cleanup,
+        )
+
+        handle = service.acquire_runtime("model-a", "image")
+        self.addCleanup(handle.release)
+        original_entry = cache._entries["model-a"]
+
+        # Legacy put() attempting to replace the same canonical id directly.
+        with self.assertRaises(RuntimeBusyError):
+            cache.put("model-a", {"id": "model-a", "instance": object()}, media_type="image")
+
+        self.assertEqual(cleanup.calls, [])
+        self.assertIs(cache._entries["model-a"], original_entry)
+        self.assertIs(cache._entries["model-a"].runtime, handle.runtime)
+
+    # ---------------------------------------------------------------- 4
+    def test_same_canonical_runtime_execution_is_mutually_exclusive(self):
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service(
+            {"model-a": manifest_a}, {"fake": loader}, max_entries=2,
+        )
+
+        state_lock = Lock()
+        state = {"current": 0, "max": 0}
+        first_inside = Event()
+        release_first = Event()
+        second_done = Event()
+        errors: list[BaseException] = []
+
+        def bump():
+            with state_lock:
+                state["current"] += 1
+                state["max"] = max(state["max"], state["current"])
+
+        def unbump():
+            with state_lock:
+                state["current"] -= 1
+
+        def first_worker():
+            try:
+                with service.acquire_runtime("model-a", "image"):
+                    bump()
+                    first_inside.set()
+                    assert release_first.wait(timeout=5)
+                    unbump()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        def second_worker():
+            try:
+                with service.acquire_runtime("model-a", "image"):
+                    bump()
+                    unbump()
+                    second_done.set()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        t1 = Thread(target=first_worker)
+        t2 = Thread(target=second_worker)
+        t1.start()
+        self.assertTrue(first_inside.wait(timeout=5))
+        t2.start()
+        release_first.set()
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+
+        self.assertEqual(errors, [])
+        self.assertTrue(second_done.wait(timeout=5))
+        self.assertEqual(state["max"], 1)
+        self.assertEqual(loader.load_calls, 1)  # second caller hit the cache, never reloaded
+
+    # ---------------------------------------------------------------- 5
+    def test_public_id_alias_and_manifest_id_converge_on_one_entry(self):
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            _write_manifest(
+                root / "image" / "sdxl-local.json",
+                {
+                    "id": "stable-diffusion-xl",
+                    "public_id": "sdxl",
+                    "display_name": "SDXL Local",
+                    "media_type": "image",
+                    "task_type": "text-to-image",
+                    "provider": "local",
+                    "runtime": "diffusers",
+                    "local_path": "./models/image/sdxl",
+                    "loader": "fake",
+                    "aliases": ["sdxl-local"],
+                    "is_default": True,
+                },
+            )
+            registry = ModelRegistry(manifest_root=root)
+            resolver = ModelResolver(registry)
+            loader = _ImmediateLoader()
+            cache = ModelRuntimeCache(max_entries=1)
+            service = ModelService(
+                registry=registry,
+                resolver=resolver,
+                loader_registry=_FakeLoaderRegistry({"fake": loader}),
+                runtime_cache=cache,
+            )
+
+            handle = service.acquire_runtime("sdxl", "image", "text-to-image")
+            entry_via_public_id = cache._entries["stable-diffusion-xl"]
+            self.assertEqual(entry_via_public_id.lease_count, 1)
+            handle.release()
+            self.assertEqual(entry_via_public_id.lease_count, 0)
+
+            # Prove the *lease domain* itself is shared (not just that each
+            # identifier resolves to the same entry) by pinning through two
+            # different identifiers at once, at the cache layer directly --
+            # `service.acquire_runtime()` also acquires E (execution
+            # exclusivity), and this same thread holding a second, nested
+            # lease on the SAME entry's execution lock would deadlock on E,
+            # which is issue #414's OWN "same canonical entry exclusive"
+            # invariant working as intended (see
+            # test_same_canonical_runtime_execution_is_mutually_exclusive
+            # for the cross-thread proof of that), not something this test
+            # should trigger.
+            public_canonical_id = resolver.resolve_manifest_id("sdxl")
+            alias_canonical_id = resolver.resolve_manifest_id("sdxl-local")
+            manifest_canonical_id = resolver.resolve_manifest_id("stable-diffusion-xl")
+            self.assertEqual(public_canonical_id, alias_canonical_id)
+            self.assertEqual(public_canonical_id, manifest_canonical_id)
+
+            pinned_via_public_id = cache.acquire_or_reserve(public_canonical_id, "image")
+            self.assertIs(pinned_via_public_id, entry_via_public_id)
+            self.assertEqual(entry_via_public_id.lease_count, 1)
+
+            pinned_via_alias = cache.acquire_or_reserve(alias_canonical_id, "image")
+            self.assertIs(pinned_via_alias, entry_via_public_id)
+            self.assertEqual(entry_via_public_id.lease_count, 2)  # same lease domain
+
+            cache.release_lease(public_canonical_id, pinned_via_public_id)
+            cache.release_lease(alias_canonical_id, pinned_via_alias)
+            self.assertEqual(entry_via_public_id.lease_count, 0)
+
+            handle3 = service.acquire_runtime("stable-diffusion-xl", "image", "text-to-image")
+            self.assertIs(cache._entries["stable-diffusion-xl"], entry_via_public_id)
+            self.assertIs(handle3._entry.execution_lock, entry_via_public_id.execution_lock)
+            handle3.release()
+
+            self.assertEqual(loader.load_calls, 1)  # loaded exactly once across all three ids
+
+            # unload via a third identifier still reaches the one entry.
+            service.unload_model("stable-diffusion-xl")
+            self.assertEqual(cache.loaded_ids(), [])
+
+    # ---------------------------------------------------------------- 6
+    def test_uncached_loads_of_different_models_serialize_through_admission(self):
+        sequence: list[str] = []
+        seq_lock = Lock()
+        a_started = Event()
+        release_a = Event()
+        loader_a = _ControllableLoader(
+            started=a_started, release=release_a, sequence=sequence, seq_lock=seq_lock,
+        )
+        loader_b = _RecordingImmediateLoader(sequence, seq_lock)
+
+        manifest_a = _FakeManifest("model-a", loader="loader-a")
+        manifest_b = _FakeManifest("model-b", loader="loader-b")
+        cache = ModelRuntimeCache(max_entries=2, media_limits={"image": 2})
+        service = ModelService(
+            registry=None,
+            resolver=_FakeResolver({"model-a": manifest_a, "model-b": manifest_b}),
+            loader_registry=_FakeLoaderRegistry({"loader-a": loader_a, "loader-b": loader_b}),
+            runtime_cache=cache,
+        )
+
+        errors: list[BaseException] = []
+
+        def worker_a():
+            try:
+                with service.acquire_runtime("model-a", "image"):
+                    pass
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        def worker_b():
+            try:
+                with service.acquire_runtime("model-b", "image"):
+                    pass
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        ta = Thread(target=worker_a)
+        ta.start()
+        self.assertTrue(a_started.wait(timeout=5))  # A holds G, blocked inside its own load()
+
+        tb = Thread(target=worker_b)
+        tb.start()
+        # B cannot proceed past G until A releases it.
+        release_a.set()
+        ta.join(timeout=5)
+        tb.join(timeout=5)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(loader_a.load_calls, 1)
+        self.assertEqual(loader_b.load_calls, 1)
+        # B's own load only ever starts after A's load fully finished -- if
+        # admission were broken (both holding G "at once"), B's immediate
+        # loader would have recorded its start/end while A was still parked
+        # inside release_a.wait(), producing a different, interleaved order.
+        self.assertEqual(
+            sequence,
+            ["model-a-load-start", "model-a-load-end", "model-b-load-start", "model-b-load-end"],
+        )
+
+    # ---------------------------------------------------------------- 7
+    def test_load_failure_unwinds_reservation_lease_and_admission(self):
+        manifest_a = _FakeManifest("model-a")
+        loader = _FailNTimesLoader(fail_count=1)
+        service, cache = _build_service({"model-a": manifest_a}, {"fake": loader})
+
+        with self.assertRaises(RuntimeError):
+            service.acquire_runtime("model-a", "image")
+
+        self.assertEqual(cache.loaded_ids(), [])
+        self.assertNotIn("model-a", cache._entries)  # reservation fully unwound, no leak
+
+        # G/L were both released on the failure path -- proved by a bounded,
+        # non-blocking retry succeeding immediately rather than raising busy.
+        handle = service.acquire_runtime("model-a", "image", wait_timeout=0)
+        try:
+            self.assertIsNotNone(handle.runtime)
+        finally:
+            handle.release()
+        self.assertEqual(loader.load_calls, 2)
+
+    # ---------------------------------------------------------------- 8
+    def test_pinned_only_budget_raises_busy_with_multiple_victims(self):
+        # PR4a v1 final-convergence pass: model-a and model-b's handles must
+        # now be held by two genuinely different (worker) threads -- one
+        # thread can no longer hold both simultaneously, since G
+        # unconditionally rejects a second, nested acquire_runtime() call
+        # from a thread that already holds an open handle, regardless of
+        # canonical id. See the comment on
+        # test_pinned_eviction_returns_busy_without_touching_the_pinned_entry
+        # above for why admission_capacity is still generous here: it
+        # isolates the cache-level "pinned-only budget" mechanism this test
+        # targets from process-wide admission (G) itself.
+        manifest_a = _FakeManifest("model-a")
+        manifest_b = _FakeManifest("model-b")
+        manifest_c = _FakeManifest("model-c")
+        loader = _ImmediateLoader()
+        loader_c = _ImmediateLoader()
+        cleanup = _RecordingCleanup()
+        service, cache = _build_service(
+            {"model-a": manifest_a, "model-b": manifest_b, "model-c": manifest_c},
+            {"fake": loader},
+            max_entries=2,
+            on_evict=cleanup,
+            admission_capacity=10,
+        )
+        service.loader_registry._loaders["fake-c"] = loader_c
+        manifest_c.loader = "fake-c"
+
+        release = Event()
+        entered_a = Event()
+        entered_b = Event()
+        handles = {}
+        worker_errors: list[BaseException] = []
+
+        def hold(model_id, entered):
+            try:
+                handles[model_id] = service.acquire_runtime(model_id, "image")
+                entered.set()
+                release.wait(timeout=5.0)
+            except BaseException as exc:  # pragma: no cover - failure path only
+                worker_errors.append(exc)
+
+        holder_a = Thread(target=hold, args=("model-a", entered_a))
+        holder_b = Thread(target=hold, args=("model-b", entered_b))
+        holder_a.start()
+        holder_b.start()
+        self.assertTrue(entered_a.wait(timeout=5.0))
+        self.assertTrue(entered_b.wait(timeout=5.0))
+        try:
+            with self.assertRaises(RuntimeBusyError):
+                service.acquire_runtime("model-c", "image")
+
+            self.assertEqual(loader_c.load_calls, 0)
+            self.assertEqual(cleanup.calls, [])
+            self.assertEqual(sorted(cache.loaded_ids()), ["model-a", "model-b"])
+        finally:
+            release.set()
+            holder_a.join(timeout=5.0)
+            holder_b.join(timeout=5.0)
+            for handle in handles.values():
+                handle.release()
+        self.assertEqual(worker_errors, [])
+
+    # ---------------------------------------------------------------- 9
+    def test_unload_all_refuses_when_any_entry_is_leased(self):
+        manifest_a = _FakeManifest("model-a")
+        manifest_b = _FakeManifest("model-b")
+        loader = _ImmediateLoader()
+        cleanup = _RecordingCleanup()
+        # A generous admission capacity isolates unload_all()'s own
+        # atomic-preflight behavior from process-wide admission (G).
+        service, cache = _build_service(
+            {"model-a": manifest_a, "model-b": manifest_b},
+            {"fake": loader},
+            max_entries=2,
+            on_evict=cleanup,
+            admission_capacity=10,
+        )
+
+        # PR4a v1 final-convergence pass: B must be fully acquired *and*
+        # released before A is acquired -- G unconditionally rejects a
+        # second, nested acquire_runtime() call from a thread that already
+        # holds an open handle, so the two can no longer overlap on this
+        # one test thread. Releasing B first still leaves the exact same
+        # end state this test needs (B idle/READY/unleased, A leased).
+        handle_b = service.acquire_runtime("model-b", "image")
+        handle_b.release()  # B is idle -- READY, unleased
+
+        handle_a = service.acquire_runtime("model-a", "image")
+        self.addCleanup(handle_a.release)
+
+        ids_before = cache.loaded_ids()
+
+        with self.assertRaises(RuntimeBusyError):
+            service.unload_all()
+
+        self.assertEqual(cleanup.calls, [])
+        self.assertEqual(cache.loaded_ids(), ids_before)  # LRU/order unchanged
+
+    # ---------------------------------------------------------------- 10
+    def test_unload_all_cleans_up_every_idle_entry_exactly_once(self):
+        manifest_a = _FakeManifest("model-a")
+        manifest_b = _FakeManifest("model-b")
+        loader = _ImmediateLoader()
+        cleanup = _RecordingCleanup()
+        service, cache = _build_service(
+            {"model-a": manifest_a, "model-b": manifest_b},
+            {"fake": loader},
+            max_entries=2,
+            on_evict=cleanup,
+        )
+
+        service.acquire_runtime("model-a", "image").release()
+        service.acquire_runtime("model-b", "image").release()
+
+        service.unload_all()
+
+        self.assertEqual(sorted(cleanup.calls), ["model-a", "model-b"])
+        self.assertEqual(cache.loaded_ids(), [])
+        self.assertEqual(len(cache._entries), 0)
+
+    # ---------------------------------------------------------------- 11
+    def test_retiring_entry_is_never_reacquired_while_cleanup_is_in_flight(self):
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        sequence: list[str] = []
+        seq_lock = Lock()
+        cleanup_release = Event()
+        cleanup_started = Event()
+
+        def on_evict(model_id, runtime_obj):
+            with seq_lock:
+                sequence.append(f"{model_id}-cleanup-start")
+            cleanup_started.set()
+            assert cleanup_release.wait(timeout=5)
+            with seq_lock:
+                sequence.append(f"{model_id}-cleanup-end")
+
+        service, cache = _build_service(
+            {"model-a": manifest_a}, {"fake": loader}, on_evict=on_evict,
+        )
+
+        service.acquire_runtime("model-a", "image").release()  # idle, READY
+
+        errors: list[BaseException] = []
+
+        def unloader():
+            try:
+                service.unload_model("model-a")
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        t_unload = Thread(target=unloader)
+        t_unload.start()
+        self.assertTrue(cleanup_started.wait(timeout=5))
+
+        # A concurrent acquire attempt while cleanup is mid-flight must be
+        # refused immediately -- never block, never return the old runtime.
+        with self.assertRaises(RuntimeBusyError):
+            service.acquire_runtime("model-a", "image", wait_timeout=0)
+
+        cleanup_release.set()
+        t_unload.join(timeout=5)
+        self.assertEqual(errors, [])
+
+        with seq_lock:
+            self.assertEqual(sequence, ["model-a-cleanup-start", "model-a-cleanup-end"])
+
+        # Now that cleanup is fully done, a fresh acquire succeeds and loads
+        # a genuinely new runtime -- proving cleanup and reload never
+        # overlapped (the sequence list would show an interleaved order if
+        # a reload had started before "model-a-cleanup-end").
+        handle = service.acquire_runtime("model-a", "image")
+        try:
+            self.assertEqual(loader.load_calls, 2)
+        finally:
+            handle.release()
+
+    # ---------------------------------------------------------------- 12
+    def test_stale_generation_release_never_decrements_a_newer_entrys_lease(self):
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service({"model-a": manifest_a}, {"fake": loader})
+
+        handle = service.acquire_runtime("model-a", "image")
+        old_entry = handle._entry
+        handle.release()  # back to lease_count == 0, still generation 0
+
+        cache.unload("model-a")  # fully retire generation 0
+
+        handle2 = service.acquire_runtime("model-a", "image")
+        new_entry = handle2._entry
+        self.assertIsNot(new_entry, old_entry)
+        self.assertEqual(new_entry.generation, old_entry.generation + 1)
+        self.assertEqual(new_entry.lease_count, 1)
+
+        # A stale release against the retired generation-0 entry must be a
+        # pure no-op against the live (generation-1) entry.
+        cache.release_lease("model-a", old_entry)
+
+        self.assertEqual(new_entry.lease_count, 1)
+        handle2.release()
+        self.assertEqual(new_entry.lease_count, 0)
+
+    # ---------------------------------------------------------------- 13
+    def test_unleased_lru_eviction_is_unchanged_by_pr4a(self):
+        cache = ModelRuntimeCache(max_entries=1)
+        cache.put("model-a", {"id": "model-a"})
+        cache.put("model-b", {"id": "model-b"})
+
+        self.assertFalse(cache.has("model-a"))
+        self.assertTrue(cache.has("model-b"))
+        self.assertEqual(cache.loaded_ids(), ["model-b"])
+
+    # ---------------------------------------------------------------- 14
+    def test_per_media_budget_is_unchanged_by_pr4a(self):
+        cache = ModelRuntimeCache(max_entries=1, media_limits={"text": 1, "image": 1})
+        cache.put("text-a", {"id": "text-a"}, media_type="text")
+        cache.put("image-a", {"id": "image-a"}, media_type="image")
+
+        self.assertTrue(cache.has("text-a"))
+        self.assertTrue(cache.has("image-a"))
+        self.assertEqual(set(cache.loaded_ids()), {"text-a", "image-a"})
+
+        cache.put("text-b", {"id": "text-b"}, media_type="text")  # evicts text-a only
+        self.assertFalse(cache.has("text-a"))
+        self.assertTrue(cache.has("image-a"))
+        self.assertTrue(cache.has("text-b"))
+
+    # ---------------------------------------------------------------- 15
+    def test_cloud_guard_denies_acquisition_before_any_admission_side_effect(self):
+        manifest = _FakeManifest("cloud-model", provider="cloud")
+        loader = _ImmediateLoader()
+        service, cache = _build_service({"cloud-model": manifest}, {"fake": loader})
+
+        # Simulate "cached while opt-in was previously on" via the legacy path.
+        cache.put("cloud-model", {"id": "cloud-model", "instance": object()}, media_type="image")
+        entry = cache._entries["cloud-model"]
+        self.assertEqual(entry.lease_count, 0)
+
+        with self.assertRaises(CloudProviderDisabledError):
+            service.acquire_runtime("cloud-model", "image")
+
+        # No pin, no admission slot consumed -- denial happened before any
+        # side effect, so a normal, non-cloud acquisition attempt right
+        # after must find the admission semaphore still fully available.
+        self.assertEqual(entry.lease_count, 0)
+        self.assertEqual(entry.state, RuntimeState.READY)
+
+        other_manifest = _FakeManifest("local-model")
+        service.resolver._manifests["local-model"] = other_manifest
+        other_loader = _ImmediateLoader()
+        service.loader_registry._loaders["fake-other"] = other_loader
+        other_manifest.loader = "fake-other"
+        handle = service.acquire_runtime("local-model", "image", wait_timeout=0)
+        try:
+            self.assertIsNotNone(handle.runtime)
+        finally:
+            handle.release()
+
+    # ---------------------------------------------------------------- 16
+    def test_bootstrap_never_triggers_loader_or_model_work(self):
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            _write_manifest(
+                root / "image" / "sdxl-local.json",
+                {
+                    "id": "sdxl-local",
+                    "public_id": "sdxl",
+                    "display_name": "SDXL Local",
+                    "media_type": "image",
+                    "task_type": "text-to-image",
+                    "provider": "local",
+                    "runtime": "diffusers",
+                    "local_path": "./models/image/sdxl",
+                    "loader": "diffusers_image_loader",
+                    "is_default": True,
+                },
+            )
+            service = create_default_model_service(manifest_root=root)
+
+            self.assertEqual(service.runtime_cache.loaded_ids(), [])
+            self.assertEqual(len(service.runtime_cache._entries), 0)
+            # Idle-application invariant: constructing the service graph
+            # allocates only lightweight synchronization/data structures --
+            # no loader has ever been asked to load anything.
+            #
+            # Multi-waiter INVALID-entry drain (approved contract, PR #420):
+            # `_metadata_lock` ("M") is now a `Condition` (over a plain
+            # `Lock`, not the default `RLock` -- see
+            # `wait_for_stale_entry_drain()`'s own docstring), not a bare
+            # `Lock` -- still exactly the same kind of lightweight,
+            # in-memory synchronization primitive this invariant is about.
+            self.assertIsInstance(service.runtime_cache._metadata_lock, Condition)
+            self.assertIsInstance(
+                service.runtime_cache._metadata_lock._lock, type(Lock())  # type: ignore[attr-defined]
+            )
+
+    # ------------------------------------------------- acquire_runtime deadline
+
+    def test_acquire_runtime_timeout_zero_denies_when_admission_is_full(self):
+        # PR4a v1 final-convergence pass: the first handle must be held by a
+        # genuinely *different* thread -- since G now unconditionally
+        # rejects (RuntimeError) any nested acquisition attempt from a
+        # thread that already holds one, a same-thread second call here
+        # would no longer even reach the semaphore this test targets. A
+        # separate worker thread isolates the mechanism this test actually
+        # exercises (a wait_timeout=0 attempt against a genuinely
+        # capacity-exhausted G, from a thread with no admission slot of its
+        # own) from that unconditional per-thread nested-acquire ban (see
+        # test_acquire_runtime_rejects_nested_blocking_acquire_of_a_different_entry
+        # for that one).
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service({"model-a": manifest_a}, {"fake": loader})
+
+        entered = Event()
+        release = Event()
+        worker_errors: list[BaseException] = []
+
+        def worker():
+            try:
+                with service.acquire_runtime("model-a", "image"):
+                    entered.set()
+                    release.wait(timeout=5.0)
+            except BaseException as exc:  # pragma: no cover - failure path only
+                worker_errors.append(exc)
+
+        holder = Thread(target=worker)
+        holder.start()
+        try:
+            self.assertTrue(entered.wait(timeout=5.0))
+
+            with self.assertRaises(RuntimeBusyError):
+                service.acquire_runtime("model-a", "image", wait_timeout=0)
+
+            # No side effect from the denied attempt: the original holder's
+            # lease is exactly what it was, and G still has zero free slots.
+            self.assertEqual(cache._entries["model-a"].lease_count, 1)
+        finally:
+            release.set()
+            holder.join(timeout=5.0)
+        self.assertEqual(worker_errors, [])
+
+    def test_acquire_runtime_timeout_zero_rolls_back_the_lease_when_e_times_out(self):
+        # PR4a v1 final-convergence pass: as above, the first handle (which
+        # this test needs to keep E held on) must come from a genuinely
+        # different thread now -- a same-thread second acquire_runtime()
+        # call for this exact id would be rejected at the G level before
+        # ever reaching E, which is a different mechanism than the one this
+        # test targets (E's own non-blocking timeout, and the lease
+        # rollback that follows it).
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        # admission_capacity=2 so the second attempt (from the main thread,
+        # which holds no slot of its own) reaches E (not G); max_entries=2
+        # so it also clears the cache-capacity check (not the "pinned-only
+        # budget" busy path) and genuinely reaches E's own timeout.
+        service, cache = _build_service(
+            {"model-a": manifest_a}, {"fake": loader}, admission_capacity=2, max_entries=2,
+        )
+
+        entered = Event()
+        release = Event()
+        worker_errors: list[BaseException] = []
+
+        def worker():
+            try:
+                with service.acquire_runtime("model-a", "image"):
+                    entered.set()
+                    release.wait(timeout=5.0)
+            except BaseException as exc:  # pragma: no cover - failure path only
+                worker_errors.append(exc)
+
+        holder = Thread(target=worker)
+        holder.start()
+        try:
+            self.assertTrue(entered.wait(timeout=5.0))
+            entry = cache._entries["model-a"]
+            self.assertEqual(entry.lease_count, 1)
+
+            with self.assertRaises(RuntimeBusyError):
+                service.acquire_runtime("model-a", "image", wait_timeout=0)
+
+            # The second attempt's own pin (taken by the acquire_or_reserve()
+            # hit path) must have been rolled back once E's own acquisition
+            # timed out -- never leaked, which would otherwise make this
+            # entry permanently un-evictable/un-unloadable.
+            self.assertEqual(entry.lease_count, 1)
+            # G's second slot was released too -- proved by a bounded,
+            # wait_timeout=0 third attempt for a DIFFERENT model succeeding
+            # immediately, still from the main thread (which by now holds
+            # no admission slot of its own again).
+            other_manifest = _FakeManifest("model-b")
+            other_loader = _ImmediateLoader()
+            service.resolver._manifests["model-b"] = other_manifest
+            service.loader_registry._loaders["fake-b"] = other_loader
+            other_manifest.loader = "fake-b"
+            handle_b = service.acquire_runtime("model-b", "image", wait_timeout=0)
+            try:
+                self.assertIsNotNone(handle_b.runtime)
+            finally:
+                handle_b.release()
+        finally:
+            release.set()
+            holder.join(timeout=5.0)
+        self.assertEqual(worker_errors, [])
+
+    def test_acquire_runtime_timeout_zero_denies_when_load_lock_is_held(self):
+        manifest_a = _FakeManifest("model-a")
+        started = Event()
+        release = Event()
+        loader = _ControllableLoader(started=started, release=release)
+        # admission_capacity=2 so the second attempt's own G acquisition
+        # succeeds and it genuinely reaches (and times out on) L, isolating
+        # L's own timeout path from G's.
+        service, cache = _build_service(
+            {"model-a": manifest_a}, {"fake": loader}, admission_capacity=2,
+        )
+
+        errors: list[BaseException] = []
+
+        def first_worker():
+            try:
+                with service.acquire_runtime("model-a", "image"):
+                    pass
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        t1 = Thread(target=first_worker)
+        t1.start()
+        self.assertTrue(started.wait(timeout=5))  # t1 holds G and L, blocked in load()
+
+        with self.assertRaises(RuntimeBusyError):
+            service.acquire_runtime("model-a", "image", wait_timeout=0)
+
+        release.set()
+        t1.join(timeout=5)
+        self.assertEqual(errors, [])
+        self.assertEqual(loader.load_calls, 1)
+
+    def test_release_is_idempotent(self):
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service({"model-a": manifest_a}, {"fake": loader})
+
+        handle = service.acquire_runtime("model-a", "image")
+        entry = cache._entries["model-a"]
+        handle.release()
+        self.assertEqual(entry.lease_count, 0)
+
+        handle.release()  # must be a pure no-op, not a double-decrement
+        self.assertEqual(entry.lease_count, 0)
+
+    # ----------------------------------------------------- INVALID entries
+
+    def test_invalid_entry_still_leased_by_another_caller_denies_new_acquires(self):
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service({"model-a": manifest_a}, {"fake": loader})
+
+        handle = service.acquire_runtime("model-a", "image")
+        entry = cache._entries["model-a"]
+        # A second, independent lease on the same entry (e.g. a genuinely
+        # concurrent caller elsewhere) -- taken directly at the cache layer
+        # to avoid this same thread deadlocking on E (see
+        # test_public_id_alias_and_manifest_id_converge_on_one_entry's own
+        # comment for why).
+        second_pin = cache.acquire_or_reserve("model-a", "image")
+        self.assertIs(second_pin, entry)
+        self.assertEqual(entry.lease_count, 2)
+
+        # The first caller's use raised -- mark INVALID -- but the second
+        # lease is still outstanding.
+        handle.release(had_exception=True)
+        self.assertEqual(entry.state, RuntimeState.INVALID)
+        self.assertEqual(entry.lease_count, 1)
+
+        with self.assertRaises(RuntimeBusyError):
+            service.acquire_runtime("model-a", "image", wait_timeout=0)
+
+        # Once the last outstanding lease releases, the (still INVALID,
+        # now unleased) entry becomes a normal eviction/replacement
+        # candidate for the next acquire -- reloaded fresh, never reused.
+        cache.release_lease("model-a", entry)
+        self.assertEqual(entry.lease_count, 0)
+
+        handle2 = service.acquire_runtime("model-a", "image")
+        try:
+            self.assertIsNot(handle2._entry, entry)
+            self.assertEqual(handle2._entry.state, RuntimeState.READY)
+        finally:
+            handle2.release()
+        self.assertEqual(loader.load_calls, 2)
+
+    # ------------------------------------- legacy put() pin-supremacy over budget
+
+    def test_legacy_put_never_evicts_a_pinned_entry_even_over_budget(self):
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service({"model-a": manifest_a}, {"fake": loader}, max_entries=1)
+
+        handle = service.acquire_runtime("model-a", "image")
+        self.addCleanup(handle.release)
+
+        # A legacy caller inserting a second, unrelated runtime into the
+        # same (default) bucket -- pin supremacy is absolute, so put() must
+        # leave the bucket over its budget=1 rather than evict the pinned
+        # entry; it has no busy/failure contract of its own to report that.
+        cache.put("model-b", {"id": "model-b", "instance": object()})
+
+        self.assertTrue(cache.has("model-a"))
+        self.assertTrue(cache.has("model-b"))
+        self.assertEqual(set(cache.loaded_ids()), {"model-a", "model-b"})
+        self.assertEqual(cache._entries["model-a"].lease_count, 1)
+
+    def test_select_capacity_victim_denies_immediately_when_one_eviction_cannot_create_room(self):
+        # Codex re-review (PR4a v1 final-convergence pass): with budget=1,
+        # a pinned model-a, and an unpinned model-b -- the exact over-budget
+        # state the previous test documents as a legitimate,
+        # absolute-pin-supremacy outcome of legacy put() -- a fresh
+        # reservation attempt for a third id must not select and destroy
+        # model-b: evicting it alone still leaves model-a occupying the
+        # entire budget by itself, so `acquire_or_reserve()`'s own
+        # post-cleanup recheck would deny the new reservation regardless.
+        # Selecting and retiring model-b anyway would destroy a healthy
+        # runtime for no benefit whatsoever.
+        #
+        # model-a is pinned directly via the cache's own lower-level API
+        # (bypassing G/ModelService entirely), since this targets the
+        # cache-level victim-selection mechanism, not G/L/E service
+        # semantics.
+        cleanup = _RecordingCleanup()
+        cache = ModelRuntimeCache(max_entries=1, on_evict=cleanup)
+
+        entry_a = cache.acquire_or_reserve("model-a", "image")
+        cache.publish_ready_and_pin("model-a", entry_a, {"id": "model-a"})
+        self.assertEqual(cache._entries["model-a"].lease_count, 1)
+
+        cache.put("model-b", {"id": "model-b", "instance": object()})
+        self.assertTrue(cache.has("model-b"))
+
+        with self.assertRaises(RuntimeBusyError):
+            cache.acquire_or_reserve("model-c", "image")
+
+        # model-b must survive completely untouched.
+        self.assertTrue(cache.has("model-b"))
+        self.assertEqual(cleanup.calls, [])
+        self.assertEqual(set(cache.loaded_ids()), {"model-a", "model-b"})
+        self.assertEqual(cache._entries["model-b"].state, RuntimeState.READY)
+
+    # ---------------------------- Codex round-1 review (PR #415), 8 findings
+
+    # ---------------------------------------------------- Finding 1 (P1)
+    def test_admission_is_shared_process_wide_across_model_service_instances(self):
+        # Force a pristine, freshly-created shared default controller for
+        # this test regardless of what earlier tests in this process may
+        # have touched (every other test in this file passes an explicit
+        # `admission_capacity`, which never touches the shared default -- see
+        # `_build_service()` -- so this reset is defensive, not a workaround
+        # for real cross-test pollution).
+        service_module._default_admission_controller = None
+
+        manifest_a = _FakeManifest("model-a")
+        manifest_b = _FakeManifest("model-b")
+
+        state_lock = Lock()
+        state = {"current": 0, "max": 0}
+
+        def bump():
+            with state_lock:
+                state["current"] += 1
+                state["max"] = max(state["max"], state["current"])
+
+        def unbump():
+            with state_lock:
+                state["current"] -= 1
+
+        class _BumpingLoader:
+            def __init__(self, started: Event, release: Event):
+                self.load_calls = 0
+                self.started = started
+                self.release = release
+
+            def load(self, manifest):
+                self.load_calls += 1
+                bump()
+                self.started.set()
+                assert self.release.wait(timeout=5)
+                unbump()
+                return {"id": manifest.id, "instance": object()}
+
+        a_started = Event()
+        release_a = Event()
+        b_started = Event()
+        release_b = Event()
+        loader_a = _BumpingLoader(a_started, release_a)
+        loader_b = _BumpingLoader(b_started, release_b)
+
+        # Two SEPARATE ModelService instances -- mimicking two independent
+        # bootstrap/factories.py create_default_model_service() call sites
+        # (e.g. two standalone generator factories each constructing their
+        # own default service). Neither passes admission/admission_capacity,
+        # so both must fall back to ONE shared, process-wide default
+        # controller (Finding 1) rather than each getting its own private
+        # admission slot.
+        service_a = ModelService(
+            registry=None,
+            resolver=_FakeResolver({"model-a": manifest_a}),
+            loader_registry=_FakeLoaderRegistry({"fake": loader_a}),
+            runtime_cache=ModelRuntimeCache(max_entries=1),
+        )
+        service_b = ModelService(
+            registry=None,
+            resolver=_FakeResolver({"model-b": manifest_b}),
+            loader_registry=_FakeLoaderRegistry({"fake": loader_b}),
+            runtime_cache=ModelRuntimeCache(max_entries=1),
+        )
+
+        # Codex re-review: the primary, scheduling-independent proof --
+        # both instances hold the exact same controller object. (The
+        # concurrency proof below is a secondary, *behavioral* check that
+        # sharing actually blocks concurrent access in practice; on its
+        # own, if the scheduler happened to run worker_b only after A had
+        # already released, the old independent-semaphore bug would also
+        # have recorded state["max"] == 1, since neither semaphore would
+        # ever have been contended -- this identity assertion has no such
+        # gap.)
+        self.assertIs(service_a._admission, service_b._admission)
+
+        errors: list[BaseException] = []
+
+        def worker_a():
+            try:
+                with service_a.acquire_runtime("model-a", "image"):
+                    pass
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        def worker_b():
+            try:
+                with service_b.acquire_runtime("model-b", "image"):
+                    pass
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        ta = Thread(target=worker_a)
+        ta.start()
+        self.assertTrue(a_started.wait(timeout=5))  # A holds the shared G slot
+
+        tb = Thread(target=worker_b)
+        tb.start()
+        # B cannot proceed past the (shared) G until A releases it -- a
+        # same-ModelService-only test could never distinguish this from
+        # ordinary same-instance serialization; using two independent
+        # instances is what actually proves the domain is shared.
+        release_a.set()
+        ta.join(timeout=5)
+        self.assertTrue(b_started.wait(timeout=5))
+        release_b.set()
+        tb.join(timeout=5)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(state["max"], 1)  # never both "in flight" at once
+        self.assertEqual(loader_a.load_calls, 1)
+        self.assertEqual(loader_b.load_calls, 1)
+
+    # ---------------------------------------------------- Finding 7 (P2)
+    def test_admission_controller_rejects_nonpositive_capacity(self):
+        for bad_capacity in (0, -1):
+            with self.subTest(capacity=bad_capacity):
+                with self.assertRaises(ValueError):
+                    RuntimeAdmissionController(bad_capacity)
+
+    # ---------------------------------------------------- Finding 2 (P2) + INVALID-handoff retry
+    def test_invalid_marking_is_visible_to_an_e_waiter_before_it_wins_e(self):
+        # This proves two layered things:
+        #  1. (Unchanged since PR4a) `RuntimeHandle.release()` publishes
+        #     INVALID strictly before it releases E -- an E-waiter can never
+        #     revalidate a still-READY runtime another caller already
+        #     deemed unsafe. This is still exactly true and still what makes
+        #     (2) below safe.
+        #  2. (New) `acquire_runtime()` no longer treats "won E onto an
+        #     entry invalidated during the wait" as an immediate, permanent
+        #     failure -- B's own call transparently retries the L -> E
+        #     sub-sequence once, internally, and succeeds with a freshly
+        #     loaded runtime, because B's own losing attempt already
+        #     released its own stale lease on the now-INVALID entry before
+        #     the retry ever runs (see `_acquire_entry_and_execution_lock()`
+        #     in core/models/service.py).
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        # admission_capacity=2 so B's own acquire_runtime() call reaches E
+        # (not denied earlier by G) -- isolating the E/INVALID race this
+        # test targets from ordinary G contention.
+        service, cache = _build_service(
+            {"model-a": manifest_a}, {"fake": loader}, admission_capacity=2,
+        )
+
+        handle_a = service.acquire_runtime("model-a", "image")
+        entry_v1 = handle_a._entry
+        self.assertEqual(entry_v1.lease_count, 1)
+        self.assertEqual(loader.load_calls, 1)
+
+        b_thread_started = Event()
+        errors: list[BaseException] = []
+        b_result: dict[str, object] = {}
+
+        def worker_b():
+            b_thread_started.set()
+            try:
+                b_result["handle"] = service.acquire_runtime("model-a", "image")
+            except RuntimeBusyError as exc:
+                b_result["busy"] = exc
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        tb = Thread(target=worker_b)
+        tb.start()
+        self.assertTrue(b_thread_started.wait(timeout=5))
+
+        # A's use of the runtime failed. Release with had_exception=True
+        # while B is (or is about to be) contending for E via its own
+        # acquire_runtime() call. This is deterministic regardless of the
+        # exact scheduling interleaving: `RuntimeHandle.release()` marks
+        # INVALID (under a short M transaction) strictly *before* it calls
+        # `entry.execution_lock.release()`, in that order, on this same
+        # thread; and a `Lock.acquire()` can never return `True` before a
+        # matching `release()` call has already completed. So by the time
+        # B's own `entry.execution_lock.acquire()` returns -- whether B was
+        # already parked waiting, or arrives afterward -- the INVALID
+        # transition has unconditionally already happened, and B's own
+        # revalidation (`is_current_and_ready()`) is guaranteed to see it.
+        handle_a.release(had_exception=True)
+        self.assertEqual(entry_v1.state, RuntimeState.INVALID)
+
+        tb.join(timeout=5)
+        self.assertEqual(errors, [])
+        self.assertNotIn("busy", b_result)  # the internal retry must absorb this
+        self.assertIn("handle", b_result)
+        handle_b = b_result["handle"]
+
+        try:
+            # B's retry triggered a genuinely fresh load (loader call #2),
+            # not a stale read of A's old, now-cleaned-up runtime object.
+            self.assertEqual(loader.load_calls, 2)
+            self.assertIsNotNone(handle_b.runtime)
+            self.assertIsNot(handle_b.runtime, handle_a.runtime)
+
+            entry_v2 = cache._entries["model-a"]
+            self.assertIsNot(entry_v2, entry_v1)  # a fresh RuntimeEntry, not the old one
+            self.assertGreater(entry_v2.generation, entry_v1.generation)
+            self.assertEqual(entry_v2.state, RuntimeState.READY)
+            self.assertEqual(entry_v2.lease_count, 1)  # only B's own current lease
+        finally:
+            handle_b.release()
+
+        # Zero lease/G leak overall: A's lease/G were released above, and
+        # B's internal retry left nothing outstanding once its own handle is
+        # released -- checked precisely (not just "a later call succeeds"),
+        # since admission_capacity=2 alone would tolerate a 1-slot G leak.
+        self.assertEqual(cache._entries["model-a"].lease_count, 0)
+        self.assertEqual(service._admission._held_by_thread, {})
+
+        # A fresh, immediate (wait_timeout=0) acquisition still succeeds --
+        # the system is left fully healthy after B's retry-and-release.
+        handle_retry = service.acquire_runtime("model-a", "image", wait_timeout=0)
+        try:
+            self.assertIsNotNone(handle_retry.runtime)
+        finally:
+            handle_retry.release()
+
+    # ---------------------------------------- INVALID-handoff retry is bounded
+    def test_invalid_handoff_retry_is_bounded_to_one_attempt(self):
+        """If B's internally-retried L -> E attempt *also* wins E onto an
+        entry a second, independent failure invalidated in the meantime,
+        `acquire_runtime()` must give up -- raising the plain, public
+        `RuntimeBusyError` -- rather than retrying a third time.
+
+        The second failure is injected by wrapping
+        `cache.publish_ready_and_pin()` so that `mark_invalid()` (the same
+        FP-005 publish-before-handoff primitive `RuntimeHandle.release()`
+        itself uses) runs on B's own thread, immediately after B's retried
+        load publishes -- strictly *before* B's own thread can possibly go
+        on to attempt `entry_v2.execution_lock.acquire()`, since
+        `_acquire_or_load_entry()` cannot call `_acquire_execution_lock()`
+        until this wrapped call has returned. This is a same-thread
+        sequencing guarantee, not a timing guess -- the only other
+        synchronization point needed is real contention on the loader's own
+        blocking second call.
+        """
+        manifest_a = _FakeManifest("model-a")
+        second_load_started = Event()
+        second_load_release = Event()
+        loader = _SecondCallBlocksLoader(
+            started=second_load_started, release=second_load_release,
+        )
+        service, cache = _build_service(
+            {"model-a": manifest_a}, {"fake": loader}, admission_capacity=2,
+        )
+
+        handle_a = service.acquire_runtime("model-a", "image")
+        entry_v1 = handle_a._entry
+        self.assertEqual(loader.load_calls, 1)
+
+        b_thread_started = Event()
+        errors: list[BaseException] = []
+        b_result: dict[str, object] = {}
+
+        def worker_b():
+            b_thread_started.set()
+            try:
+                b_result["handle"] = service.acquire_runtime("model-a", "image")
+            except RuntimeBusyError as exc:
+                b_result["busy"] = exc
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        tb = Thread(target=worker_b)
+        tb.start()
+        self.assertTrue(b_thread_started.wait(timeout=5))
+
+        # A fails; B wins E onto the now-INVALID entry_v1, loses its first
+        # revalidation, releases its own stale lease, and (still on its own
+        # thread) begins its one internal retry: acquire_or_reserve() sees
+        # entry_v1 INVALID + unpinned, retires it, and reserves a fresh
+        # LOADING entry_v2 before calling loader.load() a second time.
+        handle_a.release(had_exception=True)
+        self.assertEqual(entry_v1.state, RuntimeState.INVALID)
+
+        # B's retry is now genuinely blocked *inside* its own second
+        # loader.load() call -- a real synchronization point, not a guess.
+        self.assertTrue(second_load_started.wait(timeout=5))
+        entry_v2 = cache._entries["model-a"]
+        self.assertIsNot(entry_v2, entry_v1)
+        self.assertEqual(entry_v2.state, RuntimeState.LOADING)
+
+        original_publish = cache.publish_ready_and_pin
+
+        def publish_then_invalidate_again(canonical_id, reserved_entry, runtime_obj):
+            published = original_publish(canonical_id, reserved_entry, runtime_obj)
+            cache.mark_invalid(canonical_id, published)
+            return published
+
+        cache.publish_ready_and_pin = publish_then_invalidate_again
+        second_load_release.set()
+
+        tb.join(timeout=5)
+        # Restored only after B's own acquire_runtime() call has fully
+        # returned (joined) -- B is the only other caller that can reach
+        # publish_ready_and_pin() for "model-a" during this window.
+        cache.publish_ready_and_pin = original_publish
+
+        self.assertEqual(errors, [])
+        self.assertNotIn("handle", b_result)
+        # Exactly the plain, public RuntimeBusyError -- not a leaked private
+        # subtype, and not RuntimeWaitTimeoutError.
+        self.assertIs(type(b_result.get("busy")), RuntimeBusyError)
+
+        # Exactly two loads total: A's original, plus B's one internal
+        # retry. No third attempt was ever made.
+        self.assertEqual(loader.load_calls, 2)
+
+        # No lease/E/G leak from B's exhausted retry.
+        self.assertEqual(entry_v2.state, RuntimeState.INVALID)
+        self.assertEqual(entry_v2.lease_count, 0)
+        self.assertTrue(entry_v2.execution_lock.acquire(blocking=False))
+        entry_v2.execution_lock.release()
+        self.assertEqual(service._admission._held_by_thread, {})
+
+        # The system is still healthy afterward: a fresh call replaces the
+        # now-INVALID entry_v2 with a third, genuinely new load.
+        handle_final = service.acquire_runtime("model-a", "image", wait_timeout=0)
+        try:
+            self.assertIsNotNone(handle_final.runtime)
+        finally:
+            handle_final.release()
+        self.assertEqual(loader.load_calls, 3)
+
+    # ------------------------- Multi-waiter INVALID-entry drain (PR #420)
+    #
+    # Codex-reproduced finding: the single-caller "exactly one retry" rule
+    # above is insufficient once `admission_capacity >= 2` lets more than
+    # one caller pin the same entry before it is invalidated -- a caller's
+    # own retry can lose a race against a *different* stale lease-holder's
+    # still-outstanding pin on the exact same entry, even though that pin
+    # is provably draining. See `_RuntimeInvalidEntryDrainingError` and
+    # `ModelService._acquire_entry_after_revalidation_failure()` for the
+    # fix and its full rationale.
+
+    def test_multi_waiter_drain_both_stale_waiters_converge(self):
+        # A owns E; B and C both independently pin the same READY entry and
+        # park behind A on E. Only one of B/C can win E first; the loser is
+        # still pinned on the exact entry the winner's own post-E
+        # revalidation just failed on. Before this fix, the winner's one
+        # internal retry would observe INVALID+still-pinned (because the
+        # loser had not unwound yet) and fail immediately with a plain,
+        # permanent RuntimeBusyError -- even though the loser's pin was
+        # already draining and about to release. This proves neither
+        # thread receives that spurious failure: both converge on a
+        # freshly loaded runtime, loaded exactly once -- and leaves no
+        # G/L/E/lease leak behind.
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service(
+            {"model-a": manifest_a}, {"fake": loader}, admission_capacity=3,
+        )
+
+        handle_a = service.acquire_runtime("model-a", "image")
+        entry_v1 = handle_a._entry
+        self.assertEqual(loader.load_calls, 1)
+
+        # Confirmed once each worker's own initial pin (the READY-hit
+        # increment inside `_acquire_or_load_entry()`) has actually
+        # completed -- a real synchronization point (a method call
+        # returning), not a sleep-then-check guess.
+        pinned = {"b": Event(), "c": Event()}
+        original_acquire_or_load = service._acquire_or_load_entry
+
+        def instrumented_acquire_or_load(manifest, media_type, deadline):
+            entry = original_acquire_or_load(manifest, media_type, deadline)
+            event = pinned.get(current_thread().name)
+            if event is not None:
+                event.set()
+            return entry
+
+        service._acquire_or_load_entry = instrumented_acquire_or_load
+
+        errors: dict[str, BaseException] = {}
+        results: dict[str, object] = {}
+        entries_seen: dict[str, RuntimeEntry] = {}
+
+        def worker(name):
+            # Mirrors a real generator: acquire, use briefly, release --
+            # never holds the handle open indefinitely. This matters
+            # structurally, not just stylistically: E is exclusive per
+            # entry, so if both threads tried to hold a returned handle
+            # open at once, whichever of B/C loses the race for E on the
+            # *fresh* entry would block on this test's own two open
+            # handles rather than on anything this fix is responsible
+            # for -- a self-inflicted deadlock in the test, not a bug.
+            try:
+                handle = service.acquire_runtime("model-a", "image")
+                try:
+                    results[name] = handle.runtime
+                    entries_seen[name] = handle._entry
+                finally:
+                    handle.release()
+            except BaseException as exc:  # noqa: BLE001
+                errors[name] = exc
+
+        tb = Thread(target=worker, args=("b",), name="b")
+        tc = Thread(target=worker, args=("c",), name="c")
+        tb.start()
+        tc.start()
+        self.assertTrue(pinned["b"].wait(timeout=5))
+        self.assertTrue(pinned["c"].wait(timeout=5))
+        service._acquire_or_load_entry = original_acquire_or_load
+        self.assertEqual(entry_v1.lease_count, 3)  # A + B + C
+
+        handle_a.release(had_exception=True)
+        self.assertEqual(entry_v1.state, RuntimeState.INVALID)
+
+        tb.join(timeout=5)
+        tc.join(timeout=5)
+        self.assertFalse(tb.is_alive())
+        self.assertFalse(tc.is_alive())
+
+        self.assertEqual(errors, {})
+        self.assertEqual(set(results), {"b", "c"})
+        self.assertIsNotNone(results["b"])
+        self.assertIsNotNone(results["c"])
+
+        entry_v2 = cache._entries["model-a"]
+        self.assertIsNot(entry_v2, entry_v1)
+        self.assertGreater(entry_v2.generation, entry_v1.generation)
+        self.assertEqual(entry_v2.state, RuntimeState.READY)
+        self.assertIs(entries_seen["b"], entry_v2)
+        self.assertIs(entries_seen["c"], entry_v2)
+
+        # Exactly one fresh load: A's original, plus one reload shared by
+        # both B and C -- never a third/unbounded stale-generation load.
+        self.assertEqual(loader.load_calls, 2)
+
+        # Full G/L/E/lease leak checklist -- both workers already released
+        # their own handles above.
+        self.assertEqual(cache._entries["model-a"].lease_count, 0)
+        self.assertEqual(service._admission._held_by_thread, {})
+        self.assertTrue(cache.lock_for("model-a").acquire(blocking=False))
+        cache.lock_for("model-a").release()
+        self.assertTrue(entry_v1.execution_lock.acquire(blocking=False))
+        entry_v1.execution_lock.release()
+        self.assertTrue(entry_v2.execution_lock.acquire(blocking=False))
+        entry_v2.execution_lock.release()
+
+    def test_healthy_pinned_capacity_busy_never_invokes_drain_logic(self):
+        # A genuinely busy, healthy (READY) entry occupying the only
+        # capacity slot in its bucket must still fail fast, exactly as
+        # before this fix -- the new drain-retry logic exists only for
+        # INVALID-and-pinned entries and must never even be consulted for
+        # an ordinary pinned-capacity failure. Proved by instrumenting
+        # `wait_for_stale_entry_drain()` itself, not by elapsed time.
+        manifest_a = _FakeManifest("model-a")
+        manifest_b = _FakeManifest("model-b")
+        loader = _ImmediateLoader()
+        service, cache = _build_service(
+            {"model-a": manifest_a, "model-b": manifest_b}, {"fake": loader},
+            max_entries=1, admission_capacity=2,
+        )
+
+        handle_a = service.acquire_runtime("model-a", "image")
+
+        drain_calls: list[str] = []
+        original_wait = cache.wait_for_stale_entry_drain
+
+        def instrumented_wait(canonical_id, entry, deadline):
+            drain_calls.append(canonical_id)
+            return original_wait(canonical_id, entry, deadline)
+
+        cache.wait_for_stale_entry_drain = instrumented_wait
+
+        # A different thread, not this one -- G's own nested-acquire ban
+        # rejects a same-thread second `acquire_runtime()` call
+        # unconditionally, regardless of canonical id, which would
+        # otherwise mask the actual pinned-capacity busy path this test
+        # targets (see test_pinned_eviction_returns_busy_without_touching_the_pinned_entry
+        # for the same requirement).
+        result: dict[str, object] = {}
+
+        def worker():
+            try:
+                service.acquire_runtime("model-b", "image", wait_timeout=1.0)
+            except BaseException as exc:  # noqa: BLE001
+                result["error"] = exc
+
+        try:
+            tb = Thread(target=worker)
+            tb.start()
+            tb.join(timeout=5)
+            self.assertFalse(tb.is_alive())
+            # Exactly the plain, public type -- not RuntimeWaitTimeoutError,
+            # and not a leaked private drain-signal subtype.
+            self.assertIs(type(result.get("error")), RuntimeBusyError)
+        finally:
+            cache.wait_for_stale_entry_drain = original_wait
+            handle_a.release()
+
+        self.assertEqual(drain_calls, [])
+
+    def test_generation_isolation_does_not_attach_drain_retry_to_a_different_entry(self):
+        # A caller's own revalidation failure on `entry_v1` must only ever
+        # trigger a drain-wait for `entry_v1` itself, by object identity --
+        # never for a *different*, newer-generation entry under the same
+        # canonical id that happens, independently, to also be INVALID and
+        # pinned. Constructed directly at the cache layer for a precise,
+        # deterministic proof of this one scope-guard boundary, rather than
+        # via a timing-dependent multi-thread race.
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service(
+            {"model-a": manifest_a}, {"fake": loader}, admission_capacity=2,
+        )
+
+        # entry_v1: a stale entry a caller already failed revalidation on,
+        # but which has since fully drained and is no longer
+        # `cache._entries`'s current entry for "model-a" at all.
+        entry_v1 = cache.acquire_or_reserve("model-a", "image")
+        cache.publish_ready_and_pin("model-a", entry_v1, {"id": "model-a", "gen": 1})
+        cache.mark_invalid("model-a", entry_v1)
+        cache.release_lease("model-a", entry_v1)
+        self.assertEqual(entry_v1.lease_count, 0)
+
+        # entry_v2: a genuinely different, newer generation, independently
+        # invalidated while still pinned by an unrelated caller -- the
+        # drain this test proves must never be conflated with entry_v1's.
+        entry_v2 = cache.acquire_or_reserve("model-a", "image")
+        self.assertIsNot(entry_v2, entry_v1)
+        self.assertGreater(entry_v2.generation, entry_v1.generation)
+        cache.publish_ready_and_pin("model-a", entry_v2, {"id": "model-a", "gen": 2})
+        second_pin = cache.acquire_or_reserve("model-a", "image")
+        self.assertIs(second_pin, entry_v2)
+        cache.mark_invalid("model-a", entry_v2)
+        self.assertEqual(entry_v2.lease_count, 2)
+
+        drain_calls: list[RuntimeEntry] = []
+        original_wait = cache.wait_for_stale_entry_drain
+
+        def instrumented_wait(canonical_id, entry, deadline):
+            drain_calls.append(entry)
+            return original_wait(canonical_id, entry, deadline)
+
+        cache.wait_for_stale_entry_drain = instrumented_wait
+        # This call's own operation-local stale-drain state, armed with the
+        # entry its (simulated) revalidation failure was about.
+        drain = service_module._StaleDrainOperation()
+        drain.entry = entry_v1
+        try:
+            with self.assertRaises(RuntimeBusyError) as caught:
+                service._acquire_entry_after_revalidation_failure(
+                    manifest_a, "image", None, drain,
+                )
+            self.assertIs(type(caught.exception), RuntimeBusyError)
+        finally:
+            cache.wait_for_stale_entry_drain = original_wait
+
+        # The drain-wait must never even be invoked for entry_v2 -- it is
+        # not the entry this caller's own revalidation failure was about.
+        self.assertEqual(drain_calls, [])
+        # entry_v2's own, genuinely still-outstanding pins are left
+        # completely untouched by this rejected retry.
+        self.assertEqual(entry_v2.lease_count, 2)
+        self.assertEqual(entry_v2.state, RuntimeState.INVALID)
+
+        cache.release_lease("model-a", entry_v2)
+        cache.release_lease("model-a", entry_v2)
+
+    def test_drain_wait_bounded_by_caller_deadline_surfaces_wait_timeout(self):
+        # B must itself go through a real pin -> E-race -> revalidation
+        # failure to ever reach the drain-wait at all -- a fresh caller
+        # with no revalidation failure of its own fails fast instead (see
+        # test_healthy_pinned_capacity_busy_never_invokes_drain_logic and
+        # test_invalid_entry_still_leased_by_another_caller_denies_new_acquires).
+        # A *separate* straggler's stale pin -- taken directly at the
+        # cache layer, never touching E -- deliberately never releases
+        # within this test, so B's own drain-wait can never converge on
+        # its own: this proves the wait bounds itself strictly by B's own
+        # acquisition deadline, never by however long the drain might
+        # legitimately take, and never degrades into a plain, permanent
+        # RuntimeBusyError solely because the drain has not finished yet.
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service(
+            {"model-a": manifest_a}, {"fake": loader}, admission_capacity=2,
+        )
+
+        handle_a = service.acquire_runtime("model-a", "image")
+        entry_v1 = handle_a._entry
+
+        straggler_pin = cache.acquire_or_reserve("model-a", "image")
+        self.assertIs(straggler_pin, entry_v1)
+
+        pinned_b = Event()
+        original_acquire_or_load = service._acquire_or_load_entry
+
+        def instrumented_acquire_or_load(manifest, media_type, deadline):
+            entry = original_acquire_or_load(manifest, media_type, deadline)
+            pinned_b.set()
+            return entry
+
+        service._acquire_or_load_entry = instrumented_acquire_or_load
+
+        b_result: dict[str, BaseException] = {}
+
+        def worker_b():
+            try:
+                service.acquire_runtime("model-a", "image", wait_timeout=0.2)
+            except BaseException as exc:  # noqa: BLE001
+                b_result["error"] = exc
+
+        tb = Thread(target=worker_b)
+        tb.start()
+        self.assertTrue(pinned_b.wait(timeout=5))
+        service._acquire_or_load_entry = original_acquire_or_load
+        self.assertEqual(entry_v1.lease_count, 3)  # A + straggler + B
+
+        handle_a.release(had_exception=True)
+        self.assertEqual(entry_v1.state, RuntimeState.INVALID)
+
+        tb.join(timeout=5)
+        self.assertFalse(tb.is_alive())
+
+        # The deadline-shaped subtype a cancellation-aware generator's own
+        # bounded polling loop already retries -- never the plain,
+        # permanent RuntimeBusyError a spurious multi-waiter failure would
+        # raise.
+        self.assertIs(type(b_result.get("error")), RuntimeWaitTimeoutError)
+
+        # No leak from B's failed attempt: only the straggler's
+        # deliberately-still-outstanding pin remains.
+        self.assertEqual(entry_v1.lease_count, 1)
+        self.assertEqual(entry_v1.state, RuntimeState.INVALID)
+        self.assertEqual(service._admission._held_by_thread, {})
+        self.assertTrue(cache.lock_for("model-a").acquire(blocking=False))
+        cache.lock_for("model-a").release()
+        self.assertTrue(entry_v1.execution_lock.acquire(blocking=False))
+        entry_v1.execution_lock.release()
+
+        # Once the straggler finally does release, the system converges
+        # normally.
+        cache.release_lease("model-a", entry_v1)
+        self.assertEqual(entry_v1.lease_count, 0)
+        handle_retry = service.acquire_runtime("model-a", "image", wait_timeout=0)
+        try:
+            self.assertIsNotNone(handle_retry.runtime)
+            self.assertEqual(loader.load_calls, 2)
+        finally:
+            handle_retry.release()
+
+    def test_deadline_none_drain_wait_blocks_without_spinning_then_progresses(self):
+        # Same shape as the deadline-bounded test above -- B must itself
+        # fail its own revalidation before the drain-wait is even
+        # reachable -- but with `wait_timeout=None`: the wait may
+        # legitimately block for a stale lease to drain, but must never
+        # busy-spin. Proved two ways, both timing-independent: the
+        # underlying `Condition.wait()` is called at most once (a real,
+        # indefinite OS-level block a notification wakes -- not a tight
+        # retry loop), and the cache-level reservation check itself runs
+        # only a small, fixed number of times. B makes no progress until
+        # the straggler's lease is explicitly released from a controlled
+        # point in this test -- never from elapsed wall-clock time.
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service(
+            {"model-a": manifest_a}, {"fake": loader}, admission_capacity=2,
+        )
+
+        handle_a = service.acquire_runtime("model-a", "image")
+        entry_v1 = handle_a._entry
+
+        straggler_pin = cache.acquire_or_reserve("model-a", "image")
+        self.assertIs(straggler_pin, entry_v1)
+
+        pinned_b = Event()
+        original_acquire_or_load = service._acquire_or_load_entry
+
+        def instrumented_acquire_or_load(manifest, media_type, deadline):
+            entry = original_acquire_or_load(manifest, media_type, deadline)
+            pinned_b.set()
+            return entry
+
+        service._acquire_or_load_entry = instrumented_acquire_or_load
+
+        errors: list[BaseException] = []
+        b_result: dict[str, object] = {}
+
+        def worker_b():
+            try:
+                b_result["handle"] = service.acquire_runtime("model-a", "image")
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        tb = Thread(target=worker_b)
+        tb.start()
+        self.assertTrue(pinned_b.wait(timeout=5))
+        service._acquire_or_load_entry = original_acquire_or_load
+        self.assertEqual(entry_v1.lease_count, 3)  # A + straggler + B
+
+        # Counts real `Condition.wait()` calls on M -- the definitive,
+        # timing-independent proof this is a genuine block-then-wake, not
+        # a tight retry loop: a busy-spin variant would call this (or an
+        # equivalent) far more than once before converging.
+        wait_calls: list[float | None] = []
+        original_condition_wait = cache._metadata_lock.wait
+
+        def counting_wait(timeout=None):
+            wait_calls.append(timeout)
+            return original_condition_wait(timeout)
+
+        cache._metadata_lock.wait = counting_wait
+
+        # A second, independent, timing-robust proof of the same property:
+        # the number of times the cache-level pin/reserve check itself
+        # runs while draining. A spin loop would retry this unboundedly
+        # fast; correct code calls it only the small, fixed number of
+        # times genuine state transitions require.
+        reserve_calls: list[str] = []
+        original_acquire_or_reserve = cache.acquire_or_reserve
+
+        def counting_acquire_or_reserve(canonical_id, media_type):
+            reserve_calls.append(canonical_id)
+            return original_acquire_or_reserve(canonical_id, media_type)
+
+        cache.acquire_or_reserve = counting_acquire_or_reserve
+
+        b_entered_drain_wait = Event()
+        original_wait_for_drain = cache.wait_for_stale_entry_drain
+
+        def instrumented_wait_for_drain(canonical_id, entry, deadline):
+            b_entered_drain_wait.set()
+            return original_wait_for_drain(canonical_id, entry, deadline)
+
+        cache.wait_for_stale_entry_drain = instrumented_wait_for_drain
+
+        handle_a.release(had_exception=True)
+        self.assertEqual(entry_v1.state, RuntimeState.INVALID)
+
+        self.assertTrue(b_entered_drain_wait.wait(timeout=5))
+
+        # Release the straggler's stale lease -- the only thing that can
+        # possibly let B's wait converge (nothing else in this test could
+        # have caused it to return yet).
+        cache.release_lease("model-a", entry_v1)
+
+        tb.join(timeout=5)
+        cache.wait_for_stale_entry_drain = original_wait_for_drain
+        cache.acquire_or_reserve = original_acquire_or_reserve
+        cache._metadata_lock.wait = original_condition_wait
+
+        self.assertFalse(tb.is_alive())
+        self.assertEqual(errors, [])
+        self.assertIn("handle", b_result)
+
+        # Not a spin: at most one genuine block on the Condition (it may
+        # legitimately be zero, if the release above and B's own predicate
+        # check happened to interleave such that B never needed to park
+        # at all -- either way, never more than one).
+        self.assertLessEqual(len(wait_calls), 1)
+        # A small, fixed number of reservation-check calls -- never
+        # growing with however long the drain happened to take.
+        self.assertLessEqual(len(reserve_calls), 3)
+
+        handle_b = b_result["handle"]
+        try:
+            entry_v2 = cache._entries["model-a"]
+            self.assertIsNot(entry_v2, entry_v1)
+            self.assertGreater(entry_v2.generation, entry_v1.generation)
+            self.assertEqual(entry_v2.state, RuntimeState.READY)
+            self.assertEqual(entry_v2.lease_count, 1)
+            self.assertEqual(loader.load_calls, 2)
+        finally:
+            handle_b.release()
+
+        self.assertEqual(cache._entries["model-a"].lease_count, 0)
+        self.assertEqual(service._admission._held_by_thread, {})
+
+    # ---------- PR #420: operation-scoped stale-drain polling (wait_checkpoint)
+    #
+    # Approved ownership contract (Design C): stale-drain eligibility belongs
+    # to exactly ONE public `acquire_runtime()` call and never survives it.
+    # A cancellation-aware caller expresses "keep waiting in short slices,
+    # but let me stop between them" with `wait_checkpoint=`, never by
+    # re-calling the public API in its own loop -- separate public calls are
+    # always independent, fresh callers. See `ModelService.acquire_runtime()`.
+
+    def _build_stale_drain_scenario(self, loader=None):
+        """A holds entry S; a straggler lease is taken directly at the cache
+        layer (the established stand-in for a second, still-outstanding
+        stale lease-holder -- see
+        test_drain_wait_bounded_by_caller_deadline_surfaces_wait_timeout)."""
+
+        manifest_a = _FakeManifest("model-a")
+        loader = loader if loader is not None else _ImmediateLoader()
+        service, cache = _build_service(
+            {"model-a": manifest_a}, {"fake": loader}, admission_capacity=2,
+        )
+        handle_a = service.acquire_runtime("model-a", "image")
+        self.assertIs(cache.acquire_or_reserve("model-a", "image"), handle_a._entry)
+        return service, cache, loader, handle_a
+
+    def _gate_pin(self, service, thread_name, *, on_call=1):
+        """Park `thread_name`'s `on_call`-th `_acquire_or_load_entry()` call
+        right after it has pinned its entry, until `proceed` is set.
+
+        Makes a post-E revalidation failure deterministic: the test
+        invalidates the pinned entry (releasing its E) while the caller is
+        parked here, holding only G and its own lease -- so the caller's
+        next step always wins a free E onto an INVALID entry, never racing
+        its own slice deadline. Returns `(pinned, proceed)`; restored by
+        `del service._acquire_or_load_entry`."""
+
+        pinned, proceed = Event(), Event()
+        original = service._acquire_or_load_entry
+        calls = {"n": 0}
+
+        def gated(manifest, media_type, deadline):
+            entry = original(manifest, media_type, deadline)
+            if current_thread().name == thread_name:
+                calls["n"] += 1
+                if calls["n"] == on_call:
+                    pinned.set()
+                    proceed.wait(timeout=5)
+            return entry
+
+        service._acquire_or_load_entry = gated
+        return pinned, proceed
+
+    def _record_drain_waits(self, cache):
+        """Record every `wait_for_stale_entry_drain()` as `(thread name,
+        entry generation, converged)` -- generations, never entry objects,
+        so the recorder itself can never retain a `RuntimeEntry`. Returns
+        `(records, timed_out)`; restored by `del cache.wait_for_stale_entry_drain`."""
+
+        records: list[tuple[str, int, bool]] = []
+        timed_out = Event()
+        original = cache.wait_for_stale_entry_drain
+
+        def recording(canonical_id, entry, deadline):
+            converged = original(canonical_id, entry, deadline)
+            records.append((current_thread().name, entry.generation, converged))
+            if not converged:
+                timed_out.set()
+            return converged
+
+        cache.wait_for_stale_entry_drain = recording
+        return records, timed_out
+
+    def _resources_held(self, service, cache, canonical_id, entry=None):
+        """Called from INSIDE a `wait_checkpoint`: which of G/L/M/E does this
+        thread (or anyone) still hold? Non-blocking probes only; the caller
+        guarantees no other thread is inside the cache meanwhile."""
+
+        held: list[str] = []
+        if current_thread() in service._admission._held_by_thread:
+            held.append("G")
+        load_lock = cache.lock_for(canonical_id)
+        if load_lock.acquire(blocking=False):
+            load_lock.release()
+        else:
+            held.append("L")
+        if cache._metadata_lock.acquire(blocking=False):
+            cache._metadata_lock.release()
+        else:
+            held.append("M")
+        if entry is not None:
+            if entry.execution_lock.acquire(blocking=False):
+                entry.execution_lock.release()
+            else:
+                held.append("E")
+        return held
+
+    def _assert_service_retains_no_entry(self, service):
+        for name, value in vars(service).items():
+            self.assertNotIsInstance(value, RuntimeEntry, name)
+            if isinstance(value, dict):
+                for item in list(value.values()) + list(value.keys()):
+                    self.assertNotIsInstance(item, RuntimeEntry, name)
+
+    def _assert_exception_chain_carries_no_entry(self, exc):
+        seen = 0
+        visited: set[int] = set()
+        pending: list[BaseException | None] = [exc]
+        while pending:
+            current = pending.pop()
+            if current is None or id(current) in visited:
+                continue
+            visited.add(id(current))
+            seen += 1
+            self.assertIsNone(
+                getattr(current, "entry", None),
+                f"{type(current).__name__} in the surfaced chain carries a RuntimeEntry",
+            )
+            pending.extend([current.__cause__, current.__context__])
+        self.assertGreaterEqual(seen, 1)
+
+    # 1 + 2 + 14: converge across repeated slices, nothing held at checkpoints
+    def test_checkpointed_acquire_converges_across_stale_drain_timeout_slices(self):
+        service, cache, loader, handle_a = self._build_stale_drain_scenario()
+        stale = handle_a._entry
+        pinned, proceed = self._gate_pin(service, "b")
+        drain_records, _ = self._record_drain_waits(cache)
+        reached, release = Event(), Event()
+        checkpoint_timeouts_seen: list[int] = []
+        held_at_checkpoint: list[tuple[int, list[str]]] = []
+        result: dict = {}
+
+        def checkpoint():
+            timeouts = sum(1 for _, _, converged in drain_records if not converged)
+            first = not checkpoint_timeouts_seen
+            checkpoint_timeouts_seen.append(timeouts)
+            # Before the first slice A still legitimately owns S's E and a
+            # lease; from the second checkpoint on, only the straggler does.
+            held = self._resources_held(service, cache, "model-a", None if first else stale)
+            if not first and stale.lease_count != 1:
+                held.append(f"lease_count={stale.lease_count}")
+            held_at_checkpoint.append((len(checkpoint_timeouts_seen), held))
+            if timeouts >= 3 and not reached.is_set():
+                reached.set()
+                release.wait(timeout=5)
+
+        def worker():
+            try:
+                result["handle"] = service.acquire_runtime(
+                    "model-a", "image", wait_checkpoint=checkpoint, poll_interval=0.05,
+                )
+            except BaseException as exc:  # noqa: BLE001
+                result["error"] = exc
+
+        tb = Thread(target=worker, name="b", daemon=True)
+        try:
+            tb.start()
+            self.assertTrue(pinned.wait(timeout=5))
+            self.assertEqual(stale.lease_count, 3)  # A + straggler + B
+            handle_a.release(had_exception=True)
+            self.assertIs(stale.state, RuntimeState.INVALID)
+            proceed.set()
+
+            self.assertTrue(reached.wait(timeout=5))
+            # B is parked inside its own checkpoint after >= 3 drain-timeout
+            # slices -- every one of them on S itself, the same exact
+            # generation, never a replacement, never another thread.
+            self.assertGreaterEqual(len(drain_records), 3)
+            self.assertEqual(
+                {(name, gen, ok) for name, gen, ok in drain_records},
+                {("b", stale.generation, False)},
+            )
+            self.assertIs(cache._entries["model-a"], stale)
+            self.assertEqual(loader.load_calls, 1)
+            self.assertEqual(stale.lease_count, 1)
+
+            cache.release_lease("model-a", stale)  # the straggler finally drains
+            release.set()
+            tb.join(timeout=5)
+            self.assertFalse(tb.is_alive())
+            self.assertNotIn("error", result)
+            handle_b = result["handle"]
+            try:
+                self.assertIsNot(handle_b._entry, stale)
+                self.assertGreater(handle_b._entry.generation, stale.generation)
+                self.assertEqual(loader.load_calls, 2)
+            finally:
+                handle_b.release()
+
+            self.assertEqual(
+                [item for item in held_at_checkpoint if item[1]], [],
+                "wait_checkpoint ran while runtime resources were still held",
+            )
+            self.assertGreaterEqual(len(checkpoint_timeouts_seen), 4)
+            self.assertEqual(service._admission._held_by_thread, {})
+            self._assert_service_retains_no_entry(service)
+        finally:
+            proceed.set()
+            release.set()
+            tb.join(timeout=5)
+
+    # 3 + 8 + 9: cancellation at a checkpoint abandons state, retains nothing
+    def test_checkpoint_cancellation_after_drain_timeout_abandons_stale_state(self):
+        loader = _WeakrefTrackingLoader()
+        service, cache, _, handle_a = self._build_stale_drain_scenario(loader)
+        stale = handle_a._entry
+        pinned, proceed = self._gate_pin(service, "b")
+        drain_records, drain_timed_out = self._record_drain_waits(cache)
+        cancellation = _Cancelled("job cancelled while waiting for a stale drain")
+        checkpoint_calls = {"n": 0}
+        result: dict = {}
+
+        def checkpoint():
+            checkpoint_calls["n"] += 1
+            if drain_timed_out.is_set():
+                raise cancellation
+
+        def worker():
+            try:
+                service.acquire_runtime(
+                    "model-a", "image", wait_checkpoint=checkpoint, poll_interval=0.05,
+                )
+            except BaseException as exc:  # noqa: BLE001
+                result["error"] = exc
+
+        tb = Thread(target=worker, name="b", daemon=True)
+        try:
+            tb.start()
+            self.assertTrue(pinned.wait(timeout=5))
+            handle_a.release(had_exception=True)
+            proceed.set()
+            tb.join(timeout=5)
+            self.assertFalse(tb.is_alive())
+        finally:
+            proceed.set()
+            tb.join(timeout=5)
+
+        # The checkpoint's own exception object, unchanged, with no
+        # runtime-internal exception attached as its context.
+        self.assertIs(result.get("error"), cancellation)
+        self.assertIsNone(cancellation.__context__)
+        self.assertIsNone(cancellation.__cause__)
+        self.assertEqual(checkpoint_calls["n"], 2)  # before slice 1, after its timeout
+        self.assertEqual([ok for _, _, ok in drain_records], [False])
+
+        # Nothing leaked: only the straggler's lease remains.
+        self.assertEqual(stale.lease_count, 1)
+        self.assertEqual(service._admission._held_by_thread, {})
+        self.assertTrue(stale.execution_lock.acquire(blocking=False))
+        stale.execution_lock.release()
+        self.assertTrue(cache.lock_for("model-a").acquire(blocking=False))
+        cache.lock_for("model-a").release()
+        self._assert_service_retains_no_entry(service)
+
+        # Retention proof, with the surfaced cancellation still alive: once
+        # the cache itself drops S, S (and its runtime) must be collectable.
+        del cache.wait_for_stale_entry_drain
+        del service._acquire_or_load_entry
+        runtime_ref = loader.refs[0]
+        cache.release_lease("model-a", stale)
+        del stale, handle_a
+        service.unload_model("model-a")
+        self.assertNotIn("model-a", cache._entries)
+        gc.collect()
+        self.assertIsNone(runtime_ref(), "the abandoned stale entry is still strongly retained")
+        self.assertIs(result["error"], cancellation)
+
+    # 4 (plain API): the documented contract -- separate calls never share state
+    def test_reused_worker_thread_after_abandoned_plain_polling_is_a_fresh_caller(self):
+        service, cache, loader, handle_a = self._build_stale_drain_scenario()
+        stale = handle_a._entry
+        pinned, proceed = self._gate_pin(service, "worker")
+        drain_records, drain_timed_out = self._record_drain_waits(cache)
+        pool = _SingleWorker("worker")
+
+        def job_one():
+            # A hand-written poll loop of plain calls that gives up (as a
+            # cancelled job would) right after its first stale-drain timeout.
+            while True:
+                try:
+                    return service.acquire_runtime("model-a", "image", wait_timeout=0.05)
+                except RuntimeWaitTimeoutError:
+                    if drain_timed_out.is_set():
+                        raise _Cancelled("job one cancelled")
+
+        def job_two():
+            return service.acquire_runtime("model-a", "image", wait_timeout=1.0)
+
+        try:
+            done_one, box_one = pool.submit(job_one)
+            self.assertTrue(pinned.wait(timeout=5))
+            handle_a.release(had_exception=True)
+            proceed.set()
+            self.assertTrue(done_one.wait(timeout=5))
+            self.assertIsInstance(box_one.get("error"), _Cancelled)
+            waits_after_job_one = len(drain_records)
+            self.assertEqual(waits_after_job_one, 1)
+
+            # S is still INVALID and still pinned by the straggler.
+            self.assertIs(cache._entries["model-a"], stale)
+            self.assertEqual(stale.lease_count, 1)
+
+            done_two, box_two = pool.submit(job_two)
+            self.assertTrue(done_two.wait(timeout=5))
+            self.assertIs(box_two["thread"], box_one["thread"])
+            # A logically unrelated job on the very same worker thread is a
+            # fresh caller: immediate, plain, non-retryable busy -- it never
+            # waits on the old job's stale drain.
+            self.assertIs(type(box_two.get("error")), RuntimeBusyError)
+            self.assertEqual(len(drain_records), waits_after_job_one)
+            self._assert_service_retains_no_entry(service)
+            self.assertEqual(service._admission._held_by_thread, {})
+        finally:
+            proceed.set()
+            pool.stop()
+        cache.release_lease("model-a", stale)
+
+    # 4 (checkpoint API)
+    def test_reused_worker_thread_after_abandoned_checkpoint_polling_is_a_fresh_caller(self):
+        service, cache, loader, handle_a = self._build_stale_drain_scenario()
+        stale = handle_a._entry
+        pinned, proceed = self._gate_pin(service, "worker")
+        drain_records, drain_timed_out = self._record_drain_waits(cache)
+        pool = _SingleWorker("worker")
+        job_two_checkpoints = {"n": 0}
+
+        def cancelling_checkpoint():
+            if drain_timed_out.is_set():
+                raise _Cancelled("job one cancelled")
+
+        def counting_checkpoint():
+            job_two_checkpoints["n"] += 1
+
+        def job_one():
+            return service.acquire_runtime(
+                "model-a", "image", wait_checkpoint=cancelling_checkpoint, poll_interval=0.05,
+            )
+
+        def job_two_checkpointed():
+            return service.acquire_runtime(
+                "model-a", "image", wait_checkpoint=counting_checkpoint, poll_interval=0.05,
+            )
+
+        def job_two_plain():
+            return service.acquire_runtime("model-a", "image", wait_timeout=1.0)
+
+        try:
+            done_one, box_one = pool.submit(job_one)
+            self.assertTrue(pinned.wait(timeout=5))
+            handle_a.release(had_exception=True)
+            proceed.set()
+            self.assertTrue(done_one.wait(timeout=5))
+            self.assertIsInstance(box_one.get("error"), _Cancelled)
+            waits_after_job_one = len(drain_records)
+            self.assertEqual(waits_after_job_one, 1)
+            self.assertEqual(stale.lease_count, 1)
+
+            for job in (job_two_checkpointed, job_two_plain):
+                with self.subTest(job=job.__name__):
+                    done, box = pool.submit(job)
+                    self.assertTrue(done.wait(timeout=5))
+                    self.assertIs(box["thread"], box_one["thread"])
+                    self.assertIs(type(box.get("error")), RuntimeBusyError)
+                    self.assertEqual(len(drain_records), waits_after_job_one)
+            # Checkpointed job two failed fast on its very first slice.
+            self.assertEqual(job_two_checkpoints["n"], 1)
+            self._assert_service_retains_no_entry(service)
+            self.assertEqual(service._admission._held_by_thread, {})
+        finally:
+            proceed.set()
+            pool.stop()
+        cache.release_lease("model-a", stale)
+
+    # 5: a replacement generation never inherits stale eligibility
+    def test_checkpointed_acquire_never_transfers_eligibility_to_a_replacement_generation(self):
+        service, cache, loader, handle_a = self._build_stale_drain_scenario()
+        stale = handle_a._entry
+        pinned, proceed = self._gate_pin(service, "b")
+        drain_records, drain_timed_out = self._record_drain_waits(cache)
+        reached, release = Event(), Event()
+        checkpoint_calls = {"n": 0}
+        result: dict = {}
+
+        def checkpoint():
+            checkpoint_calls["n"] += 1
+            if drain_timed_out.is_set() and not reached.is_set():
+                reached.set()
+                release.wait(timeout=5)
+
+        def worker():
+            try:
+                result["handle"] = service.acquire_runtime(
+                    "model-a", "image", wait_checkpoint=checkpoint, poll_interval=0.05,
+                )
+            except BaseException as exc:  # noqa: BLE001
+                result["error"] = exc
+
+        tb = Thread(target=worker, name="b", daemon=True)
+        replacement = None
+        try:
+            tb.start()
+            self.assertTrue(pinned.wait(timeout=5))
+            handle_a.release(had_exception=True)
+            proceed.set()
+            self.assertTrue(reached.wait(timeout=5))
+
+            # B holds nothing while parked. Drain S, replace it with a new
+            # generation T, and make T itself INVALID and still pinned.
+            cache.release_lease("model-a", stale)
+            replacement = cache.acquire_or_reserve("model-a", "image")
+            self.assertIsNot(replacement, stale)
+            self.assertGreater(replacement.generation, stale.generation)
+            cache.publish_ready_and_pin("model-a", replacement, {"id": "model-a", "gen": 2})
+            self.assertIs(cache.acquire_or_reserve("model-a", "image"), replacement)
+            cache.mark_invalid("model-a", replacement)
+            self.assertEqual(replacement.lease_count, 2)
+            waits_before = len(drain_records)
+
+            release.set()
+            tb.join(timeout=5)
+            self.assertFalse(tb.is_alive())
+            self.assertNotIn("handle", result)
+            self.assertIs(type(result.get("error")), RuntimeBusyError)
+            self.assertEqual(len(drain_records), waits_before)  # never waited on T
+            self.assertEqual(checkpoint_calls["n"], 2)
+            self.assertEqual(replacement.lease_count, 2)
+            self.assertIs(replacement.state, RuntimeState.INVALID)
+            self.assertEqual(service._admission._held_by_thread, {})
+            self.assertTrue(replacement.execution_lock.acquire(blocking=False))
+            replacement.execution_lock.release()
+        finally:
+            proceed.set()
+            release.set()
+            tb.join(timeout=5)
+            if replacement is not None:
+                while replacement.lease_count:
+                    cache.release_lease("model-a", replacement)
+
+    # existing one-revalidation-retry bound, per logical operation
+    def test_checkpointed_acquire_keeps_one_revalidation_retry_per_logical_operation(self):
+        service, cache, loader, handle_a = self._build_stale_drain_scenario()
+        stale = handle_a._entry
+        pinned, proceed = self._gate_pin(service, "b")
+        drain_records, drain_timed_out = self._record_drain_waits(cache)
+        reached, release = Event(), Event()
+        result: dict = {}
+
+        def checkpoint():
+            if drain_timed_out.is_set() and not reached.is_set():
+                reached.set()
+                release.wait(timeout=5)
+
+        def worker():
+            try:
+                result["handle"] = service.acquire_runtime(
+                    "model-a", "image", wait_checkpoint=checkpoint, poll_interval=0.05,
+                )
+            except BaseException as exc:  # noqa: BLE001
+                result["error"] = exc
+
+        tb = Thread(target=worker, name="b", daemon=True)
+        handle_c = None
+        pinned_again = proceed_again = None
+        try:
+            tb.start()
+            self.assertTrue(pinned.wait(timeout=5))
+            handle_a.release(had_exception=True)
+            proceed.set()
+            self.assertTrue(reached.wait(timeout=5))
+
+            # While B is parked (holding nothing): S drains and C loads a
+            # fresh generation T, holding its E.
+            cache.release_lease("model-a", stale)
+            handle_c = service.acquire_runtime("model-a", "image")
+            fresh = handle_c._entry
+            self.assertIsNot(fresh, stale)
+            self.assertEqual(loader.load_calls, 2)
+
+            # B's next slice pins T and parks; C then fails, invalidating T
+            # while B holds a lease on it -- a SECOND post-E revalidation
+            # failure within B's one logical operation.
+            pinned_again, proceed_again = self._gate_pin(service, "b")
+            release.set()
+            self.assertTrue(pinned_again.wait(timeout=5))
+            handle_c.release(had_exception=True)
+            handle_c = None
+            proceed_again.set()
+
+            tb.join(timeout=5)
+            self.assertFalse(tb.is_alive())
+            self.assertNotIn("handle", result)
+            self.assertIs(type(result.get("error")), RuntimeBusyError)
+            self.assertEqual(loader.load_calls, 2)  # no third load
+            self.assertEqual(fresh.lease_count, 0)
+            self.assertIs(fresh.state, RuntimeState.INVALID)
+            self.assertEqual(service._admission._held_by_thread, {})
+        finally:
+            proceed.set()
+            release.set()
+            if proceed_again is not None:
+                proceed_again.set()
+            if handle_c is not None:
+                handle_c.release()
+            tb.join(timeout=5)
+
+    # 6: an ordinary checkpoint exception propagates unchanged
+    def test_checkpoint_runtime_error_propagates_unchanged(self):
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service({"model-a": manifest_a}, {"fake": loader})
+
+        probe_failure = RuntimeError("cancellation probe failed")
+
+        def failing_checkpoint():
+            raise probe_failure
+
+        # Before the first slice: the checkpoint runs before the model id is
+        # even resolved ("missing-model" would raise KeyError otherwise).
+        with self.assertRaises(RuntimeError) as caught:
+            service.acquire_runtime("missing-model", "image", wait_checkpoint=failing_checkpoint)
+        self.assertIs(caught.exception, probe_failure)
+        self.assertEqual(loader.load_calls, 0)
+        self.assertEqual(service._admission._held_by_thread, {})
+
+        # After a genuinely timed-out G slice.
+        owner = service.acquire_runtime("model-a", "image")
+        calls = {"n": 0}
+        second_failure = RuntimeError("cancellation probe failed after a slice")
+        result: dict = {}
+
+        def checkpoint():
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise second_failure
+
+        def worker():
+            try:
+                service.acquire_runtime(
+                    "model-a", "image", wait_checkpoint=checkpoint, poll_interval=0.05,
+                )
+            except BaseException as exc:  # noqa: BLE001
+                result["error"] = exc
+
+        tb = Thread(target=worker, daemon=True)
+        try:
+            tb.start()
+            tb.join(timeout=5)
+            self.assertFalse(tb.is_alive())
+            self.assertIs(result.get("error"), second_failure)
+            self.assertIsNone(second_failure.__context__)
+            self.assertEqual(calls["n"], 2)
+            self.assertEqual(set(service._admission._held_by_thread), {current_thread()})
+        finally:
+            owner.release()
+            tb.join(timeout=5)
+        with service.acquire_runtime("model-a", "image", wait_timeout=0):
+            pass
+
+    # 7: a BaseException from the checkpoint leaks nothing
+    def test_checkpoint_base_exception_leaks_no_resource_or_stale_state(self):
+        service, cache, loader, handle_a = self._build_stale_drain_scenario()
+        stale = handle_a._entry
+        pinned, proceed = self._gate_pin(service, "b")
+        drain_records, drain_timed_out = self._record_drain_waits(cache)
+        interruption = _FakeCancellation()
+        result: dict = {}
+
+        def checkpoint():
+            if drain_timed_out.is_set():
+                raise interruption
+
+        def worker():
+            try:
+                service.acquire_runtime(
+                    "model-a", "image", wait_checkpoint=checkpoint, poll_interval=0.05,
+                )
+            except BaseException as exc:  # noqa: BLE001
+                result["error"] = exc
+
+        tb = Thread(target=worker, name="b", daemon=True)
+        try:
+            tb.start()
+            self.assertTrue(pinned.wait(timeout=5))
+            handle_a.release(had_exception=True)
+            proceed.set()
+            tb.join(timeout=5)
+            self.assertFalse(tb.is_alive())
+        finally:
+            proceed.set()
+            tb.join(timeout=5)
+
+        self.assertIs(result.get("error"), interruption)
+        self.assertIsNone(interruption.__context__)
+        self.assertEqual(stale.lease_count, 1)  # straggler only
+        self.assertEqual(service._admission._held_by_thread, {})
+        self.assertTrue(stale.execution_lock.acquire(blocking=False))
+        stale.execution_lock.release()
+        self.assertTrue(cache.lock_for("model-a").acquire(blocking=False))
+        cache.lock_for("model-a").release()
+        self.assertTrue(cache._metadata_lock.acquire(blocking=False))
+        cache._metadata_lock.release()
+        self._assert_service_retains_no_entry(service)
+        cache.release_lease("model-a", stale)
+
+    # 8 + 9 (plain mode): a surfaced drain timeout retains nothing
+    def test_surfaced_stale_drain_timeout_does_not_retain_the_stale_entry(self):
+        loader = _WeakrefTrackingLoader()
+        service, cache, _, handle_a = self._build_stale_drain_scenario(loader)
+        stale = handle_a._entry
+        pinned, proceed = self._gate_pin(service, "b")
+        drain_records, _ = self._record_drain_waits(cache)
+        result: dict = {}
+
+        def worker():
+            try:
+                service.acquire_runtime("model-a", "image", wait_timeout=0.05)
+            except BaseException as exc:  # noqa: BLE001
+                result["error"] = exc
+
+        tb = Thread(target=worker, name="b", daemon=True)
+        try:
+            tb.start()
+            self.assertTrue(pinned.wait(timeout=5))
+            handle_a.release(had_exception=True)
+            proceed.set()
+            tb.join(timeout=5)
+            self.assertFalse(tb.is_alive())
+        finally:
+            proceed.set()
+            tb.join(timeout=5)
+
+        surfaced = result.get("error")
+        self.assertIs(type(surfaced), RuntimeWaitTimeoutError)
+        self.assertEqual([ok for _, _, ok in drain_records], [False])
+        self._assert_exception_chain_carries_no_entry(surfaced)
+        self._assert_service_retains_no_entry(service)
+
+        del cache.wait_for_stale_entry_drain
+        del service._acquire_or_load_entry
+        runtime_ref = loader.refs[0]
+        cache.release_lease("model-a", stale)
+        del stale, handle_a
+        service.unload_model("model-a")
+        gc.collect()
+        self.assertIsNone(runtime_ref(), "the surfaced timeout still retains the stale entry")
+        self.assertIs(result["error"], surfaced)
+
+    # 9 (plain mode): a surfaced fail-fast busy error retains nothing
+    def test_surfaced_fail_fast_busy_does_not_retain_the_invalid_entry(self):
+        loader = _WeakrefTrackingLoader()
+        service, cache, _, handle_a = self._build_stale_drain_scenario(loader)
+        stale = handle_a._entry
+        handle_a.release(had_exception=True)
+        self.assertEqual(stale.lease_count, 1)  # straggler only
+
+        with self.assertRaises(RuntimeBusyError) as caught:
+            service.acquire_runtime("model-a", "image", wait_timeout=0)
+        surfaced = caught.exception
+        self.assertIs(type(surfaced), RuntimeBusyError)
+        self._assert_exception_chain_carries_no_entry(surfaced)
+
+        runtime_ref = loader.refs[0]
+        cache.release_lease("model-a", stale)
+        del stale, handle_a, caught
+        service.unload_model("model-a")
+        gc.collect()
+        self.assertIsNone(runtime_ref(), "the surfaced busy error still retains the INVALID entry")
+        self.assertIs(type(surfaced), RuntimeBusyError)
+
+    # 10: another thread never inherits operation state
+    def test_checkpointed_operation_state_is_invisible_to_other_threads(self):
+        service, cache, loader, handle_a = self._build_stale_drain_scenario()
+        stale = handle_a._entry
+        pinned, proceed = self._gate_pin(service, "b")
+        drain_records, drain_timed_out = self._record_drain_waits(cache)
+        reached, release = Event(), Event()
+        result: dict = {}
+
+        def checkpoint_b():
+            if drain_timed_out.is_set() and not reached.is_set():
+                reached.set()
+                release.wait(timeout=5)
+
+        def worker_b():
+            try:
+                result["b"] = service.acquire_runtime(
+                    "model-a", "image", wait_checkpoint=checkpoint_b, poll_interval=0.05,
+                )
+            except BaseException as exc:  # noqa: BLE001
+                result["b_error"] = exc
+
+        d_checkpoints = {"n": 0}
+
+        def checkpoint_d():
+            d_checkpoints["n"] += 1
+
+        def worker_d():
+            for mode in ("checkpointed", "plain"):
+                try:
+                    if mode == "checkpointed":
+                        service.acquire_runtime(
+                            "model-a", "image", wait_checkpoint=checkpoint_d, poll_interval=0.05,
+                        )
+                    else:
+                        service.acquire_runtime("model-a", "image", wait_timeout=1.0)
+                    result[f"d_{mode}"] = "acquired"
+                except BaseException as exc:  # noqa: BLE001
+                    result[f"d_{mode}"] = exc
+
+        tb = Thread(target=worker_b, name="b", daemon=True)
+        td = Thread(target=worker_d, name="d", daemon=True)
+        try:
+            tb.start()
+            self.assertTrue(pinned.wait(timeout=5))
+            handle_a.release(had_exception=True)
+            proceed.set()
+            self.assertTrue(reached.wait(timeout=5))
+
+            # B has earned eligibility on S and is parked mid-operation.
+            td.start()
+            td.join(timeout=5)
+            self.assertFalse(td.is_alive())
+            self.assertIs(type(result.get("d_checkpointed")), RuntimeBusyError)
+            self.assertIs(type(result.get("d_plain")), RuntimeBusyError)
+            self.assertEqual(d_checkpoints["n"], 1)
+            self.assertEqual([name for name, _, _ in drain_records if name == "d"], [])
+
+            # B's own operation still converges once S drains.
+            cache.release_lease("model-a", stale)
+            release.set()
+            tb.join(timeout=5)
+            self.assertFalse(tb.is_alive())
+            self.assertNotIn("b_error", result)
+            try:
+                self.assertGreater(result["b"]._entry.generation, stale.generation)
+            finally:
+                result["b"].release()
+            self.assertEqual(service._admission._held_by_thread, {})
+        finally:
+            proceed.set()
+            release.set()
+            tb.join(timeout=5)
+            td.join(timeout=5)
+
+    # 11: a finite wait_timeout is one overall deadline, never reset per slice
+    def test_checkpoint_finite_wait_timeout_is_one_overall_deadline(self):
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service({"model-a": manifest_a}, {"fake": loader})
+        owner = service.acquire_runtime("model-a", "image")  # holds the only G slot
+
+        def run_contended(wait_timeout, poll_interval):
+            outcome: dict = {"checkpoints": 0}
+
+            def checkpoint():
+                outcome["checkpoints"] += 1
+
+            def worker():
+                started = time.monotonic()
+                try:
+                    service.acquire_runtime(
+                        "model-a", "image", wait_timeout=wait_timeout,
+                        wait_checkpoint=checkpoint, poll_interval=poll_interval,
+                    )
+                except BaseException as exc:  # noqa: BLE001
+                    outcome["error"] = exc
+                outcome["elapsed"] = time.monotonic() - started
+
+            tb = Thread(target=worker, daemon=True)
+            tb.start()
+            # A per-slice deadline reset would never end: a bounded join that
+            # the thread survives is the failure signal, not a timing guess.
+            tb.join(timeout=5)
+            self.assertFalse(tb.is_alive())
+            return outcome
+
+        try:
+            spanning = run_contended(0.3, 0.05)
+            self.assertIs(type(spanning.get("error")), RuntimeWaitTimeoutError)
+            self.assertIsNone(spanning["error"].__context__)
+            self.assertGreaterEqual(spanning["elapsed"], 0.3)
+            self.assertGreaterEqual(spanning["checkpoints"], 2)
+            self.assertLessEqual(spanning["checkpoints"], 1 + math.ceil(0.3 / 0.05) + 1)
+
+            capped = run_contended(0.02, 5.0)
+            self.assertIs(type(capped.get("error")), RuntimeWaitTimeoutError)
+            self.assertEqual(capped["checkpoints"], 1)
+            self.assertLess(capped["elapsed"], 5.0)
+            self.assertEqual(set(service._admission._held_by_thread), {current_thread()})
+        finally:
+            owner.release()
+
+    # 12: wait_timeout=None waits in real, bounded slices -- never spins
+    def test_checkpoint_none_timeout_waits_in_bounded_slices_without_spinning(self):
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service({"model-a": manifest_a}, {"fake": loader})
+        owner = service.acquire_runtime("model-a", "image")
+
+        semaphore_calls: list[tuple[str, tuple, dict]] = []
+        real_semaphore = service._admission._semaphore
+
+        class _RecordingSemaphore:
+            def acquire(self, *args, **kwargs):
+                semaphore_calls.append((current_thread().name, args, kwargs))
+                return real_semaphore.acquire(*args, **kwargs)
+
+            def release(self):
+                return real_semaphore.release()
+
+        service._admission._semaphore = _RecordingSemaphore()
+        stamps: list[float] = []
+        fourth_checkpoint = Event()
+        result: dict = {}
+
+        def checkpoint():
+            stamps.append(time.monotonic())
+            if len(stamps) == 4:
+                fourth_checkpoint.set()
+
+        def worker():
+            try:
+                handle = service.acquire_runtime(
+                    "model-a", "image", wait_checkpoint=checkpoint, poll_interval=0.2,
+                )
+                handle.release()
+                result["ok"] = True
+            except BaseException as exc:  # noqa: BLE001
+                result["error"] = exc
+
+        tb = Thread(target=worker, name="poller", daemon=True)
+        try:
+            tb.start()
+            self.assertTrue(fourth_checkpoint.wait(timeout=5))
+            owner.release()
+            owner = None
+            tb.join(timeout=5)
+            self.assertFalse(tb.is_alive())
+            self.assertEqual(result, {"ok": True})
+        finally:
+            if owner is not None:
+                owner.release()
+            tb.join(timeout=5)
+            service._admission._semaphore = real_semaphore
+
+        self.assertGreaterEqual(len(stamps), 4)
+        for earlier, later in zip(stamps, stamps[1:]):
+            self.assertGreaterEqual(later - earlier, 0.2 - 1e-6)
+        poller_calls = [kwargs for name, _, kwargs in semaphore_calls if name == "poller"]
+        self.assertEqual(len(poller_calls), len(stamps))  # one G attempt per slice
+        self.assertTrue(all(kwargs.get("timeout", 0) > 0 for kwargs in poller_calls))
+
+    # 13: wait_timeout=0 stays a single non-blocking attempt
+    def test_checkpoint_wait_timeout_zero_is_a_single_non_blocking_attempt(self):
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service({"model-a": manifest_a}, {"fake": loader})
+        owner = service.acquire_runtime("model-a", "image")
+        semaphore_calls: list[dict] = []
+        real_semaphore = service._admission._semaphore
+
+        class _RecordingSemaphore:
+            def acquire(self, *args, **kwargs):
+                semaphore_calls.append(dict(kwargs))
+                return real_semaphore.acquire(*args, **kwargs)
+
+            def release(self):
+                return real_semaphore.release()
+
+        checkpoints = {"n": 0}
+        result: dict = {}
+
+        def checkpoint():
+            checkpoints["n"] += 1
+
+        def worker():
+            try:
+                service.acquire_runtime(
+                    "model-a", "image", wait_timeout=0,
+                    wait_checkpoint=checkpoint, poll_interval=5.0,
+                )
+            except BaseException as exc:  # noqa: BLE001
+                result["error"] = exc
+
+        service._admission._semaphore = _RecordingSemaphore()
+        tb = Thread(target=worker, daemon=True)
+        try:
+            tb.start()
+            tb.join(timeout=5)
+            self.assertFalse(tb.is_alive())
+        finally:
+            service._admission._semaphore = real_semaphore
+            owner.release()
+            tb.join(timeout=5)
+
+        self.assertIs(type(result.get("error")), RuntimeWaitTimeoutError)
+        self.assertEqual(checkpoints["n"], 1)
+        self.assertEqual(semaphore_calls, [{"blocking": False}])
+
+    def test_invalid_wait_parameters_are_rejected_before_any_resource(self):
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service({"model-a": manifest_a}, {"fake": loader})
+        resolve_calls = {"n": 0}
+        original_resolve = service.resolver.resolve
+
+        def counting_resolve(*args, **kwargs):
+            resolve_calls["n"] += 1
+            return original_resolve(*args, **kwargs)
+
+        service.resolver.resolve = counting_resolve
+        checkpoints = {"n": 0}
+
+        def checkpoint():
+            checkpoints["n"] += 1
+
+        cases = [
+            ({"poll_interval": 0}, ValueError),
+            ({"poll_interval": -0.1}, ValueError),
+            ({"poll_interval": math.nan}, ValueError),
+            ({"poll_interval": math.inf}, ValueError),
+            ({"poll_interval": True}, TypeError),
+            ({"poll_interval": "0.1"}, TypeError),
+            ({"wait_checkpoint": "not callable"}, TypeError),
+            ({"wait_checkpoint": checkpoint, "wait_timeout": -1}, ValueError),
+            ({"wait_checkpoint": checkpoint, "wait_timeout": math.nan}, ValueError),
+            ({"wait_checkpoint": checkpoint, "wait_timeout": math.inf}, ValueError),
+            ({"wait_checkpoint": checkpoint, "wait_timeout": True}, TypeError),
+        ]
+        for kwargs, expected in cases:
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(expected):
+                    service.acquire_runtime("model-a", "image", **kwargs)
+        self.assertEqual(resolve_calls["n"], 0)
+        self.assertEqual(checkpoints["n"], 0)
+        self.assertEqual(loader.load_calls, 0)
+        self.assertEqual(service._admission._held_by_thread, {})
+        self.assertNotIn("model-a", cache._entries)
+
+        # Plain mode keeps its existing `wait_timeout` semantics untouched.
+        with service.acquire_runtime("model-a", "image", wait_timeout=-1):
+            pass
+
+    def test_checkpoint_mode_rechecks_cloud_opt_in_before_every_slice(self):
+        # Revoking a cloud opt-in while a checkpointed call is between slices
+        # must deny its next slice -- the same "revocation blocks even a
+        # waiting caller" property a generator's old per-slice public calls
+        # had -- and the refusal must leave nothing held or loaded.
+        cloud = _FakeManifest("cloud-model", provider="cloud")
+        local = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service(
+            {"cloud-model": cloud, "model-a": local}, {"fake": loader},
+            max_entries=2,
+        )
+        owner = service.acquire_runtime("model-a", "image")  # holds the only G slot
+        provider_flag = cloud_provider_env_flag("cloud-model")
+        checkpoints = {"n": 0}
+        result: dict = {}
+
+        def checkpoint():
+            checkpoints["n"] += 1
+            if checkpoints["n"] == 2:  # only ever reached after a timed-out slice
+                os.environ[provider_flag] = "false"
+
+        def worker():
+            try:
+                service.acquire_runtime(
+                    "cloud-model", "image", wait_checkpoint=checkpoint, poll_interval=0.05,
+                )
+            except BaseException as exc:  # noqa: BLE001
+                result["error"] = exc
+
+        tb = Thread(target=worker, daemon=True)
+        with mock.patch.dict(os.environ, {"ALLOW_CLOUD_PROVIDERS": "true", provider_flag: "true"}):
+            try:
+                tb.start()
+                tb.join(timeout=5)
+                self.assertFalse(tb.is_alive())
+            finally:
+                owner.release()
+                tb.join(timeout=5)
+
+        self.assertIsInstance(result.get("error"), CloudProviderDisabledError)
+        self.assertEqual(checkpoints["n"], 2)
+        self.assertEqual(loader.load_calls, 1)  # only the owner's local model
+        self.assertNotIn("cloud-model", cache._entries)
+        self.assertEqual(service._admission._held_by_thread, {})
+
+    # ------------------- PR #420 follow-up P2: stale-drain-through-RETIRING
+    def test_stale_drain_converges_through_the_exact_entrys_own_retiring_window(self):
+        # Codex P2 (PR #420 follow-up): `release_lease()`'s own deferred
+        # overflow eviction (see test_release_lease_evicts_deferred_overflow_
+        # once_the_last_pin_drains above) can retire the *exact* entry a
+        # concurrent wait_for_stale_entry_drain() call is waiting on, in the
+        # very same metadata-lock transaction that drops its last lease --
+        # reachable via the legacy put() path, exactly like that test: a
+        # legacy put() overflows the (budget=1) bucket while model-a is
+        # still INVALID+pinned (pin supremacy leaves it over budget), so the
+        # moment the last stale lease releases, model-a -- now unpinned and
+        # INVALID, hence itself evictable -- is the bucket's own deferred
+        # overflow victim.
+        #
+        # Before this fix, wait_for_stale_entry_drain()'s predicate only
+        # checked `entry.is_pinned()`, so it returned success the instant
+        # lease_count reached zero -- even though, in that same instant,
+        # this exact entry had already been marked RETIRING and handed to
+        # (here, deliberately slow) cleanup. The caller's immediate retry
+        # then found RETIRING (a `_BUSY_FOR_UNLOAD_STATES` member) and
+        # failed with a plain, permanent RuntimeBusyError -- an
+        # otherwise-valid handoff lost, not merely delayed.
+        cleanup_started = Event()
+        cleanup_release = Event()
+
+        def blocking_cleanup(model_id, runtime_obj):
+            cleanup_started.set()
+            assert cleanup_release.wait(timeout=5), "cleanup release event was never set"
+
+        cache = ModelRuntimeCache(max_entries=1, on_evict=blocking_cleanup)
+
+        # Three stale leases on the same entry (mirrors an
+        # admission_capacity >= 3 multi-waiter scenario), then invalidated
+        # while all three are still outstanding.
+        entry = cache.acquire_or_reserve("model-a", "image")
+        cache.publish_ready_and_pin("model-a", entry, {"id": "model-a"})  # lease_count=1
+        second = cache.acquire_or_reserve("model-a", "image")  # READY hit -> lease_count=2
+        self.assertIs(second, entry)
+        third = cache.acquire_or_reserve("model-a", "image")  # READY hit -> lease_count=3
+        self.assertIs(third, entry)
+        cache.mark_invalid("model-a", entry)
+        self.assertEqual(entry.lease_count, 3)
+        self.assertEqual(entry.state, RuntimeState.INVALID)
+
+        # Legacy put() overflows the (budget=1, default bucket) bucket while
+        # model-a is pinned+invalid -- pin supremacy leaves the bucket
+        # deliberately over budget rather than touching a pinned entry.
+        cache.put("model-b", {"id": "model-b", "instance": object()})
+        self.assertEqual(cache._entries["model-a"].state, RuntimeState.INVALID)
+        self.assertEqual(set(cache._entries.keys()), {"model-a", "model-b"})
+
+        # Two of the three stale leases release up front -- ordinary drain,
+        # nothing under test yet (lease_count never reaches zero here).
+        cache.release_lease("model-a", entry)
+        cache.release_lease("model-a", entry)
+        self.assertEqual(entry.lease_count, 1)
+
+        # A drain-waiter parks on the exact remaining stale lease with
+        # deadline=None -- a real, non-spinning OS-level block.
+        entered_wait = Event()
+        original_condition_wait = cache._metadata_lock.wait
+
+        def signaling_wait(timeout=None):
+            entered_wait.set()
+            return original_condition_wait(timeout)
+
+        cache._metadata_lock.wait = signaling_wait
+
+        waiter_result: dict[str, object] = {}
+
+        def waiter():
+            waiter_result["converged"] = cache.wait_for_stale_entry_drain(
+                "model-a", entry, None
+            )
+
+        # Test-harness hygiene: `waiter()` calls `wait_for_stale_entry_drain()`
+        # with `deadline=None` -- a genuine, unbounded `Condition.wait()`.
+        # If a regression in the fix this test exists to guard ever breaks
+        # the RETIRING-window notification, `tw` could block forever with
+        # nothing in this test able to wake it. `daemon=True` plus the
+        # unconditional `finally` below (which always sets `cleanup_release`
+        # and always attempts a bounded `join()`) together guarantee that
+        # such a regression surfaces as an ordinary failing test -- not a
+        # hung, non-daemon thread blocking process exit at interpreter
+        # shutdown.
+        tw = Thread(target=waiter, daemon=True)
+        tr: Thread | None = None
+        try:
+            tw.start()
+            self.assertTrue(entered_wait.wait(timeout=5))
+            cache._metadata_lock.wait = original_condition_wait
+
+            # The final release runs on its own thread: release_lease()
+            # itself runs _finish_retirement() (and therefore the blocking
+            # cleanup) synchronously on the calling thread, so calling it
+            # inline here would deadlock this test thread against its own
+            # blocked cleanup. This is still the real, production
+            # release_lease()/on_evict path -- just invoked from a thread
+            # that can afford to block on it, exactly as a real worker
+            # thread would.
+            releaser_errors: list[BaseException] = []
+
+            def releaser():
+                try:
+                    cache.release_lease("model-a", entry)
+                except BaseException as exc:  # noqa: BLE001
+                    releaser_errors.append(exc)
+
+            tr = Thread(target=releaser, daemon=True)
+            tr.start()
+            self.assertTrue(cleanup_started.wait(timeout=5))
+
+            # While cleanup is still blocked, the entry is RETIRING and
+            # still current -- deterministic, since `cleanup_started` can
+            # only have been set (by `blocking_cleanup`, on the releaser
+            # thread) after `release_lease()`'s own metadata-lock
+            # transaction -- the one that marks this exact entry RETIRING
+            # -- already completed on that same thread, sequentially,
+            # before `_finish_retirement()` ever calls it.
+            self.assertIs(cache._entries.get("model-a"), entry)
+            self.assertEqual(entry.state, RuntimeState.RETIRING)
+            # A retry attempted right now (mirroring what the old, buggy
+            # premature-success return would have let the caller do
+            # immediately) must see the same plain, permanent
+            # RuntimeBusyError the lost-handoff bug produced -- proving the
+            # RETIRING window is genuinely observable and genuinely busy,
+            # not a test artifact.
+            with self.assertRaises(RuntimeBusyError) as premature:
+                cache.acquire_or_reserve("model-a", "image")
+            self.assertIs(type(premature.exception), RuntimeBusyError)
+
+            # The drain-waiter itself must NOT have converged yet either: a
+            # bounded join on a thread parked in a genuine, timeout-less
+            # `Condition.wait()` is a real synchronization check, not a
+            # sleep guess -- under a correct fix this thread cannot return
+            # before `cleanup_release` (below) is ever set, no matter how
+            # long we wait, so still-alive after a modest bound is
+            # conclusive, not a race.
+            tw.join(timeout=0.3)
+            self.assertTrue(tw.is_alive())
+            self.assertNotIn("converged", waiter_result)
+
+            # Let cleanup finish -- this must be what finally wakes the
+            # waiter; nothing else in this test could cause it to converge.
+            cleanup_release.set()
+            tr.join(timeout=5)
+            tw.join(timeout=5)
+            self.assertFalse(tr.is_alive())
+            self.assertFalse(tw.is_alive())
+            self.assertEqual(releaser_errors, [])
+            self.assertTrue(waiter_result.get("converged"))
+            self.assertNotIn("model-a", cache._entries)
+
+            # Convergence: a retry now succeeds immediately -- the
+            # otherwise-valid handoff is no longer lost.
+            fresh = cache.acquire_or_reserve("model-a", "image")
+            self.assertEqual(fresh.state, RuntimeState.LOADING)
+            self.assertIsNot(fresh, entry)
+            self.assertGreater(fresh.generation, entry.generation)
+            cache.abort_reservation("model-a", fresh)
+        finally:
+            # Unconditional teardown (see the comment on `tw`'s own
+            # construction above): whatever assertion above failed or
+            # raised, always release the cleanup gate and always attempt a
+            # bounded join, so a regression this test catches ends the test
+            # process normally rather than hanging it.
+            cleanup_release.set()
+            if tr is not None:
+                tr.join(timeout=5)
+            tw.join(timeout=5)
+
+    def test_stale_drain_deadline_expires_while_entry_is_retiring(self):
+        # Same RETIRING window as above, but the waiter's own deadline
+        # elapses while cleanup is still blocked -- must still surface the
+        # existing, bounded RuntimeWaitTimeoutError-shaped `False` return
+        # rather than hanging or spuriously succeeding, and must never
+        # reset/extend the deadline because it happened to observe an
+        # intermediate RETIRING state.
+        cleanup_started = Event()
+        cleanup_release = Event()
+
+        def blocking_cleanup(model_id, runtime_obj):
+            cleanup_started.set()
+            assert cleanup_release.wait(timeout=5), "cleanup release event was never set"
+
+        cache = ModelRuntimeCache(max_entries=1, on_evict=blocking_cleanup)
+
+        entry = cache.acquire_or_reserve("model-a", "image")
+        cache.publish_ready_and_pin("model-a", entry, {"id": "model-a"})
+        cache.acquire_or_reserve("model-a", "image")
+        cache.mark_invalid("model-a", entry)
+        self.assertEqual(entry.lease_count, 2)
+
+        cache.put("model-b", {"id": "model-b", "instance": object()})
+
+        cache.release_lease("model-a", entry)  # lease_count=1, still pinned;
+        # not the last lease, so no eviction/cleanup is triggered by this
+        # call -- safe to run inline on this thread.
+
+        deadline = time.monotonic() + 0.2
+        result = cache.wait_for_stale_entry_drain("model-a", entry, deadline)
+        # Still pinned at this point (nothing released the last lease) --
+        # the ordinary pinned-timeout path, proved unchanged by this fix.
+        self.assertFalse(result)
+
+        # Now let the last lease release on its own thread (see the test
+        # above for why this cannot run inline: it synchronously drives the
+        # blocking cleanup), entering the RETIRING window.
+        releaser_errors: list[BaseException] = []
+
+        def releaser():
+            try:
+                cache.release_lease("model-a", entry)  # lease_count=0 -> RETIRING
+            except BaseException as exc:  # noqa: BLE001
+                releaser_errors.append(exc)
+
+        # Test-harness hygiene (same rationale as the sibling RETIRING test
+        # above): daemon=True plus an unconditional `finally` teardown means
+        # a regression that ever breaks `blocking_cleanup`'s own bounded
+        # wait cannot turn an assertion failure below into a hung,
+        # non-daemon thread blocking process exit.
+        tr = Thread(target=releaser, daemon=True)
+        try:
+            tr.start()
+            self.assertTrue(cleanup_started.wait(timeout=5))
+            self.assertEqual(entry.state, RuntimeState.RETIRING)
+
+            retiring_deadline = time.monotonic() + 0.2
+            result = cache.wait_for_stale_entry_drain("model-a", entry, retiring_deadline)
+            self.assertFalse(result)
+            # Still RETIRING, still current, cleanup still blocked -- the
+            # timeout came from the deadline, not from the entry resolving.
+            self.assertIs(cache._entries.get("model-a"), entry)
+            self.assertEqual(entry.state, RuntimeState.RETIRING)
+
+            cleanup_release.set()
+            tr.join(timeout=5)
+            self.assertFalse(tr.is_alive())
+            self.assertEqual(releaser_errors, [])
+            self.assertNotIn("model-a", cache._entries)
+        finally:
+            cleanup_release.set()
+            tr.join(timeout=5)
+
+    # ---------------------------------------------------- Finding 3 (P2)
+    def test_capacity_reservation_is_atomic_for_racing_misses_into_an_empty_bucket(self):
+        manifest_a = _FakeManifest("model-a", loader="loader-a")
+        manifest_b = _FakeManifest("model-b", loader="loader-b")
+        a_started = Event()
+        release_a = Event()
+        loader_a = _ControllableLoader(started=a_started, release=release_a)
+        loader_b = _ImmediateLoader()
+
+        # budget=1 for "image"; the bucket starts completely empty.
+        cache = ModelRuntimeCache(max_entries=5, media_limits={"image": 1})
+        service = ModelService(
+            registry=None,
+            resolver=_FakeResolver({"model-a": manifest_a, "model-b": manifest_b}),
+            loader_registry=_FakeLoaderRegistry({"loader-a": loader_a, "loader-b": loader_b}),
+            runtime_cache=cache,
+            admission_capacity=2,
+        )
+
+        errors: list[BaseException] = []
+        results: dict[str, object] = {}
+
+        def worker_a():
+            try:
+                results["a"] = service.acquire_runtime("model-a", "image")
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        ta = Thread(target=worker_a)
+        ta.start()
+        # A holds G+L, blocked inside load() -- its LOADING reservation was
+        # already created atomically (Finding 3) before load() was ever
+        # called.
+        self.assertTrue(a_started.wait(timeout=5))
+
+        self.assertEqual(len(cache._entries), 1)
+        self.assertEqual(cache._entries["model-a"].state, RuntimeState.LOADING)
+
+        # B races the SAME (now full, budget=1) bucket for a DIFFERENT id,
+        # concurrently -- must be refused immediately, never silently
+        # overbooking the bucket and never starting its own load.
+        with self.assertRaises(RuntimeBusyError):
+            service.acquire_runtime("model-b", "image")
+        self.assertEqual(loader_b.load_calls, 0)
+        self.assertEqual(len(cache._entries), 1)  # still only A's reservation
+
+        release_a.set()
+        ta.join(timeout=5)
+        self.assertEqual(errors, [])
+
+        handle_a = results["a"]
+        try:
+            self.assertIsNotNone(handle_a.runtime)
+        finally:
+            handle_a.release()
+        self.assertEqual(loader_a.load_calls, 1)
+
+    # ---------------------------------------------------- Finding 4 (P2)
+    def test_resolve_runtime_disposes_the_loaded_runtime_when_publication_is_rejected(self):
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        cleanup = _RecordingCleanup()
+        service, cache = _build_service(
+            {"model-a": manifest_a}, {"fake": loader}, on_evict=cleanup,
+        )
+
+        # Force put()'s own publication to be rejected: a LOADING
+        # reservation for this exact id, created out-of-band (as a
+        # concurrent acquire_runtime() call in flight would), makes put()
+        # see a busy existing entry once resolve_runtime() reaches it.
+        reservation = cache.acquire_or_reserve("model-a", "image")
+        self.assertEqual(reservation.state, RuntimeState.LOADING)
+
+        with self.assertRaises(RuntimeBusyError):
+            service.resolve_runtime("model-a", "image")
+
+        self.assertEqual(loader.load_calls, 1)  # the load itself succeeded...
+        self.assertEqual(cleanup.calls, ["model-a"])  # ...but was disposed exactly once
+        # The pre-existing reservation itself was never touched by the
+        # rejected publication attempt -- put() raises before mutating
+        # `_entries` in this case.
+        self.assertIs(cache._entries["model-a"], reservation)
+        self.assertEqual(reservation.state, RuntimeState.LOADING)
+
+    # ------------------------- bonus: found during this round's own adversarial review
+    def test_acquire_runtime_disposes_the_loaded_runtime_when_publish_is_rejected(self):
+        # `publish_ready_and_pin()` only raises its own defensive backstop
+        # if a LOADING reservation was somehow lost before publish --
+        # believed unreachable in production given `_acquire_or_load_entry()`
+        # holds L for its entire duration, but the analogous gap on the
+        # legacy `resolve_runtime()` path (Finding 4) shows this class of
+        # bug is real when it does happen, so `_acquire_or_load_entry()`
+        # disposes the freshly-loaded runtime the same way. Forced here via
+        # a stand-in for `publish_ready_and_pin()` rather than by actually
+        # reaching the believed-unreachable precondition-violation.
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        cleanup = _RecordingCleanup()
+        service, cache = _build_service(
+            {"model-a": manifest_a}, {"fake": loader}, on_evict=cleanup,
+        )
+
+        def failing_publish(canonical_id, reserved_entry, runtime_obj):
+            raise RuntimeBusyError("simulated: reservation lost before publish")
+
+        cache.publish_ready_and_pin = failing_publish
+
+        with self.assertRaises(RuntimeBusyError):
+            service.acquire_runtime("model-a", "image")
+
+        self.assertEqual(loader.load_calls, 1)  # the load itself succeeded...
+        self.assertEqual(cleanup.calls, ["model-a"])  # ...but was disposed exactly once
+
+    def test_acquire_runtime_releases_the_orphaned_lease_when_publish_mutates_then_raises(self):
+        # Codex's own review of the fix above (round 1-of-round-1) found a
+        # real gap: publish_ready_and_pin() mutates `entry` in place (READY,
+        # lease_count=1, runtime set) *before* it can raise -- an async
+        # BaseException landing right after that mutation but before the
+        # call returns (believed rare, but KeyboardInterrupt/SystemExit can
+        # land between any two bytecode instructions in CPython) would have
+        # made the old fix wrongly dispose an already-published, now-live
+        # cached runtime, corrupting it out from under any other caller,
+        # while also leaking the lease this call took (no RuntimeHandle is
+        # ever returned to release it). Simulated here by actually
+        # performing the publish, then raising.
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        cleanup = _RecordingCleanup()
+        service, cache = _build_service(
+            {"model-a": manifest_a}, {"fake": loader}, on_evict=cleanup,
+        )
+
+        original_publish = cache.publish_ready_and_pin
+
+        def publish_then_raise(canonical_id, reserved_entry, runtime_obj):
+            original_publish(canonical_id, reserved_entry, runtime_obj)
+            raise _FakeCancellation("injected: interrupted right after publish")
+
+        cache.publish_ready_and_pin = publish_then_raise
+
+        with self.assertRaises(_FakeCancellation):
+            service.acquire_runtime("model-a", "image")
+
+        entry = cache._entries["model-a"]
+        # Published successfully -- must NOT have been disposed (that would
+        # corrupt a runtime other callers can now see as cached).
+        self.assertEqual(cleanup.calls, [])
+        self.assertEqual(entry.state, RuntimeState.READY)
+        # The lease this call took is released, not orphaned.
+        self.assertEqual(entry.lease_count, 0)
+
+        # The entry is fully usable afterward -- never disposed, never
+        # reloaded.
+        handle = service.acquire_runtime("model-a", "image")
+        try:
+            self.assertIs(handle.runtime, entry.runtime)
+        finally:
+            handle.release()
+        self.assertEqual(loader.load_calls, 1)
+
+    # ------------------------- bonus 2: legacy put() overflow-victim visibility
+    def test_legacy_put_overflow_victim_stays_visible_until_cleanup_finishes(self):
+        # Also found by Codex's round-1-of-round-1 re-review: the old
+        # `_evict_bucket_overflow_locked()` popped its victim from
+        # `_entries` immediately, under M, well before that victim's
+        # cleanup (run afterward, outside M, by put()'s own caller code)
+        # ever ran. In the window between M being released and cleanup
+        # actually finishing, the victim's id looked like a plain cache
+        # miss to any concurrent caller -- unlike every other
+        # eviction/retirement path in this class, which marks RETIRING and
+        # keeps the entry visible (busy) until cleanup completes.
+        manifest_a = _FakeManifest("model-a")
+        loader_a = _ImmediateLoader()
+        cleanup_started = Event()
+        cleanup_release = Event()
+
+        def blocking_cleanup(model_id, runtime_obj):
+            cleanup_started.set()
+            assert cleanup_release.wait(timeout=5)
+
+        cache = ModelRuntimeCache(max_entries=1, on_evict=blocking_cleanup)
+        service = ModelService(
+            registry=None,
+            resolver=_FakeResolver({"model-a": manifest_a}),
+            loader_registry=_FakeLoaderRegistry({"fake": loader_a}),
+            runtime_cache=cache,
+        )
+
+        cache.put("model-a", {"id": "model-a", "instance": object()})  # occupies the sole slot
+
+        errors: list[BaseException] = []
+
+        def evictor():
+            try:
+                # A second legacy put() for a different id overflows
+                # model-a out of the (budget=1) default bucket.
+                cache.put("model-b", {"id": "model-b", "instance": object()})
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        t = Thread(target=evictor)
+        t.start()
+        self.assertTrue(cleanup_started.wait(timeout=5))
+
+        # model-a's cleanup is mid-flight (blocked) -- it must still be
+        # visible as RETIRING (busy), never silently absent.
+        self.assertEqual(cache._entries["model-a"].state, RuntimeState.RETIRING)
+        with self.assertRaises(RuntimeBusyError):
+            service.acquire_runtime("model-a", "image", wait_timeout=0)
+        self.assertEqual(loader_a.load_calls, 0)  # no competing load started
+
+        cleanup_release.set()
+        t.join(timeout=5)
+        self.assertEqual(errors, [])
+        self.assertNotIn("model-a", cache._entries)
+        self.assertTrue(cache.has("model-b"))
+
+        # Now a fresh acquire for model-a succeeds and genuinely reloads.
+        handle = service.acquire_runtime("model-a", "image")
+        try:
+            self.assertIsNotNone(handle.runtime)
+        finally:
+            handle.release()
+        self.assertEqual(loader_a.load_calls, 1)
+
+    # ------------------------- bonus 3: legacy put() same-object busy-state ordering
+    def test_put_rejects_same_object_reinsertion_of_a_retiring_entry(self):
+        # Also found by Codex's round-1-of-round-1 re-review: the
+        # same-object fast path ran *before* the busy-state check, so a
+        # caller retaining a reference to a RETIRING entry's runtime (an
+        # unload() already in flight, cleanup mid-run outside M) could
+        # still pass that same object back into put(), moving it to a
+        # different bucket and triggering eviction there -- all while
+        # _finish_retirement() was concurrently tearing the exact same
+        # object down and about to remove the entry regardless.
+        cleanup_started = Event()
+        cleanup_release = Event()
+
+        def blocking_cleanup(model_id, runtime_obj):
+            cleanup_started.set()
+            assert cleanup_release.wait(timeout=5)
+
+        cache = ModelRuntimeCache(
+            max_entries=1, media_limits={"image": 1, "text": 1}, on_evict=blocking_cleanup,
+        )
+        runtime_a = {"id": "model-a", "instance": object()}
+        cache.put("model-a", runtime_a, media_type="image")
+
+        errors: list[BaseException] = []
+
+        def unloader():
+            try:
+                cache.unload("model-a")
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        t = Thread(target=unloader)
+        t.start()
+        self.assertTrue(cleanup_started.wait(timeout=5))
+        self.assertEqual(cache._entries["model-a"].state, RuntimeState.RETIRING)
+
+        # A caller still holding the old runtime object must not be able to
+        # move/revive it into another bucket while it is RETIRING.
+        with self.assertRaises(RuntimeBusyError):
+            cache.put("model-a", runtime_a, media_type="text")
+
+        cleanup_release.set()
+        t.join(timeout=5)
+        self.assertEqual(errors, [])
+        self.assertNotIn("model-a", cache._entries)
+
+    # ------------------------- bonus 4: loader-lookup-failure reservation unwind
+    def test_acquire_runtime_aborts_reservation_when_loader_lookup_fails(self):
+        # Also found by Codex's round-1-of-round-1 re-review (P1):
+        # `loader_registry.get()` used to run *before* the try block that
+        # aborts the reservation on failure, so a manifest naming an
+        # unregistered loader left the fresh LOADING reservation stuck
+        # forever -- permanently denying every future acquisition for that
+        # id, and (with a single-entry bucket) blocking every other model
+        # sharing it too. Uses the real `LoaderRegistry`, not the fake one,
+        # so this exercises its actual `LookupError`.
+        manifest_a = _FakeManifest("model-a", loader="unregistered-loader")
+        service, cache = _build_service(
+            {"model-a": manifest_a}, {}, max_entries=1,
+        )
+        service.loader_registry = LoaderRegistry()  # empty -- no loaders registered
+
+        with self.assertRaises(LookupError):
+            service.acquire_runtime("model-a", "image")
+
+        # The reservation is fully unwound -- not stuck at LOADING.
+        self.assertNotIn("model-a", cache._entries)
+
+        # A subsequent, correctly-configured attempt succeeds normally.
+        real_loader = _ImmediateLoader()
+        service.loader_registry.register("unregistered-loader", real_loader)
+        handle = service.acquire_runtime("model-a", "image")
+        try:
+            self.assertIsNotNone(handle.runtime)
+        finally:
+            handle.release()
+        self.assertEqual(real_loader.load_calls, 1)
+
+    # ---------------------------------------------------- Finding 5 (P2)
+    def test_same_object_bucket_move_enforces_the_destination_budget(self):
+        cleanup = _RecordingCleanup()
+        cache = ModelRuntimeCache(
+            max_entries=1, media_limits={"image": 1, "text": 1}, on_evict=cleanup,
+        )
+
+        runtime_a = {"id": "model-a", "instance": object()}
+        cache.put("model-a", runtime_a, media_type="image")
+        cache.put("model-b", {"id": "model-b", "instance": object()}, media_type="text")
+        self.assertEqual(set(cache.loaded_ids()), {"model-a", "model-b"})
+
+        # Move model-a's SAME runtime object from "image" into "text" -- a
+        # bucket that is already at its own budget=1 (occupied by model-b).
+        cache.put("model-a", runtime_a, media_type="text")
+
+        # model-a survives (it is the object being moved, excluded from its
+        # own eviction candidacy); model-b -- the destination bucket's prior
+        # LRU occupant -- is evicted exactly once to keep "text" at budget.
+        self.assertTrue(cache.has("model-a"))
+        self.assertFalse(cache.has("model-b"))
+        self.assertEqual(cache._entries["model-a"].media_bucket, "text")
+        self.assertEqual(cleanup.calls, ["model-b"])
+        text_bucket_count = sum(
+            1 for entry in cache._entries.values() if entry.media_bucket == "text"
+        )
+        self.assertEqual(text_bucket_count, 1)
+
+    # ---------------------------------------------------- Finding 6 (P2)
+    def test_finish_retirement_never_strands_retiring_after_a_base_exception(self):
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+
+        def failing_cleanup(model_id, runtime_obj):
+            raise _FakeCancellation("injected: cleanup interrupted")
+
+        service, cache = _build_service(
+            {"model-a": manifest_a}, {"fake": loader}, on_evict=failing_cleanup,
+        )
+
+        service.acquire_runtime("model-a", "image").release()  # idle, READY
+
+        with self.assertRaises(_FakeCancellation):
+            service.unload_model("model-a")
+
+        # No permanently-RETIRING zombie: the entry is fully gone, not stuck.
+        self.assertNotIn("model-a", cache._entries)
+
+        # Future calls for the same id can make progress -- a fresh acquire
+        # reloads cleanly rather than being refused as still "busy".
+        handle = service.acquire_runtime("model-a", "image")
+        try:
+            self.assertIsNotNone(handle.runtime)
+        finally:
+            handle.release()
+        self.assertEqual(loader.load_calls, 2)
+
+    def test_unload_all_finalizes_every_target_even_after_a_base_exception(self):
+        manifest_a = _FakeManifest("model-a")
+        manifest_b = _FakeManifest("model-b")
+        loader = _ImmediateLoader()
+        cleanup_calls: list[str] = []
+
+        def mixed_cleanup(model_id, runtime_obj):
+            cleanup_calls.append(model_id)
+            if model_id == "model-a":
+                raise _FakeCancellation("injected: model-a's cleanup interrupted")
+
+        service, cache = _build_service(
+            {"model-a": manifest_a, "model-b": manifest_b},
+            {"fake": loader},
+            max_entries=2,
+            on_evict=mixed_cleanup,
+        )
+
+        service.acquire_runtime("model-a", "image").release()
+        service.acquire_runtime("model-b", "image").release()
+
+        with self.assertRaises(_FakeCancellation):
+            service.unload_all()
+
+        # BOTH targets were finalized -- model-b's cleanup was attempted too,
+        # not skipped just because model-a's raised first.
+        self.assertEqual(cleanup_calls, ["model-a", "model-b"])
+        # Neither is left stuck at RETIRING.
+        self.assertEqual(cache.loaded_ids(), [])
+        self.assertEqual(len(cache._entries), 0)
+
+        # Future calls can make progress for both ids.
+        service.acquire_runtime("model-a", "image").release()
+        service.acquire_runtime("model-b", "image").release()
+        self.assertEqual(loader.load_calls, 4)
+
+    # ---------------------------------------------------- Finding 8 (P2)
+    def test_wait_timeout_zero_does_not_bound_a_synchronous_load(self):
+        manifest_a = _FakeManifest("model-a")
+        load_running = Event()
+        release_load = Event()
+
+        class _SlowLoader:
+            def __init__(self):
+                self.load_calls = 0
+
+            def load(self, manifest):
+                self.load_calls += 1
+                load_running.set()
+                assert release_load.wait(timeout=5)
+                return {"id": manifest.id, "instance": object()}
+
+        loader = _SlowLoader()
+        service, cache = _build_service({"model-a": manifest_a}, {"fake": loader})
+
+        result: dict[str, object] = {}
+
+        def worker():
+            # wait_timeout=0 means "do not wait for a contended G/L/E" -- G
+            # and L are both uncontended here (nothing else holds them), so
+            # this call proceeds straight into loader.load(), which is NOT
+            # bounded by wait_timeout=0 and is free to take as long as it
+            # needs (Finding 8's corrected contract).
+            result["handle"] = service.acquire_runtime("model-a", "image", wait_timeout=0)
+
+        t = Thread(target=worker)
+        t.start()
+        self.assertTrue(load_running.wait(timeout=5))  # load() genuinely started
+        release_load.set()
+        t.join(timeout=5)
+
+        self.assertIn("handle", result)
+        handle = result["handle"]
+        try:
+            self.assertIsNotNone(handle.runtime)
+        finally:
+            handle.release()
+        self.assertEqual(loader.load_calls, 1)
+
+    # ------------------------- bonus 5: overflow eviction evicts only the excess
+    def test_legacy_put_overflow_evicts_only_the_excess_not_every_eligible_entry(self):
+        # Found by a further Codex re-review pass on the RETIRING-visibility
+        # fix (bonus 2) above: marking a victim RETIRING (rather than
+        # popping it) leaves it counted in the bucket's raw membership on
+        # the loop's next iteration, so the budget check must subtract
+        # this call's own already-decided victims back out, or it keeps
+        # finding "still over budget" and evicts every remaining eligible
+        # entry -- not just the genuine excess.
+        cleanup = _RecordingCleanup()
+        cache = ModelRuntimeCache(max_entries=2, on_evict=cleanup)
+        cache.put("model-a", {"id": "model-a"})
+        cache.put("model-b", {"id": "model-b"})
+        self.assertEqual(set(cache.loaded_ids()), {"model-a", "model-b"})
+
+        cache.put("model-c", {"id": "model-c"})  # overflow by exactly 1
+
+        # Only the LRU entry (model-a) is evicted -- not both.
+        self.assertEqual(cleanup.calls, ["model-a"])
+        self.assertEqual(set(cache.loaded_ids()), {"model-b", "model-c"})
+
+    # ------------------------- bonus 6: E released when revalidation is interrupted
+    def test_acquire_execution_lock_releases_e_when_revalidation_is_interrupted(self):
+        # Found by the same re-review pass: an async BaseException landing
+        # during is_current_and_ready() (after E was already won) used to
+        # leave _acquire_execution_lock() exiting without releasing E --
+        # the caller's own exception handling only releases the lease and
+        # G, never E, permanently deadlocking every future caller of this
+        # exact entry.
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service({"model-a": manifest_a}, {"fake": loader})
+
+        original_is_current_and_ready = cache.is_current_and_ready
+
+        def interrupted_check(canonical_id, entry):
+            raise _FakeCancellation("injected: interrupted during revalidation")
+
+        cache.is_current_and_ready = interrupted_check
+
+        with self.assertRaises(_FakeCancellation):
+            service.acquire_runtime("model-a", "image")
+
+        entry = cache._entries["model-a"]
+        # E must not be leaked -- a non-blocking acquire proves it's free.
+        self.assertTrue(entry.execution_lock.acquire(blocking=False))
+        entry.execution_lock.release()
+        # The lease is released too (acquire_runtime()'s own cleanup).
+        self.assertEqual(entry.lease_count, 0)
+
+        cache.is_current_and_ready = original_is_current_and_ready
+        # G was released too -- a fresh, immediate acquire succeeds.
+        handle = service.acquire_runtime("model-a", "image", wait_timeout=0)
+        try:
+            self.assertIsNotNone(handle.runtime)
+        finally:
+            handle.release()
+
+    # ------------------------- bonus 7: publish interrupted before state flips
+    def test_acquire_or_load_entry_aborts_reservation_when_publish_is_interrupted(self):
+        # Found by the same re-review pass: if an async BaseException lands
+        # during publish_ready_and_pin() *before* it actually flips
+        # entry.state to READY (e.g. between assigning .runtime and
+        # assigning .state), the old fix's state-only check took the
+        # "dispose the runtime" branch correctly, but never called
+        # abort_reservation() -- leaving the entry stuck at LOADING
+        # forever, exactly like an un-aborted load failure would.
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        cleanup = _RecordingCleanup()
+        service, cache = _build_service(
+            {"model-a": manifest_a}, {"fake": loader}, on_evict=cleanup,
+        )
+
+        original_publish = cache.publish_ready_and_pin
+
+        def interrupted_before_ready(canonical_id, reserved_entry, runtime_obj):
+            # Simulates an interruption strictly before publication -- the
+            # entry is never mutated at all (the strictest sub-case of
+            # "still LOADING when the exception arrives").
+            raise _FakeCancellation("injected: interrupted before publish")
+
+        cache.publish_ready_and_pin = interrupted_before_ready
+
+        with self.assertRaises(_FakeCancellation):
+            service.acquire_runtime("model-a", "image")
+
+        # The reservation is fully unwound -- not stuck at LOADING -- and
+        # the never-published runtime was disposed exactly once.
+        self.assertNotIn("model-a", cache._entries)
+        self.assertEqual(cleanup.calls, ["model-a"])
+
+        cache.publish_ready_and_pin = original_publish
+
+        # A subsequent attempt succeeds normally.
+        handle = service.acquire_runtime("model-a", "image")
+        try:
+            self.assertIsNotNone(handle.runtime)
+        finally:
+            handle.release()
+        self.assertEqual(loader.load_calls, 2)
+
+    # ------------------------- bonus 8: concurrent handle releases never double-release G
+    def test_concurrent_handle_releases_never_double_release_admission(self):
+        # Found by the same re-review pass: RuntimeHandle.release()'s own
+        # `if self._released: return; self._released = True` was not
+        # atomic -- two threads calling release() on the exact same handle
+        # at once could both observe `_released is False` before either
+        # set it `True`, both entering the unwind path. The second
+        # execution_lock.release() would raise, but its own nested
+        # `finally` chain would still reach `self._admission.release()` a
+        # second time, permanently inflating the process-wide admission
+        # capacity by one.
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service({"model-a": manifest_a}, {"fake": loader})
+
+        handle = service.acquire_runtime("model-a", "image")
+        # capacity=1, one slot taken -- semaphore's internal counter is 0.
+        self.assertEqual(service._admission._semaphore._value, 0)
+
+        barrier = Barrier(2)
+        errors: list[BaseException] = []
+
+        def release_racer():
+            barrier.wait(timeout=5)
+            try:
+                handle.release()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        t1 = Thread(target=release_racer)
+        t2 = Thread(target=release_racer)
+        t1.start()
+        t2.start()
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+
+        # release() itself must never raise, even racing itself.
+        self.assertEqual(errors, [])
+        # Exactly one net release -- the semaphore's counter is back to
+        # its full capacity (1), never 2 (which a double-release causes).
+        self.assertEqual(service._admission._semaphore._value, 1)
+
+    # ------------------------- bonus 9: handle-construction-interrupted unwind
+    def test_acquire_runtime_unwinds_g_lease_and_e_when_handle_construction_fails(self):
+        # Found by a further Codex re-review pass: by the time
+        # `RuntimeHandle(...)` is constructed, G, the lease, and E have all
+        # already been acquired -- but that construction call used to sit
+        # outside every protective try/except. An exception during
+        # `__init__` itself (an async BaseException, a hypothetical
+        # allocation failure, ...) left all three held with no handle ever
+        # created to release them.
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service({"model-a": manifest_a}, {"fake": loader})
+
+        original_init = service_module.RuntimeHandle.__init__
+
+        def failing_init(self, **kwargs):
+            raise _FakeCancellation("injected: interrupted during handle construction")
+
+        service_module.RuntimeHandle.__init__ = failing_init
+        try:
+            with self.assertRaises(_FakeCancellation):
+                service.acquire_runtime("model-a", "image")
+        finally:
+            service_module.RuntimeHandle.__init__ = original_init
+
+        entry = cache._entries["model-a"]
+        self.assertEqual(entry.lease_count, 0)
+        self.assertTrue(entry.execution_lock.acquire(blocking=False))
+        entry.execution_lock.release()
+
+        # G was released too -- a fresh, immediate acquire succeeds.
+        handle = service.acquire_runtime("model-a", "image", wait_timeout=0)
+        try:
+            self.assertIsNotNone(handle.runtime)
+        finally:
+            handle.release()
+
+    # ------------------------- bonus 10: reject same-thread recursive acquisition
+    def test_acquire_runtime_rejects_recursive_acquisition_on_the_same_thread(self):
+        # Found by the same re-review pass: a thread calling
+        # acquire_runtime() again while it already holds a handle from an
+        # earlier, still-open call would otherwise block on G forever --
+        # only that same (now blocked) thread could ever release the slot
+        # it is waiting for -- even for a completely different model_id,
+        # since G is process-wide, not per-canonical-id.
+        manifest_a = _FakeManifest("model-a", loader="fake-a")
+        manifest_b = _FakeManifest("model-b", loader="fake-b")
+        loader_a = _ImmediateLoader()
+        loader_b = _ImmediateLoader()
+        service, cache = _build_service(
+            {"model-a": manifest_a, "model-b": manifest_b},
+            {"fake-a": loader_a, "fake-b": loader_b},
+        )
+
+        handle = service.acquire_runtime("model-a", "image")
+        try:
+            with self.assertRaises(RuntimeError) as cm:
+                service.acquire_runtime("model-b", "image")
+            self.assertNotIsInstance(cm.exception, RuntimeBusyError)
+        finally:
+            handle.release()
+
+        # Once released, a fresh acquisition on this same thread succeeds
+        # normally -- the "held" flag was correctly cleared, not stuck
+        # permanently rejecting this thread.
+        handle2 = service.acquire_runtime("model-b", "image")
+        try:
+            self.assertIsNotNone(handle2.runtime)
+        finally:
+            handle2.release()
+
+    # ------------------------- bonus 10b: cross-thread release credits the true owner
+    def test_admission_release_credits_the_original_acquiring_thread_not_the_releaser(self):
+        # Found by Codex's re-review of bonus 10 above: a first version of
+        # the recursion guard tracked "does this thread hold a slot" via
+        # threading.local(), which cannot be updated for another thread at
+        # all. Releasing a handle from a different thread than the one
+        # that acquired it (a supported, already-tested pattern -- see the
+        # concurrent-release test) left the *original* acquiring thread's
+        # local counter permanently stuck at "holding", so its next,
+        # perfectly legitimate acquisition was wrongly rejected as
+        # recursive.
+        manifest_a = _FakeManifest("model-a", loader="fake-a")
+        manifest_b = _FakeManifest("model-b", loader="fake-b")
+        loader_a = _ImmediateLoader()
+        loader_b = _ImmediateLoader()
+        service, cache = _build_service(
+            {"model-a": manifest_a, "model-b": manifest_b},
+            {"fake-a": loader_a, "fake-b": loader_b},
+        )
+
+        handle = service.acquire_runtime("model-a", "image")  # acquired on THIS (main) thread
+
+        errors: list[BaseException] = []
+
+        def releaser():
+            try:
+                handle.release()  # released on a DIFFERENT thread
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        t = Thread(target=releaser)
+        t.start()
+        t.join(timeout=5)
+        self.assertEqual(errors, [])
+
+        # A fresh acquisition on the ORIGINAL (main) thread must succeed
+        # normally -- not be wrongly rejected as a recursive acquisition.
+        handle2 = service.acquire_runtime("model-b", "image")
+        try:
+            self.assertIsNotNone(handle2.runtime)
+        finally:
+            handle2.release()
+
+    # ------------------------- bonus 11: put() finalizes every victim under BaseException
+    def test_put_finalizes_all_victims_even_after_a_base_exception(self):
+        # Found by a further Codex re-review pass: put()'s own
+        # replace-then-overflow cleanup sequence had no equivalent of
+        # unload_all()'s "finalize everyone before re-raising" guarantee --
+        # an interrupted replaced-victim cleanup skipped the overflow-victim
+        # loop entirely, stranding those already-RETIRING entries forever.
+        cleanup_calls: list[str] = []
+
+        def mixed_cleanup(model_id, runtime_obj):
+            cleanup_calls.append(model_id)
+            if model_id == "model-a":
+                raise _FakeCancellation("injected: model-a's replaced runtime cleanup interrupted")
+
+        cache = ModelRuntimeCache(
+            max_entries=1, media_limits={"image": 1, "text": 2}, on_evict=mixed_cleanup,
+        )
+        cache.put("model-a", {"id": "model-a", "instance": object()}, media_type="image")
+        cache.put("model-b", {"id": "model-b", "instance": object()}, media_type="text")
+        cache.put("model-c", {"id": "model-c", "instance": object()}, media_type="text")
+        self.assertEqual(set(cache.loaded_ids()), {"model-a", "model-b", "model-c"})
+
+        # Replace model-a's runtime AND move it into "text" -- already at
+        # budget=2 -- forcing both a replace-cleanup and an overflow-
+        # cleanup (evicting the LRU "text" occupant, model-b) in one call.
+        with self.assertRaises(_FakeCancellation):
+            cache.put("model-a", {"id": "model-a", "instance": object()}, media_type="text")
+
+        # Both targets were finalized -- model-b's overflow cleanup ran
+        # too, not skipped just because model-a's raised first.
+        self.assertEqual(cleanup_calls, ["model-a", "model-b"])
+        self.assertNotIn("model-b", cache._entries)
+        self.assertEqual(set(cache.loaded_ids()), {"model-a", "model-c"})
+
+    # ------------------------- bonus 12: reject same-object reinsertion of an INVALID entry
+    def test_put_rejects_same_object_reinsertion_of_an_invalid_entry(self):
+        # Found by the same re-review pass: INVALID is not in
+        # _BUSY_FOR_UNLOAD_STATES, so an unpinned INVALID entry passed the
+        # busy check and reached the same-object fast path -- which
+        # refreshes bucket/LRU position but never restores .state to
+        # READY, so get()/has() kept treating it as absent while it could
+        # still evict a healthy destination-bucket entry for no benefit.
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service({"model-a": manifest_a}, {"fake": loader})
+
+        handle = service.acquire_runtime("model-a", "image")
+        runtime_obj = handle.runtime
+        handle.release(had_exception=True)  # marks INVALID, lease_count back to 0
+        entry = cache._entries["model-a"]
+        self.assertEqual(entry.state, RuntimeState.INVALID)
+        self.assertEqual(entry.lease_count, 0)
+
+        with self.assertRaises(RuntimeBusyError):
+            cache.put("model-a", runtime_obj)  # same object, still INVALID
+
+        self.assertEqual(cache._entries["model-a"].state, RuntimeState.INVALID)
+
+    # ------------------------- bonus 13: acquire_or_reserve never overwrites a concurrent put()
+    def test_acquire_or_reserve_never_overwrites_a_concurrently_republished_target(self):
+        # Found by the same re-review pass: a legacy put() does not
+        # participate in L, so it could republish the exact id
+        # acquire_or_reserve() is trying to reserve while that call's own
+        # victim cleanup was running outside M. The post-cleanup recheck
+        # only checked bucket *capacity* -- if that happened to look fine,
+        # it would blindly overwrite the concurrently published entry,
+        # leaking its runtime with zero cleanup.
+        cleanup_started = Event()
+        cleanup_release = Event()
+
+        def blocking_cleanup(model_id, runtime_obj):
+            cleanup_started.set()
+            assert cleanup_release.wait(timeout=5)
+
+        # budget=1 for "image"; a generous budget=5 for "text" -- the
+        # concurrent put() below republishes "model-b" into "text", a
+        # *different* bucket than the one acquire_or_reserve() is
+        # reserving into ("image"). This is what actually distinguishes
+        # the fix from the old code: if the concurrent put() landed in the
+        # *same* bucket, removing one victim and adding one entry back
+        # nets to exactly the same occupancy either way, so the old
+        # bucket-capacity-only recheck would coincidentally still see (and
+        # reject) the occupied slot -- masking the bug. Publishing into an
+        # unrelated bucket makes the *target id itself* the only thing
+        # that would have caught the collision.
+        cache = ModelRuntimeCache(
+            max_entries=1, media_limits={"image": 1, "text": 5}, on_evict=blocking_cleanup,
+        )
+        cache.put("model-a", {"id": "model-a", "instance": object()}, media_type="image")
+
+        errors: list[BaseException] = []
+        result: dict[str, object] = {}
+
+        def reserver():
+            try:
+                result["entry"] = cache.acquire_or_reserve("model-b", "image")
+            except RuntimeBusyError as exc:
+                result["busy"] = exc
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        t = Thread(target=reserver)
+        t.start()
+        self.assertTrue(cleanup_started.wait(timeout=5))  # model-a's victim cleanup is mid-flight
+
+        # A concurrent legacy put() republishes "model-b" -- the exact id
+        # acquire_or_reserve() is trying to reserve -- while it's outside M,
+        # into a different (spacious) bucket.
+        republished_runtime = {"id": "model-b", "instance": object()}
+        cache.put("model-b", republished_runtime, media_type="text")
+
+        cleanup_release.set()
+        t.join(timeout=5)
+
+        self.assertEqual(errors, [])
+        self.assertNotIn("entry", result)  # never silently overwritten
+        self.assertIsInstance(result.get("busy"), RuntimeBusyError)
+
+        # The concurrently published entry survives, fully intact.
+        self.assertIs(cache._entries["model-b"].runtime, republished_runtime)
+        self.assertEqual(cache._entries["model-b"].state, RuntimeState.READY)
+
+    # ------------------------- bonus 14: deferred overflow eviction on final unpin
+    def test_release_lease_evicts_deferred_overflow_once_the_last_pin_drains(self):
+        # Found by the same re-review pass: legacy put() intentionally
+        # leaves a bucket over budget while every over-budget member is
+        # pinned (pin supremacy). Nothing previously re-triggered eviction
+        # once the last such pin released -- the overage could persist
+        # indefinitely.
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        cleanup = _RecordingCleanup()
+        service, cache = _build_service(
+            {"model-a": manifest_a}, {"fake": loader}, on_evict=cleanup, max_entries=1,
+        )
+
+        handle = service.acquire_runtime("model-a", "image")  # pins model-a
+
+        # A legacy put() overflows the (budget=1) bucket while model-a is
+        # pinned -- pin supremacy leaves the bucket over budget, as designed.
+        cache.put("model-b", {"id": "model-b", "instance": object()})
+        self.assertEqual(set(cache.loaded_ids()), {"model-a", "model-b"})
+        self.assertEqual(cleanup.calls, [])
+
+        # Releasing the last pin on model-a must now retire the deferred
+        # overflow -- model-a itself, being the LRU entry.
+        handle.release()
+
+        self.assertEqual(cleanup.calls, ["model-a"])
+        self.assertEqual(cache.loaded_ids(), ["model-b"])
+
+    # ------------------------- bonus 15: reject recursive acquisition of the same entry
+    def test_acquire_runtime_rejects_recursive_acquisition_of_the_same_entry(self):
+        # Originally found with admission_capacity > 1: G alone used to not
+        # reject a same-thread second acquisition of the *same* canonical
+        # entry (the lease-hit path in acquire_or_reserve() has no
+        # knowledge of E at all), so the thread would proceed to block
+        # forever trying to acquire its own already-held, non-reentrant
+        # execution_lock -- guarded at the time by a dedicated E-level
+        # owner check. PR4a v1's final-convergence pass replaced that
+        # E-level check with an unconditional G-level one
+        # (`RuntimeAdmissionController.acquire()` now rejects ANY nested
+        # acquire_runtime() call from a thread already holding an open
+        # handle, same id or not, regardless of capacity), which already
+        # catches this exact same-id case before E is ever reached -- this
+        # test still exercises it, now via that unconditional G-level path.
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service(
+            {"model-a": manifest_a}, {"fake": loader}, admission_capacity=2,
+        )
+
+        handle = service.acquire_runtime("model-a", "image")
+        try:
+            with self.assertRaises(RuntimeError) as cm:
+                service.acquire_runtime("model-a", "image")  # same id, same thread
+            self.assertNotIsInstance(cm.exception, RuntimeBusyError)
+        finally:
+            handle.release()
+
+        # Once released, a fresh acquisition on this same thread succeeds
+        # normally -- the owner marker was correctly cleared, not stuck.
+        handle2 = service.acquire_runtime("model-a", "image")
+        try:
+            self.assertIsNotNone(handle2.runtime)
+        finally:
+            handle2.release()
+
+    # ------------------- PR4a v1 final-convergence (issue #414), required regression (a)
+    def test_acquire_runtime_rejects_nested_blocking_acquire_of_a_different_entry(self):
+        # PR4a v1 final-convergence pass, Codex-review finding "Reject
+        # blocking nested acquisitions before taking another G slot": a
+        # single thread already holding an open RuntimeHandle must be
+        # rejected immediately -- via a plain RuntimeError, never a wait --
+        # the instant it attempts ANY other blocking-capable
+        # acquire_runtime() call, for a genuinely *different* canonical id,
+        # even with spare admission capacity that would otherwise let the
+        # semaphore itself succeed. No second thread is needed to prove
+        # this: the rejection must be unconditional and immediate from a
+        # single thread alone (see
+        # test_nested_acquire_cannot_deadlock_against_a_genuine_cross_thread_e_contention_cycle
+        # below for the full cross-thread cycle this closes).
+        manifest_x = _FakeManifest("model-x", loader="fake-x")
+        manifest_y = _FakeManifest("model-y", loader="fake-y")
+        loader_x = _ImmediateLoader()
+        loader_y = _ImmediateLoader()
+        service, cache = _build_service(
+            {"model-x": manifest_x, "model-y": manifest_y},
+            {"fake-x": loader_x, "fake-y": loader_y},
+            admission_capacity=2,  # a free G slot exists for Y -- not about G exhaustion
+        )
+
+        handle_x = service.acquire_runtime("model-x", "image")
+        try:
+            with self.assertRaises(RuntimeError) as cm:
+                service.acquire_runtime("model-y", "image")
+            self.assertNotIsInstance(cm.exception, RuntimeBusyError)
+            # No side effect from the rejected attempt: Y was never loaded,
+            # and X's own state is untouched.
+            self.assertEqual(loader_y.load_calls, 0)
+            self.assertEqual(cache._entries["model-x"].lease_count, 1)
+        finally:
+            handle_x.release()
+
+        # Once X is released, a fresh acquisition of Y on this same thread
+        # succeeds normally.
+        handle_y = service.acquire_runtime("model-y", "image")
+        try:
+            self.assertIsNotNone(handle_y.runtime)
+        finally:
+            handle_y.release()
+
+    # ------------------- PR4a v1 final-convergence (issue #414), required regression (b)
+    def test_nested_acquire_cannot_deadlock_against_a_genuine_cross_thread_e_contention_cycle(self):
+        # PR4a v1 final-convergence pass: reproduces the exact cross-thread
+        # cycle a prior, narrower version of the nested-acquisition guard
+        # left open (see `RuntimeAdmissionController`'s own docstring in
+        # core/models/service.py): thread A holds entry X plus one of G's
+        # two slots; thread B holds G's other slot and is itself
+        # genuinely, provably blocked waiting on X's E, which only A can
+        # release. A must never be allowed to block trying to acquire G
+        # for a *different* entry Y while in this state -- it could never
+        # release X to unblock B while parked there, which is exactly the
+        # deadlock this fix closes. "B is genuinely blocked on E, not just
+        # started" is proved by intercepting the exact module-level
+        # blocking-acquire call `_acquire_execution_lock()` makes for X's
+        # `execution_lock` specifically (threading.Lock instances forbid
+        # arbitrary attribute assignment, so the interception is at the
+        # call boundary, not the lock object itself) -- a genuine
+        # synchronization point, never a sleep()-based timing guess.
+        manifest_x = _FakeManifest("model-x", loader="fake-x")
+        manifest_y = _FakeManifest("model-y", loader="fake-y")
+        loader_x = _ImmediateLoader()
+        loader_y = _ImmediateLoader()
+        service, cache = _build_service(
+            {"model-x": manifest_x, "model-y": manifest_y},
+            {"fake-x": loader_x, "fake-y": loader_y},
+            admission_capacity=2,
+        )
+
+        handle_x = service.acquire_runtime("model-x", "image")  # A: G-slot-1 + E(X)
+        entry_x = handle_x._entry
+
+        b_blocked_on_e = Event()
+        original_acquire_with_deadline = service_module._acquire_with_deadline
+
+        def signaling_acquire_with_deadline(lockable, deadline):
+            if lockable is entry_x.execution_lock:
+                b_blocked_on_e.set()
+            return original_acquire_with_deadline(lockable, deadline)
+
+        b_errors: list[BaseException] = []
+
+        def thread_b():
+            try:
+                # B: takes G's second slot, then genuinely blocks trying to
+                # acquire X's E -- its own lease-hit path in
+                # acquire_or_reserve() never touches E at all, so this
+                # call's own block is entirely inside
+                # _acquire_execution_lock().
+                handle = service.acquire_runtime("model-x", "image")
+                handle.release()
+            except BaseException as exc:  # noqa: BLE001
+                b_errors.append(exc)
+
+        service_module._acquire_with_deadline = signaling_acquire_with_deadline
+        try:
+            tb = Thread(target=thread_b)
+            tb.start()
+            self.assertTrue(b_blocked_on_e.wait(timeout=5))
+
+            # B is now provably parked inside its own blocking acquisition
+            # of X's E, holding G's second slot. A (this thread) must be
+            # rejected immediately -- not deadlocked -- attempting to nest
+            # an acquisition of a *different* entry, Y.
+            with self.assertRaises(RuntimeError) as cm:
+                service.acquire_runtime("model-y", "image")
+            self.assertNotIsInstance(cm.exception, RuntimeBusyError)
+            self.assertEqual(loader_y.load_calls, 0)
+        finally:
+            service_module._acquire_with_deadline = original_acquire_with_deadline
+
+        # Releasing X frees E for B (who then completes normally) and frees
+        # A's own G slot.
+        handle_x.release()
+        tb.join(timeout=5)
+        self.assertEqual(b_errors, [])
+
+    # ------------------------- bonus 16: deferred eviction finalizes every victim
+    def test_release_lease_finalizes_every_deferred_victim_even_after_a_base_exception(self):
+        # Found by the same re-review pass: the deferred-overflow-eviction
+        # fix (bonus 14) had no equivalent of put()/unload_all()'s
+        # "finalize everyone before re-raising" guarantee -- an
+        # interrupted first victim's cleanup would strand every later
+        # victim (already marked RETIRING under M) permanently.
+        cleanup_calls: list[str] = []
+
+        def mixed_cleanup(model_id, runtime_obj):
+            cleanup_calls.append(model_id)
+            if model_id == "model-a":
+                raise _FakeCancellation("injected: model-a's deferred cleanup interrupted")
+
+        cache = ModelRuntimeCache(max_entries=1, media_limits={"shared": 1}, on_evict=mixed_cleanup)
+        # Directly construct 3 READY entries sharing one budget=1 bucket --
+        # model-a starts pinned, so put()'s own incremental eviction never
+        # gets a chance to catch up as each one is added. Releasing
+        # model-a's lease must then discover *two* deferred victims
+        # (model-a itself and model-b) in the same pass.
+        entries = {}
+        for model_id in ("model-a", "model-b", "model-c"):
+            entry = RuntimeEntry(
+                model_id, "shared", RuntimeState.READY,
+                generation=0, runtime={"id": model_id},
+            )
+            cache._entries[model_id] = entry
+            entries[model_id] = entry
+        entries["model-a"].lease_count = 1
+
+        with self.assertRaises(_FakeCancellation):
+            cache.release_lease("model-a", entries["model-a"])
+
+        # Both deferred victims were finalized -- model-b's cleanup ran
+        # too, not skipped just because model-a's raised first.
+        self.assertEqual(cleanup_calls, ["model-a", "model-b"])
+        self.assertNotIn("model-a", cache._entries)
+        self.assertNotIn("model-b", cache._entries)
+        self.assertIn("model-c", cache._entries)
+
+    # ------------------------- bonus 17: preserve invalidation across racing releases
+    def test_release_preserves_invalidation_from_a_racing_concurrent_caller(self):
+        # Found by the same re-review pass: RuntimeHandle.release()'s
+        # guard used to let whichever caller won it decide the outcome
+        # unilaterally -- a `release(had_exception=False)` (a clean
+        # context-manager exit) that won the race against a concurrent
+        # `release(had_exception=True)` (e.g. a supervisor/cancellation
+        # thread) silently discarded the second call's invalidation
+        # request entirely, leaving a runtime that one caller explicitly
+        # flagged as failed sitting at READY, available to the next
+        # acquirer.
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service({"model-a": manifest_a}, {"fake": loader})
+
+        handle = service.acquire_runtime("model-a", "image")
+        entry = handle._entry
+
+        class _InterceptingLock:
+            """Wraps `entry.execution_lock` to pause release() mid-unwind,
+            deterministically landing a second, racing release() call
+            while the first (winning) call is still in flight."""
+
+            def __init__(self, real_lock, on_release):
+                self._real = real_lock
+                self._on_release = on_release
+
+            def acquire(self, *args, **kwargs):
+                return self._real.acquire(*args, **kwargs)
+
+            def release(self):
+                self._on_release()
+                self._real.release()
+
+        y_in_unwind = Event()
+        let_y_continue = Event()
+        entry.execution_lock = _InterceptingLock(
+            entry.execution_lock,
+            on_release=lambda: (y_in_unwind.set(), let_y_continue.wait(timeout=5)),
+        )
+
+        errors: list[BaseException] = []
+
+        def clean_exit():
+            try:
+                handle.release(had_exception=False)  # the "winning" caller
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        ty = Thread(target=clean_exit)
+        ty.start()
+        # Y has already set _released=True (won the guard) and is now
+        # paused just before actually releasing E.
+        self.assertTrue(y_in_unwind.wait(timeout=5))
+
+        # X: a racing caller with had_exception=True, arriving while Y's
+        # own unwind is still genuinely in flight.
+        handle.release(had_exception=True)
+
+        let_y_continue.set()
+        ty.join(timeout=5)
+        self.assertEqual(errors, [])
+
+        self.assertEqual(entry.state, RuntimeState.INVALID)
+
+    # ------------------------- bonus 18: admission ownership survives thread-id recycling
+    def test_admission_controller_tracks_ownership_by_thread_object_not_recyclable_id(self):
+        # Found by a further Codex re-review pass: threading.get_ident()
+        # values ARE recycled by the OS/interpreter once a thread exits.
+        # Keying ownership by that raw integer could misattribute a still-
+        # open handle's slot to an unrelated, later-started thread that
+        # happens to reuse the same numeric id -- wrongly rejecting its
+        # own, perfectly legitimate acquisition as "recursive". Keying by
+        # the `Thread` object itself (never recycled, unlike its `.ident`)
+        # avoids this regardless of what the OS does with the underlying
+        # thread id.
+        controller = RuntimeAdmissionController(capacity=1)
+
+        acquired: dict[str, object] = {}
+
+        def worker():
+            acquired["ok"] = controller.acquire(None)
+            # Exits WITHOUT releasing -- a separate "cleanup" thread below
+            # releases on this worker's behalf, exactly like a supported
+            # cross-thread release.
+
+        worker_thread = Thread(target=worker)
+        worker_thread.start()
+        worker_thread.join(timeout=5)
+        self.assertTrue(acquired.get("ok"))
+
+        # Ownership is keyed by the actual Thread object, not an int --
+        # still a valid, distinct dict key even after the worker thread has
+        # fully exited.
+        self.assertEqual(len(controller._held_by_thread), 1)
+        self.assertIsInstance(next(iter(controller._held_by_thread)), Thread)
+
+        cleanup_errors: list[BaseException] = []
+
+        def cleanup():
+            try:
+                controller.release(worker_thread)
+            except BaseException as exc:  # noqa: BLE001
+                cleanup_errors.append(exc)
+
+        cleanup_thread = Thread(target=cleanup)
+        cleanup_thread.start()
+        cleanup_thread.join(timeout=5)
+        self.assertEqual(cleanup_errors, [])
+        self.assertEqual(controller._held_by_thread, {})
+
+        # A brand-new thread's acquisition succeeds normally -- never
+        # confused with the exited worker's, whatever the OS did with its
+        # numeric thread id.
+        new_thread_result: dict[str, object] = {}
+
+        def new_worker():
+            new_thread_result["ok"] = controller.acquire(None)
+
+        new_thread = Thread(target=new_worker)
+        new_thread.start()
+        new_thread.join(timeout=5)
+        self.assertTrue(new_thread_result.get("ok"))
+        controller.release(new_thread)
+
+    # ------------------------- bonus 19: replacement built before old entry is deleted
+    def test_put_leaves_the_old_entry_untouched_when_replacement_construction_fails(self):
+        # Found by the same re-review pass: the old entry used to be
+        # deleted from `_entries` *before* its replacement `RuntimeEntry`
+        # was constructed. If construction itself raised (a hypothetical
+        # `Lock()` allocation failure, an async BaseException), the old
+        # entry vanished with its cleanup never scheduled, and no
+        # replacement was ever installed -- model_id ends up completely
+        # absent, as if it had never been cached at all.
+        cleanup = _RecordingCleanup()
+        cache = ModelRuntimeCache(max_entries=1, on_evict=cleanup)
+        original_runtime = {"id": "model-a", "instance": object()}
+        cache.put("model-a", original_runtime)
+        original_entry = cache._entries["model-a"]
+
+        original_runtime_entry_cls = cache_module.RuntimeEntry
+
+        def failing_runtime_entry(*args, **kwargs):
+            raise _FakeCancellation("injected: entry construction interrupted")
+
+        cache_module.RuntimeEntry = failing_runtime_entry
+        try:
+            with self.assertRaises(_FakeCancellation):
+                cache.put("model-a", {"id": "model-a", "instance": object()})
+        finally:
+            cache_module.RuntimeEntry = original_runtime_entry_cls
+
+        # The old entry survives completely untouched -- never deleted, no
+        # spurious cleanup call.
+        self.assertIs(cache._entries["model-a"], original_entry)
+        self.assertIs(cache._entries["model-a"].runtime, original_runtime)
+        self.assertEqual(cleanup.calls, [])
+
+    # ------------------------- bonus 20: reject handle re-entry and nesting
+    def test_runtime_handle_rejects_reentry_and_nested_with_blocks(self):
+        # Found by the same re-review pass: __enter__() used to return
+        # `self` unconditionally, so a released handle could be re-entered
+        # (its E/lease/G already returned, with the next __exit__ then a
+        # silent no-op), and the same handle could be entered again inside
+        # its own `with` block (the inner block's __exit__ would release
+        # everything while the outer block kept using the runtime
+        # unprotected).
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service({"model-a": manifest_a}, {"fake": loader})
+
+        handle = service.acquire_runtime("model-a", "image")
+        with handle:
+            with self.assertRaises(RuntimeError):
+                with handle:  # nested -- rejected
+                    pass
+        # The outer `with` block's own exit still released normally.
+        self.assertEqual(cache._entries["model-a"].lease_count, 0)
+
+        with self.assertRaises(RuntimeError):
+            with handle:  # re-entry after release -- rejected
+                pass
+
+    # ------------------------- bonus 21: overflow accounts for concurrent retirements
+    def test_legacy_put_overflow_accounts_for_concurrently_retiring_entries(self):
+        # Found by a further Codex re-review pass on the earlier
+        # within-call over-eviction fix (bonus 5): that fix only
+        # discounted victims *this call itself* selected, not entries
+        # already marked RETIRING by a *different*, concurrent put() call
+        # whose own cleanup was still in flight. Budget=2, bucket at
+        # {a, b}: a blocked put(c) retires "a" (mid-cleanup, not yet
+        # removed); a concurrent put(d), unaware "a" is already doomed,
+        # used to retire *two* more (b and c) to "compensate", leaving
+        # only {d} instead of the correct {c, d}.
+        cleanup_started = Event()
+        cleanup_release = Event()
+        cleanup_calls: list[str] = []
+
+        def cleanup(model_id, runtime_obj):
+            cleanup_calls.append(model_id)
+            if model_id == "model-a":
+                cleanup_started.set()
+                assert cleanup_release.wait(timeout=5)
+
+        cache = ModelRuntimeCache(max_entries=2, on_evict=cleanup)
+        cache.put("model-a", {"id": "model-a"})
+        cache.put("model-b", {"id": "model-b"})
+
+        errors: list[BaseException] = []
+
+        def put_c():
+            try:
+                cache.put("model-c", {"id": "model-c"})
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        tc = Thread(target=put_c)
+        tc.start()
+        self.assertTrue(cleanup_started.wait(timeout=5))
+        self.assertEqual(cache._entries["model-a"].state, RuntimeState.RETIRING)
+
+        # A second, concurrent put() while model-a is still RETIRING
+        # (cleanup not yet finished) must not "double-compensate" by
+        # evicting two more entries -- only one more is actually needed.
+        cache.put("model-d", {"id": "model-d"})
+
+        cleanup_release.set()
+        tc.join(timeout=5)
+        self.assertEqual(errors, [])
+
+        self.assertEqual(sorted(cleanup_calls), ["model-a", "model-b"])
+        self.assertEqual(set(cache.loaded_ids()), {"model-c", "model-d"})
+
+    # ------------------------- bonus 22: __enter__ serialized with release()
+    def test_enter_blocks_on_release_guard_then_observes_the_committed_state(self):
+        # Found by a further Codex re-review pass on the re-entry guard
+        # (bonus 20): that fix checked `_released` without sharing
+        # `release()`'s own `_release_guard`, so `__enter__()` could read a
+        # stale `False` while a concurrent, cross-thread `release()` call
+        # (an explicitly supported pattern) was itself mid-transition,
+        # returning a handle whose E/lease/G had already been -- or were
+        # about to be -- returned. Sharing `_release_guard` between the two
+        # makes them mutually exclusive: `__enter__()` can only ever run
+        # entirely before or entirely after any given `release()` call's
+        # own transition, never overlapping it.
+        #
+        # Proven here by pausing `release()` *while it still holds*
+        # `_release_guard` (via a stand-in for `mark_invalid()`, called
+        # from inside that exact critical section) and confirming
+        # `__enter__()`, attempted concurrently, always ends up correctly
+        # rejecting -- it cannot even attempt its own check until the
+        # guard is free, by which point `_released` is already durably
+        # `True`.
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service({"model-a": manifest_a}, {"fake": loader})
+
+        handle = service.acquire_runtime("model-a", "image")
+
+        release_paused = Event()
+        let_release_continue = Event()
+        original_mark_invalid = cache.mark_invalid
+
+        def pausing_mark_invalid(canonical_id, entry_arg):
+            release_paused.set()
+            assert let_release_continue.wait(timeout=5)
+            original_mark_invalid(canonical_id, entry_arg)
+
+        cache.mark_invalid = pausing_mark_invalid
+
+        errors: list[BaseException] = []
+
+        def release_worker():
+            try:
+                handle.release(had_exception=True)  # takes the mark_invalid path
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        t = Thread(target=release_worker)
+        t.start()
+        # release() is now paused *inside* its own `_release_guard`
+        # critical section -- `_released` is already `True`, and the
+        # guard itself is still held.
+        self.assertTrue(release_paused.wait(timeout=5))
+
+        enter_result: dict[str, object] = {}
+
+        def enter_worker():
+            try:
+                handle.__enter__()
+                enter_result["entered"] = True
+            except RuntimeError as exc:
+                enter_result["error"] = exc
+
+        te = Thread(target=enter_worker)
+        te.start()
+
+        # Unblock release() -- only once its guard section actually exits
+        # can __enter__()'s own blocked attempt proceed, at which point
+        # `_released` is unconditionally `True`.
+        let_release_continue.set()
+        t.join(timeout=5)
+        te.join(timeout=5)
+
+        self.assertEqual(errors, [])
+        self.assertIsInstance(enter_result.get("error"), RuntimeError)
+
+    # ------------------------- bonus 23: avoid evicting behind an in-flight retirement
+    def test_acquire_or_reserve_denies_rather_than_evicting_behind_a_retirement(self):
+        # Found by a further Codex re-review pass: _select_capacity_victim_locked()
+        # denied a request only when *every* candidate was pinned/mid-
+        # transition -- but if a healthy, evictable entry was ALSO present
+        # alongside an unrelated in-flight retirement (someone else's
+        # unload(), cleanup still running), it evicted that healthy entry
+        # instead of recognizing the in-flight retirement was already
+        # about to free the needed capacity on its own.
+        cleanup_started = Event()
+        cleanup_release = Event()
+        cleanup_calls: list[str] = []
+
+        def cleanup(model_id, runtime_obj):
+            cleanup_calls.append(model_id)
+            if model_id == "model-a":
+                cleanup_started.set()
+                assert cleanup_release.wait(timeout=5)
+
+        cache = ModelRuntimeCache(max_entries=2, on_evict=cleanup)
+        cache.put("model-a", {"id": "model-a"})
+        cache.put("model-b", {"id": "model-b"})
+
+        errors: list[BaseException] = []
+
+        def unload_a():
+            try:
+                cache.unload("model-a")
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        t = Thread(target=unload_a)
+        t.start()
+        self.assertTrue(cleanup_started.wait(timeout=5))
+        self.assertEqual(cache._entries["model-a"].state, RuntimeState.RETIRING)
+
+        # A concurrent reservation for a NEW id must not evict the healthy
+        # "model-b" just to compensate for capacity "model-a"'s own
+        # in-flight retirement is already freeing.
+        with self.assertRaises(RuntimeBusyError):
+            cache.acquire_or_reserve("model-c", None)
+        self.assertTrue(cache.has("model-b"))  # survives, untouched
+
+        cleanup_release.set()
+        t.join(timeout=5)
+        self.assertEqual(errors, [])
+
+        # Once model-a's retirement has actually finished, capacity is
+        # genuinely available and the same request succeeds cleanly.
+        entry = cache.acquire_or_reserve("model-c", None)
+        self.assertEqual(entry.state, RuntimeState.LOADING)
+        self.assertEqual(sorted(cache._entries.keys()), ["model-b", "model-c"])
+
+    # ------------------------- bonus 24: __enter__ hands off before release() proceeds
+    # ------------------- PR4a v1 final-convergence (issue #414), required regression
+    def test_cross_thread_release_during_active_context_is_deferred_to_exit(self):
+        # PR4a v1 final-convergence pass, Codex-review finding "Prevent
+        # release before the context body starts": a cross-thread
+        # release() call arriving while a handle's context is
+        # entering-or-active must never tear down E/lease/G out from under
+        # a `with` body that may already be running (or about to start) --
+        # reachable via ordinary thread scheduling alone, no exception
+        # required, unlike the accepted async-BaseException/signal-
+        # interruption residual risk documented elsewhere in this module.
+        # A prior, narrower fix only shrank this to the tiny gap between
+        # __enter__() committing `_entered = True` and its own `return
+        # self`; this closes it structurally instead: `release()` now
+        # unconditionally defers to `__exit__()` for as long as `_entered`
+        # is `True`, so there is no instant, of any size, at which any
+        # OTHER call can tear down what the body might still be using.
+        #
+        # `__enter__()`/`__exit__()` are called explicitly here (not via a
+        # `with` statement) so the test can deterministically land the
+        # cleanup thread's `release()` call in exactly the window the old
+        # bug was about: after `__enter__()` has fully returned, before the
+        # body is considered to have "started".
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service({"model-a": manifest_a}, {"fake": loader})
+
+        handle = service.acquire_runtime("model-a", "image")
+        entry = handle._entry
+
+        entered_handle = handle.__enter__()
+        self.assertIs(entered_handle, handle)
+
+        release_done = Event()
+        release_errors: list[BaseException] = []
+
+        def cleanup_release():
+            try:
+                # had_exception=True here, while the body will later exit
+                # via __exit__(None, None, None) (no exception): proves the
+                # OR-combined-invalidation requirement below -- a cleanup
+                # thread's own belief that this runtime is unsafe must land
+                # on the safe (INVALID) side regardless of how the body
+                # itself eventually exits.
+                handle.release(had_exception=True)
+            except BaseException as exc:  # noqa: BLE001
+                release_errors.append(exc)
+            finally:
+                release_done.set()
+
+        t = Thread(target=cleanup_release)
+        t.start()
+        self.assertTrue(release_done.wait(timeout=5))
+        self.assertEqual(release_errors, [])
+
+        # The deferred request was recorded, but NOTHING was actually torn
+        # down yet -- the body (this handle's "owner") has not exited.
+        self.assertTrue(handle._pending_release)
+        self.assertTrue(handle._pending_invalidation)
+        self.assertFalse(handle._released)
+        self.assertEqual(entry.lease_count, 1)
+        self.assertTrue(entry.execution_lock.locked())
+        self.assertGreaterEqual(
+            service._admission._held_by_thread.get(handle._owner_thread, 0), 1
+        )
+        # Invalidation itself was applied immediately -- mark_invalid() is
+        # a short, idempotent, always-safe metadata transaction (see
+        # release()'s own docstring) -- even though the rest of the unwind
+        # is deferred.
+        self.assertEqual(entry.state, RuntimeState.INVALID)
+
+        # Only now does the body "finish", via __exit__() -- the one call
+        # path allowed to actually perform the unwind while `_entered` was
+        # `True`.
+        handle.__exit__(None, None, None)
+
+        self.assertTrue(handle._released)
+        self.assertEqual(entry.lease_count, 0)
+        self.assertFalse(entry.execution_lock.locked())
+        self.assertEqual(
+            service._admission._held_by_thread.get(handle._owner_thread, 0), 0
+        )
+
+        # Idempotent: a further release() call after __exit__() has already
+        # run is a pure no-op, exactly as before.
+        handle.release()
+        self.assertEqual(entry.lease_count, 0)
+
+    def test_manual_release_inside_own_with_block_defers_to_exit(self):
+        # Companion to the cross-thread test above: an intentional
+        # *same*-thread `release()` call made from inside the handle's own
+        # `with` body defers exactly the same way -- v1 deliberately keeps
+        # one rule ("release() during an active context never itself
+        # tears down resources") rather than special-casing same-thread vs
+        # cross-thread, per this fix's own docstring.
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service({"model-a": manifest_a}, {"fake": loader})
+
+        with service.acquire_runtime("model-a", "image") as handle:
+            entry = handle._entry
+            handle.release()  # early, same-thread, intentional manual call
+            # Still fully protected -- __exit__() has not run yet.
+            self.assertTrue(handle._pending_release)
+            self.assertFalse(handle._released)
+            self.assertEqual(entry.lease_count, 1)
+            self.assertTrue(entry.execution_lock.locked())
+
+        # __exit__() performed the actual unwind once the body finished.
+        self.assertTrue(handle._released)
+        self.assertEqual(entry.lease_count, 0)
+        self.assertFalse(entry.execution_lock.locked())
+
+    def test_enter_on_a_different_thread_than_the_acquiring_thread_is_rejected(self):
+        # Codex re-review (post-convergence auto-re-review, PR #415): the
+        # process-wide admission slot (G) a handle holds is credited to
+        # the thread that called acquire_runtime(), not to whichever
+        # thread happens to call __enter__(). Entering on a *different*
+        # thread than the acquiring one would let that thread start an
+        # unrelated acquire_runtime() call of its own -- G's nested-
+        # acquisition ban has no recorded holding for it -- while a third
+        # thread contending for this handle's own E can only ever be
+        # unblocked by this handle's own __exit__(), which only the
+        # entering thread will ever call: the exact cross-thread deadlock
+        # cycle the G-level ban exists to prevent, reintroduced through a
+        # path its per-thread bookkeeping cannot see. Rejected immediately
+        # instead, before anything is torn down.
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service({"model-a": manifest_a}, {"fake": loader})
+
+        handle = service.acquire_runtime("model-a", "image")
+        entry = handle._entry
+
+        enter_result: dict[str, object] = {}
+
+        def other_thread():
+            try:
+                handle.__enter__()
+                enter_result["entered"] = True
+            except RuntimeError as exc:
+                enter_result["error"] = exc
+
+        t = Thread(target=other_thread)
+        t.start()
+        t.join(timeout=5)
+
+        self.assertIsInstance(enter_result.get("error"), RuntimeError)
+        self.assertNotIn("entered", enter_result)
+        # Nothing torn down by the rejected attempt.
+        self.assertFalse(handle._entered)
+        self.assertEqual(entry.lease_count, 1)
+        self.assertTrue(entry.execution_lock.locked())
+
+        # The handle remains fully usable, normally, on its own acquiring
+        # (this) thread.
+        with handle:
+            self.assertIs(handle.runtime, entry.runtime)
+        self.assertEqual(entry.lease_count, 0)
+
+    def test_racing_invalidation_is_published_before_e_can_be_released(self):
+        # PR4a v1 final-convergence pass, Codex-review finding "Publish
+        # racing invalidation before releasing E": reproduces the exact
+        # 3-thread interleaving the finding described --
+        #   A: a normal __exit__() (no exception of its own) wins
+        #      _release_guard
+        #   B: release(had_exception=True) starts, contending for the
+        #      same guard
+        #   A: releases the guard, then releases E
+        #   C: an existing E-waiter wins E and revalidates
+        # -- and proves the fix: B's own mark_invalid() call now runs
+        # *before* B ever touches _release_guard, so it has already
+        # happened by the time A is allowed to proceed past its own
+        # (test-paused) guard section, regardless of whether B has won the
+        # guard yet. C must therefore see the entry INVALID, never READY --
+        # this part of the proof is unchanged. What C's own acquire_runtime()
+        # call does about that (below) has changed: it no longer fails
+        # outright on this first loss -- it retries the L -> E sub-sequence
+        # internally, exactly once, and succeeds with a freshly loaded
+        # runtime, since C's own losing attempt already released its own
+        # stale lease on the now-INVALID entry before the retry runs.
+        manifest_a = _FakeManifest("model-a")
+        loader = _ImmediateLoader()
+        service, cache = _build_service(
+            {"model-a": manifest_a}, {"fake": loader}, admission_capacity=2,
+        )
+
+        a_entered = Event()
+        a_may_exit = Event()
+        a_errors: list[BaseException] = []
+        handle_holder: list = []
+
+        def thread_a():
+            try:
+                handle = service.acquire_runtime("model-a", "image")
+                handle_holder.append(handle)
+                handle.__enter__()
+                a_entered.set()
+                assert a_may_exit.wait(timeout=5.0)
+                handle.__exit__(None, None, None)  # A's own exit is clean
+            except BaseException as exc:  # noqa: BLE001
+                a_errors.append(exc)
+
+        ta = Thread(target=thread_a)
+        ta.start()
+        self.assertTrue(a_entered.wait(timeout=5.0))
+        handle = handle_holder[0]
+        entry = handle._entry
+
+        # Swap in the test-controllable guard *after* __enter__() has
+        # already used the real one -- the only remaining users are this
+        # handle's own __exit__() (thread A, below) and release() (thread
+        # B, below).
+        guard = _PausingReleaseGuard()
+        handle._release_guard = guard
+
+        # C: a genuinely separate acquire_runtime() call for the exact
+        # same entry, proven to be blocked *inside* its own blocking
+        # acquisition of E (not merely "started") by intercepting the
+        # actual module-level blocking-acquire call -- a real
+        # synchronization point, not a timing guess.
+        c_blocked_on_e = Event()
+        original_acquire_with_deadline = service_module._acquire_with_deadline
+
+        def signaling_acquire_with_deadline(lockable, deadline):
+            if lockable is entry.execution_lock:
+                c_blocked_on_e.set()
+            return original_acquire_with_deadline(lockable, deadline)
+
+        c_result: dict[str, object] = {}
+        c_user_code_runs = 0
+
+        def thread_c():
+            nonlocal c_user_code_runs
+            try:
+                c_handle = service.acquire_runtime("model-a", "image")
+            except RuntimeBusyError as exc:
+                c_result["busy"] = exc
+                return
+            except BaseException as exc:  # noqa: BLE001
+                c_result["error"] = exc
+                return
+            c_user_code_runs += 1
+            c_result["handle"] = c_handle
+
+        service_module._acquire_with_deadline = signaling_acquire_with_deadline
+        tc = Thread(target=thread_c)
+        try:
+            tc.start()
+            self.assertTrue(c_blocked_on_e.wait(timeout=5.0))
+        finally:
+            service_module._acquire_with_deadline = original_acquire_with_deadline
+
+        # Let A proceed into __exit__(): it commits _released = True,
+        # decides had_exception=False (its own exit is clean), and is then
+        # paused by the test guard *while still holding it* -- exactly "A
+        # owns _release_guard" in the scenario above.
+        a_may_exit.set()
+        self.assertTrue(guard.paused.wait(timeout=5.0))
+
+        # B: the cross-thread exception release, started only now -- while
+        # A is confirmed still holding the guard, so B's own eventual
+        # attempt to acquire it is guaranteed to genuinely block on the
+        # real lock underneath (not a race against A's own progress).
+        b_errors: list[BaseException] = []
+
+        def thread_b():
+            try:
+                handle.release(had_exception=True)
+            except BaseException as exc:  # noqa: BLE001
+                b_errors.append(exc)
+
+        b_marked_invalid = Event()
+        original_mark_invalid = cache.mark_invalid
+
+        def signaling_mark_invalid(canonical_id, entry_arg):
+            original_mark_invalid(canonical_id, entry_arg)
+            if canonical_id == "model-a":
+                b_marked_invalid.set()
+
+        cache.mark_invalid = signaling_mark_invalid
+        tb = Thread(target=thread_b)
+        try:
+            tb.start()
+            # B's own mark_invalid() call happens *before* it ever touches
+            # _release_guard (the fix) -- so it completes even though A is
+            # still holding that exact guard right now.
+            self.assertTrue(b_marked_invalid.wait(timeout=5.0))
+        finally:
+            cache.mark_invalid = original_mark_invalid
+
+        # The critical invariant: INVALID is already visible *before* A
+        # has been allowed to release E at all.
+        self.assertEqual(entry.state, RuntimeState.INVALID)
+
+        # Now let A actually proceed: release the guard, then release E
+        # via _teardown().
+        guard.let_continue.set()
+        ta.join(timeout=5.0)
+        tb.join(timeout=5.0)
+        tc.join(timeout=5.0)
+
+        self.assertEqual(a_errors, [])
+        self.assertEqual(b_errors, [])
+        # C loses its first revalidation against the invalidation B already
+        # published (the FP-005 ordering proof above still holds exactly as
+        # before), but its own acquire_runtime() call absorbs that loss with
+        # one internal retry and succeeds -- a fresh runtime, not the one A
+        # was using.
+        self.assertEqual(c_user_code_runs, 1)
+        self.assertIn("handle", c_result)
+        self.assertNotIn("busy", c_result)
+        c_handle = c_result["handle"]
+        self.assertIsNotNone(c_handle.runtime)
+        self.assertIsNot(c_handle.runtime, handle.runtime)
+        self.assertEqual(loader.load_calls, 2)  # A's original load + C's retry-triggered reload
+        c_handle.release()
+
+        # Final state: fully unwound, nothing leaked -- including on the
+        # OLD entry object A/B/C's first attempt all touched (now retired
+        # and replaced by C's retry, but still checkable directly).
+        self.assertEqual(entry.lease_count, 0)
+        self.assertFalse(entry.execution_lock.locked())
+        new_entry = cache._entries["model-a"]
+        self.assertIsNot(new_entry, entry)
+        self.assertEqual(new_entry.lease_count, 0)
+        self.assertFalse(new_entry.execution_lock.locked())
+        self.assertEqual(service._admission._held_by_thread, {})
+
+
+class PublicModelFacadeExportsTest(unittest.TestCase):
+    """Safety convergence pass, Codex finding "export the retryable timeout
+    from the model facade": a caller using the public `ModelService
+    .acquire_runtime()` API needs `RuntimeWaitTimeoutError` to distinguish a
+    retryable synchronization deadline from other `RuntimeBusyError`
+    conditions, without reaching into the internal `core.models.runtime_lease`
+    module."""
+
+    def test_runtime_wait_timeout_error_is_importable_from_the_public_facade(
+        self,
+    ) -> None:
+        from core.models import RuntimeWaitTimeoutError as facade_error
+        from core.models.runtime_lease import RuntimeWaitTimeoutError as internal_error
+
+        self.assertIs(facade_error, internal_error)
+        import core.models as facade_module
+
+        self.assertIn("RuntimeWaitTimeoutError", facade_module.__all__)
+
+
+if __name__ == "__main__":
+    unittest.main()

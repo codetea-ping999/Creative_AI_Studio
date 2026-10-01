@@ -8,6 +8,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event, Thread
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 import wave
@@ -37,6 +38,7 @@ try:
         release_runtime,
     )
     from core.models.cache import resolve_media_cache_limits
+    from core.models.runtime_lease import RuntimeState
     from core.prompting import PromptComposer
     from core.reference_capabilities import (
         DEFAULT_REFERENCE_STRENGTH,
@@ -243,6 +245,94 @@ def _fake_diffusers_load_reference_capable_step_aware(self, manifest):
         "path_exists": True,
         "pipeline": _FakeStepAwarePipeline(),
         "img2img_pipeline": _FakeReferenceCapableStepAwarePipeline(),
+    }
+
+
+class _FakeReferenceCapableSecondOrderPipeline:
+    """Img2img-shaped pipeline simulating a second-order scheduler (#389).
+
+    Real diffusers 0.37 expands a second-order scheduler's (e.g.
+    HeunDiscreteScheduler) internal timestep table for the *full* requested
+    `num_inference_steps` when `set_timesteps()` runs, so
+    `scheduler.timesteps` stays at that full expanded length (19, for 10
+    requested steps) regardless of strength. For an img2img call,
+    `get_timesteps()` then slices a *local* variable down to the steps
+    strength actually selects -- `scheduler.timesteps` itself is never
+    replaced -- so callback_on_step_end fires only
+    `2 * base_steps - 1` times for `base_steps =
+    int(num_inference_steps * strength)` (7, here), not 19 times (#393
+    Codex P2). This fake reproduces both numbers distinctly: `scheduler
+    .timesteps` deliberately stays at the full, un-sliced 19-length table a
+    correct fix must NOT read, while `num_timesteps` -- diffusers' own
+    count of the current call's actual loop length, mirrored here exactly
+    as diffusers sets it -- carries the true 7.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+        self.steps_invoked = 0
+        self.scheduler = SimpleNamespace(timesteps=[])
+        self.num_timesteps = 0
+
+    def __call__(
+        self,
+        *,
+        prompt,
+        negative_prompt=None,
+        width=64,
+        height=64,
+        guidance_scale=7.5,
+        num_inference_steps=30,
+        image=None,
+        strength=None,
+        callback_on_step_end=None,
+        **kwargs,
+    ):
+        self.calls.append({"image": image, "strength": strength})
+        base_steps = max(1, int(num_inference_steps * (strength or 0.0)))
+        expanded_steps = 2 * base_steps - 1
+        full_schedule_steps = 2 * num_inference_steps - 1
+        # Deliberately the *wrong*, larger number a correct fix must ignore
+        # -- mirrors a real scheduler's un-sliced, multi-element
+        # torch.Tensor closely enough to also catch a regression back to
+        # `if timesteps:` truthiness-testing it (#393 Codex P1): a
+        # non-empty list is truthy exactly like a non-empty tensor would be,
+        # so this alone wouldn't raise, but reading its *length* here as the
+        # denominator reproduces the P2 under-reporting bug precisely.
+        self.scheduler = SimpleNamespace(
+            timesteps=list(range(full_schedule_steps))
+        )
+        self.num_timesteps = expanded_steps
+        for step_index in range(expanded_steps):
+            self.steps_invoked = step_index + 1
+            if callback_on_step_end is not None:
+                callback_on_step_end(self, step_index, 0, {})
+        return _FakePipelineResult(Image.new("RGB", (width, height), color=(7, 8, 9)))
+
+    def to(self, device: str) -> "_FakeReferenceCapableSecondOrderPipeline":
+        return self
+
+
+def _fake_diffusers_load_reference_capable_second_order(self, manifest):
+    return {
+        "stub": False,
+        "loader": self.__class__.__name__,
+        "manifest_id": manifest.id,
+        "display_name": manifest.display_name,
+        "runtime": manifest.runtime,
+        "provider": manifest.provider,
+        "local_path": manifest.local_path,
+        "remote_ref": manifest.remote_ref,
+        "dtype": manifest.dtype,
+        "load_dtype": "float32",
+        "torch_dtype": "float32",
+        "weight_dtype": "float16",
+        "variant": "fp16",
+        "device": "cpu",
+        "default_params": dict(manifest.default_params),
+        "path_exists": True,
+        "pipeline": _FakeStepAwarePipeline(),
+        "img2img_pipeline": _FakeReferenceCapableSecondOrderPipeline(),
     }
 
 
@@ -1232,6 +1322,15 @@ class ModelSystemTests(unittest.TestCase):
             self.assertEqual(reported_progress, [0.25, 0.5, 0.75, 1.0])
 
     def test_image_generator_stops_diffusers_pipeline_when_cancelled(self) -> None:
+        # PR4b / FP-002: cancellation observed mid-inference (inside the
+        # step callback, after the runtime lease's mutation/inference
+        # interval has already begun) is a genuine runtime-use failure and
+        # conservatively marks the leased entry INVALID -- it is no longer
+        # safe to assume the same cached pipeline instance is still READY
+        # afterward, so this reads the cache entry directly (bypassing the
+        # READY-only `get()` filter) rather than through
+        # `service.get_runtime()`, which would now (correctly) reload a
+        # fresh pipeline instead of returning the one actually used.
         with TemporaryDirectory() as tmp_dir:
             output_dir = Path(tmp_dir) / "outputs"
             cancellation_state = {"requested": False}
@@ -1263,13 +1362,12 @@ class ModelSystemTests(unittest.TestCase):
                         ),
                         context,
                     )
-                pipeline = service.get_runtime(
-                    "sdxl",
-                    "image",
-                    "text-to-image",
-                )["pipeline"]
+                entry = service.runtime_cache._entries["sdxl-local"]
+                pipeline = entry.runtime["pipeline"]
 
             self.assertEqual(pipeline.steps_invoked, 2)
+            self.assertIs(entry.state, RuntimeState.INVALID)
+            self.assertEqual(entry.lease_count, 0)
             self.assertEqual(list(output_dir.glob("*")), [])
 
     def test_image_generator_removes_completed_variations_when_later_one_is_cancelled(
@@ -1804,6 +1902,120 @@ class ModelSystemTests(unittest.TestCase):
             }
             self.assertEqual(considered_asset_ids, {"asset_char_1", "asset_location_1"})
 
+    def test_image_generator_excludes_a_zero_strength_reference_from_a_shared_role_limit(
+        self,
+    ) -> None:
+        # Regression (#387 P1 hotfix, case 1, runtime side): two *direct*
+        # `character` references -- one strength=0, one strength=0.8 --
+        # previously tripped this manifest's max_references_per_role=1
+        # because validate_reference_inputs() ran against the raw
+        # (unfiltered) list, even though only the nonzero one has any
+        # conditioning effect. Unlike the combined-limit test above (two
+        # different roles), this exercises the per-role count specifically.
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_root = root / "manifests"
+            model_id = self._write_reference_capable_manifest(manifest_root)
+            composer, _character_id = self._prepare_character_reference(root)
+            second_reference_path = root / "second_character.png"
+            Image.new("RGB", (16, 16), color=(80, 40, 20)).save(second_reference_path)
+            composer.asset_repository.create_or_update(
+                Asset(
+                    id="asset_char_2",
+                    job_id="job_fixture",
+                    project_id=None,
+                    media_type="image",
+                    kind="output",
+                    title="second character fixture",
+                    prompt="a second reference image",
+                    model_id="sdxl",
+                    path=str(second_reference_path),
+                )
+            )
+            output_dir = root / "outputs"
+
+            with patch(
+                "core.models.loader.DiffusersImageLoader.load",
+                new=_fake_diffusers_load_reference_capable,
+            ):
+                service = create_default_model_service(manifest_root=manifest_root)
+                generator = ImageGenerator(
+                    service, output_dir=output_dir, prompt_composer=composer
+                )
+                result = generator.run(
+                    GenerationRequest(
+                        media_type="image",
+                        prompt="Mina, twice",
+                        model_id=model_id,
+                        references=[
+                            ReferenceImageInput(
+                                asset_id="asset_char_1", role="character", strength=0.0
+                            ),
+                            ReferenceImageInput(
+                                asset_id="asset_char_2", role="character", strength=0.8
+                            ),
+                        ],
+                        params={"steps": 10, "width": 64, "height": 64},
+                    )
+                )
+                runtime = service.get_runtime(model_id, "image", "text-to-image")
+                img2img_pipeline = runtime["img2img_pipeline"]
+
+            self.assertEqual(result.status, "succeeded")
+            self.assertEqual(len(img2img_pipeline.calls), 1)
+            self.assertTrue(result.metadata["reference_conditioning_applied"])
+            self.assertEqual(result.metadata["reference_applied_asset_id"], "asset_char_2")
+            considered_asset_ids = {
+                reference["asset_id"]
+                for reference in result.metadata["considered_references"]
+            }
+            self.assertEqual(considered_asset_ids, {"asset_char_1", "asset_char_2"})
+
+    def test_image_generator_treats_an_all_zero_strength_reference_as_unconditioned(
+        self,
+    ) -> None:
+        # Regression (#387 P1 hotfix, case 2, runtime side): a request whose
+        # only reference is strength=0 has no conditioning effect and must
+        # fall through to the ordinary text-to-image path, even against
+        # "ssd-1b" (the shipped manifest with no reference_capability at
+        # all) -- previously validate_reference_inputs() ran on the raw
+        # list before effective filtering and rejected this outright.
+        with TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir) / "outputs"
+            with patch(
+                "core.models.loader.DiffusersImageLoader.load",
+                new=_fake_diffusers_load,
+            ):
+                service = create_default_model_service()  # real "ssd-1b": no reference_capability
+                generator = ImageGenerator(service, output_dir=output_dir)
+                result = generator.run(
+                    GenerationRequest(
+                        media_type="image",
+                        prompt="a knight",
+                        model_id="ssd-1b",
+                        references=[
+                            ReferenceImageInput(
+                                asset_id="char-1", role="character", strength=0.0
+                            )
+                        ],
+                        params={"steps": 2, "width": 64, "height": 64},
+                    )
+                )
+                pipeline = service.get_runtime(
+                    "ssd-1b", "image", "text-to-image"
+                )["pipeline"]
+
+            self.assertEqual(result.status, "succeeded")
+            self.assertEqual(len(pipeline.calls), 1)
+            self.assertFalse(result.metadata["reference_conditioning_applied"])
+            self.assertIsNone(result.metadata["reference_applied_asset_id"])
+            # Still visible in audit metadata, not silently dropped.
+            considered_asset_ids = {
+                reference["asset_id"]
+                for reference in result.metadata["considered_references"]
+            }
+            self.assertEqual(considered_asset_ids, {"char-1"})
+
     def test_image_generator_rejects_a_reference_asset_outside_the_context_project(
         self,
     ) -> None:
@@ -1931,6 +2143,77 @@ class ModelSystemTests(unittest.TestCase):
             self.assertEqual(img2img_pipeline.steps_invoked, 4)
             self.assertTrue(reported_progress)
             self.assertAlmostEqual(reported_progress[-1], 1.0)
+
+    def test_image_generator_reports_progress_correctly_for_a_second_order_scheduler(
+        self,
+    ) -> None:
+        # Regression (#389): a second-order scheduler (e.g.
+        # HeunDiscreteScheduler) expands diffusers' internal timestep table,
+        # so callback_on_step_end fires roughly 2 * base_steps - 1 times for
+        # base_steps = int(num_inference_steps * strength), not base_steps
+        # times. The old denominator (base_steps alone, mirrored from
+        # DEFAULT_REFERENCE_STRENGTH=0.6 -> diffusers strength 0.4, 10
+        # requested steps -> base_steps=4) would report 100% after the 4th
+        # callback even though this fake -- reproducing the real expansion --
+        # invokes it 2*4-1=7 times, then keeps invoking it three more times
+        # with progress stuck at (or clamped past) 1.0; monotonic step
+        # fractions computed from the *actual* invocation count must instead
+        # keep climbing smoothly across all 7 and land on exactly 1.0 at the
+        # last one.
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_root = root / "manifests"
+            model_id = self._write_reference_capable_manifest(manifest_root)
+            composer, character_id = self._prepare_character_reference(root)
+            output_dir = root / "outputs"
+            reported_progress: list[float] = []
+            context = GenerationContext(
+                is_cancelled=lambda: False,
+                on_progress=reported_progress.append,
+                min_interval_seconds=0.0,
+                min_progress_delta=0.0,
+            )
+
+            with patch(
+                "core.models.loader.DiffusersImageLoader.load",
+                new=_fake_diffusers_load_reference_capable_second_order,
+            ):
+                service = create_default_model_service(manifest_root=manifest_root)
+                generator = ImageGenerator(
+                    service, output_dir=output_dir, prompt_composer=composer
+                )
+                generator.run(
+                    GenerationRequest(
+                        media_type="image",
+                        prompt="Mina on the rooftop",
+                        model_id=model_id,
+                        params={
+                            "steps": 10,
+                            "width": 64,
+                            "height": 64,
+                            "bible_refs": [character_id],
+                        },
+                    ),
+                    context,
+                )
+                img2img_pipeline = service.get_runtime(
+                    model_id, "image", "text-to-image"
+                )["img2img_pipeline"]
+
+            # base_steps = int(10 * 0.4) == 4; expanded (second-order) steps
+            # = 2*4 - 1 == 7.
+            self.assertEqual(img2img_pipeline.steps_invoked, 7)
+            self.assertEqual(len(reported_progress), 7)
+            # Monotonically non-decreasing across every callback, never
+            # exceeding 1.0, and landing on exactly 1.0 at the true last
+            # step -- not part way through, and not clamped-but-flat for
+            # several trailing calls.
+            for earlier, later in zip(reported_progress, reported_progress[1:]):
+                self.assertLessEqual(earlier, later)
+            for value in reported_progress:
+                self.assertLessEqual(value, 1.0)
+            self.assertAlmostEqual(reported_progress[-1], 1.0)
+            self.assertLess(reported_progress[3], 1.0)
 
     def test_image_generator_rejects_a_lock_strength_too_strong_for_the_step_count(
         self,
@@ -2697,6 +2980,73 @@ class ModelSystemTests(unittest.TestCase):
 
             self.assertEqual(list(output_dir.glob("**/*")), [])
             self.assertLess(elapsed, 5.0)
+
+    def test_image_generator_corrupt_reference_file_does_not_invalidate_healthy_runtime(
+        self,
+    ) -> None:
+        # Safety convergence pass, Codex finding "decode reference images
+        # before acquiring the runtime": a reference asset that is corrupt,
+        # unreadable, or deleted after repository lookup is a pure
+        # request-owned failure, not a runtime fault, and must not
+        # invalidate an already-healthy cached pipeline.
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            manifest_root = root / "manifests"
+            model_id = self._write_reference_capable_manifest(manifest_root)
+            composer, character_id = self._prepare_character_reference(root)
+            output_dir = root / "outputs"
+
+            with patch(
+                "core.models.loader.DiffusersImageLoader.load",
+                new=_fake_diffusers_load_reference_capable,
+            ):
+                service = create_default_model_service(manifest_root=manifest_root)
+                generator = ImageGenerator(
+                    service, output_dir=output_dir, prompt_composer=composer
+                )
+                # Warm the cache with a successful, reference-free
+                # generation first, so there is a genuinely healthy runtime
+                # to protect.
+                warm_result = generator.run(
+                    GenerationRequest(
+                        media_type="image",
+                        prompt="Mina on the rooftop",
+                        model_id=model_id,
+                        params={"steps": 1, "width": 64, "height": 64},
+                    )
+                )
+                self.assertEqual(warm_result.status, "succeeded")
+                cached_entry = service.runtime_cache._entries[model_id]
+                self.assertIs(cached_entry.state, RuntimeState.READY)
+                files_after_warmup = set(output_dir.glob("**/*.png"))
+
+                # Corrupt the reference asset's backing file in place.
+                asset = composer.asset_repository.get("asset_char_1")
+                Path(asset.path).write_bytes(b"not a real image")
+
+                with self.assertRaises(Exception):
+                    generator.run(
+                        GenerationRequest(
+                            media_type="image",
+                            prompt="Mina on the rooftop",
+                            model_id=model_id,
+                            params={
+                                "steps": 1,
+                                "width": 64,
+                                "height": 64,
+                                "bible_refs": [character_id],
+                            },
+                        )
+                    )
+
+                # Same entry object, still READY, unleased -- never
+                # reloaded, never invalidated.
+                self.assertIs(service.runtime_cache._entries[model_id], cached_entry)
+                self.assertIs(cached_entry.state, RuntimeState.READY)
+                self.assertEqual(cached_entry.lease_count, 0)
+                # No new output was produced by the failed, corrupted-reference
+                # attempt -- only the warm-up call's own file remains.
+                self.assertEqual(set(output_dir.glob("**/*.png")), files_after_warmup)
 
     def test_bootstrap_factory_composes_default_image_generator(self) -> None:
         with TemporaryDirectory() as tmp_dir:

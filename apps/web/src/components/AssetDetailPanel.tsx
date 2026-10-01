@@ -7,6 +7,7 @@ import {
 import {
   formatDate,
   formatScore,
+  isPlayableVideoAsset,
   type GalleryAssetDetailResponse,
   type ProjectResponse,
 } from "../studio";
@@ -129,12 +130,17 @@ export function AssetDetailPanel({
     }
   }
 
+  // #447: an Assembly MP4's preview_path is a still `*_preview.png`; play the
+  // output itself and use the still as the poster frame.
+  const playsVideo = isPlayableVideoAsset(detail.output_path);
+
   return (
     <div className="detail-grid">
       <div className="stage-stack">
         <StagePreview
           mediaType={detail.media_type}
-          outputPath={detail.preview_path}
+          outputPath={playsVideo ? detail.output_path : detail.preview_path}
+          posterPath={playsVideo ? detail.preview_path : null}
           title={detail.prompt}
           subtitle={detail.project_name || "Unassigned"}
         />

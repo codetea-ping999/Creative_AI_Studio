@@ -341,6 +341,28 @@ export function isVideoAsset(pathValue: string | null | undefined): boolean {
   return Boolean(pathValue && /\.(gif|mp4|webm|mov)$/i.test(pathValue));
 }
 
+// GIF is a video-media asset (storyboard output) but browsers cannot play it in <video>;
+// previews must render it with <img>.
+export function isPlayableVideoAsset(pathValue: string | null | undefined): boolean {
+  return Boolean(pathValue && /\.(mp4|webm|mov)$/i.test(pathValue));
+}
+
+// Animated GIF (storyboard output). Previews show a still first frame under
+// prefers-reduced-motion instead of autoplaying it.
+// Output URLs may carry a query string or fragment (e.g. `preview.gif?token=...`), so the
+// extension is checked against the URL pathname rather than the raw string.
+export function isGifAsset(pathValue: string | null | undefined): boolean {
+  return Boolean(pathValue && /\.gif$/i.test(assetPathname(pathValue)));
+}
+
+function assetPathname(pathValue: string): string {
+  try {
+    return new URL(pathValue, "http://asset.invalid/").pathname;
+  } catch {
+    return pathValue.split(/[?#]/, 1)[0];
+  }
+}
+
 export function isTextAsset(pathValue: string | null | undefined): boolean {
   return Boolean(pathValue && /\.(md|markdown|txt)$/i.test(pathValue));
 }

@@ -148,6 +148,287 @@ cache = ModelRuntimeCache(
 設定手順・推奨メモリバジェットは `docs/configuration.md` の
 「per-media runtime cache（#182）」節を参照してください。
 
+## Runtime Safety Core（Issue #414, PR4a）
+
+`ModelRuntimeCache` は canonical id（`manifest.id`）ごとに `RuntimeEntry` を
+1 つ持ちます。`runtime` オブジェクトそのものと、状態・pin 数・実行排他 lock
+を分離したことで、「同じ runtime を 2 箇所が同時に使っている」「pin 中の
+runtime が evict される」といった race を型として塞いでいます。
+
+### RuntimeEntry の state
+
+| state | 意味 |
+| --- | --- |
+| `LOADING` | slot は予約済みだが `runtime` は未公開。取得不可 |
+| `READY` | 通常の cached runtime。pin 済みでのみ handle として公開される |
+| `INVALID` | 新規 caller へは公開しない。既存 lease の unwind 待ち |
+| `RETIRING` | cleanup owner が確定済み。新規 acquire/load/replace 不可 |
+
+### 2 系統の API
+
+- 既存の `get()` / `put()` / `unload()` / `unload_all()` / `resolve_runtime()`
+  / `get_runtime()` は外部からの挙動を変えていません（PR4a はキャッシュの
+  内部表現を `RuntimeEntry` に統一しただけ）。ただし **lease を取らない**
+  ため concurrency-safe ではありません
+- **PR4b 完了時点の契約**：`resolve_runtime()` / `get_runtime()` は
+  **test / diagnostic 専用**です。production の 5 generator はすべて
+  `acquire_runtime()` へ移行済みで、closure audit の結果 production 側に
+  安全な call site は 1 件も見つかりませんでした（`get_runtime()` が
+  `resolve_runtime()` へ委譲する内部 1 箇所のみが allowlist 対象）。
+  これらの API は lease / 実行排他（`E`）/ admission（`G`）/ INVALID 参加の
+  **いずれも提供しません**。返り値の runtime を実行・変更・
+  「unload/evict/replace しうる他の操作をまたいで保持」する用途は禁止です。
+  互換性のため削除も `DeprecationWarning` 追加も行っていません（後者は
+  正当な test だけを騒がせるため）。詳細な契約は
+  `ModelService.resolve_runtime()` の docstring を参照
+- 再発防止は静的 guard で機械的に担保します：
+  `tests/test_runtime_surface_guard.py` が AST で `apps/` `bootstrap/`
+  `core/` `generators/` `scripts/` 全体を走査し、bare API 呼び出し・
+  `getattr()` 経由の間接呼び出し・`runtime_cache` / `loader` への
+  直接アクセス・`with` を伴わない generator の runtime 取得を検出します
+  （定義・docstring・同名の無関係 method は誤検知しません）
+- 新しい `ModelService.acquire_runtime(model_id, media_type, task_type=None,
+  *, wait_timeout=None, wait_checkpoint=None, poll_interval=0.1) -> RuntimeHandle`
+  が安全な取得経路です（`wait_checkpoint`/`poll_interval`は後述の
+  「checkpoint mode」を参照）
+
+```python
+with model_service.acquire_runtime(model_id, media_type, task_type) as handle:
+    manifest = handle.manifest
+    runtime = handle.runtime
+    ...  # generate
+```
+
+`RuntimeHandle` は「取得している間、この canonical entry を排他的に使える」
+ことを保証します。同じ entry を 2 つの caller が同時に取得しても、実行は
+必ず直列化されます（fake runtime を使った決定的 concurrency test は
+`tests/test_runtime_safety_core.py` を参照）。
+
+### lock / admission の順序
+
+- `G`：process全体で共有される、`RuntimeAdmissionController`が保持する
+  admission semaphore（既定capacity=1）。「重いruntimeのload」と「実行」は
+  PR4aでは同じ1枠を共有します
+- `L`：canonical idごとのload lock（`ModelRuntimeCache.lock_for()`。
+  PR4a以前から存在するlockをそのまま再利用）
+- `E`：`RuntimeEntry.execution_lock`。1entryにつき1つ、排他実行を保証
+- `M`：`ModelRuntimeCache._metadata_lock`。entryのstate・lease数・
+  LRU順序だけを守る、短命なlock
+
+取得順は常に`G -> L -> E`。`M`は単独の短いprobeとしてのみ使い、
+G/L/Eを待っている間は絶対に保持しません（loader.load()やcleanup
+callbackをM保持中に呼ぶことも禁止）。解放順は`E`を解放する前に、
+Eをまだ保持したまま短いM区間で`RuntimeEntry`をINVALID化し
+（**「Eを保持したまま短いMを取る」のは許可**、逆に「Mを保持した
+ままEを待つ」のは引き続き絶対禁止）、そのうえで`E -> M`
+（lease減算）`-> G`の順に解放します。Eを待っていた別callerが
+Eを獲得した直後には、対象entryがまだcurrentかつREADYかを
+再検証します（`ModelRuntimeCache.is_current_and_ready()`）。
+INVALID化・削除・差し替えのいずれかが起きていた場合はEを
+即座に解放し直し、handleをuser codeへは絶対に渡さず
+`RuntimeBusyError`を送出します。この順序が崩れない限り、
+この4資源の組み合わせで自己deadlockは起きません。
+
+**INVALID entryのhandoff retryとmulti-waiter drain**（issue #414
+follow-up, PR #420）：上記の再検証に失敗した caller（＝E獲得直後に
+対象entryがINVALIDだったcaller）は、L -> Eの取得シーケンスを
+同じ`acquire_runtime()`呼び出しの中で、同じ`deadline`に束縛された
+まま内部的にretryします。これ自体は「自分自身の stale lease を
+既に解放済み」という前提があるため安全です（他のcallerの将来の
+行動を待つのではなく、自分自身がすでに行った解放が entry を
+evict/reload可能にしている）。
+
+ただし `admission_capacity >= 2` では、同じ READY entry を複数の
+caller が pin した状態で invalidate されうるため、retryした
+caller が同じ entry を再度 `acquire_or_reserve()` した際に
+「INVALIDのままだが**別の** stale lease 保持者がまだ pin している」
+状態に出会うことがあります。この状態は最小限、かつ厳密に scope された
+条件下でのみ内部的に retry 可能な唯一の `RuntimeBusyError` 原因です：
+
+> post-E revalidation に失敗した caller は、その失敗の原因となった
+> **まさにその** entry/generation が stale lease の drain 待ちである
+> 間に限り、caller 自身の acquisition deadline の範囲内で内部的に
+> 待機・retry してよい。それ以外の busy/capacity 状態
+> （健全な entry が genuinely busy、LOADING/RETIRING、別の
+> entry/generation、容量競合など）は引き続き即座に非retryの
+> `RuntimeBusyError`のままです。
+
+この待機は `ModelRuntimeCache.wait_for_stale_entry_drain()` が
+`threading.Condition`（`_metadata_lock`をLockではなくConditionに
+した上で、`release_lease()`が lease 減算のたびに`notify_all()`する）
+で実装しており、poll/busy-spinは一切行いません。deadlineが尽きれば
+既存の公開`RuntimeWaitTimeoutError`が送出されます。この仕組みはG/L/E
+順序・`RuntimeEntry`の構造・publicな例外taxonomyを一切変更しません
+（`core/models/runtime_lease.py`の`_RuntimeInvalidEntryDrainingError`は
+privateなtype変更のみで、message・timing・「ここでは待たず即決定する」
+という`acquire_or_reserve()`自体の挙動は不変です）。
+
+**stale-drain資格の所有権：1回の公開呼び出しに限定**（PR #420）：
+上記の「再検証失敗の原因となった**まさにその** entry を待ってよい」
+という資格は、**1回の`acquire_runtime()`呼び出し**だけが所有し、その
+呼び出しを越えて生き残ることはありません。資格は呼び出しローカルな
+private holder に保持され、成功・timeout・checkpoint例外・その他
+あらゆる例外のいずれで終わっても`finally`で破棄されます。
+`ModelService`のfieldにも、threadをkeyにしたdict/thread-localにも
+保存しません。したがって別々の公開呼び出し（callerが自前で書いた
+plainな呼び出しのretryループを含む）は常に独立したfresh callerであり、
+WorkerPoolのworker threadが後で別jobに再利用されても資格は引き継がれず、
+INVALIDかつpin中のentryに対しては即座に非retryの`RuntimeBusyError`に
+なります。再検証失敗のretry予算（1回）も、この論理的な1回の呼び出し
+ごとに1回です。
+
+**checkpoint mode**（`wait_checkpoint`を渡した場合）：cooperativeな
+キャンセルをしながら待ちたいcallerの正式な経路です。1回の公開呼び出しが
+1つの論理的な待機操作になります。
+
+- `wait_checkpoint()`は最初の同期取得の前に1回、その後は
+  `RuntimeWaitTimeoutError`で終わった同期sliceの後ごとに呼ばれます。
+  呼ばれる時点で、この呼び出しはG/L/E/M/leaseを**一切保持していません**。
+  正常にreturnしたときだけ次のsliceが始まり、送出した例外（キャンセル、
+  失敗したprobe、`BaseException`）はそのまま伝播して操作が終わります
+- 各sliceは通常のG -> L -> E取得で、`min(now + poll_interval, 全体deadline)`
+  で束縛されます
+- `wait_timeout`は呼び出し全体のdeadline（呼び出し開始時点から計測、
+  sliceごとにリセットしない）。`None`は無期限ですが、checkpointで区切られた
+  有界sliceの繰り返しとしてのみ待ちます。`0`は1回の非blocking試行のままで、
+  polling待機にはなりません。checkpoint modeでは`None`または有限の`>= 0`
+  でなければなりません
+- model idの解決は最初のcheckpointの後に1回だけ。cloud providerのopt-in
+  guardは各sliceの前に毎回再確認します
+- 次のsliceを始めてよいのは`RuntimeWaitTimeoutError`だけです。それ以外の
+  `RuntimeBusyError`やあらゆる例外は、その時点で呼び出しを終わらせます
+- 同じ呼び出しのslice間では、自分の再検証失敗で得た資格が保持されます。
+  次のsliceの最初の試行が**同一object**のentryで
+  `_RuntimeInvalidEntryDrainingError`に当たった場合だけdrain待ちを再開し、
+  別のentry/generationなら即座に`RuntimeBusyError`です
+
+`wait_checkpoint=None`（plain mode）は従来どおり`wait_timeout`で束縛された
+1回のsliceで、`poll_interval`は値の検証のみ行い使いません。不正な
+`poll_interval`/`wait_checkpoint`（checkpoint modeでは`wait_timeout`も）は、
+model id解決やresource取得より前に`TypeError`/`ValueError`になります。
+
+Image/Video/Textの各generatorは、`GenerationContext`がある場合に
+`wait_checkpoint=context.raise_if_cancelled`を渡す1回の呼び出しで
+runtimeを取得します（generator側で公開APIを呼び直すループは持ちません）。
+
+**公開例外が内部entryを保持しないこと**：`acquire_runtime()`が送出する
+`RuntimeBusyError`/`RuntimeWaitTimeoutError`は、捕捉した内部例外と同じ
+公開型・同じmessageの新しいinstanceとして、内部例外の`except`スコープの
+外で送出されます。そのため`__cause__`/`__context__`/tracebackから、
+`.entry`でstaleな`RuntimeEntry`（とそのruntime object）を掴んだprivate
+例外に到達することはありません。
+
+**admissionの共有範囲**（Codex round 1 review, Finding 1）：
+`ModelService.__init__`が`admission`/`admission_capacity`を
+どちらも受け取らない場合、`core.models.service.get_default_admission_controller()`
+が遅延生成する、process全体でただ1つの`RuntimeAdmissionController`
+instanceを共有します。`bootstrap/factories.py`の
+`create_default_model_service()`は呼び出し側ごとに独立した
+`ModelService`を構築しうる（standalone generator factoryが複数
+存在するため）ため、この共有がなければ「processごとに1枠」が
+実際にはinstanceごとに1枠になってしまいます。テストコードのみ、
+`admission_capacity=`（独立したcapacity値の専用controllerを生成）
+または`admission=`（任意のcontrollerを直接注入）でこの既定を
+明示的に上書きできます。`RuntimeAdmissionController.__init__`は
+`capacity < 1`を`ValueError`で拒否します（Finding 7；
+`threading.Semaphore(0)`が誰も通れない恒久的に閉じたgateに
+なってしまう不備の修正）。
+
+### capacityはloadの前に確保する
+
+cache miss時、`loader.load()`を呼ぶ前に:
+
+1. 既存READY entryがあればpinして終了（hit）
+2. なければbudgetを確認し、unleasedなvictimを1つ選ぶ
+3. victimが無くcapacityが必要なら即座に`RuntimeBusyError`
+   （`loader.load()`は0回、victim cleanupも0回、無期限waitはしない）
+4. victim不要（すでにbudget内）ならLOADINGの予約は最初のM区間内で
+   原子的に作成します（Codex round 1 review, Finding 3；victimを
+   選ぶ側とLOADING予約を作る側が別々のM区間だと、その間隙へ
+   別callerが同じ枠を先取りできてしまう余地がありました）
+5. victimがある場合はvictimを`RETIRING`にしてMを解放し、
+   cleanupをMの外で実行したうえで、あらためてMを取り直して
+   capacityを再確認してからLOADINGの予約を作成します
+   （cleanupの間にMは解放されているため、他callerがその枠を
+   先取りしている可能性を必ず再チェックします。再チェックで
+   枠が埋まっていた場合は、連鎖的に次のvictimへ波及させず
+   `RuntimeBusyError`を返します）
+6. 成功したらREADY化と最初のpinを同じM区間で行う。失敗したら
+   予約を破棄し、G/L/leaseを一切残さない
+
+新旧runtimeが同時にメモリ上へ存在する時間を作らないための設計です。
+
+legacy `put()`にも2点、同じ原則を適用しています（Codex round 1
+review）：同一runtime objectをbucket間で移動させる高速経路
+（`existing.runtime is runtime_obj`）でも、移動先bucketのbudgetは
+必ず強制します（Finding 5；以前は`media_bucket`とLRU位置の更新
+だけで、budget超過を許してしまっていました）。また
+`resolve_runtime()`が`loader.load()`成功後に`put()`を呼んで
+`RuntimeBusyError`で拒否された場合（対象entryが別callerに
+先取りされていた等）、load済みだが一度もpublishされなかった
+runtimeは`ModelRuntimeCache.dispose_unpublished()`で必ず1回
+cleanupされ、leakしません（Finding 4）。
+
+### unloadのcontract
+
+- `ModelService.unload_model(model_id)`はpublic id・alias・manifest id
+  のどれを渡してもresolverを経由し、同じcanonical entryを対象にします
+  （PR4a以前はaliasを渡すとcache keyが一致せず無言でno-opしていた
+  bugの修正でもあります）
+- 対象がleased・loading・retiringなら`RuntimeBusyError`。runtimeは
+  一切変更されません。未loadなら安全なno-op
+- `unload_all()`はatomic preflight：1つでもbusyなentryがあれば
+  全体を`RuntimeBusyError`とし、状態変更もcleanup呼び出しも0件。
+  全entryがidleと確認できてはじめて、Mの同じ区間内で一括
+  `RETIRING`化し、M解放後にcleanupします（cleanup自体はbest-effort
+  のままで、rollback保証ではありません）
+- `_finish_retirement()`はcleanup呼び出しをtry/finallyで囲み、
+  cleanupが（`KeyboardInterrupt`等の）`BaseException`で中断しても
+  entryは必ず`_entries`から除去されます。`unload_all()`も同様に、
+  ある対象のcleanupが`BaseException`で中断しても残り全対象への
+  `_finish_retirement()`呼び出しを継続し、最初に発生した例外だけを
+  全対象の後始末が終わってから再送出します（Codex round 1 review,
+  Finding 6）。「一部の対象だけpre-RETIRING状態へ戻す」contractは
+  採用していません — cleanupが一度も走っていないentryを安全な
+  READYへ戻せる保証がないためで、常に「全対象を必ずfinalizeしてから
+  再送出」という1つのcontractに統一しています。これにより、entryが
+  永久に`RETIRING`のまま取り残される（以降そのcanonical idへの
+  `acquire_or_reserve()`/`unload()`/`unload_all()`が恒久的に
+  `RuntimeBusyError`になる）ことはありません。
+
+### semantic judge の admission 参加（PR4b）
+
+`core/quality/semantic.py` の CLIP / CLAP backend は、PR4a と**同一の**
+process-wide `RuntimeAdmissionController`（`get_default_admission_controller()`）
+を共有します。新しい semaphore / admission domain は追加していません。
+`SemanticJudge(config, admission=None)` は未指定時のみ default controller を
+使い、test だけが private controller を注入できます。
+
+- lock 順序は **`G` -> backend lock** に固定。逆順は存在せず、backend lock を
+  保持したまま `G` を待つ経路もありません
+- `G` は cold load（`from_pretrained()`）と warm inference の**両方**を保護
+  します。「既に load 済みだから `G` を取らない」は不可
+- backend lock は `G` の capacity が 1 より大きい場合でも、同一 CLIP / CLAP
+  model object の lazy load と推論が重ならないことを保証します
+- semantic score の disk cache hit / 設定検証 / cache JSON 書き込みは `G` の
+  外で行い、不要な admission を消費しません
+- video semantics は frame ごとに image backend の通常の admitted path を
+  通ります。video 側で独自に `G` を取得しないため、PR4a が禁止する
+  same-thread nested acquisition は構造的に発生しません
+- generator は runtime lease を解放した**後**に semantic scoring へ進みます。
+  lease 保持中に semantic `G` を取ろうとした場合は、PR4a の
+  nested-acquisition ban がそのまま fail-fast します
+
+決定論的な証拠は `tests/test_semantic_admission.py` を参照してください。
+
+### 未解決のscope（PR4b 完了後）
+
+PR4bのscopeであったproductionの5generator移行、semantic judgeのadmission
+統合、legacy raw-runtime APIの利用制限、generator側のcancellation/error
+統合は完了しています。production WorkerPoolと`JOB_LANES`のproduction活用は
+引き続き無効で、PR5のgateのままです（dynamic capacity policy、process
+isolation、semantic runtimeの`ModelRuntimeCache`統合も同様に範囲外）。
+
 ## Image Provider Credentials（Issue #257）
 
 `generators/image/providers.py` はクラウド image provider の credential を、
@@ -187,6 +468,21 @@ text runtime の `api_key_env` 規約（`core/models/text_runtimes.py`）と同�
   request の auth header/param 以外（`ImageGenerationSpec.extra_params` や
   `ImageProviderResult.metadata` など、job/asset/request へ永続化されうる
   フィールド）へ絶対に置かないこと
+
+## Procedural Storyboard のフォント選択
+
+- `storyboard-video`（`procedural_video_loader`）のテキストカードは Pillow の既定フォントで描画します。
+  既定フォントは ASCII のみを収録しているため、描画できない文字（日本語など）を含む行だけ
+  CJK 対応のシステムフォントへ切り替えます（`generators/video/fonts.py`、#449）
+- 探索順: `STORYBOARD_FONT_PATH`（存在するファイルのみ）→ macOS のヒラギノ角ゴシック W3 /
+  Hiragino Sans GB / Arial Unicode → Linux の Noto Sans CJK → Windows の msgothic / YuGothM / meiryo
+- フォントファイルは同梱しません（ライセンスのため）。どれも見つからない場合は従来どおり既定フォントで
+  描画し（該当文字は □ になります）、エラーにはしません
+- フォントの解決結果はプロセス内でキャッシュされるため、同じマシンでは同じフォントが選ばれ続けます。
+  `STORYBOARD_FONT_PATH` を変更したら API を再起動してください。ここで保証するのはフォント選択の
+  決定性だけで、seed を省略した場合の出力全体は決定的ではありません
+- 日本語の折り返しには最小限の禁則処理（`generators/video/subtitle_line_breaking.py` の
+  `apply_kinsoku_rules`）を適用し、句読点や閉じ括弧が行頭に来ないようにします
 
 ## Learned Video Runtime Contract
 

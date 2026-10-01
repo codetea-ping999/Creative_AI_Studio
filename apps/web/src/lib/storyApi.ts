@@ -293,6 +293,14 @@ export function loglineCandidates(story: StoryDocument | null): string[] {
 
 export type SceneRole = "visual" | "narration" | "music";
 
+/**
+ * How a scene's `visual` role is produced. `image` is the still-image path (the
+ * default image model, SDXL when installed — Preview). `video` is the
+ * weight-free procedural storyboard clip (`storyboard-video`) the Stable
+ * journey assembles from.
+ */
+export type SceneVisualMediaType = "image" | "video";
+
 export const sceneRoleLabels: Record<SceneRole, string> = {
   visual: "画像",
   narration: "ナレーション",
@@ -308,7 +316,13 @@ export const sceneRoleLabels: Record<SceneRole, string> = {
 export function generateSceneMedia(
   storyId: string,
   sceneId: string,
-  payload: { role: SceneRole; model_id?: string; seed?: number | null },
+  payload: {
+    role: SceneRole;
+    model_id?: string;
+    seed?: number | null;
+    /** Only meaningful for the `visual` role; omitted means the image path. */
+    media_type?: SceneVisualMediaType;
+  },
 ): Promise<{ job_id: string; status: string }> {
   return requestJson<{ job_id: string; status: string }>(
     `/stories/${storyId}/scenes/${sceneId}/generate`,
@@ -319,6 +333,7 @@ export function generateSceneMedia(
         role: payload.role,
         model_id: payload.model_id ?? "",
         seed: payload.seed ?? null,
+        ...(payload.media_type ? { media_type: payload.media_type } : {}),
       }),
     },
   );
@@ -357,11 +372,27 @@ export function missingRolesForScene(
   return order.filter((role) => missing.includes(role));
 }
 
-/** True when every scene has what the timeline needs. */
+/**
+ * True when every scene has the one thing the timeline needs: a visual.
+ *
+ * Narration and music are not required to assemble — the server's
+ * `build_timeline` renders a silent or unscored scene as a legitimate choice
+ * — and gating on them would make the weight-free Stable journey (procedural
+ * visuals, no TTS/MusicGen weights) impossible to finish from the UI.
+ */
 export function isReadyToAssemble(detail: StoryDetail | null): boolean {
   return Boolean(
-    detail && detail.story.scenes.length > 0 && detail.missing_assets.length === 0,
+    detail &&
+      detail.story.scenes.length > 0 &&
+      !detail.missing_assets.some((entry) => entry.role === "visual"),
   );
+}
+
+/** Missing narration/music: worth telling the user about, never a blocker. */
+export function missingAudioCount(detail: StoryDetail | null): number {
+  return detail
+    ? detail.missing_assets.filter((entry) => entry.role !== "visual").length
+    : 0;
 }
 
 /** Index `detail.asset_status` by scene id, then role, for O(1) row lookups. */

@@ -1,5 +1,13 @@
 # Repository Agent Instructions
 
+## AI development operating model
+
+Follow `docs/ai-development-operating-model.md` for role assignment, risk-based routing,
+OpenCode stop/escalation conditions, human-review budget, and release-mode scope
+control. It defines the default responsibility split between the human operator,
+OpenCode, Claude/Codex, and CI. More specific repository safety rules below still
+apply.
+
 ## Working as one of several parallel agents
 
 When you are a subagent in a fan-out (see `.claude/workflows/issue-fleet.js`),
@@ -30,6 +38,20 @@ Before calling a frontend change complete:
 
 Do not judge visual completion from source code alone.
 
+## Shared cognitive infrastructure
+
+`.agents/` is the provider-neutral source of truth for shared cognitive artifacts.
+Provider-specific instructions may point into it but must not silently fork its
+validated memory or skills.
+
+For any task that changes shared runtime ownership, caching, leases, lock ordering,
+admission, cleanup, cancellation, or concurrent lifecycle/state-machine code, read
+and follow `.agents/skills/concurrency-safety/SKILL.md` before implementation or
+review. Load the failure-pattern memories referenced by that skill. If those
+memories conflict with current code, deterministic tests, or an accepted
+specification, treat the memory as stale or contradicted and escalate instead of
+forcing the old rule onto current code.
+
 ## Experimental Codex model routing
 
 For non-trivial Codex tasks, follow the `Codex モデル・ルーティングの試行`
@@ -48,3 +70,25 @@ starting its `Agent` consumes Claude usage and requires operator approval.
 - Never allow two providers to write to the same worktree concurrently.
 - Prefer the other provider for independent verification of high-risk changes.
 - Preserve the patch and verification contract in `docs/agent-harness.md`.
+
+## Desktop shell — verification gate
+
+When any change touches `apps/desktop/`, `apps/api` CORS in `apps/api/main.py` /
+`tests/test_api_extensions.py`, or `apps/web/src/runtime.ts` / `studioClient.ts`,
+follow `docs/desktop/desktop-shell-runbook.md` in addition to the backend and
+frontend gates. Minimum, before calling it complete:
+
+- run the boundary guard: `python3 apps/desktop/scripts/check_no_backend_spawn.py`;
+- `cd apps/desktop/src-tauri && cargo check --all-targets && cargo test --all-targets`;
+- build the bundles: `(cd apps/desktop/src-tauri && cargo tauri build)`;
+- after a full build, run the packaged-app smoke:
+  `./scripts/desktop_smoke.sh` (build-tree binary only — never `open`
+  `/Applications`, which may resolve to the same-bundle-id old install).
+
+Desktop smoke verifies default 8000, CORS read/preflight/JSON write, the
+`API_PORT=8123` non-default flow through root `.env`, and second-instance focus.
+
+Hard invariant: the Rust shell must never spawn Python/FastAPI, initialize CUDA,
+or load model runtimes. Do not put the probe words (python/fastapi/uvicorn/
+cuda/torch/spawn) in Rust code outside comments/strings. Do not touch `models/`.
+A stale root `.env` can divert the non-default-port smoke; the script restores it.

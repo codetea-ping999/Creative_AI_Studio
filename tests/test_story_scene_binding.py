@@ -110,6 +110,8 @@ class SceneBinderTests(unittest.TestCase):
             ),
         )
         job = self.job_service.create_job(request)
+        for status in ("preparing", "running", "postprocessing"):
+            assert self.job_repository.update_status(job.id, status) is not None
         self.job_service.mark_succeeded(
             job.id,
             GenerationResult(
@@ -168,6 +170,8 @@ class SceneBinderTests(unittest.TestCase):
             media_type="image", prompt="anything", model_id="sdxl", params={}
         )
         job = self.job_service.create_job(request)
+        for status in ("preparing", "running", "postprocessing"):
+            assert self.job_repository.update_status(job.id, status) is not None
         self.job_service.mark_succeeded(
             job.id,
             GenerationResult(
@@ -327,6 +331,8 @@ class SceneGenerationApiTests(unittest.TestCase):
                     params=scene_binding_params(story.id, scene.id, "visual"),
                 )
             )
+            for status in ("preparing", "running", "postprocessing"):
+                assert self.services.job_repository.update_status(job.id, status) is not None
             self.services.job_service.mark_succeeded(
                 job.id,
                 GenerationResult(
@@ -386,6 +392,8 @@ class SceneGenerationApiTests(unittest.TestCase):
                 ),
                 project_id=project_id,
             )
+            for status in ("preparing", "running", "postprocessing"):
+                assert self.services.job_repository.update_status(job.id, status) is not None
             self.services.job_service.mark_succeeded(
                 job.id,
                 GenerationResult(
@@ -575,6 +583,8 @@ class SceneAssetStatusApiTests(unittest.TestCase):
 
     def test_assigned_role_is_reported_from_the_scene_asset_id(self) -> None:
         job_id = self._queue_scene_job("scene_01", "visual")
+        for status in ("preparing", "running", "postprocessing"):
+            assert self.services.job_repository.update_status(job_id, status) is not None
         self.services.job_service.mark_succeeded(
             job_id,
             GenerationResult(

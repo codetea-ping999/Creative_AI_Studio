@@ -38,9 +38,12 @@ class CancellationRegistry:
             event = self._events.get(job_id)
         return event is not None and event.is_set()
 
-    def end(self, job_id: str) -> None:
+    def end(self, job_id: str, token: Event) -> None:
+        """Remove an entry only when the caller still owns its registration."""
+
         with self._lock:
-            self._events.pop(job_id, None)
+            if self._events.get(job_id) is token:
+                self._events.pop(job_id, None)
 
 
 __all__ = ["CancellationRegistry"]

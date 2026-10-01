@@ -1,0 +1,85 @@
+{
+  "audience": "",
+  "beats": [
+    {
+      "act": "act1",
+      "id": "beat_1",
+      "order": 0,
+      "purpose": "setup",
+      "summary": "dawn"
+    }
+  ],
+  "chapters": [],
+  "characters": [],
+  "created_at": "2026-09-01T09:05:00Z",
+  "format": "short-video",
+  "genre": "",
+  "id": "story_fixture",
+  "language": "ja",
+  "logline": "A keeper watches the sea.",
+  "metadata": {},
+  "premise": "",
+  "project_id": null,
+  "scenes": [
+    {
+      "asset_ids": {
+        "visual": "asset_e6c220e30f3d37f101bb39e8"
+      },
+      "beat_id": null,
+      "bgm_mood": "",
+      "bible_refs": [],
+      "camera": "",
+      "dialogue": [],
+      "duration_seconds": 4.0,
+      "heading": "Scene 1",
+      "id": "scene_1",
+      "image_negative": "",
+      "image_prompt": "p1",
+      "job_ids": [
+        "job_fx_succeeded"
+      ],
+      "narration": "",
+      "order": 0,
+      "summary": "s1"
+    },
+    {
+      "asset_ids": {},
+      "beat_id": null,
+      "bgm_mood": "",
+      "bible_refs": [],
+      "camera": "",
+      "dialogue": [],
+      "duration_seconds": 4.0,
+      "heading": "Scene 2",
+      "id": "scene_2",
+      "image_negative": "",
+      "image_prompt": "p2",
+      "job_ids": [],
+      "narration": "",
+      "order": 1,
+      "summary": "s2"
+    },
+    {
+      "asset_ids": {},
+      "beat_id": null,
+      "bgm_mood": "",
+      "bible_refs": [],
+      "camera": "",
+      "dialogue": [],
+      "duration_seconds": 4.0,
+      "heading": "Scene 3",
+      "id": "scene_3",
+      "image_negative": "",
+      "image_prompt": "p3",
+      "job_ids": [],
+      "narration": "",
+      "order": 2,
+      "summary": "s3"
+    }
+  ],
+  "source_job_ids": [],
+  "structure": "three-act",
+  "title": "Fixture Story",
+  "tone": "",
+  "updated_at": "2026-09-18T19:28:44.337663Z"
+}
