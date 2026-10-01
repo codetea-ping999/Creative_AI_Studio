@@ -687,6 +687,63 @@ pre,
   bottom: 12px;
 }
 
+/* Shown when a reduced-motion GIF still frame cannot be fetched or decoded. */
+.media-still-error {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: var(--danger);
+  overflow-wrap: anywhere;
+}
+
+.media-still-error__mark {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border: 1px solid var(--danger);
+  border-radius: 50%;
+  font-size: 0.75rem;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.media-still-error--stage {
+  align-self: center;
+  justify-self: center;
+  max-width: min(100% - 32px, 420px);
+  padding: 12px 14px;
+  border-left: 2px solid var(--danger);
+  background: var(--surface-base);
+}
+
+.media-still-error--stage strong {
+  display: block;
+  font-size: 0.875rem;
+}
+
+.media-still-error--stage p {
+  margin: 2px 0 0;
+  color: var(--text-soft);
+  font-size: 0.8125rem;
+}
+
+.media-still-error--thumbnail {
+  justify-content: center;
+  min-height: 68px;
+  padding: 4px;
+  font-size: 0.72rem;
+  font-weight: 650;
+}
+
+.media-still-error--thumbnail .media-still-error__mark {
+  width: 16px;
+  height: 16px;
+  font-size: 0.65rem;
+}
+
 .stage-surface--audio {
   place-items: center;
   padding: 24px;

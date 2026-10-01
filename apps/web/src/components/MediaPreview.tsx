@@ -108,7 +108,7 @@ function MotionSafeGif({
       {isPlaying ? (
         <img src={src} alt={alt} loading="lazy" />
       ) : (
-        <GifStillFrame src={src} alt={alt} />
+        <GifStillFrame src={src} alt={alt} variant={allowPlayback ? "stage" : "thumbnail"} />
       )}
       {allowPlayback ? (
         <button
@@ -123,10 +123,51 @@ function MotionSafeGif({
   );
 }
 
-function GifStillFrame({ src, alt }: { src: string; alt: string }) {
+// Start fetching a still frame shortly before the thumbnail scrolls into view, matching
+// the `loading="lazy"` behaviour of the animated <img> path.
+const STILL_FRAME_ROOT_MARGIN = "200px";
+
+function GifStillFrame({
+  src,
+  alt,
+  variant,
+}: {
+  src: string;
+  alt: string;
+  variant: "stage" | "thumbnail";
+}) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [isNearViewport, setIsNearViewport] = useState(
+    () => typeof IntersectionObserver === "undefined",
+  );
+  // MotionSafeGif is keyed by src, so a new src remounts this and resets the error.
+  const [hasError, setHasError] = useState(false);
 
   useEffect(() => {
+    if (isNearViewport) {
+      return;
+    }
+    const canvas = canvasRef.current;
+    if (!canvas) {
+      return;
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          observer.disconnect();
+          setIsNearViewport(true);
+        }
+      },
+      { rootMargin: STILL_FRAME_ROOT_MARGIN },
+    );
+    observer.observe(canvas);
+    return () => observer.disconnect();
+  }, [isNearViewport]);
+
+  useEffect(() => {
+    if (!isNearViewport) {
+      return;
+    }
     const image = new Image();
     image.onload = () => {
       const canvas = canvasRef.current;
@@ -138,11 +179,35 @@ function GifStillFrame({ src, alt }: { src: string; alt: string }) {
       // drawImage uses the GIF's first (default) frame, never an animation frame.
       canvas.getContext("2d")?.drawImage(image, 0, 0);
     };
+    // 404s and decode failures would otherwise leave an empty canvas behind.
+    image.onerror = () => setHasError(true);
     image.src = src;
     return () => {
       image.onload = null;
+      image.onerror = null;
     };
-  }, [src]);
+  }, [isNearViewport, src]);
+
+  if (hasError) {
+    return variant === "stage" ? (
+      <div className="media-still-error media-still-error--stage" role="alert">
+        <span className="media-still-error__mark" aria-hidden="true">
+          !
+        </span>
+        <div>
+          <strong>Preview frame unavailable</strong>
+          <p>The GIF could not be loaded or decoded.</p>
+        </div>
+      </div>
+    ) : (
+      <div className="media-still-error media-still-error--thumbnail">
+        <span className="media-still-error__mark" aria-hidden="true">
+          !
+        </span>
+        <span>No preview</span>
+      </div>
+    );
+  }
 
   return alt ? (
     <canvas ref={canvasRef} role="img" aria-label={alt} />
