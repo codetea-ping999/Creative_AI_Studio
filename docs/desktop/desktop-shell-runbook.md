@@ -15,13 +15,19 @@ Desktop Shell（Tauri 2）を変更したときに「何をどの順で確かめ
 
 ## ビルド
 
+前提: Rust toolchain（`rust-version = 1.77.2` 以上）と Tauri 2 CLI。CLI はバージョンを固定して入れる:
+
 ```bash
+cargo install tauri-cli --version "^2" --locked   # `cargo tauri --version` が 2.x を返すこと
 cd apps/desktop/src-tauri && cargo tauri build
 ```
 
+Linux でビルド・`cargo check` する場合は WebKitGTK 等の system package も必要
+（Debian/Ubuntu: `libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev`）。
+
 - `beforeBuildCommand` が `web/dist` を再ビルドする（`tauri.conf.json` の `frontendDist = ../../web/dist`）
 - `bundle.targets = all` → `.app` と `.dmg`（`target/release/bundle/` 以下、両方 gitignore）
-- 単体テストのみなら `cargo test --all-targets`（現在 16 passed）
+- 単体テストのみなら `cargo test --all-targets`（現在 23 passed）
 
 ## 検証ゲート（変更を「完了」と呼ぶ前に必ず回す）
 
@@ -32,7 +38,7 @@ cd apps/desktop/src-tauri && cargo tauri build
 | Web lint | `npm --prefix apps/web run lint` | 0 errors（react-hooks の警告群は変更前から存在） |
 | Web build | `npm --prefix apps/web run build` | tauri build 内でも実行される |
 | Rust check | `cd apps/desktop/src-tauri && cargo check --all-targets` | warning 0 |
-| Rust test | `cd apps/desktop/src-tauri && cargo test --all-targets` | 16 passed |
+| Rust test | `cd apps/desktop/src-tauri && cargo test --all-targets` | 23 passed |
 | 境界ガード | `python3 apps/desktop/scripts/check_no_backend_spawn.py` | Rust に backend/spawn 系の実経路がないこと |
 | diff 衛生 | `git diff --check` | 空白エラー禁止 |
 
@@ -40,8 +46,12 @@ cd apps/desktop/src-tauri && cargo tauri build
 
 ```bash
 ./scripts/desktop_smoke.sh            # ビルド済み .app が必要
-./scripts/desktop_smoke.sh --force    # 既存の Studio backend/app を先に止める
+./scripts/desktop_smoke.sh --force    # smoke 用 port の listener と、同じ bundle バイナリの起動中インスタンスを先に止める
 ```
+
+安全性: 終了時に止めるのはスクリプト自身が起動した PID（backend とその子、app）だけで、パターン一致の
+`pkill` はしない。既存の root `.env` は backup より前に一切触らず、実行中は退避（phase の `API_PORT` を
+上書きさせない）、終了時に復元する。途中で失敗したコマンドの終了コードはそのまま返る。
 
 検証内容（すべて断言付き）:
 
@@ -67,14 +77,20 @@ env -u API_PORT -u STUDIO_BACKEND_URL \
 
 ### 非既定 port（例: 8123）— 既存の `API_PORT` フローと整合
 
-1. `printf 'API_PORT=8123\n' > .env` を作る（末尾で削除すること）
+1. 既存の `.env` を退避し、`printf 'API_PORT=8123\n' > .env` を作る（末尾で削除・復元すること）
 2. `API_PORT=8123 ./scripts/run_api_dev.sh` で backend を起動
 3. `env -u API_PORT -u STUDIO_BACKEND_URL <binary> &` で「通常起動」を再現
 4. 8123 の backend ログに UI の読み出しが現れ、8000 のログ行数が増えないことを確認
 
-エンドポイント解決の precedence（ADR §7a）: `STUDIO_BACKEND_URL` > `API_PORT`（環境）>
-root `.env` の `API_PORT` > `http://127.0.0.1:8000`。exact loopback（probing なし）。
-backend は起動しない（接続のみ）。
+エンドポイント解決の precedence（ADR §7a）: `STUDIO_BACKEND_URL` > root `.env` の `API_PORT`
+（最後の行が有効）> `API_PORT`（環境）> `http://127.0.0.1:8000`。`run_api_dev.sh` が `.env` を
+環境より後に `source` するのと同じ順序。exact loopback（probing なし）。backend は起動しない（接続のみ）。
+
+`.env` の場所は実行時に決まる（ビルドマシンのパスは埋め込まない）: `CREATIVE_AI_STUDIO_ROOT`
+> 実行ファイルの祖先にある Studio checkout > アプリ設定ディレクトリ
+（macOS: `~/Library/Application Support/com.creativeaistudio.desktop/.env`）> debug ビルドのみ build 時の
+checkout。`/Applications` に置いた配布版で非既定 port を使うときは、アプリ設定ディレクトリの `.env` に
+`API_PORT=8123` を書くか、`CREATIVE_AI_STUDIO_ROOT` で checkout を指す。
 
 ### global shortcut 失敗系（非 fatal の実証方法）
 

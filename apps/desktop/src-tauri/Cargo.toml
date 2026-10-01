@@ -1,6 +1,6 @@
 [package]
 name = "creative-ai-studio-desktop"
-version = "0.1.0"
+version = "1.0.0"
 description = "Creative AI Studio desktop shell (Tauri 2)"
 authors = ["Creative AI Studio contributors"]
 edition = "2021"

@@ -14,7 +14,7 @@ pub mod windows;
 
 use std::path::{Path, PathBuf};
 
-use tauri::WindowEvent;
+use tauri::{Manager, WindowEvent};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
@@ -24,36 +24,137 @@ pub const MAIN_WINDOW_LABEL: &str = "main";
 /// Loopback endpoint used when no runtime configuration is present.
 const FALLBACK_BACKEND_ENDPOINT: &str = "http://127.0.0.1:8000";
 
-/// Project root at build time (three ancestors above `CARGO_MANIFEST_DIR`). It
-/// locates the same root `.env` that the development scripts source, so the
-/// packaged UI follows the same runtime configuration without rebuilding the
-/// bundle.
-fn project_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(3)
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from(""))
+/// Environment variable naming the Studio checkout whose root `.env` the
+/// desktop shell should read (the same file `scripts/run_api_dev.sh` sources).
+pub const STUDIO_ROOT_ENV: &str = "CREATIVE_AI_STUDIO_ROOT";
+
+/// True when `dir` looks like a Creative AI Studio checkout (the directory
+/// `scripts/run_api_dev.sh` runs from).
+fn is_studio_root(dir: &Path) -> bool {
+    dir.join("scripts").join("run_api_dev.sh").is_file() && dir.join("apps").join("api").is_dir()
 }
 
-/// Extract `API_PORT` from the subset of dotenv syntax the development scripts
-/// use (`API_PORT=NNNN`, optional leading `export `, surrounding quotes).
-/// Comment and unrelated lines are ignored; port `0` and non-numeric values are
-/// rejected.
-fn dotenv_api_port(contents: &str) -> Option<u16> {
-    contents.lines().find_map(|raw| {
-        let line = raw
-            .trim()
-            .strip_prefix("export ")
-            .map(str::trim)
-            .unwrap_or(raw.trim());
-        let (key, raw_port) = line.split_once('=')?;
-        if key.trim() != "API_PORT" {
-            return None;
+/// Locate the `.env` file the shell reads `API_PORT` from, resolved at
+/// runtime on the user's machine (never a path baked in at build time).
+///
+/// Precedence:
+///
+/// 1. `CREATIVE_AI_STUDIO_ROOT` — explicit checkout root; when set (non-empty)
+///    it is authoritative and `<root>/.env` is the only candidate;
+/// 2. the nearest ancestor of the running executable that is a Studio
+///    checkout (a bundle built and run inside the checkout, e.g. from
+///    `apps/desktop/src-tauri/target/...`);
+/// 3. `<app config dir>/.env` — the per-user location for an installed app
+///    (`~/Library/Application Support/com.creativeaistudio.desktop/.env` on
+///    macOS);
+/// 4. debug builds only: the build-time checkout (`CARGO_MANIFEST_DIR/../../..`),
+///    so `cargo tauri dev` keeps following the developer's root `.env`.
+///
+/// Candidates 2–4 are used only when the `.env` file actually exists.
+fn locate_dotenv(
+    studio_root_env: Option<String>,
+    current_exe: Option<PathBuf>,
+    app_config_dir: Option<PathBuf>,
+    debug_build_root: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(root) = studio_root_env {
+        let trimmed = root.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed).join(".env"));
         }
-        let port = raw_port.trim().trim_matches(['"', '\'']);
-        port.parse::<u16>().ok().filter(|port| *port != 0)
-    })
+    }
+    let exe_root = current_exe.and_then(|exe| {
+        exe.ancestors()
+            .skip(1)
+            .find(|dir| is_studio_root(dir))
+            .map(Path::to_path_buf)
+    });
+    [
+        exe_root.map(|root| root.join(".env")),
+        app_config_dir.map(|dir| dir.join(".env")),
+        debug_build_root.map(|root| root.join(".env")),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|candidate| candidate.is_file())
+}
+
+/// Build-time checkout root, offered as a candidate only in debug builds so a
+/// release bundle never reads the build machine's checkout.
+fn debug_build_root() -> Option<PathBuf> {
+    if cfg!(debug_assertions) {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .map(Path::to_path_buf)
+    } else {
+        None
+    }
+}
+
+/// What the root `.env` says about `API_PORT`, mirroring how
+/// `scripts/run_api_dev.sh` consumes it (`set -a; source .env`).
+#[derive(Debug, PartialEq, Eq)]
+enum DotenvPort {
+    /// No `API_PORT` assignment: the inherited environment decides.
+    Unset,
+    /// `API_PORT=` (empty): the backend falls back to `${API_PORT:-8000}`.
+    Empty,
+    /// A valid, non-zero port.
+    Port(u16),
+    /// A value the backend could not bind; ignored here.
+    Invalid,
+}
+
+/// Extract the effective `API_PORT` from the subset of dotenv syntax the
+/// development scripts use (`API_PORT=NNNN`, optional leading `export `,
+/// surrounding quotes, trailing ` # comment` on unquoted values). Like a
+/// shell `source`, the **last** assignment wins. Comment and unrelated lines
+/// are ignored.
+fn dotenv_api_port(contents: &str) -> DotenvPort {
+    let mut last: Option<&str> = None;
+    for raw in contents.lines() {
+        let trimmed = raw.trim();
+        let line = trimmed
+            .strip_prefix("export ")
+            .map(str::trim_start)
+            .unwrap_or(trimmed);
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key != "API_PORT" {
+            continue;
+        }
+        last = Some(value);
+    }
+    let Some(value) = last else {
+        return DotenvPort::Unset;
+    };
+    let value = value.trim();
+    let value = if let Some(inner) = value
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .or_else(|| {
+            value
+                .strip_prefix('\'')
+                .and_then(|rest| rest.strip_suffix('\''))
+        }) {
+        inner
+    } else {
+        // Unquoted: a shell treats ` #...` as a comment.
+        value
+            .split_once(" #")
+            .map(|(head, _)| head)
+            .unwrap_or(value)
+            .trim()
+    };
+    if value.is_empty() {
+        return DotenvPort::Empty;
+    }
+    match value.parse::<u16>() {
+        Ok(port) if port != 0 => DotenvPort::Port(port),
+        _ => DotenvPort::Invalid,
+    }
 }
 
 /// Build a loopback endpoint from a port string, or `None` when it is not a
@@ -69,14 +170,14 @@ fn port_loopback_endpoint(port_value: Option<String>) -> Option<String> {
 /// Resolve the backend endpoint from Tauri-managed runtime configuration.
 ///
 /// The desktop bundle must not depend solely on build-time `VITE_API_BASE_URL`
-/// (ADR ¶3). Precedence:
+/// (ADR ¶3). The port precedence matches `scripts/run_api_dev.sh`, which
+/// sources the root `.env` with `set -a` *after* inheriting the environment,
+/// so `.env` overrides an exported `API_PORT`:
 ///
 /// 1. `STUDIO_BACKEND_URL` — explicit full-URL override for the desktop shell;
-/// 2. `API_PORT` from the launch environment — the existing development
-///    backend knob (e.g. `API_PORT=8123` with `scripts/run_api_dev.sh`);
-/// 3. `API_PORT` from the project root `.env` — the configuration file the
-///    development scripts source, so a normally-launched packaged app follows
-///    the same set port without rebuilding or exporting overrides;
+/// 2. `API_PORT` from the root `.env` (last assignment wins; an empty value
+///    means the backend's own default 8000);
+/// 3. `API_PORT` from the launch environment;
 /// 4. loopback default `http://127.0.0.1:8000`.
 fn resolve_backend_endpoint(
     studio_backend_url: Option<String>,
@@ -89,18 +190,26 @@ fn resolve_backend_endpoint(
             return trimmed;
         }
     }
+    match dotenv_contents.map_or(DotenvPort::Unset, dotenv_api_port) {
+        DotenvPort::Port(port) => return format!("http://127.0.0.1:{port}"),
+        DotenvPort::Empty => return FALLBACK_BACKEND_ENDPOINT.to_string(),
+        DotenvPort::Unset | DotenvPort::Invalid => {}
+    }
     if let Some(endpoint) = port_loopback_endpoint(api_port_env) {
         return endpoint;
-    }
-    if let Some(port) = dotenv_contents.and_then(dotenv_api_port) {
-        return format!("http://127.0.0.1:{port}");
     }
     FALLBACK_BACKEND_ENDPOINT.to_string()
 }
 
 #[tauri::command]
-fn get_backend_endpoint() -> String {
-    let dotenv = std::fs::read_to_string(project_root().join(".env")).ok();
+fn get_backend_endpoint(app: tauri::AppHandle) -> String {
+    let dotenv_path = locate_dotenv(
+        std::env::var(STUDIO_ROOT_ENV).ok(),
+        std::env::current_exe().ok(),
+        app.path().app_config_dir().ok(),
+        debug_build_root(),
+    );
+    let dotenv = dotenv_path.and_then(|path| std::fs::read_to_string(path).ok());
     resolve_backend_endpoint(
         std::env::var("STUDIO_BACKEND_URL").ok(),
         std::env::var("API_PORT").ok(),
@@ -137,7 +246,10 @@ fn build_app() -> tauri::Builder<tauri::Wry> {
             let _ = windows::focus_main_window(app);
         }))
         // Autostart is registered but disabled by default (`set_autostart`).
-        .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, None))
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            None,
+        ))
         // The global-shortcut plugin is installed without shortcuts so plugin
         // setup can never fail on registration; the shortcut is registered in
         // `setup` below in a non-fatal way.
@@ -190,9 +302,11 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        dotenv_api_port, port_loopback_endpoint, project_root, resolve_backend_endpoint,
-        FALLBACK_BACKEND_ENDPOINT,
+        debug_build_root, dotenv_api_port, is_studio_root, locate_dotenv, port_loopback_endpoint,
+        resolve_backend_endpoint, DotenvPort, FALLBACK_BACKEND_ENDPOINT,
     };
+    use std::fs;
+    use std::path::PathBuf;
 
     fn resolve(
         studio_backend_url: Option<&str>,
@@ -204,6 +318,21 @@ mod tests {
             api_port_env.map(String::from),
             dotenv_contents,
         )
+    }
+
+    /// Fresh scratch directory under the system temp dir.
+    fn scratch(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("cas-desktop-test-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn make_checkout(root: &PathBuf) {
+        fs::create_dir_all(root.join("scripts")).unwrap();
+        fs::create_dir_all(root.join("apps").join("api")).unwrap();
+        fs::write(root.join("scripts").join("run_api_dev.sh"), "").unwrap();
     }
 
     #[test]
@@ -230,10 +359,30 @@ mod tests {
     }
 
     #[test]
-    fn env_api_port_wins_over_dotenv() {
+    fn dotenv_wins_over_env_api_port_like_run_api_dev() {
+        // run_api_dev.sh sources .env with `set -a` after inheriting the
+        // environment, so the .env value is what the backend binds.
         assert_eq!(
             resolve(None, Some("8123"), Some("API_PORT=9000")),
+            "http://127.0.0.1:9000"
+        );
+    }
+
+    #[test]
+    fn env_api_port_used_when_dotenv_has_no_assignment() {
+        assert_eq!(
+            resolve(None, Some("8123"), Some("WEB_PORT=5173\n# API_PORT=9000\n")),
             "http://127.0.0.1:8123"
+        );
+    }
+
+    #[test]
+    fn empty_dotenv_assignment_means_backend_default() {
+        // `API_PORT=` in .env clears the exported value; the backend then
+        // uses `${API_PORT:-8000}`.
+        assert_eq!(
+            resolve(None, Some("8123"), Some("API_PORT=\n")),
+            FALLBACK_BACKEND_ENDPOINT
         );
     }
 
@@ -250,10 +399,30 @@ mod tests {
     }
 
     #[test]
-    fn invalid_env_port_falls_through_to_dotenv() {
+    fn last_dotenv_assignment_wins_like_shell_source() {
         assert_eq!(
-            resolve(None, Some("not-a-port"), Some("API_PORT=8123")),
+            dotenv_api_port("API_PORT=8123\nAPI_PORT=9000\n"),
+            DotenvPort::Port(9000)
+        );
+        assert_eq!(
+            resolve(None, None, Some("API_PORT=8123\nexport API_PORT=9000\n")),
+            "http://127.0.0.1:9000"
+        );
+    }
+
+    #[test]
+    fn invalid_dotenv_port_falls_through_to_env() {
+        assert_eq!(
+            resolve(None, Some("8123"), Some("API_PORT=not-a-port")),
             "http://127.0.0.1:8123"
+        );
+    }
+
+    #[test]
+    fn invalid_env_port_falls_back_to_default() {
+        assert_eq!(
+            resolve(None, Some("not-a-port"), None),
+            FALLBACK_BACKEND_ENDPOINT
         );
     }
 
@@ -270,19 +439,33 @@ mod tests {
     }
 
     #[test]
-    fn dotenv_parser_accepts_export_and_quotes() {
-        assert_eq!(dotenv_api_port("export API_PORT='8123'\n"), Some(8123));
-        assert_eq!(dotenv_api_port("API_PORT=\"8123\"\n"), Some(8123));
-        assert_eq!(dotenv_api_port("API_PORT= 8123 \n"), Some(8123));
+    fn dotenv_parser_accepts_export_quotes_and_inline_comment() {
+        assert_eq!(
+            dotenv_api_port("export API_PORT='8123'\n"),
+            DotenvPort::Port(8123)
+        );
+        assert_eq!(
+            dotenv_api_port("API_PORT=\"8123\"\n"),
+            DotenvPort::Port(8123)
+        );
+        assert_eq!(
+            dotenv_api_port("API_PORT=8123 # dev\n"),
+            DotenvPort::Port(8123)
+        );
+        assert_eq!(dotenv_api_port("  API_PORT=8123\n"), DotenvPort::Port(8123));
     }
 
     #[test]
     fn dotenv_parser_ignores_comments_other_vars_zero_and_garbage() {
-        assert_eq!(dotenv_api_port("# API_PORT=8123\n"), None);
-        assert_eq!(dotenv_api_port("WEB_PORT=8123\n"), None);
-        assert_eq!(dotenv_api_port("API_PORT=0\n"), None);
-        assert_eq!(dotenv_api_port("API_PORT=not-a-port\n"), None);
-        assert_eq!(dotenv_api_port(""), None);
+        assert_eq!(dotenv_api_port("# API_PORT=8123\n"), DotenvPort::Unset);
+        assert_eq!(dotenv_api_port("WEB_PORT=8123\n"), DotenvPort::Unset);
+        assert_eq!(dotenv_api_port("API_PORT=0\n"), DotenvPort::Invalid);
+        assert_eq!(
+            dotenv_api_port("API_PORT=not-a-port\n"),
+            DotenvPort::Invalid
+        );
+        assert_eq!(dotenv_api_port("API_PORT=\n"), DotenvPort::Empty);
+        assert_eq!(dotenv_api_port(""), DotenvPort::Unset);
     }
 
     #[test]
@@ -293,7 +476,66 @@ mod tests {
     }
 
     #[test]
-    fn project_root_located_above_manifest_dir() {
-        assert!(project_root().join("apps").join("api").is_dir());
+    fn explicit_studio_root_is_authoritative() {
+        let other = scratch("explicit-other");
+        fs::write(other.join(".env"), "API_PORT=9000\n").unwrap();
+        assert_eq!(
+            locate_dotenv(Some("/srv/studio".into()), None, Some(other.clone()), None),
+            Some(PathBuf::from("/srv/studio/.env"))
+        );
+        // Blank override is ignored.
+        assert_eq!(
+            locate_dotenv(Some("  ".into()), None, Some(other.clone()), None),
+            Some(other.join(".env"))
+        );
+    }
+
+    #[test]
+    fn executable_inside_a_checkout_uses_that_checkout() {
+        let root = scratch("exe-root");
+        make_checkout(&root);
+        fs::write(root.join(".env"), "API_PORT=8123\n").unwrap();
+        let config = scratch("exe-config");
+        fs::write(config.join(".env"), "API_PORT=9000\n").unwrap();
+        let exe =
+            root.join("apps/desktop/src-tauri/target/release/bundle/X.app/Contents/MacOS/bin");
+        assert!(is_studio_root(&root));
+        assert_eq!(
+            locate_dotenv(None, Some(exe), Some(config), None),
+            Some(root.join(".env"))
+        );
+    }
+
+    #[test]
+    fn installed_app_uses_app_config_dir_not_build_checkout() {
+        let config = scratch("installed-config");
+        fs::write(config.join(".env"), "API_PORT=8123\n").unwrap();
+        let exe = PathBuf::from("/Applications/Creative AI Studio.app/Contents/MacOS/bin");
+        assert_eq!(
+            locate_dotenv(None, Some(exe.clone()), Some(config.clone()), None),
+            Some(config.join(".env"))
+        );
+        // Nothing configured: no .env at all (release builds pass no build root).
+        let empty = scratch("installed-empty");
+        assert_eq!(locate_dotenv(None, Some(exe), Some(empty), None), None);
+    }
+
+    #[test]
+    fn debug_build_root_is_only_a_last_resort() {
+        let build_root = scratch("debug-root");
+        fs::write(build_root.join(".env"), "API_PORT=8123\n").unwrap();
+        assert_eq!(
+            locate_dotenv(None, None, None, Some(build_root.clone())),
+            Some(build_root.join(".env"))
+        );
+        if cfg!(debug_assertions) {
+            assert!(debug_build_root()
+                .expect("debug build exposes the checkout")
+                .join("apps")
+                .join("api")
+                .is_dir());
+        } else {
+            assert_eq!(debug_build_root(), None);
+        }
     }
 }
