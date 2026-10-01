@@ -134,7 +134,15 @@ start_backend() {
     fail "a backend already answers on 127.0.0.1:$port; stop it or pass --force"
     exit 1
   fi
-  API_PORT="$port" "$API_SCRIPT" >"$log" 2>&1 &
+  # Each backend gets its own smoke-owned data/output tree under LOG_DIR, so
+  # startup recovery and the job runner never touch the checkout's real
+  # data/ or outputs/, and the two concurrent backends never contend for
+  # the same data-directory ownership lock.
+  local state="$LOG_DIR/state-$port"
+  mkdir -p "$state/data" "$state/outputs"
+  env -u OUTPUT_IMAGE_DIR -u OUTPUT_AUDIO_DIR -u OUTPUT_TEXT_DIR -u OUTPUT_VIDEO_DIR \
+    API_PORT="$port" DB_PATH="$state/data/jobs.db" OUTPUT_DIR="$state/outputs" \
+    "$API_SCRIPT" >"$log" 2>&1 &
   pid=$!
   OWNED_PIDS+=("$pid")
   if ! wait_for_health "$port"; then
@@ -179,10 +187,15 @@ done
   exit 1
 }
 
+# pgrep treats its operand as an extended regex; escape the bundle path so
+# "." in "Creative AI Studio.app" (or any other metacharacter) matches literally.
+# shellcheck disable=SC2001
+APP_BIN_ERE="$(printf '%s' "$APP_BIN" | sed 's/[][\.^$*+?(){}|]/\\&/g')"
+
 if [[ "$FORCE" -eq 1 ]]; then
   force_stop_port_listener "$DEFAULT_PORT"
   force_stop_port_listener "$NON_DEFAULT_PORT"
-  EXISTING_APP="$(pgrep -f -x "$APP_BIN" 2>/dev/null || true)"
+  EXISTING_APP="$(pgrep -f -x "$APP_BIN_ERE" 2>/dev/null || true)"
   if [[ -n "$EXISTING_APP" ]]; then
     say "stopping running instance of this bundle (--force): $(echo "$EXISTING_APP" | tr '\n' ' ')"
     # shellcheck disable=SC2086
@@ -194,7 +207,7 @@ if backend_running_here "$DEFAULT_PORT" || backend_running_here "$NON_DEFAULT_PO
   fail "a Studio backend already appears to be running; stop it or pass --force"
   exit 1
 fi
-if pgrep -f -x "$APP_BIN" >/dev/null 2>&1; then
+if pgrep -f -x "$APP_BIN_ERE" >/dev/null 2>&1; then
   fail "this desktop bundle is already running; quit it or pass --force"
   exit 1
 fi

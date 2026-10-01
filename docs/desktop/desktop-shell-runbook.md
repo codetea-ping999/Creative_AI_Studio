@@ -15,7 +15,7 @@ Desktop Shell（Tauri 2）を変更したときに「何をどの順で確かめ
 
 ## ビルド
 
-前提: Rust toolchain（`rust-version = 1.77.2` 以上）と Tauri 2 CLI。CLI はバージョンを固定して入れる:
+前提: Rust toolchain（`rust-version = 1.88` 以上。ロック済み依存（darling 0.23、time 0.3.55 など）の MSRV に合わせています）と Tauri 2 CLI。CLI はバージョンを固定して入れる:
 
 ```bash
 cargo install tauri-cli --version "^2" --locked   # `cargo tauri --version` が 2.x を返すこと

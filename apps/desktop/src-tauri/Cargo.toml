@@ -4,7 +4,7 @@ version = "1.0.0"
 description = "Creative AI Studio desktop shell (Tauri 2)"
 authors = ["Creative AI Studio contributors"]
 edition = "2021"
-rust-version = "1.77.2"
+rust-version = "1.88"
 
 # The UI is the existing apps/web React/Vite build. Keep the Rust core a
 # thin shell that owns only resident-desktop concerns (tray, single-instance,
