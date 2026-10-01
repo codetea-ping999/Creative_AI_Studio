@@ -47,6 +47,11 @@ export type Batch = {
   stage_names: string[];
   aggregate: BatchAggregate;
   items: BatchItem[];
+  // Set when an automatic stage advance fails outright (a preflight
+  // rejection, not a failed item) -- distinct from a batch that is
+  // `failed` because items in it failed, where `aggregate.failed` already
+  // explains the state.
+  error_message: string | null;
   created_at: string;
   updated_at: string;
 };

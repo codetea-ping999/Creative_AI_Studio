@@ -602,6 +602,15 @@ export function MatrixPanel({
                 Stage {batch.stage_index + 1} / {batch.stage_names.length}
               </span>
             </div>
+            {batch.status === "failed" && batch.error_message ? (
+              // Distinct from a batch failed via failed items (already
+              // explained by 失敗 in the metrics below): this is a
+              // stage-advance preflight rejection, so aggregate.failed can
+              // legitimately be 0 while the batch still shows as failed.
+              <div className="error-banner matrix-progress__error" role="alert">
+                <span>{batch.error_message}</span>
+              </div>
+            ) : null}
             <progress
               value={doneCount}
               max={Math.max(batch.aggregate.total, 1)}
