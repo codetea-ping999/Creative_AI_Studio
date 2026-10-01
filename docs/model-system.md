@@ -478,8 +478,11 @@ text runtime の `api_key_env` 規約（`core/models/text_runtimes.py`）と同�
   Hiragino Sans GB / Arial Unicode → Linux の Noto Sans CJK → Windows の msgothic / YuGothM / meiryo
 - フォントファイルは同梱しません（ライセンスのため）。どれも見つからない場合は従来どおり既定フォントで
   描画し（該当文字は □ になります）、エラーにはしません
-- 解決結果はプロセス内でキャッシュされるため、同じマシン・同じ入力なら出力は決定的です。
-  `STORYBOARD_FONT_PATH` を変更したら API を再起動してください
+- フォントの解決結果はプロセス内でキャッシュされるため、同じマシンでは同じフォントが選ばれ続けます。
+  `STORYBOARD_FONT_PATH` を変更したら API を再起動してください。ここで保証するのはフォント選択の
+  決定性だけで、seed を省略した場合の出力全体は決定的ではありません
+- 日本語の折り返しには最小限の禁則処理（`generators/video/subtitle_line_breaking.py` の
+  `apply_kinsoku_rules`）を適用し、句読点や閉じ括弧が行頭に来ないようにします
 
 ## Learned Video Runtime Contract
 

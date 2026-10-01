@@ -18,6 +18,7 @@ from core.models import ModelManifest
 from core.schemas import GenerationRequest
 from generators.common import safe_is_cancelled
 from generators.video.fonts import font_for_text
+from generators.video.subtitle_line_breaking import apply_kinsoku_rules
 
 if TYPE_CHECKING:
     from core.jobs.context import GenerationContext
@@ -45,7 +46,9 @@ def _wrap_columns(text: str, width: int) -> list[str]:
 
     Latin-only text goes through ``textwrap.wrap`` unchanged (identical output
     to before #449). Text containing wide (CJK) characters is wrapped greedily
-    by display columns, counting a wide character as two columns.
+    by display columns, counting a wide character as two columns, then the
+    minimum kinsoku rules are applied so closing punctuation never starts a
+    line (a pulled-back character may run one past ``width``).
     """
 
     if not any(_is_wide(char) for char in text):
@@ -66,7 +69,7 @@ def _wrap_columns(text: str, width: int) -> list[str]:
         columns += char_columns
     if current.strip():
         lines.append(current.strip())
-    return lines
+    return apply_kinsoku_rules(lines)
 
 
 def _shorten_columns(text: str, width: int, placeholder: str = "...") -> str:

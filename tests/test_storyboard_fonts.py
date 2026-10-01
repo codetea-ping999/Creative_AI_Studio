@@ -134,6 +134,14 @@ class ColumnWrapTests(unittest.TestCase):
         lines = runtime_module._wrap_columns("あ" * 40, 34)
         self.assertEqual(lines, ["あ" * 17, "あ" * 17, "あ" * 6])
 
+    def test_cjk_wrap_keeps_closing_punctuation_off_line_start(self) -> None:
+        lines = runtime_module._wrap_columns("あ" * 17 + "。続き", 34)
+        self.assertEqual(lines, ["あ" * 17 + "。", "続き"])
+
+    def test_cjk_wrap_keeps_opening_bracket_off_line_end(self) -> None:
+        lines = runtime_module._wrap_columns("あ" * 16 + "「続き」", 34)
+        self.assertEqual(lines, ["あ" * 16, "「続き」"])
+
     def test_cjk_shorten_truncates_with_placeholder(self) -> None:
         shortened = runtime_module._shorten_columns("avoid: " + "ぼ" * 40, 54)
         self.assertTrue(shortened.endswith("..."))
