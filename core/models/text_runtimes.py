@@ -422,12 +422,16 @@ def _scene_image_prompt(subject: str, mood: str, index: int, total: int) -> str:
     resolution, and paired with a shot type, so each scene of one story gets a
     different frame while the subject still anchors every prompt. Pure function
     of its inputs, so the same story always yields the same prompts.
+
+    The scene-specific shot and arc cue come first: CLIP-based image encoders
+    (SDXL) only read the first 77 tokens, and a long Japanese subject alone
+    can exceed that, which would cut off everything that tells scenes apart.
     """
 
     shot = _SCENE_SHOTS[max(0, index - 1) % len(_SCENE_SHOTS)]
     role = _scene_arc_role(index, total)
     return (
-        f"{subject}, {shot}, {_SCENE_ARC_CUES[role]}, {mood}, "
+        f"{shot}, {_SCENE_ARC_CUES[role]}, {subject}, {mood}, "
         "cinematic composition, detailed lighting"
     )
 

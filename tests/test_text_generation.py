@@ -220,6 +220,46 @@ class TemplateScenePromptTests(unittest.TestCase):
                 self.assertEqual(len(prompts), scene_count)
                 self.assertEqual(len(set(prompts)), scene_count)
 
+    _LONG_JA_PREMISE = (
+        "嵐の夜、年老いた灯台守は遭難しかけた漁船を港へ導くため、"
+        "錆びついた階段を一段ずつ登り、最後の油で灯りをともす。"
+        "かつて自分が救えなかった弟子の面影を胸に、彼は海と向き合い、"
+        "夜明けまで灯を守り抜くと誓う。港では家族たちが祈るように海を見つめている。"
+    )
+
+    def test_scene_specific_cues_precede_a_long_subject(self) -> None:
+        # SDXL's CLIP encoders read only the first 77 tokens; a long Japanese
+        # subject placed first would truncate away everything scene-specific.
+        for scene_count in (5, 24):
+            with self.subTest(scene_count=scene_count):
+                prompts = self._scene_prompts(self._LONG_JA_PREMISE, scene_count)
+                prefixes = []
+                for prompt in prompts:
+                    subject_at = prompt.find("嵐の夜")
+                    self.assertGreater(subject_at, 0, prompt)
+                    prefix = prompt[:subject_at]
+                    self.assertTrue(prefix.isascii(), prefix)
+                    # Plain English words: comfortably inside 77 CLIP tokens.
+                    self.assertLessEqual(len(prefix.split()), 20, prefix)
+                    prefixes.append(prefix)
+                self.assertEqual(len(set(prefixes)), scene_count, prefixes)
+
+    def test_scene_prompts_differ_within_the_clip_token_window(self) -> None:
+        try:
+            from transformers import CLIPTokenizer
+
+            tokenizer = CLIPTokenizer.from_pretrained(
+                "openai/clip-vit-large-patch14", local_files_only=True
+            )
+        except Exception as exc:  # tokenizer files are not vendored
+            self.skipTest(f"CLIP tokenizer not available locally: {exc}")
+        prompts = self._scene_prompts(self._LONG_JA_PREMISE, 5)
+        windows = [
+            tuple(tokenizer(prompt, truncation=True, max_length=77)["input_ids"])
+            for prompt in prompts
+        ]
+        self.assertEqual(len(set(windows)), 5)
+
     def test_regenerated_template_scenes_keep_asset_lineage(self) -> None:
         from core.storage.json_files import utc_now
         from core.story import Scene, StoryDocument, apply_text_result
