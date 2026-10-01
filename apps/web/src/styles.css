@@ -1389,6 +1389,7 @@ pre,
 
 .download-guide {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   align-items: center;
   gap: 12px;
@@ -1406,6 +1407,33 @@ pre,
   margin: 3px 0 0;
   color: var(--text-soft);
   font-size: 0.76rem;
+}
+
+.download-guide__body {
+  flex: 1 1 240px;
+  min-width: 0;
+}
+
+.download-guide__path code {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  overflow-wrap: anywhere;
+}
+
+.download-guide__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.download-guide__status {
+  flex-basis: 100%;
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.download-guide .download-guide__status--error {
+  color: var(--danger);
 }
 
 /* Status and detail actions */
@@ -1772,6 +1800,11 @@ pre,
   .download-guide {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .download-guide__body,
+  .download-guide__status {
+    flex: 0 0 auto;
   }
 }
 

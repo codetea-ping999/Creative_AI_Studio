@@ -38,9 +38,33 @@ function currentBaseUrlSync(): string {
   return resolvedBaseUrl ?? DEFAULT_LOOPBACK_BASE_URL;
 }
 
+export class ApiError extends Error {
+  readonly status: number;
+  readonly code: string | null;
+
+  constructor(message: string, status: number, code: string | null = null) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.code = code;
+  }
+}
+
+function readErrorCode(detail: unknown): string | null {
+  if (detail && typeof detail === "object" && !Array.isArray(detail)) {
+    const code = (detail as { code?: unknown }).code;
+    return typeof code === "string" ? code : null;
+  }
+  return null;
+}
+
 export function formatApiErrorDetail(detail: unknown): string {
   if (typeof detail === "string") {
     return detail;
+  }
+  if (detail && typeof detail === "object" && !Array.isArray(detail)) {
+    const message = (detail as { message?: unknown }).message;
+    return typeof message === "string" ? message : "";
   }
   if (!Array.isArray(detail)) {
     return "";
@@ -73,13 +97,19 @@ export async function requestJson<T>(path: string, init?: RequestInit): Promise<
   const responseText = await response.text();
   if (!response.ok) {
     let detail = responseText;
+    let code: string | null = null;
     try {
       const parsed = JSON.parse(responseText) as { detail?: unknown };
       detail = formatApiErrorDetail(parsed.detail) || detail;
+      code = readErrorCode(parsed.detail);
     } catch {
       // Keep the raw response text when the API does not return JSON.
     }
-    throw new Error(detail || `${response.status} ${response.statusText}`);
+    throw new ApiError(
+      detail || `${response.status} ${response.statusText}`,
+      response.status,
+      code,
+    );
   }
   return responseText ? (JSON.parse(responseText) as T) : (undefined as T);
 }

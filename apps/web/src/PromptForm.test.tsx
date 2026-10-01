@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { PromptForm, type ModelOption } from "./components/PromptForm";
@@ -15,6 +15,8 @@ const storyboardModel: ModelOption = {
   isDefault: true,
   runtimeStatus: "ready",
   availabilityMessage: "Ready",
+  installPath: "",
+  supportsLocalInstall: false,
 };
 
 afterEach(() => {
@@ -547,5 +549,146 @@ describe("studio helpers", () => {
     ).toBe(
       "body.prompt: Field required; body.params.width: Input should be a valid integer",
     );
+  });
+});
+
+describe("PromptForm local model install", () => {
+  const missingSdxl: ModelOption = {
+    ...storyboardModel,
+    id: "ssd-1b",
+    displayName: "SSD-1B Local",
+    isAvailable: false,
+    isDefault: false,
+    runtimeStatus: "missing_files",
+    availabilityMessage: "Diffusers model files are missing: model_index.json",
+    installPath: "/Users/me/Studio/models/image/ssd-1b",
+    supportsLocalInstall: true,
+  };
+
+  it("shows a download link and the install location for models without a guide before", () => {
+    render(<PromptForm mediaType="image" modelOptions={[storyboardModel, missingSdxl]} />);
+
+    expect(screen.getByRole("link", { name: "Download" }).getAttribute("href")).toBe(
+      "https://huggingface.co/segmind/SSD-1B",
+    );
+    expect(screen.getByText("/Users/me/Studio/models/image/ssd-1b")).toBeTruthy();
+  });
+
+  it("picks a folder and reports the outcome", async () => {
+    const user = userEvent.setup();
+    const install = vi.fn().mockResolvedValue({
+      status: "installed",
+      message: "ssd-1b を配置しました。",
+    });
+
+    render(
+      <PromptForm
+        mediaType="image"
+        modelOptions={[storyboardModel, missingSdxl]}
+        onInstallLocalModel={install}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "手元のモデルを配置…" }));
+
+    expect(install).toHaveBeenCalledWith("ssd-1b", undefined);
+    const guides = screen.getByLabelText("Model download guides");
+    expect((await within(guides).findByRole("status")).textContent).toContain(
+      "ssd-1b を配置しました。",
+    );
+  });
+
+  it("stays quiet when the folder dialog is cancelled", async () => {
+    const user = userEvent.setup();
+    const install = vi.fn().mockResolvedValue({ status: "cancelled" });
+
+    render(
+      <PromptForm
+        mediaType="image"
+        modelOptions={[storyboardModel, missingSdxl]}
+        onInstallLocalModel={install}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "手元のモデルを配置…" }));
+
+    await waitFor(() => {
+      expect(
+        (screen.getByRole("button", { name: "手元のモデルを配置…" }) as HTMLButtonElement)
+          .disabled,
+      ).toBe(false);
+    });
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("asks before replacing existing files and then retries with replace", async () => {
+    const user = userEvent.setup();
+    const install = vi
+      .fn()
+      .mockResolvedValueOnce({
+        status: "needs_replace",
+        message: "配置先にファイルがあります。",
+        sourcePath: "/Users/me/Downloads/ssd-1b",
+      })
+      .mockResolvedValueOnce({ status: "installed", message: "配置しました。" });
+
+    render(
+      <PromptForm
+        mediaType="image"
+        modelOptions={[storyboardModel, missingSdxl]}
+        onInstallLocalModel={install}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "手元のモデルを配置…" }));
+    expect((await screen.findByRole("alert")).textContent).toContain("配置先にファイルがあります。");
+
+    await user.click(screen.getByRole("button", { name: "置き換えて配置" }));
+
+    expect(install).toHaveBeenLastCalledWith("ssd-1b", {
+      sourcePath: "/Users/me/Downloads/ssd-1b",
+      replace: true,
+    });
+    const guides = screen.getByLabelText("Model download guides");
+    expect((await within(guides).findByRole("status")).textContent).toContain("配置しました。");
+  });
+
+  it("shows an error message and keeps the button usable", async () => {
+    const user = userEvent.setup();
+    const install = vi.fn().mockResolvedValue({
+      status: "error",
+      message: "The selected folder does not contain a complete model.",
+    });
+
+    render(
+      <PromptForm
+        mediaType="image"
+        modelOptions={[storyboardModel, missingSdxl]}
+        onInstallLocalModel={install}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "手元のモデルを配置…" }));
+
+    expect((await screen.findByRole("alert")).textContent).toContain("complete model");
+    expect(
+      (screen.getByRole("button", { name: "手元のモデルを配置…" }) as HTMLButtonElement).disabled,
+    ).toBe(false);
+  });
+
+  it("hides the install button for endpoint models or when no handler is given", () => {
+    const { rerender } = render(
+      <PromptForm
+        mediaType="image"
+        modelOptions={[storyboardModel, missingSdxl]}
+        onInstallLocalModel={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "手元のモデルを配置…" })).toBeTruthy();
+
+    rerender(
+      <PromptForm
+        mediaType="image"
+        modelOptions={[storyboardModel, { ...missingSdxl, supportsLocalInstall: false }]}
+        onInstallLocalModel={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "手元のモデルを配置…" })).toBeNull();
   });
 });

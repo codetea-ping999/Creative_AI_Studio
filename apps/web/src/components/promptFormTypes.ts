@@ -9,6 +9,8 @@ export type ModelOption = {
   isDefault: boolean;
   runtimeStatus: string;
   availabilityMessage: string;
+  installPath: string;
+  supportsLocalInstall: boolean;
 };
 
 export type LoraOption = {
@@ -79,6 +81,17 @@ export type PromptFormSubmitValues = {
   visualStyle: string;
 };
 
+export type LocalModelInstallOptions = {
+  sourcePath?: string;
+  replace?: boolean;
+};
+
+export type LocalModelInstallOutcome =
+  | { status: "installed"; message: string }
+  | { status: "cancelled" }
+  | { status: "needs_replace"; message: string; sourcePath: string }
+  | { status: "error"; message: string };
+
 export type PromptFormProps = {
   formId?: string;
   mediaType?: MediaType;
@@ -91,6 +104,10 @@ export type PromptFormProps = {
   statusMessage?: string | null;
   onSubmit?: (values: PromptFormSubmitValues) => void;
   onDraftChange?: (values: Partial<PromptFormSubmitValues>) => void;
+  onInstallLocalModel?: (
+    modelId: string,
+    options?: LocalModelInstallOptions,
+  ) => Promise<LocalModelInstallOutcome>;
 };
 
 export type ImagePreset = {
