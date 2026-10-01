@@ -63,7 +63,25 @@ cleanup() {
   for pid in "${OWNED_PIDS[@]+"${OWNED_PIDS[@]}"}"; do
     stop_owned_pid "$pid"
   done
-  if [[ "${#OWNED_PIDS[@]}" -gt 0 ]]; then sleep 1; fi
+  # The API lifespan can take several seconds to join its threads after TERM;
+  # wait (bounded) for every owned PID, then KILL whatever is still alive so
+  # the smoke never exits with its ports occupied.
+  local waited=0 alive
+  while :; do
+    alive=0
+    for pid in "${OWNED_PIDS[@]+"${OWNED_PIDS[@]}"}"; do
+      if kill -0 "$pid" 2>/dev/null; then alive=1; fi
+    done
+    [[ "$alive" -eq 0 || "$waited" -ge 15 ]] && break
+    sleep 1
+    waited=$((waited + 1))
+  done
+  if [[ "$alive" -eq 1 ]]; then
+    for pid in "${OWNED_PIDS[@]+"${OWNED_PIDS[@]}"}"; do
+      pkill -KILL -P "$pid" 2>/dev/null || true
+      kill -KILL "$pid" 2>/dev/null || true
+    done
+  fi
   if [[ "$ENV_OWNED" -eq 1 ]]; then
     rm -f "$ROOT/.env"
     if [[ -n "$ENV_BACKUP" && -f "$ENV_BACKUP" ]]; then

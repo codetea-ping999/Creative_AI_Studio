@@ -322,8 +322,13 @@ mod tests {
 
     /// Fresh scratch directory under the system temp dir.
     fn scratch(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("cas-desktop-test-{}-{name}", std::process::id()));
+        // Nanosecond timestamp keeps concurrent runs apart without touching
+        // the process API that check_no_backend_spawn.py forbids.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let dir = std::env::temp_dir().join(format!("cas-desktop-test-{nanos}-{name}"));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir

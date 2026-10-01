@@ -43,7 +43,7 @@ _COMMENT_STRIP = re.compile(
     | /\*.*?\*/                    # block comment
     | "(?:\\.|[^"\\])*"            # double-quoted string
     | b"(?:\\.|[^"\\])*"           # byte string
-    | r#"[^"]*"#                   # raw string (common cases)
+    | b?r(\#*)".*?"\1               # raw string: r"..", r#".."#, br##".."##
     """,
     re.DOTALL | re.VERBOSE,
 )
