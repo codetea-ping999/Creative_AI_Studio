@@ -65,6 +65,17 @@ class AgentBrokerTests(unittest.TestCase):
         path.chmod(0o755)
         return path
 
+    def _fake_opencode(self, body: str, *, version: str = "1.18.28") -> Path:
+        """Fake OpenCode CLI that answers the broker's pure-mode version probe."""
+
+        header = (
+            "import sys as _broker_sys\n"
+            "if _broker_sys.argv[1:] == ['--version']:\n"
+            f"    print({version!r})\n"
+            "    raise SystemExit(0)\n"
+        )
+        return self._fake("opencode", header + textwrap.dedent(body).lstrip())
+
     def _task(
         self,
         *,
@@ -1148,8 +1159,7 @@ class AgentBrokerTests(unittest.TestCase):
 
     def test_opencode_success_prompt_is_only_on_stdin(self) -> None:
         opencode_record = self.root / "opencode-record.json"
-        opencode = self._fake(
-            "opencode",
+        opencode = self._fake_opencode(
             f"""
             import json, os, pathlib, sys
             record = {{
@@ -1160,6 +1170,11 @@ class AgentBrokerTests(unittest.TestCase):
                     for k in sorted(os.environ)
                     if k.startswith("OPENCODE_")
                 }},
+                "xdg_config_home": os.environ.get("XDG_CONFIG_HOME"),
+                "xdg_data_home": os.environ.get("XDG_DATA_HOME"),
+                "global_config_entries": sorted(
+                    p.name for p in pathlib.Path(os.environ["XDG_CONFIG_HOME"]).iterdir()
+                ),
                 "secret_env": sorted(k for k in os.environ if k in {{
                     "OPENAI_API_KEY", "CODEX_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"
                 }}),
@@ -1176,8 +1191,23 @@ class AgentBrokerTests(unittest.TestCase):
         codex = self._fake("codex", "raise SystemExit(99)\n")
         claude = self._fake("claude", "raise SystemExit(99)\n")
         task = self._task(providers=["opencode"])
+        real_config = self.root / "real-xdg-config"
+        (real_config / "opencode").mkdir(parents=True)
+        (real_config / "opencode" / "opencode.json").write_text(
+            json.dumps({"plugin": ["malicious-global-plugin"]}), encoding="utf-8"
+        )
+        real_data = self.root / "real-xdg-data"
 
-        result = self._run_broker(task, codex, claude, opencode=opencode)
+        result = self._run_broker(
+            task,
+            codex,
+            claude,
+            opencode=opencode,
+            extra_env={
+                "XDG_CONFIG_HOME": str(real_config),
+                "XDG_DATA_HOME": str(real_data),
+            },
+        )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         payload = json.loads(result.stdout)
         self.assertTrue(payload["ok"])
@@ -1197,7 +1227,15 @@ class AgentBrokerTests(unittest.TestCase):
         self.assertIn("what could break", data["stdin"])
         self.assertEqual(data["secret_env"], [])
 
-        self.assertEqual(data["argv"][0], "run")
+        self.assertEqual(data["argv"][:2], ["--pure", "run"])
+        self.assertEqual(data["env"].get("OPENCODE_PURE"), "1")
+        # Global config is isolated to an empty broker-owned directory; auth
+        # storage under XDG_DATA_HOME is still inherited.
+        isolated_config = Path(data["xdg_config_home"])
+        self.assertNotEqual(isolated_config, real_config)
+        isolated_config.relative_to(self.state_dir)
+        self.assertEqual(data["global_config_entries"], [])
+        self.assertEqual(data["xdg_data_home"], str(real_data))
         self.assertEqual(data["argv"][data["argv"].index("--format") + 1], "json")
         self.assertEqual(
             data["argv"][data["argv"].index("--agent") + 1], "broker"
@@ -1217,8 +1255,7 @@ class AgentBrokerTests(unittest.TestCase):
         self.assertEqual(permission["read"]["*.env"], "deny")
 
     def test_opencode_quota_error_falls_back_to_claude(self) -> None:
-        opencode = self._fake(
-            "opencode",
+        opencode = self._fake_opencode(
             """
             import json, sys
             sys.stdin.read()
@@ -1261,8 +1298,7 @@ class AgentBrokerTests(unittest.TestCase):
         self.assertNotIn("MALICIOUS", claude_stdin)
 
     def test_opencode_worker_error_does_not_fall_back(self) -> None:
-        opencode = self._fake(
-            "opencode",
+        opencode = self._fake_opencode(
             """
             import json, sys
             sys.stdin.read()
@@ -1322,8 +1358,7 @@ class AgentBrokerTests(unittest.TestCase):
         self.assertTrue(Path(payload["result_path"]).is_file())
 
     def test_opencode_read_only_cannot_modify_workspace(self) -> None:
-        opencode = self._fake(
-            "opencode",
+        opencode = self._fake_opencode(
             """
             import json, pathlib, sys
             sys.stdin.read()
@@ -1349,8 +1384,7 @@ class AgentBrokerTests(unittest.TestCase):
     def test_opencode_write_mode_allows_untracked_change_in_worktree(self) -> None:
         worktree = self.root / "wt"
         self._git("worktree", "add", "-q", str(worktree), "HEAD")
-        opencode = self._fake(
-            "opencode",
+        opencode = self._fake_opencode(
             """
             import json, pathlib, sys
             sys.stdin.read()
@@ -1377,8 +1411,7 @@ class AgentBrokerTests(unittest.TestCase):
     def test_opencode_failed_write_never_falls_back_when_tree_changed(self) -> None:
         worktree = self.root / "wt"
         self._git("worktree", "add", "-q", str(worktree), "HEAD")
-        opencode = self._fake(
-            "opencode",
+        opencode = self._fake_opencode(
             """
             import json, pathlib, sys
             sys.stdin.read()
@@ -1412,6 +1445,96 @@ class AgentBrokerTests(unittest.TestCase):
         self.assertEqual([item["reason"] for item in payload["attempts"]], ["workspace_changed"])
         self.assertEqual(payload["provider"], "opencode")
         self.assertFalse(claude_marker.exists())
+
+    def test_opencode_without_pure_mode_is_never_launched(self) -> None:
+        for version_output in ("1.3.3", "opencode dev build"):
+            with self.subTest(version_output=version_output):
+                launched = self.root / "opencode-launched"
+                launched.unlink(missing_ok=True)
+                opencode = self._fake_opencode(
+                    f"""
+                    import pathlib
+                    pathlib.Path({str(launched)!r}).write_text("launched")
+                    raise SystemExit(0)
+                    """,
+                    version=version_output,
+                )
+                claude = self._fake(
+                    "claude",
+                    """
+                    import json, sys
+                    sys.stdin.read()
+                    print(json.dumps({
+                        "type": "result", "subtype": "success", "is_error": False,
+                        "session_id": "claude-fallback", "result": "completed"
+                    }))
+                    """,
+                )
+                codex = self._fake("codex", "raise SystemExit(99)\n")
+
+                only = self._run_broker(
+                    self._task(providers=["opencode"]), codex, claude, opencode=opencode
+                )
+                self.assertEqual(only.returncode, 1, only.stdout + only.stderr)
+                payload = json.loads(only.stdout)
+                self.assertFalse(payload["ok"])
+                self.assertEqual(
+                    [item["reason"] for item in payload["attempts"]], ["unavailable"]
+                )
+                stderr_log = Path(payload["attempts"][0]["stderr_path"]).read_text()
+                self.assertIn("pure mode", stderr_log)
+                self.assertFalse(launched.exists())
+
+                fallback = self._run_broker(
+                    self._task(providers=["opencode", "claude"]),
+                    codex,
+                    claude,
+                    opencode=opencode,
+                )
+                self.assertEqual(fallback.returncode, 0, fallback.stdout + fallback.stderr)
+                payload = json.loads(fallback.stdout)
+                self.assertEqual(payload["provider"], "claude")
+                self.assertEqual(
+                    [item["reason"] for item in payload["attempts"]],
+                    ["unavailable", "success"],
+                )
+                self.assertFalse(launched.exists())
+
+    def test_doctor_reports_opencode_without_pure_mode(self) -> None:
+        opencode = self._fake_opencode("raise SystemExit(0)\n", version="1.3.3")
+        codex = self._fake("codex", 'print("codex ok")\n')
+        claude = self._fake("claude", 'print("claude ok")\n')
+        env = os.environ.copy()
+        env.update(
+            {
+                "AGENT_BROKER_CODEX_BIN": str(codex),
+                "AGENT_BROKER_CLAUDE_BIN": str(claude),
+                "AGENT_BROKER_OPENCODE_BIN": str(opencode),
+            }
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(BROKER),
+                "--json",
+                "--state-dir",
+                str(self.state_dir),
+                "doctor",
+                "--workspace",
+                str(self.repo),
+            ],
+            cwd=REPOSITORY_ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["ok"])
+        self.assertTrue(payload["checks"]["opencode_cli"]["ok"])
+        self.assertFalse(payload["checks"]["opencode_pure"]["ok"])
+        self.assertIn("1.3.4", payload["checks"]["opencode_pure"]["detail"])
 
     def test_doctor_includes_opencode_checks(self) -> None:
         opencode = self._fake(
@@ -1457,6 +1580,7 @@ class AgentBrokerTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertTrue(payload["checks"]["opencode_cli"]["ok"])
         self.assertTrue(payload["checks"]["opencode_auth"]["ok"])
+        self.assertTrue(payload["checks"]["opencode_pure"]["ok"])
 
 
 if __name__ == "__main__":

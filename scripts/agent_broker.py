@@ -50,6 +50,11 @@ PROVIDERS = frozenset({"codex", "claude", "opencode"})
 MODES = frozenset({"read-only", "workspace-write"})
 OPENCODE_AGENT_NAME = "broker"
 OPENCODE_AGENT_DESCRIPTION = "Broker-managed bounded worker agent."
+# First OpenCode release whose CLI exposes ``--pure`` / ``OPENCODE_PURE`` and skips
+# every external (config-declared or auto-discovered) plugin when it is set. The
+# broker refuses to launch an older or unidentifiable OpenCode binary.
+OPENCODE_MIN_PURE_VERSION = (1, 3, 4)
+OPENCODE_VERSION_RE = re.compile(r"(?<![0-9.])(\d+)\.(\d+)\.(\d+)(?![0-9])")
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
@@ -317,7 +322,10 @@ def _redact_text(text: str, inherited_env: Mapping[str, str] | None = None) -> s
 
 
 def _safe_environment(
-    provider: str, task: Mapping[str, Any] | None = None
+    provider: str,
+    task: Mapping[str, Any] | None = None,
+    *,
+    opencode_config_home: Path | None = None,
 ) -> dict[str, str]:
     inherited = os.environ
     env = {key: value for key, value in inherited.items() if key in SAFE_ENV_KEYS}
@@ -329,6 +337,17 @@ def _safe_environment(
         env["CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS"] = "1"
         env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
     if provider == "opencode":
+        if opencode_config_home is None:
+            raise BrokerError(
+                "internal_error", "opencode worker requires an isolated config directory"
+            )
+        # Global config (XDG_CONFIG_HOME/opencode) can declare plugins, MCP servers,
+        # formatters, and LSP commands. Point it at an empty broker-owned directory;
+        # auth stays under XDG_DATA_HOME, which is still inherited.
+        env["XDG_CONFIG_HOME"] = str(opencode_config_home)
+        # Pure mode makes OpenCode skip every external plugin before any of them
+        # can run code; it is also passed as --pure on argv.
+        env["OPENCODE_PURE"] = "1"
         env["OPENCODE_CONFIG_CONTENT"] = _opencode_agent_config(task)
         env["OPENCODE_DISABLE_PROJECT_CONFIG"] = "1"
         env["OPENCODE_DISABLE_AUTOUPDATE"] = "1"
@@ -346,6 +365,7 @@ def _run_control_command(
         list(argv),
         cwd=cwd,
         env=_safe_environment("control"),
+        stdin=subprocess.DEVNULL,
         text=True,
         capture_output=True,
         timeout=timeout,
@@ -819,9 +839,37 @@ def _opencode_agent_config(task: Mapping[str, Any] | None) -> str:
     return json.dumps(config)
 
 
+def _parse_opencode_version(text: str) -> tuple[int, int, int] | None:
+    match = OPENCODE_VERSION_RE.search(text)
+    if match is None:
+        return None
+    major, minor, patch = (int(part) for part in match.groups())
+    return (major, minor, patch)
+
+
+def _opencode_pure_support(cwd: Path) -> tuple[bool, str]:
+    """Return whether the OpenCode binary supports pure mode; fail closed otherwise."""
+
+    minimum = ".".join(str(part) for part in OPENCODE_MIN_PURE_VERSION)
+    try:
+        result = _run_control_command([_provider_binary("opencode"), "--version"], cwd=cwd)
+    except (OSError, subprocess.TimeoutExpired):
+        return False, "opencode executable is unavailable"
+    if result.returncode != 0:
+        return False, "opencode --version failed; pure mode cannot be verified"
+    version = _parse_opencode_version(result.stdout or "")
+    if version is None:
+        return False, "opencode version is unrecognized; pure mode cannot be verified"
+    found = ".".join(str(part) for part in version)
+    if version < OPENCODE_MIN_PURE_VERSION:
+        return False, f"opencode {found} lacks pure mode; {minimum} or newer is required"
+    return True, f"opencode {found} (pure mode supported)"
+
+
 def _opencode_command(task: Mapping[str, Any]) -> list[str]:
     return [
         _provider_binary("opencode"),
+        "--pure",
         "run",
         "--format",
         "json",
@@ -885,12 +933,14 @@ def _invoke(
     timeout: int,
     provider: str,
     task: Mapping[str, Any] | None = None,
+    opencode_config_home: Path | None = None,
 ) -> ProcessResult:
+    env = _safe_environment(provider, task, opencode_config_home=opencode_config_home)
     try:
         process = subprocess.Popen(
             list(argv),
             cwd=cwd,
-            env=_safe_environment(provider, task),
+            env=env,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1311,14 +1361,33 @@ def _attempt(
     else:
         command = _opencode_command(task)
     started_at = _now()
-    process = _invoke(
-        command,
-        cwd=Path(str(task["workspace"])),
-        prompt=prompt,
-        timeout=int(task["timeout_seconds"]),
-        provider=provider,
-        task=task,
-    )
+    workspace = Path(str(task["workspace"]))
+    opencode_config_home: Path | None = None
+    pure_supported, pure_detail = True, ""
+    if provider == "opencode":
+        pure_supported, pure_detail = _opencode_pure_support(workspace)
+        opencode_config_home = attempt_dir / "opencode-xdg-config"
+        _mkdir_private(opencode_config_home)
+    if not pure_supported:
+        # Never launch an OpenCode worker that could load external plugins.
+        process = ProcessResult(
+            exit_code=None,
+            stdout="",
+            stderr=pure_detail,
+            timed_out=False,
+            unavailable=True,
+            output_overflow=False,
+        )
+    else:
+        process = _invoke(
+            command,
+            cwd=workspace,
+            prompt=prompt,
+            timeout=int(task["timeout_seconds"]),
+            provider=provider,
+            task=task,
+            opencode_config_home=opencode_config_home,
+        )
     inherited_env = dict(os.environ)
     clean_stdout = _truncate_stream(_redact_text(process.stdout, inherited_env))
     clean_stderr = _truncate_stream(_redact_text(process.stderr, inherited_env))
@@ -1686,6 +1755,9 @@ def _doctor(workspace: Path, *, explicit_state_dir: str | None) -> dict[str, Any
     checks["opencode_cli"] = _probe(
         "opencode", [_provider_binary("opencode"), "--version"], workspace
     )
+    if checks["opencode_cli"]["ok"]:
+        pure_ok, pure_detail = _opencode_pure_support(workspace)
+        checks["opencode_pure"] = {"ok": pure_ok, "detail": pure_detail}
     checks["opencode_auth"] = _probe(
         "opencode auth", [_provider_binary("opencode"), "auth", "list"], workspace
     )
