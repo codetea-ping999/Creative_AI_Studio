@@ -115,6 +115,213 @@ class TemplateRuntimeTests(unittest.TestCase):
         self.assertIn("少女", text)
 
 
+class TemplateSubjectClippingTests(unittest.TestCase):
+    """A long premise must not be cut mid-word in template output (#450)."""
+
+    def _logline_text(self, premise: str) -> str:
+        task = get_story_task("logline")
+        raw = build_template_runtime()(
+            task.build_prompt({"premise": premise, "count": 1}),
+            json_schema=task.json_schema(),
+        )
+        return extract_json_object(raw)["loglines"][0]["text"]
+
+    def test_an_ordinary_premise_survives_whole(self) -> None:
+        premise = (
+            "A baker opens her stall at dawn and meets a lost child who changes her day"
+        )
+        self.assertIn(premise, self._logline_text(premise))
+
+    def test_a_long_english_premise_is_clipped_at_a_clause_boundary(self) -> None:
+        premise = (
+            "A retired lighthouse keeper, haunted by the wreck he failed to prevent, "
+            "climbs the tower one last time on a stormy night to guide a lost ship home "
+            "while the village below sleeps"
+        )
+        text = self._logline_text(premise)
+        self.assertIn(
+            "A retired lighthouse keeper, haunted by the wreck he failed to prevent",
+            text,
+        )
+        self.assertNotIn("climbs the tower", text)
+
+    def test_a_long_japanese_premise_is_clipped_at_a_phrase_boundary(self) -> None:
+        sentence = "嵐の夜、年老いた灯台守が遭難船を導くために最後の灯りをともす"
+        premise = "。".join([sentence] * 4)
+        text = self._logline_text(premise)
+        # Three whole sentences fit; the fourth is dropped rather than cut.
+        self.assertTrue(text.startswith("。".join([sentence] * 3) + "が"), text)
+
+    def test_text_without_any_boundary_is_marked_as_clipped(self) -> None:
+        text = self._logline_text("x" * 300)
+        self.assertIn("x" * 119 + "…", text)
+
+
+class TemplateScenePromptTests(unittest.TestCase):
+    """Issue #450: template scenes must not all share the premise as their prompt."""
+
+    _PREMISES = (
+        "嵐の夜、年老いた灯台守が遭難船を導くために最後の灯りをともす",
+        "A baker opens her stall at dawn and meets a lost child who changes her day",
+    )
+
+    def _scenes(self, premise: str, scene_count: int = 5) -> list[dict]:
+        task = get_story_task("scene_list")
+        raw = _template_runtime()["generate"](
+            task.build_prompt(
+                {"premise": premise, "subject": premise, "scene_count": scene_count}
+            ),
+            system=task.system_prompt,
+            seed=1,
+            json_schema=task.json_schema(),
+        )
+        payload = task.response_model.model_validate(extract_json_object(raw))
+        return payload.model_dump(mode="json")["scenes"]
+
+    def _scene_prompts(self, premise: str, scene_count: int = 5) -> list[str]:
+        return [scene["image_prompt"] for scene in self._scenes(premise, scene_count)]
+
+    def test_five_scenes_get_pairwise_distinct_prompts_anchored_on_the_subject(
+        self,
+    ) -> None:
+        for premise in self._PREMISES:
+            with self.subTest(premise=premise):
+                prompts = self._scene_prompts(premise)
+                self.assertEqual(len(prompts), 5)
+                self.assertEqual(len(set(prompts)), 5, prompts)
+                for prompt in prompts:
+                    self.assertIn(premise, prompt)
+
+    def test_five_scene_narrations_are_distinct(self) -> None:
+        narrations = [
+            scene["narration"] for scene in self._scenes(self._PREMISES[0])
+        ]
+        self.assertEqual(len(set(narrations)), 5, narrations)
+        self.assertIn(self._PREMISES[0], narrations[0])
+
+    def test_middle_scene_narrations_carry_the_story_mood(self) -> None:
+        task = get_story_task("scene_list")
+        raw = _template_runtime()["generate"](
+            task.build_prompt(
+                {"premise": "p", "subject": "p", "mood": "凍てつく静寂", "scene_count": 5}
+            ),
+            system=task.system_prompt,
+            seed=1,
+            json_schema=task.json_schema(),
+        )
+        scenes = task.response_model.model_validate(extract_json_object(raw)).scenes
+        for scene in scenes:
+            self.assertIn("凍てつく静寂", scene.narration)
+
+    def test_later_narrations_differ_between_stories_without_a_tone(self) -> None:
+        first, second = (
+            [scene["narration"] for scene in self._scenes(premise)]
+            for premise in self._PREMISES
+        )
+        for index in range(1, 5):
+            with self.subTest(scene=index + 1):
+                self.assertNotEqual(first[index], second[index])
+        self.assertTrue(first[1].startswith("嵐の夜。"), first[1])
+
+    def test_a_single_scene_stands_for_the_whole_arc(self) -> None:
+        scenes = self._scenes(self._PREMISES[0], scene_count=1)
+        self.assertEqual(len(scenes), 1)
+        self.assertIn("key moment of the whole story", scenes[0]["image_prompt"])
+        self.assertNotIn("calm before the story begins", scenes[0]["image_prompt"])
+        self.assertIn("決定的な瞬間", scenes[0]["narration"])
+
+    def test_five_scene_prompts_follow_the_story_arc(self) -> None:
+        prompts = self._scene_prompts(self._PREMISES[0])
+        for prompt, cue in zip(
+            prompts,
+            ("establishing", "inciting", "rising tension", "climax", "resolution"),
+        ):
+            self.assertIn(cue, prompt)
+
+    def test_scene_prompts_are_deterministic(self) -> None:
+        self.assertEqual(
+            self._scene_prompts(self._PREMISES[0]),
+            self._scene_prompts(self._PREMISES[0]),
+        )
+
+    def test_prompts_stay_distinct_for_every_supported_scene_count(self) -> None:
+        for scene_count in range(1, 25):
+            with self.subTest(scene_count=scene_count):
+                prompts = self._scene_prompts("p", scene_count=scene_count)
+                self.assertEqual(len(prompts), scene_count)
+                self.assertEqual(len(set(prompts)), scene_count)
+
+    _LONG_JA_PREMISE = (
+        "嵐の夜、年老いた灯台守は遭難しかけた漁船を港へ導くため、"
+        "錆びついた階段を一段ずつ登り、最後の油で灯りをともす。"
+        "かつて自分が救えなかった弟子の面影を胸に、彼は海と向き合い、"
+        "夜明けまで灯を守り抜くと誓う。港では家族たちが祈るように海を見つめている。"
+    )
+
+    def test_scene_specific_cues_precede_a_long_subject(self) -> None:
+        # SDXL's CLIP encoders read only the first 77 tokens; a long Japanese
+        # subject placed first would truncate away everything scene-specific.
+        for scene_count in (5, 24):
+            with self.subTest(scene_count=scene_count):
+                prompts = self._scene_prompts(self._LONG_JA_PREMISE, scene_count)
+                prefixes = []
+                for prompt in prompts:
+                    subject_at = prompt.find("嵐の夜")
+                    self.assertGreater(subject_at, 0, prompt)
+                    prefix = prompt[:subject_at]
+                    self.assertTrue(prefix.isascii(), prefix)
+                    # Plain English words: comfortably inside 77 CLIP tokens.
+                    self.assertLessEqual(len(prefix.split()), 20, prefix)
+                    prefixes.append(prefix)
+                self.assertEqual(len(set(prefixes)), scene_count, prefixes)
+
+    def test_scene_prompts_differ_within_the_clip_token_window(self) -> None:
+        try:
+            from transformers import CLIPTokenizer
+
+            tokenizer = CLIPTokenizer.from_pretrained(
+                "openai/clip-vit-large-patch14", local_files_only=True
+            )
+        except Exception as exc:  # tokenizer files are not vendored
+            self.skipTest(f"CLIP tokenizer not available locally: {exc}")
+        prompts = self._scene_prompts(self._LONG_JA_PREMISE, 5)
+        windows = [
+            tuple(tokenizer(prompt, truncation=True, max_length=77)["input_ids"])
+            for prompt in prompts
+        ]
+        self.assertEqual(len(set(windows)), 5)
+
+    def test_regenerated_template_scenes_keep_asset_lineage(self) -> None:
+        from core.storage.json_files import utc_now
+        from core.story import Scene, StoryDocument, apply_text_result
+
+        now = utc_now()
+        story = StoryDocument(
+            id="story_450",
+            created_at=now,
+            updated_at=now,
+            scenes=[
+                Scene(
+                    id="scene_01",
+                    order=0,
+                    asset_ids={"visual": "asset_a"},
+                    job_ids=["job_old"],
+                )
+            ],
+        )
+        prompts = self._scene_prompts(self._PREMISES[0])
+        payload = {
+            "scenes": [
+                {"heading": f"h{index}", "image_prompt": prompt}
+                for index, prompt in enumerate(prompts)
+            ]
+        }
+        merged = apply_text_result(story, "scene_list", payload)
+        self.assertEqual([scene.image_prompt for scene in merged.scenes], prompts)
+        self.assertEqual(merged.scenes[0].asset_ids, {"visual": "asset_a"})
+        self.assertEqual(merged.scenes[0].job_ids, ["job_old"])
+
+
 class StoryTaskTests(unittest.TestCase):
     def test_every_task_round_trips_through_the_template_runtime(self) -> None:
         runtime = _template_runtime()
