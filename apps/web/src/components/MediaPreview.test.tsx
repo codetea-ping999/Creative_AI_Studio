@@ -1,4 +1,4 @@
-import { act, cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { OutputThumbnail, StagePreview } from "./MediaPreview";
@@ -107,6 +107,73 @@ describe("MediaPreview", () => {
 
     expect(container.querySelector("video")).not.toBeNull();
     expect(container.querySelector("img")).toBeNull();
+  });
+
+  it("uses a still preview as the poster of a playable video", () => {
+    const { container } = render(
+      <StagePreview
+        mediaType="video"
+        outputPath="outputs/videos/assembly.mp4"
+        posterPath="outputs/videos/assembly_preview.png"
+        title="Assembly"
+        subtitle="assembly"
+      />,
+    );
+
+    const video = container.querySelector("video");
+    expect(video?.getAttribute("src")).toMatch(/\/outputs\/videos\/assembly\.mp4$/);
+    expect(video?.getAttribute("poster")).toMatch(/\/outputs\/videos\/assembly_preview\.png$/);
+  });
+
+  it("falls back to the still frame with an alert when the video fails to load", () => {
+    const { container, getByRole } = render(
+      <StagePreview
+        mediaType="video"
+        outputPath="outputs/videos/missing.mp4"
+        posterPath="outputs/videos/missing_preview.png"
+        title="Assembly"
+        subtitle="assembly"
+      />,
+    );
+
+    fireEvent.error(container.querySelector("video") as HTMLVideoElement);
+
+    expect(container.querySelector("video")).toBeNull();
+    expect(getByRole("img", { name: "Assembly" }).getAttribute("src")).toMatch(
+      /\/outputs\/videos\/missing_preview\.png$/,
+    );
+    expect(getByRole("alert").textContent).toMatch(/could not be loaded/);
+
+    // The still can be missing too; then explain rather than show a broken image.
+    fireEvent.error(getByRole("img", { name: "Assembly" }));
+    expect(container.querySelector("img")).toBeNull();
+    expect(getByRole("heading", { name: "Video unavailable" })).toBeTruthy();
+  });
+
+  it("explains a failed video without a poster and recovers for the next source", () => {
+    const { container, getByRole, queryByRole, rerender } = render(
+      <StagePreview
+        mediaType="video"
+        outputPath="outputs/videos/missing.mp4"
+        title="Assembly"
+        subtitle="assembly"
+      />,
+    );
+
+    fireEvent.error(container.querySelector("video") as HTMLVideoElement);
+    expect(getByRole("heading", { name: "Video unavailable" })).toBeTruthy();
+    expect(getByRole("alert")).toBeTruthy();
+
+    rerender(
+      <StagePreview
+        mediaType="video"
+        outputPath="outputs/videos/other.mp4"
+        title="Other"
+        subtitle="assembly"
+      />,
+    );
+    expect(container.querySelector("video")).not.toBeNull();
+    expect(queryByRole("alert")).toBeNull();
   });
 
   // #448: storyboard GIFs kept animating for users who asked for reduced motion.

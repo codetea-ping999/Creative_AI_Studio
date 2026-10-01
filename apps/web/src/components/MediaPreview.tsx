@@ -16,6 +16,8 @@ type StagePreviewProps = {
   outputPath: string | null;
   title: string;
   subtitle: string;
+  /** Still frame shown before a playable video starts (e.g. an Assembly `*_preview.png`). */
+  posterPath?: string | null;
 };
 
 export function StagePreview({
@@ -23,6 +25,7 @@ export function StagePreview({
   outputPath,
   title,
   subtitle,
+  posterPath = null,
 }: StagePreviewProps) {
   const src = createOutputUrl(outputPath);
 
@@ -55,11 +58,9 @@ export function StagePreview({
   }
 
   if (isPlayableVideoAsset(outputPath)) {
-    return (
-      <div className="stage-surface stage-surface--hero">
-        <video controls muted playsInline preload="metadata" src={src} />
-      </div>
-    );
+    const poster = isPlayableVideoAsset(posterPath) ? null : createOutputUrl(posterPath);
+    // Keyed on the source so a failed load does not stick to the next selection.
+    return <VideoStagePreview key={src} src={src} poster={poster} title={title} />;
   }
 
   if (mediaType === "text" || isTextAsset(outputPath)) {
@@ -77,6 +78,62 @@ export function StagePreview({
   return (
     <div className="stage-surface stage-surface--hero">
       <img src={src} alt={title} loading="lazy" />
+    </div>
+  );
+}
+
+function VideoStagePreview({
+  src,
+  poster,
+  title,
+}: {
+  src: string;
+  poster: string | null;
+  title: string;
+}) {
+  const [failed, setFailed] = useState(false);
+  const [posterFailed, setPosterFailed] = useState(false);
+
+  // A missing or undecodable video leaves the browser on a blank frame with an
+  // endless spinner and drops the poster, so fall back to the still with a
+  // textual error instead.
+  if (failed) {
+    if (!poster || posterFailed) {
+      return (
+        <div className="stage-surface">
+          <div className="empty-stage">
+            <div>
+              <h3>Video unavailable</h3>
+              <p role="alert">The video could not be loaded.</p>
+            </div>
+          </div>
+        </div>
+      );
+    }
+    return (
+      <>
+        <div className="stage-surface stage-surface--hero">
+          <img src={poster} alt={title} onError={() => setPosterFailed(true)} />
+        </div>
+        <p className="error-banner" role="alert">
+          The video could not be loaded. Showing its still frame instead.
+        </p>
+      </>
+    );
+  }
+
+  return (
+    <div className="stage-surface stage-surface--hero">
+      <video
+        controls
+        muted
+        playsInline
+        preload="metadata"
+        src={src}
+        poster={poster ?? undefined}
+        aria-label={title}
+        onError={() => setFailed(true)}
+      />
     </div>
   );
 }
