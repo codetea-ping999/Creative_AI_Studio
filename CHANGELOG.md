@@ -11,6 +11,12 @@ v1.0.0 の既知の制限と検証の所見のうち、次のものを v1.1 で�
 - 日本語 Storyboard overlay の文字が MP4 で表示されない問題
 - Preview / Experimental 用の ML 依存の更新（`torch`、`diffusers`、`transformers`）
 
+### Fixed
+
+- procedural storyboard（`storyboard-video`）のフレームで日本語が □（豆腐）になる問題を修正。
+  既定フォントで描けない文字を含む行は CJK 対応のシステムフォントで描画します。
+  `STORYBOARD_FONT_PATH` で任意のフォントを指定できます（#449）。
+
 ## [1.0.0] - 2026-09-30
 
 v1.0.0 は「約束する範囲を明示した最初のリリース」です。機能を Stable / Preview /
