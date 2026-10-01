@@ -33,6 +33,14 @@ except ModuleNotFoundError as exc:
 
 
 if CORE_IMPORT_ERROR is None:
+    def _advance_job_to(repository: JobRepository, job_id: str, status: str) -> None:
+        """Seed an in-flight state through the persisted lifecycle contract."""
+
+        phases = ("preparing", "running", "postprocessing")
+        for phase in phases[: phases.index(status) + 1]:
+            assert repository.update_status(job_id, phase) is not None
+
+
     class _FailingImageGenerator(BaseGenerator):
         def validate_request(self, request: GenerationRequest) -> None:
             return None
@@ -453,6 +461,7 @@ class JobPipelineTests(unittest.TestCase):
             from core.batches import BatchRepository, BatchService
             from core.bible import BibleRepository
             from core.feedback import FeedbackRepository
+            from core.jobs.completion import CompletionConverger
             from core.projects import ProjectRepository
             from core.prompting import PromptComposer
             from core.story import SceneBinder, StoryRepository
@@ -461,6 +470,12 @@ class JobPipelineTests(unittest.TestCase):
             story_repository = StoryRepository(root / "stories")
             bible_repository = BibleRepository(root / "bible")
             batch_repository = BatchRepository(root / "batches")
+            scene_binder = SceneBinder(
+                story_repository, repository, asset_repository, event_bus=event_bus
+            )
+            batch_service = BatchService(
+                batch_repository, service, repository, event_bus=event_bus
+            )
             services = ApplicationServices(
                 output_dir=root / "outputs" / "images",
                 model_service=create_default_model_service(),
@@ -476,12 +491,15 @@ class JobPipelineTests(unittest.TestCase):
                 bible_repository=bible_repository,
                 prompt_composer=PromptComposer(bible_repository),
                 story_repository=story_repository,
-                scene_binder=SceneBinder(
-                    story_repository, repository, asset_repository, event_bus=event_bus
-                ),
+                scene_binder=scene_binder,
                 batch_repository=batch_repository,
-                batch_service=BatchService(
-                    batch_repository, service, repository, event_bus=event_bus
+                batch_service=batch_service,
+                completion_converger=CompletionConverger(
+                    repository,
+                    asset_repository,
+                    story_repository=story_repository,
+                    scene_binder=scene_binder,
+                    batch_service=batch_service,
                 ),
             )
             client = TestClient(create_app(services, start_job_runner=False))
@@ -527,7 +545,7 @@ class JobPipelineTests(unittest.TestCase):
                     params={},
                 )
             )
-            services.job_repository.update_status(job.id, "running")
+            _advance_job_to(services.job_repository, job.id, "running")
 
             response = client.post(f"/jobs/{job.id}/cancel")
 
@@ -589,7 +607,7 @@ class JobPipelineTests(unittest.TestCase):
                             params={},
                         )
                     )
-                    repository.update_status(job.id, running_like_status)
+                    _advance_job_to(repository, job.id, running_like_status)
 
                     cancelled = service.cancel_job(job.id)
 
@@ -620,7 +638,14 @@ class JobPipelineTests(unittest.TestCase):
                             params={},
                         )
                     )
-                    repository.update_status(job.id, terminal_status)
+                    if terminal_status == "succeeded":
+                        _advance_job_to(repository, job.id, "postprocessing")
+                        service.mark_succeeded(
+                            job.id,
+                            GenerationResult(job_id=job.id, status="succeeded"),
+                        )
+                    else:
+                        assert repository.update_status(job.id, terminal_status) is not None
 
                     result = service.cancel_job(job.id)
 
@@ -645,7 +670,7 @@ class JobPipelineTests(unittest.TestCase):
                     params={},
                 )
             )
-            repository.update_status(job.id, "running")
+            _advance_job_to(repository, job.id, "running")
 
             first = service.cancel_job(job.id)
             second = service.cancel_job(job.id)
@@ -675,7 +700,7 @@ class JobPipelineTests(unittest.TestCase):
                     params={},
                 )
             )
-            repository.update_status(job.id, "running")
+            _advance_job_to(repository, job.id, "running")
             service.cancel_job(job.id)
 
             result = service.mark_succeeded(
@@ -929,6 +954,7 @@ class JobPipelineTests(unittest.TestCase):
                         params={},
                     )
                 )
+                _advance_job_to(services.job_repository, job.id, "postprocessing")
                 persisted = services.job_repository.update(
                     job.id,
                     status="succeeded",

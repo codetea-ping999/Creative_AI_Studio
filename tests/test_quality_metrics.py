@@ -129,6 +129,9 @@ class QualityMetricsTests(unittest.TestCase):
                 )
             )
 
+            for job in (image_job, audio_job):
+                for status in ("preparing", "running", "postprocessing"):
+                    assert services.job_repository.update_status(job.id, status) is not None
             services.job_service.mark_succeeded(
                 image_job.id,
                 GenerationResult(
@@ -225,6 +228,8 @@ class QualityMetricsTests(unittest.TestCase):
                 )
             )
 
+            for status in ("preparing", "running", "postprocessing"):
+                assert services.job_repository.update_status(succeeded_job.id, status) is not None
             services.job_service.mark_succeeded(
                 succeeded_job.id,
                 GenerationResult(
@@ -244,6 +249,7 @@ class QualityMetricsTests(unittest.TestCase):
                 ),
             )
             services.job_service.mark_failed(failed_job.id, "stub failure")
+            assert services.job_repository.update_status(running_job.id, "preparing") is not None
             services.job_service.update_status(running_job.id, "running", progress=0.5)
             services.job_service.cancel_job(cancelled_job.id)
             services.feedback_repository.create(

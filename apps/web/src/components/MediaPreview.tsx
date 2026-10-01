@@ -1,5 +1,5 @@
 import { createOutputUrl } from "../studioClient";
-import { isAudioAsset, isTextAsset, isVideoAsset, type GalleryMediaType } from "../studio";
+import { isAudioAsset, isPlayableVideoAsset, isTextAsset, type GalleryMediaType } from "../studio";
 import { excerptFromMarkdown, useTextAssetContent } from "../lib/textAssetPreview";
 import { renderMarkdownLite } from "../lib/markdownLite";
 
@@ -46,7 +46,7 @@ export function StagePreview({
     );
   }
 
-  if (isVideoAsset(outputPath)) {
+  if (isPlayableVideoAsset(outputPath)) {
     return (
       <div className="stage-surface stage-surface--hero">
         <video controls muted playsInline preload="metadata" src={src} />
@@ -121,7 +121,7 @@ export function OutputThumbnail({ mediaType, outputPath }: OutputThumbnailProps)
     );
   }
 
-  if (isVideoAsset(outputPath)) {
+  if (isPlayableVideoAsset(outputPath)) {
     return (
       <div className="gallery-item__thumb">
         <video muted playsInline preload="metadata" src={src} />

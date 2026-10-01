@@ -1,6 +1,6 @@
 PYTHON ?= ./venv/bin/python
 
-.PHONY: verify verify-lite setup-check web-build test web-test npm-audit lint typecheck test-coverage web-test-coverage api-smoke calibration-report cogvideox-smoke musicgen-smoke desktop-smoke
+.PHONY: verify verify-lite setup-check web-build test web-test npm-audit lint typecheck test-coverage web-test-coverage api-smoke calibration-report cogvideox-smoke musicgen-smoke download-models release-artifact release-smoke third-party-notices desktop-smoke
 
 verify:
 	$(PYTHON) scripts/verify_local_stack.py --start-api
@@ -41,6 +41,9 @@ api-smoke:
 calibration-report:
 	$(PYTHON) scripts/build_calibration_report.py
 
+download-models:
+	$(PYTHON) scripts/download_models.py
+
 cogvideox-smoke:
 	$(PYTHON) scripts/smoke_cogvideox.py
 
@@ -50,3 +53,19 @@ musicgen-smoke:
 # Desktop Shell packaged-app smoke. Requires `cargo tauri build` first.
 desktop-smoke:
 	./scripts/desktop_smoke.sh
+
+# Build the release tarball (creative-ai-studio-v<VERSION>.tar.gz + SHA256SUMS)
+# into artifacts/. Requires a clean working tree: the artifact is cut from HEAD.
+release-artifact:
+	./scripts/build_release_artifact.sh
+
+# Unpack the built artifact into a throwaway directory, install it, run the
+# Stable journey against it, and verify clean shutdown.
+release-smoke:
+	$(PYTHON) scripts/smoke_release_artifact.py
+
+# Regenerate THIRD_PARTY_NOTICES.md from the installed dependencies. Requires a
+# venv built from requirements.txt and apps/web/node_modules (npm ci), because
+# it reads real package metadata rather than restating requirements.txt.
+third-party-notices:
+	$(PYTHON) scripts/collect_third_party_notices.py

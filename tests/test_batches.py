@@ -315,6 +315,8 @@ class BatchServiceTests(unittest.TestCase):
         )
 
     def _succeed(self, job_id: str, score: float) -> None:
+        for status in ("preparing", "running", "postprocessing"):
+            assert self.job_repository.update_status(job_id, status) is not None
         self.job_service.mark_succeeded(
             job_id,
             GenerationResult(

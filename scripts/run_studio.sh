@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
+
+if [[ -f "$ROOT_DIR/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$ROOT_DIR/.env"
+  set +a
+fi
+
+API_HOST_VALUE="${API_HOST:-127.0.0.1}"
+API_HOST_IS_LOOPBACK=0
+if [[ "$API_HOST_VALUE" == "localhost" || "$API_HOST_VALUE" == "::1" ]]; then
+  API_HOST_IS_LOOPBACK=1
+elif [[ "$API_HOST_VALUE" =~ ^127\.([0-9]{1,3}\.){2}[0-9]{1,3}$ ]]; then
+  API_HOST_IS_LOOPBACK=1
+fi
+
+if [[ "$API_HOST_IS_LOOPBACK" != "1" ]]; then
+  if [[ "${ALLOW_UNSAFE_API_BIND:-0}" != "1" ]]; then
+    printf 'Refusing non-loopback API_HOST=%q. The API is unauthenticated; set ALLOW_UNSAFE_API_BIND=1 only after accepting the exposure risk.\n' "$API_HOST_VALUE" >&2
+    exit 2
+  fi
+  printf 'WARNING: binding the unauthenticated API to non-loopback host %q.\n' "$API_HOST_VALUE" >&2
+fi
+
+# Production/artifact mode serves the prebuilt web UI from apps/web/dist. There
+# is no Vite dev server to fall back to, so a missing build is a hard error
+# with an actionable message instead of a mysterious 404 later.
+if [[ ! -f "$ROOT_DIR/apps/web/dist/index.html" ]]; then
+  printf 'Production mode requires the prebuilt web UI (%s). Run `npm --prefix apps/web run build` first, or use scripts/start_studio.sh for the Vite development path.\n' "$ROOT_DIR/apps/web/dist/index.html" >&2
+  exit 2
+fi
+
+if [[ -x "$ROOT_DIR/venv/bin/uvicorn" ]]; then
+  UVICORN_BIN="$ROOT_DIR/venv/bin/uvicorn"
+else
+  UVICORN_BIN="uvicorn"
+fi
+
+# exec so SIGTERM/SIGINT reach the uvicorn process and the port is released
+# promptly on shutdown.
+exec "$UVICORN_BIN" apps.api.main:app \
+  --host "$API_HOST_VALUE" \
+  --port "${API_PORT:-8000}"

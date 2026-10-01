@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 import json
@@ -10,9 +11,43 @@ import sqlite3
 from typing import Any
 
 from core.jobs.schemas import JobRecord
+from core.jobs.statuses import JOB_STATUSES, TERMINAL_JOB_STATUSES, is_valid_transition
 from core.schemas import GenerationRequest, GenerationResult, GenerationStatus
 
 _UNSET = object()
+
+# Shared column list for every full-row SELECT (get/list/list_tolerant/
+# list_terminal_pending_completion) so adding a column only means editing
+# this one place plus `_row_to_record()`.
+_SELECT_COLUMNS = (
+    "id, project_id, media_type, status, request_json, result_json, "
+    "progress, error_message, completion_state, completion_error, "
+    "created_at, updated_at"
+)
+
+
+class JobRecordDecodeError(Exception):
+    """A job row could not be deterministically reconstructed into a `JobRecord`.
+
+    Raised by `_row_to_record()` when the row's own stored bytes -- not the
+    read operation itself -- are the problem, at any stage of
+    reconstruction: malformed JSON (`json.JSONDecodeError`) or a schema the
+    current `GenerationRequest`/`GenerationResult` models no longer accept
+    (`pydantic.ValidationError`) in the request/result payload; JSON nested
+    deep enough to overflow the decoder's C stack (`RecursionError`); a
+    malformed `created_at`/`updated_at` timestamp, whether a bad ISO string
+    (`datetime.fromisoformat` raising `ValueError`) or a non-`str` value --
+    SQLite tolerates a BLOB in a TEXT-affinity column, so a raw byte string
+    there raises `TypeError` instead; or the row as a whole failing
+    `JobRecord`'s own validation (an invalid persisted `status`/`media_type`
+    literal, a `progress` outside `[0.0, 1.0]`, etc. -- also
+    `pydantic.ValidationError`). Every one of these is deterministic: the
+    same persisted bytes fail identically on every future read of this row,
+    unlike a `sqlite3.Error` (locked, busy, disk I/O), which says nothing
+    about the row's content. A caller (see `core.jobs.runner.JobRunner`)
+    uses this type, specifically, to tell "retrying can never help" apart
+    from "the database itself had a transient problem."
+    """
 
 
 class JobRepository:
@@ -22,6 +57,12 @@ class JobRepository:
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
+
+    @property
+    def data_directory(self) -> Path:
+        """Return the directory containing this repository's SQLite data."""
+
+        return self._db_path.resolve().parent
 
     def create(self, job: JobRecord) -> JobRecord:
         with self._connection() as connection:
@@ -36,9 +77,11 @@ class JobRepository:
                     result_json,
                     progress,
                     error_message,
+                    completion_state,
+                    completion_error,
                     created_at,
                     updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job.id,
@@ -49,6 +92,8 @@ class JobRepository:
                     self._serialize_payload(job.result),
                     job.progress,
                     job.error_message,
+                    job.completion_state,
+                    job.completion_error,
                     self._normalize_timestamp(job.created_at),
                     self._normalize_timestamp(job.updated_at),
                 ),
@@ -59,21 +104,39 @@ class JobRepository:
             raise RuntimeError(f"Job {job.id!r} was not persisted.")
         return created_job
 
+    def create_if_absent(self, job: JobRecord) -> tuple[JobRecord, bool]:
+        """Insert `job`, or return the existing row if its id already exists.
+
+        Closes a race `create()` alone cannot: two callers racing to
+        materialize the same stable id (e.g. two concurrent
+        `_enqueue_stage()` passes for the same Batch item, or a terminal-
+        event handler racing a completion-retry pass) can both observe "no
+        row for this id" via a prior `get()` and both then attempt
+        `create()` -- one wins the INSERT, the other hits
+        `sqlite3.IntegrityError` on the primary key. Catching that here and
+        rereading the winner's row -- rather than letting it propagate as
+        an API 500 -- makes concurrent create-or-reuse callers converge on
+        the one row that actually exists.
+
+        Returns `(record, was_created)`: `was_created=True` only for the
+        caller whose INSERT actually committed; every other, losing caller
+        gets the winner's already-persisted row and `was_created=False`, so
+        only the true creator publishes `"job_created"`/enqueues it.
+        """
+
+        try:
+            return self.create(job), True
+        except sqlite3.IntegrityError:
+            existing = self.get(job.id)
+            if existing is None:  # pragma: no cover - row can't vanish mid-race
+                raise
+            return existing, False
+
     def get(self, job_id: str) -> JobRecord | None:
         with self._connection() as connection:
             row = connection.execute(
-                """
-                SELECT
-                    id,
-                    project_id,
-                    media_type,
-                    status,
-                    request_json,
-                    result_json,
-                    progress,
-                    error_message,
-                    created_at,
-                    updated_at
+                f"""
+                SELECT {_SELECT_COLUMNS}
                 FROM jobs
                 WHERE id = ?
                 """,
@@ -87,24 +150,88 @@ class JobRepository:
     def list(self) -> list[JobRecord]:
         with self._connection() as connection:
             rows = connection.execute(
-                """
-                SELECT
-                    id,
-                    project_id,
-                    media_type,
-                    status,
-                    request_json,
-                    result_json,
-                    progress,
-                    error_message,
-                    created_at,
-                    updated_at
+                f"""
+                SELECT {_SELECT_COLUMNS}
                 FROM jobs
                 ORDER BY created_at DESC
                 """
             ).fetchall()
 
         return [self._row_to_record(row) for row in rows]
+
+    def list_tolerant(
+        self,
+    ) -> tuple[
+        "builtins.list[JobRecord]", "builtins.list[tuple[str, JobRecordDecodeError]]"
+    ]:
+        """Row-by-row read of every job, tolerating a per-row decode failure.
+
+        Annotated via ``builtins.list`` (not the bare ``list[...]``
+        generic): this class already defines a method named ``list()``,
+        which shadows the builtin type of the same name for any annotation
+        appearing later in this class body under
+        ``from __future__ import annotations``.
+
+        Unlike `list()`, a single poison row (see `JobRecordDecodeError`)
+        never aborts the whole read -- it is reported alongside its `id`
+        instead, so a caller (startup recovery, Story replay candidate
+        selection) can still see and process every other row. A `sqlite3`-
+        level failure fetching the rows in the first place still propagates
+        normally: that is a transient, whole-scan problem, not a per-row
+        content one, and must not be silently treated as "scan complete."
+        Only for recovery/best-effort scanning; ordinary reads should keep
+        using `get()`/`list()`.
+        """
+
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT {_SELECT_COLUMNS}
+                FROM jobs
+                ORDER BY created_at DESC
+                """
+            ).fetchall()
+
+        records: list[JobRecord] = []
+        failures: list[tuple[str, JobRecordDecodeError]] = []
+        for row in rows:
+            try:
+                records.append(self._row_to_record(row))
+            except JobRecordDecodeError as exc:
+                failures.append((row["id"], exc))
+        return records, failures
+
+    def list_terminal_pending_completion(self) -> "builtins.list[JobRecord]":
+        """Terminal jobs whose completion convergence has not committed yet.
+
+        A narrow, indexed-by-column filter (`completion_state = 'pending'`
+        AND a terminal `status`) for the runtime/retry convergence loop, so
+        it does not need to decode the whole table on every pass. A poison
+        row here is silently skipped (not reported) -- it is
+        `list_tolerant()`'s job, via startup recovery, to quarantine those;
+        this method is read-only best-effort convergence input.
+        """
+
+        placeholders = ", ".join("?" for _ in TERMINAL_JOB_STATUSES)
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT {_SELECT_COLUMNS}
+                FROM jobs
+                WHERE completion_state = 'pending'
+                  AND status IN ({placeholders})
+                ORDER BY created_at ASC
+                """,
+                tuple(TERMINAL_JOB_STATUSES),
+            ).fetchall()
+
+        records: list[JobRecord] = []
+        for row in rows:
+            try:
+                records.append(self._row_to_record(row))
+            except JobRecordDecodeError:
+                continue
+        return records
 
     def update(
         self,
@@ -150,6 +277,281 @@ class JobRepository:
             expected_statuses=expected_statuses,
         )
 
+    def transition_if_status(
+        self,
+        job_id: str,
+        expected_statuses: tuple[str, ...],
+        *,
+        status: GenerationStatus,
+        progress: float | None = None,
+        error_message: str | None | object = _UNSET,
+    ) -> bool:
+        """Atomically transition a job and return only whether the CAS won.
+
+        Unlike ``update_if_status()``, this primitive deliberately does not
+        reread the job after its UPDATE commits.  Callers that establish
+        execution ownership need that boolean before any fallible follow-up
+        read can occur.
+
+        ``error_message`` (optional, `_UNSET` by default so ordinary claim/
+        transition callers leave the column untouched) lets a caller
+        quarantining an unreadable row -- see
+        `core.jobs.runner.JobRunner._quarantine_poison_job` -- persist the
+        failure reason in the same atomic UPDATE, without ever needing to
+        read the row back first. Recording *why* a job failed only via a
+        transient event publish is not enough: it must survive in the
+        database exactly like `JobService.mark_failed()`'s own
+        ``error_message`` does.
+        """
+
+        if not expected_statuses or status not in JOB_STATUSES:
+            return False
+
+        transition_sources = tuple(
+            current
+            for current in JOB_STATUSES
+            if is_valid_transition(current, status)
+        )
+        assignments = ["status = ?"]
+        parameters: list[Any] = [status]
+        if progress is not None:
+            assignments.append("progress = ?")
+            parameters.append(progress)
+        if error_message is not _UNSET:
+            assignments.append("error_message = ?")
+            parameters.append(error_message)
+        assignments.append("updated_at = ?")
+        parameters.append(self._normalize_timestamp(None))
+        parameters.append(job_id)
+        expected_placeholders = ", ".join("?" for _ in expected_statuses)
+        transition_placeholders = ", ".join("?" for _ in transition_sources)
+        parameters.extend(expected_statuses)
+        parameters.extend(transition_sources)
+
+        with self._connection() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE jobs
+                SET {', '.join(assignments)}
+                WHERE id = ?
+                  AND status IN ({expected_placeholders})
+                  AND status IN ({transition_placeholders})
+                """,
+                parameters,
+            )
+        return cursor.rowcount > 0
+
+    def get_raw_status(self, job_id: str) -> str | None:
+        """Return `job_id`'s persisted `status` column, or `None` if missing.
+
+        A narrow, single-column read that never touches `request_json`/
+        `result_json`/timestamps and never goes through `_row_to_record()`,
+        so it cannot itself raise `JobRecordDecodeError` -- it is exactly
+        what a caller needs to tell a *structurally invalid* raw status
+        (outside `JOB_STATUSES` entirely) apart from a valid one that
+        simply is not the status a CAS expected. Not a general escape
+        hatch: it reads one column for one job id and nothing else.
+        """
+
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT status FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        return None if row is None else row["status"]
+
+    def get_raw_error_message(self, job_id: str) -> str | None:
+        """Return `job_id`'s persisted `error_message` column, type-checked.
+
+        Same narrow shape as `get_raw_status()` -- `error_message` is a
+        plain `TEXT`-affinity column, populated once by `JobRunner`/
+        `JobService` at the moment a job reaches a terminal outcome, never
+        touched again afterwards, and independently readable without
+        decoding `request_json`/`result_json` -- so a caller that already
+        knows a row cannot currently be decoded (`JobRecordDecodeError`)
+        can still recover its real, previously-recorded diagnostic message
+        instead of fabricating a generic placeholder in its place (PR3
+        exact-HEAD audit, fourth round, adversarial self-review: a job
+        that legitimately failed with a real message, and only *later*
+        became undecodable for an unrelated reason, must not lose that
+        message just because the rest of its row currently cannot be
+        reconstructed).
+
+        SQLite's type affinity is a hint, not an enforced constraint: a
+        `TEXT`-affinity column can still hold a `BLOB` storage class value
+        (e.g. bytes that are not valid UTF-8), which this repository's own
+        write paths never produce, but which external corruption or a
+        direct raw write could. This method's *return type* is a promise
+        callers rely on (`str | None`, matching `BatchItem.error_message`)
+        -- returning that raw value un-type-checked would let a non-`str`
+        leak into a domain model field, breaking its later JSON
+        serialization (`BatchRecord.model_dump(mode="json")`) and
+        aborting the reconciliation pass that was trying to *recover*
+        this exact row (PR3 exact-HEAD audit, fifth round, finding 4).
+        Only a genuine `str` is ever returned as the real message; `NULL`
+        (no message ever recorded) returns `None`; any other raw storage
+        class (e.g. `bytes`, `int`, `float`) is treated as unrecoverable
+        raw metadata and reported via a fixed, descriptive fallback string
+        instead -- never decoded, re-encoded, or `repr()`-ed (which could
+        embed an arbitrarily large BLOB verbatim into the Batch record).
+
+        Returns `None` if the row does not exist, or if no error message
+        was ever recorded for it (both indistinguishable from this single
+        column alone, which matches every other caller's existing
+        treatment of "no error message" as `None`).
+        """
+
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT error_message FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        raw_value = row["error_message"]
+        if raw_value is None or isinstance(raw_value, str):
+            return raw_value
+        return (
+            "Job's error_message column contains non-text data and could "
+            "not be recovered."
+        )
+
+    def peek_raw_request_params(
+        self, job_id: str
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        """Lightweight raw peek at one row's `status` and request `params`.
+
+        Deliberately does not go through `_row_to_record()`: this exists
+        for judging the relevance of a row `list_tolerant()` already
+        reported as undecodable (see `core.story.replay_selection`), and
+        routing that same row back through full reconstruction would just
+        raise `JobRecordDecodeError` again. Reads only what a relevance
+        check needs -- the `status` column, and the `params` key inside
+        `request_json` -- tolerating a broken `request_json` payload by
+        returning `(status, None)` rather than raising, so a caller can
+        treat "can't tell" as "assume relevant" instead of crashing.
+
+        Returns `(None, None)` if the row does not exist at all.
+        """
+
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT status, request_json FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        if row is None:
+            return None, None
+        status = row["status"]
+        try:
+            payload = self._deserialize_payload(row["request_json"])
+        except (ValueError, RecursionError, TypeError):
+            return status, None
+        params = payload.get("params") if isinstance(payload, dict) else None
+        return status, params if isinstance(params, dict) else None
+
+    def quarantine_structurally_invalid_status(
+        self,
+        job_id: str,
+        *,
+        error_message: str,
+    ) -> bool:
+        """Terminalize a row whose persisted `status` is outside `JOB_STATUSES`.
+
+        A structurally invalid raw status (never written by this
+        codebase -- external corruption, a truncated write, a downgraded
+        schema) can never equal any expected status in an ordinary CAS, so
+        `transition_if_status()` always reports it as a miss; treating that
+        miss as "already resolved by something else" would discard the
+        queue entry while leaving the row stuck in that invalid status
+        forever -- a lost job (Codex exact-HEAD review). This is a
+        deliberately narrow escape hatch, not a general "rewrite any
+        status" helper:
+
+        - Scoped to exactly one `job_id`.
+        - The UPDATE's own WHERE clause re-checks, transactionally, that the
+          *current* raw status is NOT one of `JOB_STATUSES` -- so this can
+          never match, and can never overwrite, a row already in any valid
+          status (including a valid terminal one). It is not a bypass of
+          the execution-claim or lifecycle-transition contract; it only
+          ever fires for a status that contract was never defined for.
+        - Always sets `status="failed"`, `progress=1.0`, and
+          `error_message` together in the one atomic UPDATE -- there is no
+          reread step for a caller to lose the reason on, matching
+          `transition_if_status()`'s own no-reread design.
+
+        Returns whether this call's UPDATE actually matched a row -- a
+        `False` here means the row was no longer in that invalid status by
+        the time this ran (someone else already resolved or repaired it),
+        not that this call failed.
+        """
+
+        placeholders = ", ".join("?" for _ in JOB_STATUSES)
+        with self._connection() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE jobs
+                SET status = ?, progress = ?, error_message = ?, updated_at = ?
+                WHERE id = ?
+                  AND status NOT IN ({placeholders})
+                """,
+                (
+                    "failed",
+                    1.0,
+                    error_message,
+                    self._normalize_timestamp(None),
+                    job_id,
+                    *JOB_STATUSES,
+                ),
+            )
+        return cursor.rowcount > 0
+
+    def mark_completion_done(self, job_id: str) -> bool:
+        """Record that `job_id`'s post-terminal convergence fully applied.
+
+        Only ever flips `completion_state`/`completion_error`; never
+        touches `status`/`result`/`error_message` -- convergence succeeding
+        or failing must never look like the generation itself changed
+        outcome. Scoped to a terminal `status` so this can never mark an
+        active job "done" by mistake.
+        """
+
+        placeholders = ", ".join("?" for _ in TERMINAL_JOB_STATUSES)
+        with self._connection() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE jobs
+                SET completion_state = 'done', completion_error = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                  AND status IN ({placeholders})
+                """,
+                (self._normalize_timestamp(None), job_id, *TERMINAL_JOB_STATUSES),
+            )
+        return cursor.rowcount > 0
+
+    def mark_completion_pending_with_error(self, job_id: str, error_message: str) -> bool:
+        """Record a retryable/ambiguous completion failure, staying `pending`.
+
+        `completion_state` is left exactly as it already is ('pending' by
+        construction for anything that has not converged yet) -- this only
+        records *why* the last attempt did not reach 'done', so a later
+        retry (or an operator) can see it via `JobRepository.get()` without
+        needing to have been listening for an event at the time. Never
+        touches `status`/`result`/`error_message`: a completion failure
+        must never look like the generation itself failed.
+        """
+
+        placeholders = ", ".join("?" for _ in TERMINAL_JOB_STATUSES)
+        with self._connection() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE jobs
+                SET completion_error = ?, updated_at = ?
+                WHERE id = ?
+                  AND status IN ({placeholders})
+                  AND completion_state = 'pending'
+                """,
+                (error_message, self._normalize_timestamp(None), job_id, *TERMINAL_JOB_STATUSES),
+            )
+        return cursor.rowcount > 0
+
     def _update(
         self,
         job_id: str,
@@ -163,8 +565,19 @@ class JobRepository:
     ) -> JobRecord | None:
         assignments: list[str] = []
         parameters: list[Any] = []
+        transition_sources: tuple[str, ...] | None = None
 
         if status is not None:
+            if status not in JOB_STATUSES:
+                return None
+            # A caller's stale read must never become execution authority.
+            # Keep the lifecycle edge in this UPDATE's WHERE clause so every
+            # public and legacy update path shares one SQLite-enforced contract.
+            transition_sources = tuple(
+                current
+                for current in JOB_STATUSES
+                if is_valid_transition(current, status)
+            )
             assignments.append("status = ?")
             parameters.append(status)
 
@@ -195,6 +608,10 @@ class JobRepository:
             placeholders = ", ".join("?" for _ in expected_statuses)
             where_clause += f" AND status IN ({placeholders})"
             parameters.extend(expected_statuses)
+        if transition_sources is not None:
+            placeholders = ", ".join("?" for _ in transition_sources)
+            where_clause += f" AND status IN ({placeholders})"
+            parameters.extend(transition_sources)
 
         with self._connection() as connection:
             cursor = connection.execute(
@@ -257,6 +674,40 @@ class JobRepository:
             self._ensure_column(connection, "project_id", "TEXT")
             self._ensure_column(connection, "media_type", "TEXT NOT NULL DEFAULT 'image'")
             self._ensure_column(connection, "error_message", "TEXT")
+            # PR3: completion convergence tracking, separate from the
+            # generation-level `status` (see `JobRecord.completion_state`).
+            # `ALTER TABLE ... ADD COLUMN ... DEFAULT 'pending'` backfills
+            # every pre-existing row with 'pending' too -- the safe default
+            # for a legacy row (see the schema docstring for why).
+            self._ensure_column(connection, "completion_state", "TEXT NOT NULL DEFAULT 'pending'")
+            self._ensure_column(connection, "completion_error", "TEXT")
+            # PR3 exact-HEAD audit, fourth round: `run_retry_loop()` (see
+            # core/jobs/completion.py) executes
+            # `list_terminal_pending_completion()`'s query every few
+            # seconds; without an index beyond the primary key, SQLite must
+            # scan and sort the entire table on every single poll, even
+            # once nearly every job is already `completion_state='done'`.
+            # `CREATE INDEX IF NOT EXISTS` is itself idempotent -- safe on
+            # a fresh DB and on a legacy DB being upgraded in place, since
+            # this always runs after the `_ensure_column()` calls above,
+            # so `completion_state` is guaranteed to already exist.
+            # Column order (`completion_state`, `status`, `created_at`)
+            # matches the query's own shape: `completion_state` is always
+            # equality-filtered and `status` is filtered via `IN (...)`
+            # over `TERMINAL_JOB_STATUSES`, so SQLite can seek straight to
+            # each matching sub-range instead of scanning the whole table.
+            # Empirically verified (`EXPLAIN QUERY PLAN`, PR3 exact-HEAD
+            # audit, fourth round, adversarial self-review): because the
+            # `status IN (...)` spans multiple values, each per-status
+            # sub-range is only locally sorted by `created_at`, so SQLite
+            # still adds `USE TEMP B-TREE FOR ORDER BY` to merge them --
+            # this index removes the full-table scan, not the sort.
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_jobs_completion_retry
+                ON jobs (completion_state, status, created_at)
+                """
+            )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self._db_path)
@@ -276,26 +727,66 @@ class JobRepository:
             yield connection
 
     def _row_to_record(self, row: sqlite3.Row) -> JobRecord:
-        request_payload = self._deserialize_payload(row["request_json"]) or {}
-        result_payload = self._deserialize_payload(row["result_json"])
-        request = GenerationRequest.model_validate(request_payload)
-        result = (
-            GenerationResult.model_validate(result_payload)
-            if result_payload is not None
-            else None
-        )
-        return JobRecord(
-            id=row["id"],
-            project_id=row["project_id"],
-            media_type=row["media_type"],
-            status=row["status"],
-            request=request,
-            result=result,
-            progress=row["progress"],
-            error_message=row["error_message"],
-            created_at=datetime.fromisoformat(row["created_at"]),
-            updated_at=datetime.fromisoformat(row["updated_at"]),
-        )
+        # The entire reconstruction -- payload JSON decode, request/result
+        # model validation, timestamp parsing, and the final JobRecord
+        # construction (itself a Pydantic validation of status/media_type/
+        # progress/id together) -- runs on data already fetched into `row`.
+        # None of it performs I/O or touches SQLite again, so wrapping the
+        # whole method body in one try/except cannot ever catch a
+        # sqlite3.Error: only a deterministic, content-caused failure can
+        # originate here (Codex exact-HEAD review: a malformed
+        # created_at/updated_at or a JobRecord-level validation failure
+        # -- e.g. an invalid persisted status/progress -- was previously
+        # unwrapped, past the payload-only boundary below, and would have
+        # been misclassified as transient and requeued forever).
+        try:
+            request_payload = self._deserialize_payload(row["request_json"]) or {}
+            result_payload = self._deserialize_payload(row["result_json"])
+            request = GenerationRequest.model_validate(request_payload)
+            result = (
+                GenerationResult.model_validate(result_payload)
+                if result_payload is not None
+                else None
+            )
+            return JobRecord(
+                id=row["id"],
+                project_id=row["project_id"],
+                media_type=row["media_type"],
+                status=row["status"],
+                request=request,
+                result=result,
+                progress=row["progress"],
+                error_message=row["error_message"],
+                completion_state=row["completion_state"],
+                completion_error=row["completion_error"],
+                created_at=datetime.fromisoformat(row["created_at"]),
+                updated_at=datetime.fromisoformat(row["updated_at"]),
+            )
+        except (ValueError, RecursionError, TypeError) as exc:
+            # ValueError covers json.JSONDecodeError, every
+            # pydantic.ValidationError (request/result payload *and* the
+            # final JobRecord construction), and datetime.fromisoformat's
+            # ValueError on a malformed-but-string timestamp; RecursionError
+            # covers JSON nested deep enough to overflow the decoder's C
+            # stack; TypeError covers datetime.fromisoformat's own reaction
+            # to a non-str value -- SQLite's type affinity is advisory, so a
+            # BLOB can end up in created_at/updated_at despite the column's
+            # TEXT affinity (Codex exact-HEAD review: this was the one
+            # content-caused exception type this boundary missed). All of
+            # these can only be caused by this row's own persisted values --
+            # never by the read operation itself -- so they are normalized
+            # into one boundary type a caller can classify as "never retry"
+            # without having to know which underlying library, or which
+            # field, raised it. Deliberately scoped to just these three
+            # types: a `sqlite3.Error` (or any other exception) must keep
+            # propagating unchanged, since it says nothing about this row's
+            # content -- and this scoping is safe precisely because nothing
+            # in this method's body performs I/O, so it can never coincide
+            # with a database-level TypeError from somewhere else.
+            raise JobRecordDecodeError(
+                f"Job {row['id']!r}'s persisted row could not be "
+                f"reconstructed: {exc}"
+            ) from exc
 
     def _ensure_column(
         self,
