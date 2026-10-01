@@ -82,9 +82,9 @@ _BOUNDARY_TIERS: tuple[tuple[str, ...], ...] = (
 # track of a template story does not repeat one sentence for every scene.
 _SCENE_ARC_NARRATION: tuple[str, ...] = (
     "{subject}。{mood}の中、物語が静かに幕を開ける。",
-    "その瞬間、すべてが動き出した。もう後戻りはできない。",
-    "行く手を阻むものが、ひとつ、またひとつと迫ってくる。",
-    "ついに決断の時が訪れる。すべてはこの一瞬にかかっていた。",
+    "その瞬間、{mood}の空気が一変した。もう後戻りはできない。",
+    "{mood}の気配が濃くなり、行く手を阻むものがひとつ、またひとつと迫ってくる。",
+    "ついに決断の時が訪れる。{mood}の中、すべてはこの一瞬にかかっていた。",
     "やがて静けさが戻り、{mood}の余韻だけが残った。",
 )
 
@@ -101,6 +101,12 @@ _SCENE_ARC_CUES: tuple[str, ...] = (
     "climax, the decisive moment, intense high-contrast light",
     "resolution, quiet aftermath, gentle diffused light",
 )
+
+# A one-scene story has no later scenes to carry the turn, climax or outcome,
+# so its single frame and narration stand for the whole arc instead of only
+# the opening.
+_SINGLE_SCENE_CUE = "key moment of the whole story, the decisive action, dramatic light"
+_SINGLE_SCENE_NARRATION = "{subject}。{mood}の中、物語は決定的な瞬間を迎える。"
 
 # Shot types cycle independently of the arc role so that stories with more
 # scenes than roles still get a distinct frame per scene. Seven entries exceed
@@ -384,7 +390,10 @@ def _string_value(
     if field_name == "image_prompt":
         return _scene_image_prompt(subject, mood, index, _scene_total(context))
     if field_name == "narration":
-        role = _scene_arc_role(index, _scene_total(context))
+        total = _scene_total(context)
+        if total <= 1:
+            return _SINGLE_SCENE_NARRATION.format(subject=subject, mood=mood)
+        role = _scene_arc_role(index, total)
         return _SCENE_ARC_NARRATION[role].format(subject=subject, mood=mood)
     if template is not None:
         return template.format(subject=subject, mood=mood, index=index)
@@ -429,9 +438,9 @@ def _scene_image_prompt(subject: str, mood: str, index: int, total: int) -> str:
     """
 
     shot = _SCENE_SHOTS[max(0, index - 1) % len(_SCENE_SHOTS)]
-    role = _scene_arc_role(index, total)
+    cue = _SINGLE_SCENE_CUE if total <= 1 else _SCENE_ARC_CUES[_scene_arc_role(index, total)]
     return (
-        f"{shot}, {_SCENE_ARC_CUES[role]}, {subject}, {mood}, "
+        f"{shot}, {cue}, {subject}, {mood}, "
         "cinematic composition, detailed lighting"
     )
 

@@ -199,6 +199,27 @@ class TemplateScenePromptTests(unittest.TestCase):
         self.assertEqual(len(set(narrations)), 5, narrations)
         self.assertIn(self._PREMISES[0], narrations[0])
 
+    def test_middle_scene_narrations_carry_the_story_mood(self) -> None:
+        task = get_story_task("scene_list")
+        raw = _template_runtime()["generate"](
+            task.build_prompt(
+                {"premise": "p", "subject": "p", "mood": "凍てつく静寂", "scene_count": 5}
+            ),
+            system=task.system_prompt,
+            seed=1,
+            json_schema=task.json_schema(),
+        )
+        scenes = task.response_model.model_validate(extract_json_object(raw)).scenes
+        for scene in scenes:
+            self.assertIn("凍てつく静寂", scene.narration)
+
+    def test_a_single_scene_stands_for_the_whole_arc(self) -> None:
+        scenes = self._scenes(self._PREMISES[0], scene_count=1)
+        self.assertEqual(len(scenes), 1)
+        self.assertIn("key moment of the whole story", scenes[0]["image_prompt"])
+        self.assertNotIn("calm before the story begins", scenes[0]["image_prompt"])
+        self.assertIn("決定的な瞬間", scenes[0]["narration"])
+
     def test_five_scene_prompts_follow_the_story_arc(self) -> None:
         prompts = self._scene_prompts(self._PREMISES[0])
         for prompt, cue in zip(
