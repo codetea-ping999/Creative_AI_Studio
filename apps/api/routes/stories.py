@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+import zlib
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field
@@ -48,6 +49,12 @@ CONTINUITY_INJECTED_TASKS: frozenset[str] = frozenset({"prose"})
 
 # The tracks whose entries reference an asset the UI may want to preview.
 _PREVIEWABLE_TRACKS = ("visual", "narration", "music")
+
+# The weight-free Stable visual path: a scene's ``visual`` role can be filled by
+# the procedural storyboard runtime (a GIF, no model weights) instead of a still.
+# Named explicitly rather than left to the manifest default so a learned video
+# model installed later can never silently become the Stable journey's default.
+PROCEDURAL_VISUAL_MODEL_ID = "storyboard-video"
 
 # Job statuses that mean "still working on it" for a scene asset role — every
 # non-terminal state a job can hold before it either succeeds (and binds) or
@@ -495,6 +502,14 @@ def update_story(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
         ) from exc
+    if story is None:
+        # Existed at the check above but a concurrent delete removed it
+        # before update() ran its own read; StoryRepository.mutate() already
+        # refused to resurrect it, so this route reports the same 404 a
+        # request arriving just slightly later would have gotten on its own.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Story not found"
+        )
     return StorySummaryResponse.from_story(story)
 
 
@@ -628,36 +643,52 @@ def apply_story_result(
         if isinstance(raw_as_of_chapter_id, str):
             continuity_as_of_chapter_id = raw_as_of_chapter_id
 
-    if task in SCENE_SCOPED_TASKS:
-        # The scene was chosen when the job was queued; the model's payload has
-        # no way to name it, so the target is restored from the request here.
-        scene_id = job_params.get("scene_id")
-        if isinstance(scene_id, str) and scene_id:
-            structured = {**structured, "scene_id": scene_id}
-        elif not _names_a_scene(story, structured):
-            # Merging would park the lines in metadata["unassigned_script_lines"],
-            # where no route can read them back into a scene: the dialogue would be
-            # generated, reported as applied, and lost. Refusing with the stage to
-            # re-run keeps the work recoverable.
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=_no_scene_target_detail(story, request.job_id, task),
-            )
+    def _apply(current: StoryDocument | None) -> StoryDocument | None:
+        if current is None:
+            return None
 
-    try:
-        merged = apply_text_result(
-            story,
+        merge_structured = structured
+        if task in SCENE_SCOPED_TASKS:
+            # The scene was chosen when the job was queued; the model's
+            # payload has no way to name it, so the target is restored from
+            # the request here. Checked against the freshest document (not
+            # the one read before this callback ran) so a scene list that was
+            # regenerated moments ago is judged correctly.
+            scene_id = job_params.get("scene_id")
+            if isinstance(scene_id, str) and scene_id:
+                merge_structured = {**structured, "scene_id": scene_id}
+            elif not _names_a_scene(current, structured):
+                # Merging would park the lines in
+                # metadata["unassigned_script_lines"], where no route can read
+                # them back into a scene: the dialogue would be generated,
+                # reported as applied, and lost. Refusing with the stage to
+                # re-run keeps the work recoverable.
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=_no_scene_target_detail(current, request.job_id, task),
+                )
+
+        return apply_text_result(
+            current,
             task,
-            structured,
+            merge_structured,
             job_id=job.id,
             continuity_as_of_chapter_id=continuity_as_of_chapter_id,
         )
+
+    try:
+        saved = services.story_repository.mutate(story_id, _apply)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
         ) from exc
-
-    saved = services.story_repository.save(merged)
+    if saved is None:
+        # Existed at the _get_story() check above but a concurrent delete
+        # removed it before this mutation ran; mutate() already refused to
+        # resurrect it.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Story not found"
+        )
     return StoryDetailResponse(
         story=saved.model_dump(mode="json"),
         missing_assets=missing_scene_assets(saved),
@@ -700,13 +731,28 @@ def acknowledge_stale_chapter(
     chapter = _find_chapter(story, chapter_id)
 
     if chapter.stale_after_chapter_id is not None:
-        chapters = [
-            entry.model_copy(update={"stale_after_chapter_id": None})
-            if entry.id == chapter_id
-            else entry
-            for entry in story.chapters
-        ]
-        story = services.story_repository.update(story_id, chapters=chapters) or story
+
+        def _clear_stale_flag(current: StoryDocument | None) -> StoryDocument | None:
+            if current is None:
+                return None
+            # Rebuilt from the freshest chapters, not the ones read above:
+            # another writer may have changed this story between that read
+            # and this mutation running, and blindly saving the outer,
+            # possibly-stale list back would discard that change.
+            chapters = [
+                entry.model_copy(update={"stale_after_chapter_id": None})
+                if entry.id == chapter_id
+                else entry
+                for entry in current.chapters
+            ]
+            return current.model_copy(update={"chapters": chapters})
+
+        updated = services.story_repository.mutate(story_id, _clear_stale_flag)
+        if updated is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Story not found"
+            )
+        story = updated
 
     return StoryDetailResponse(
         story=story.model_dump(mode="json"),
@@ -795,6 +841,10 @@ class GenerateSceneRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     role: str
+    # Only meaningful for the ``visual`` role. ``None``/``"image"`` keeps the
+    # still-image path; ``"video"`` requests a procedural storyboard clip
+    # (``PROCEDURAL_VISUAL_MODEL_ID`` unless ``model_id`` names another model).
+    media_type: Literal["image", "video"] | None = None
     model_id: str = ""
     seed: int | None = None
     output_format: str | None = None
@@ -825,6 +875,15 @@ def _scene_generation_request(
     binding = scene_binding_params(story.id, scene.id, request.role)
     params: dict[str, Any] = {**binding, **request.params}
 
+    if request.media_type is not None and request.role != "visual":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "media_type only applies to the visual role; "
+                f"the {request.role} role has a fixed media type."
+            ),
+        )
+
     if request.role == "visual":
         prompt = str(request.params.get("prompt") or scene.image_prompt).strip()
         if not prompt:
@@ -833,6 +892,28 @@ def _scene_generation_request(
                 detail=f"Scene {scene.id} has no image prompt to generate from.",
             )
         params.pop("prompt", None)
+        if request.media_type == "video":
+            # Procedural storyboard clip. It still travels the ordinary job
+            # lifecycle and binds through the same scene params as a still; the
+            # runtime renders no Bible references, so none are forwarded.
+            params.setdefault("duration_seconds", max(1, round(scene.duration_seconds)))
+            return GenerationRequest(
+                media_type="video",
+                task_type="text-to-video",
+                prompt=prompt,
+                negative_prompt=scene.image_negative or None,
+                model_id=request.model_id.strip() or PROCEDURAL_VISUAL_MODEL_ID,
+                # The procedural runtime falls back to the per-process
+                # ``hash(prompt)`` without a seed, which differs between server
+                # restarts. A stable seed keeps a scene's clip reproducible.
+                seed=(
+                    request.seed
+                    if request.seed is not None
+                    else zlib.crc32(f"{story.id}:{scene.id}:{prompt}".encode())
+                ),
+                output_format=request.output_format,
+                params=params,
+            )
         if scene.bible_refs and "bible_refs" not in params:
             params["bible_refs"] = list(scene.bible_refs)
         return GenerationRequest(

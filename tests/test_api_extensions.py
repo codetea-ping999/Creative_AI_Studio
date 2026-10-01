@@ -816,6 +816,8 @@ class ApiExtensionTests(unittest.TestCase):
                     params={"steps": 12, "variation_count": 2},
                 )
             )
+            for status in ("preparing", "running", "postprocessing"):
+                assert services.job_repository.update_status(source_job.id, status) is not None
             services.job_service.mark_succeeded(
                 source_job.id,
                 GenerationResult(

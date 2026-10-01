@@ -53,17 +53,17 @@ _STATUS_TO_EVENT = {
     JOB_STATUS_CANCELLED: "job_cancelled",
 }
 
-# Statuses from which a job may still be reported as `succeeded` (#207).
-# Deliberately ACTIVE_JOB_STATUSES minus `cancel_requested`: once a cancel has
-# been requested against an in-flight job, `is_valid_transition` (see
-# `core/jobs/statuses.py`) forbids that job from ever resolving to
-# `succeeded` -- a generation that races a cancel request must not be
-# reported as a success. Enforcing that here (rather than only via
-# `JobRunner`'s own pre-check) means a late/racing `mark_succeeded` call can
-# never violate the contract, regardless of caller.
-_SUCCEEDABLE_JOB_STATUSES = tuple(
-    status for status in ACTIVE_JOB_STATUSES if status != JOB_STATUS_CANCEL_REQUESTED
-)
+# A result is only committed after generation has crossed the postprocessing
+# boundary. This makes a persisted cancellation request authoritative even if
+# a generator returns a result at the same instant: losing this CAS to a
+# concurrent cancel leaves the job `cancel_requested`, not `succeeded`.
+# Resolving that `cancel_requested` to a terminal state is deliberately left
+# to the caller (see JobRunner.process_job's check right after calling
+# mark_succeeded, post-#395 audit P1) rather than done unconditionally here:
+# a bare CAS-miss can also mean "already succeeded/failed" or a stale direct
+# call with no runner in the loop, and this method stays a no-op for those
+# (see test_success_only_commits_from_postprocessing).
+_SUCCEEDABLE_JOB_STATUSES = (JOB_STATUS_POSTPROCESSING,)
 
 
 class JobService:
@@ -127,6 +127,122 @@ class JobService:
         )
         self.enqueue_job(created_job.id)
         return created_job
+
+    def create_or_reuse_job(
+        self,
+        job_id: str,
+        request: GenerationRequest,
+        project_id: str | None = None,
+    ) -> JobRecord:
+        """Create a job under a caller-chosen id, or reuse the existing one.
+
+        For a caller (see `core.batches.service.BatchService`) that must
+        durably persist a *stable* child job id before the job row itself
+        exists, so a crash between "id persisted" and "row created" can
+        resume by re-running this exact call rather than minting a new id
+        and creating a duplicate job.
+
+        Thin wrapper around `create_or_reuse_job_without_enqueue()` that
+        enqueues immediately on a fresh creation -- the ordinary contract
+        every caller other than `BatchService._enqueue_stage()` wants (see
+        that method's own two-step use of the split primitive for why it
+        needs the two halves kept apart).
+        """
+
+        created_job, was_created = self.create_or_reuse_job_without_enqueue(
+            job_id, request, project_id
+        )
+        if was_created:
+            self.enqueue_job(created_job.id)
+        return created_job
+
+    def create_or_reuse_job_without_enqueue(
+        self,
+        job_id: str,
+        request: GenerationRequest,
+        project_id: str | None = None,
+    ) -> tuple[JobRecord, bool]:
+        """Materialize `job_id`'s row, but never enqueue it -- see
+        `create_or_reuse_job()` for the create-or-reuse contract itself
+        (reuse validates `existing.request == request`, a mismatch raises).
+
+        For a caller that needs a strict happens-before ordering between
+        "the Job row exists" and "a worker can observe it" -- specifically,
+        `BatchService._enqueue_stage()`'s fresh cancellation recheck in
+        between (PR3 exact-HEAD audit, second round, P1-1): the combined
+        `create_or_reuse_job()` used to create *and* enqueue a fresh row in
+        one call, so a durable cancellation that landed in the exact window
+        between that call returning and the caller's own post-create
+        recheck could still race a worker that had already claimed the
+        now-enqueued job and begun generating -- `cancel_job()` on an
+        already-`preparing`/`running` job only requests cooperative
+        cancellation, it does not undo work already started. Splitting
+        "materialize" from "expose to a worker" closes that window: nothing
+        calls `JobQueue.enqueue()` until the caller has confirmed, on a
+        provably later read, that the batch is not durably cancelled.
+
+        Returns `(record, was_created)`. The caller owns calling
+        `enqueue_job(record.id)` itself when `was_created` is `True` and it
+        has confirmed the job should still run; on reuse
+        (`was_created=False`) the caller must not enqueue at all -- exactly
+        like `create_or_reuse_job()` -- since a restart's own queued-job
+        recovery is what re-enqueues an already-`queued`-but-never-enqueued
+        row.
+
+        Two concurrent callers can both observe "no row for this id" from
+        the check below and both fall through to insert it -- a terminal
+        event handler racing a completion-retry pass over the same stable
+        Batch child id, for instance. The insert itself goes through
+        `JobRepository.create_if_absent()`, which resolves that race
+        atomically at the database layer (one caller's INSERT commits, the
+        other's `sqlite3.IntegrityError` is caught and rereads the winner's
+        row) rather than both proceeding as if each had created the row: a
+        naive `get()`-then-`create()` here would let the loser's `create()`
+        raise an unhandled `sqlite3.IntegrityError`, or -- if that were
+        merely swallowed -- double-publish `"job_created"` for the same id.
+        Only the actual winner does either.
+        """
+
+        existing = self.job_repository.get(job_id)
+        if existing is not None:
+            if existing.request != request:
+                raise ValueError(
+                    f"Job {job_id!r} already exists with a different "
+                    "request; refusing to silently reuse it for a "
+                    "mismatched request."
+                )
+            return existing, False
+
+        self.validate_references(request, project_id)
+        now = datetime.now(timezone.utc)
+        job = JobRecord(
+            id=job_id,
+            project_id=project_id,
+            media_type=request.media_type,
+            status=JOB_STATUS_QUEUED,
+            request=request,
+            progress=0.0,
+            created_at=now,
+            updated_at=now,
+        )
+        created_job, was_created = self.job_repository.create_if_absent(job)
+        if not was_created:
+            if created_job.request != request:
+                raise ValueError(
+                    f"Job {job_id!r} already exists with a different "
+                    "request; refusing to silently reuse it for a "
+                    "mismatched request."
+                )
+            return created_job, False
+        self._publish(
+            "job_created",
+            {
+                "job_id": created_job.id,
+                "status": created_job.status,
+                "media_type": created_job.media_type,
+            },
+        )
+        return created_job, True
 
     def validate_references(
         self,
@@ -605,30 +721,36 @@ class JobService:
           an error and never a new transition (#206).
         """
 
-        job = self.get_job(job_id)
-        if job is None:
-            return None
+        updated: JobRecord | None = None
+        changed = False
+        while True:
+            job = self.get_job(job_id)
+            if job is None:
+                return None
 
-        if job.status == JOB_STATUS_QUEUED:
-            target_status: str | None = JOB_STATUS_CANCELLED
-        elif job.status in (JOB_STATUS_PREPARING, JOB_STATUS_RUNNING, JOB_STATUS_POSTPROCESSING):
-            target_status = JOB_STATUS_CANCEL_REQUESTED
-        else:
-            target_status = None
+            if job.status == JOB_STATUS_QUEUED:
+                target_status: str | None = JOB_STATUS_CANCELLED
+            elif job.status in (
+                JOB_STATUS_PREPARING,
+                JOB_STATUS_RUNNING,
+                JOB_STATUS_POSTPROCESSING,
+            ):
+                target_status = JOB_STATUS_CANCEL_REQUESTED
+            else:
+                updated = job
+                break
 
-        updated: JobRecord | None = job
-        if target_status is not None:
             updated = self.job_repository.update_if_status(
                 job_id,
                 (job.status,),
                 status=target_status,
                 progress=1.0 if target_status == JOB_STATUS_CANCELLED else None,
             )
-            if updated is None:
-                # The status moved on between the read above and this write
-                # (e.g. the job finished, or another cancel request already
-                # landed) -- report whatever it is now rather than raising.
-                updated = self.get_job(job_id)
+            if updated is not None:
+                changed = True
+                break
+            # A queued worker may claim the job between our read and CAS. Read
+            # again and turn that newly active state into cancel_requested.
 
         # A running worker has already registered its Event on begin(). For a
         # queued job, or a job that already reached a terminal/cancel_requested
@@ -636,7 +758,7 @@ class JobService:
         if self.cancellation_registry is not None:
             self.cancellation_registry.request_cancel(job_id)
 
-        if updated is not None and target_status is not None:
+        if updated is not None and changed:
             self._publish(
                 _STATUS_TO_EVENT.get(updated.status, "job_status_updated"),
                 {

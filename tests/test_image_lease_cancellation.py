@@ -1,0 +1,969 @@
+"""Cooperative cancellation and lease boundaries for ImageGenerator, without real models.
+
+Mirrors tests/test_video_lease_cancellation.py's structure (PR4b): every
+concurrency claim below is proven with real synchronization (Event/Barrier or
+genuine lock contention), never a bare sleep, per the concurrency-safety
+skill's deterministic-proof requirement.
+"""
+
+from threading import Event, Thread
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import Mock
+
+from PIL import Image
+import pytest
+
+from core.jobs.context import GenerationCancelled, GenerationContext
+from core.models.cache import ModelRuntimeCache
+from core.models.runtime_lease import RuntimeBusyError, RuntimeState
+from core.models.service import ModelService
+from core.schemas import GenerationRequest
+import generators.image.generator as image_generator_module
+from generators.image.generator import ImageGenerator
+from generators.image.providers import UnsupportedImageParameterError
+
+
+class _FakePipelineResult:
+    def __init__(self, image: Image.Image) -> None:
+        self.images = [image]
+
+
+class _FakePipeline:
+    """Diffusers-pipeline-shaped fake with no step callback parameter."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.load_lora_calls: list[tuple[str, dict[str, Any]]] = []
+        self.set_adapters_calls: list[tuple[str, float]] = []
+        self.unload_calls = 0
+
+    def __call__(self, **kwargs: Any) -> _FakePipelineResult:
+        self.calls.append(kwargs)
+        width = int(kwargs.get("width", 64))
+        height = int(kwargs.get("height", 64))
+        return _FakePipelineResult(Image.new("RGB", (width, height), color=(1, 2, 3)))
+
+    def to(self, device: str) -> "_FakePipeline":
+        return self
+
+    def load_lora_weights(self, path: str, **kwargs: Any) -> None:
+        self.load_lora_calls.append((path, kwargs))
+
+    def set_adapters(self, adapter_name: str, adapter_weights: float | None = None) -> None:
+        self.set_adapters_calls.append((adapter_name, adapter_weights))
+
+    def delete_adapters(self, adapter_name: str) -> None:
+        pass
+
+    def unload_lora_weights(self) -> None:
+        self.unload_calls += 1
+
+
+class _FakeStepAwarePipeline(_FakePipeline):
+    """Same as `_FakePipeline`, but declares `callback_on_step_end` so
+    `ImageGenerator._pipeline_accepts_step_callback` routes through it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.steps_invoked = 0
+
+    def __call__(  # type: ignore[override]
+        self,
+        *,
+        prompt: str,
+        negative_prompt: str | None = None,
+        width: int = 64,
+        height: int = 64,
+        guidance_scale: float = 7.5,
+        num_inference_steps: int = 30,
+        callback_on_step_end=None,
+        **kwargs: Any,
+    ) -> _FakePipelineResult:
+        self.calls.append(
+            {"prompt": prompt, "width": width, "height": height, **kwargs}
+        )
+        for step_index in range(num_inference_steps):
+            self.steps_invoked = step_index + 1
+            if callback_on_step_end is not None:
+                callback_on_step_end(self, step_index, 0, {})
+        return _FakePipelineResult(Image.new("RGB", (width, height), color=(1, 2, 3)))
+
+    def to(self, device: str) -> "_FakeStepAwarePipeline":
+        return self
+
+
+def _build(tmp_path, monkeypatch, *, admission_capacity=1, pipeline_cls=_FakePipeline):
+    pipelines: dict[str, Any] = {}
+
+    def manifest(model_id, media_type, task_type=None):
+        return SimpleNamespace(
+            id=model_id,
+            public_model_id=model_id,
+            provider="local",
+            loader="fake",
+            default_params={},
+            runtime="diffusers",
+            display_name="fake image",
+        )
+
+    def load(item):
+        pipeline = pipeline_cls()
+        pipelines[item.id] = pipeline
+        return {
+            "pipeline": pipeline,
+            "img2img_pipeline": None,
+            "device": "cpu",
+            "torch_dtype": "float32",
+            "load_dtype": "float32",
+        }
+
+    loader = Mock()
+    loader.load.side_effect = load
+    cache = ModelRuntimeCache(max_entries=4)
+    service = ModelService(
+        registry=None,
+        resolver=SimpleNamespace(resolve=manifest),
+        loader_registry=SimpleNamespace(get=lambda name: loader),
+        runtime_cache=cache,
+        admission_capacity=admission_capacity,
+    )
+    generator = ImageGenerator(service, output_dir=tmp_path)
+    monkeypatch.setattr("generators.image.generator.evaluate_image_output", lambda *a: {})
+    monkeypatch.setattr("generators.image.generator.evaluate_image_semantics", lambda *a: {})
+    monkeypatch.setattr("generators.image.generator.enrich_quality_report", lambda *a: None)
+    return generator, service, cache, loader, pipelines
+
+
+def _request(**params):
+    return GenerationRequest(
+        media_type="image", prompt="test", model_id="target", params=params
+    )
+
+
+def test_image_production_path_never_uses_bare_resolve_runtime(tmp_path, monkeypatch):
+    generator, service, cache, loader, pipelines = _build(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        service,
+        "resolve_runtime",
+        Mock(side_effect=AssertionError("must not call bare resolve_runtime()")),
+    )
+    result = generator.run(_request(width=64, height=64, steps=1))
+    assert result.status == "succeeded"
+
+
+def test_all_variations_run_inside_one_runtime_lease(tmp_path, monkeypatch):
+    generator, service, cache, loader, pipelines = _build(tmp_path, monkeypatch)
+    result = generator.run(
+        _request(width=64, height=64, steps=1, variation_count=3)
+    )
+    assert result.status == "succeeded"
+    # A single load: every variation reused the one leased runtime instead
+    # of each re-acquiring/reloading it.
+    assert loader.load.call_count == 1
+    assert len(pipelines["target"].calls) == 3
+    assert cache._entries["target"].lease_count == 0
+    assert cache._entries["target"].state is RuntimeState.READY
+
+
+def test_lora_runtime_mutation_occurs_while_lease_is_active(tmp_path, monkeypatch):
+    generator, service, cache, loader, pipelines = _build(tmp_path, monkeypatch)
+    lora_file = tmp_path / "style.safetensors"
+    lora_file.write_bytes(b"fake-lora")
+    mutation_observed = {}
+
+    original_load_lora = _FakePipeline.load_lora_weights
+
+    def observed_load_lora(self, path, **kwargs):
+        entry = cache._entries["target"]
+        mutation_observed["lease_count"] = entry.lease_count
+        mutation_observed["state"] = entry.state
+        return original_load_lora(self, path, **kwargs)
+
+    monkeypatch.setattr(_FakePipeline, "load_lora_weights", observed_load_lora)
+
+    result = generator.run(
+        _request(
+            width=64, height=64, steps=1, lora_path=str(lora_file), lora_scale=0.8
+        )
+    )
+
+    assert result.status == "succeeded"
+    assert mutation_observed == {"lease_count": 1, "state": RuntimeState.READY}
+    assert pipelines["target"].load_lora_calls
+    assert result.metadata["lora_path"] == str(lora_file)
+    assert result.metadata["lora_scale"] == 0.8
+
+
+def test_invalid_numeric_parameters_do_not_invalidate_a_healthy_runtime(tmp_path, monkeypatch):
+    generator, service, cache, loader, pipelines = _build(tmp_path, monkeypatch)
+    # Populate the cache with a healthy, already-loaded runtime first.
+    with service.acquire_runtime("target", "image"):
+        pass
+    assert cache._entries["target"].state is RuntimeState.READY
+
+    # A width outside the local provider's declared [64, 2048] range is
+    # discovered via validate_capabilities() -- runtime *inspection*
+    # (reference-capability probing), never mutation -- so it must not
+    # touch a healthy entry's state.
+    with pytest.raises(UnsupportedImageParameterError):
+        generator.run(_request(width=8192, height=64, steps=1))
+
+    assert loader.load.call_count == 1  # no reload
+    assert cache._entries["target"].state is RuntimeState.READY
+    assert cache._entries["target"].lease_count == 0
+    assert pipelines["target"].calls == []  # inference never started
+
+
+def test_invalid_lora_path_discovered_before_mutation_does_not_invalidate(
+    tmp_path, monkeypatch
+):
+    generator, service, cache, loader, pipelines = _build(tmp_path, monkeypatch)
+    with service.acquire_runtime("target", "image"):
+        pass
+    assert cache._entries["target"].state is RuntimeState.READY
+
+    missing_path = str(tmp_path / "does_not_exist.safetensors")
+    with pytest.raises(FileNotFoundError):
+        generator.run(_request(width=64, height=64, steps=1, lora_path=missing_path))
+
+    # The bad path is pure input parsing (preflight, before any lease is
+    # even acquired) -- no second load, no mutation, no invalidation.
+    assert loader.load.call_count == 1
+    assert cache._entries["target"].state is RuntimeState.READY
+    assert cache._entries["target"].lease_count == 0
+    assert pipelines["target"].load_lora_calls == []
+    assert pipelines["target"].calls == []
+
+
+def test_cancelled_before_acquisition_does_not_load(tmp_path, monkeypatch):
+    generator, service, cache, loader, pipelines = _build(tmp_path, monkeypatch)
+    context = GenerationContext(is_cancelled=lambda: True)
+    with pytest.raises(GenerationCancelled):
+        generator.run(_request(width=64, height=64, steps=1), context=context)
+    loader.load.assert_not_called()
+
+
+def test_precancellation_does_not_invalidate_an_unused_runtime(tmp_path, monkeypatch):
+    generator, service, cache, loader, pipelines = _build(tmp_path, monkeypatch)
+    # Load once, normally, to prove the *same* cached runtime survives.
+    with service.acquire_runtime("target", "image") as handle:
+        cached_runtime = handle.runtime
+
+    cancelled = Event()
+    original_acquire = service.acquire_runtime
+
+    def acquire(*args, **kwargs):
+        handle = original_acquire(*args, **kwargs)
+        # Cancellation arrives after every lock was acquired but before any
+        # mutation/inference started.
+        cancelled.set()
+        return handle
+
+    monkeypatch.setattr(service, "acquire_runtime", acquire)
+    with pytest.raises(GenerationCancelled):
+        generator.run(
+            _request(width=64, height=64, steps=1),
+            context=GenerationContext(is_cancelled=cancelled.is_set),
+        )
+
+    assert pipelines["target"].calls == []
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY
+    assert entry.lease_count == 0
+    with original_acquire("target", "image", wait_timeout=0) as handle:
+        assert handle.runtime is cached_runtime
+    assert loader.load.call_count == 1
+
+
+def test_precancellation_probe_error_does_not_invalidate_an_unused_runtime(
+    tmp_path, monkeypatch
+):
+    # PR4b P2-A proof (fallible-probe case): production
+    # `GenerationContext.is_cancelled()` reads JobRepository and can raise
+    # (e.g. a transient DB failure). Observed here, before any pipeline
+    # inspection or LoRA mutation, that is external bookkeeping, not a
+    # runtime fault -- the lease must exit cleanly (not invalidate) and the
+    # exact external exception must be re-raised once it is gone, with the
+    # pipeline never invoked.
+    generator, service, cache, loader, pipelines = _build(tmp_path, monkeypatch)
+    with service.acquire_runtime("target", "image") as handle:
+        cached_runtime = handle.runtime
+
+    probe_error = RuntimeError("job repository unavailable")
+
+    def failing_is_cancelled() -> bool:
+        raise probe_error
+
+    with pytest.raises(RuntimeError) as caught:
+        generator.run(
+            _request(width=64, height=64, steps=1),
+            context=GenerationContext(is_cancelled=failing_is_cancelled),
+        )
+    assert caught.value is probe_error
+    assert pipelines["target"].calls == []
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY
+    assert entry.lease_count == 0
+    with service.acquire_runtime("target", "image", wait_timeout=0) as handle:
+        assert handle.runtime is cached_runtime  # never reloaded
+    assert loader.load.call_count == 1
+
+
+def test_cancellation_before_lora_mutation_prevents_mutation_and_preserves_runtime(
+    tmp_path, monkeypatch
+):
+    # PR4b P2-B proof (ordinary case): cancellation may become observable
+    # during the capability/signature/request inspection between the first
+    # probe and `_apply_lora()` -- the first actual runtime mutation. A
+    # second probe immediately before that call must catch it, skip LoRA
+    # mutation and inference entirely, release the still-healthy lease
+    # cleanly, and raise GenerationCancelled only once it is gone.
+    generator, service, cache, loader, pipelines = _build(tmp_path, monkeypatch)
+    with service.acquire_runtime("target", "image"):
+        pass
+    assert cache._entries["target"].state is RuntimeState.READY
+
+    lora_file = tmp_path / "style.safetensors"
+    lora_file.write_bytes(b"fake-lora")
+
+    probe_calls = {"count": 0}
+
+    def is_cancelled() -> bool:
+        probe_calls["count"] += 1
+        # First probe (`cancelled_before_mutation`, before inspection) sees
+        # not-yet-cancelled; the second probe (P2-B, immediately before
+        # `_apply_lora()`) is where cancellation becomes observable.
+        return probe_calls["count"] >= 2
+
+    with pytest.raises(GenerationCancelled):
+        generator.run(
+            _request(width=64, height=64, steps=1, lora_path=str(lora_file)),
+            context=GenerationContext(is_cancelled=is_cancelled),
+        )
+
+    assert probe_calls["count"] == 2
+    assert pipelines["target"].load_lora_calls == []
+    assert pipelines["target"].calls == []
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY
+    assert entry.lease_count == 0
+    assert loader.load.call_count == 1
+
+
+def test_lora_mutation_probe_error_preserves_runtime_and_skips_mutation(
+    tmp_path, monkeypatch
+):
+    # PR4b P2-B proof (fallible-probe case): the second probe immediately
+    # before `_apply_lora()` can itself raise the same way the first one
+    # can. That must also skip LoRA mutation/inference, release the
+    # still-healthy lease cleanly, and re-raise the exact external
+    # exception once it is gone -- keeping the runtime READY/reusable.
+    generator, service, cache, loader, pipelines = _build(tmp_path, monkeypatch)
+    with service.acquire_runtime("target", "image"):
+        pass
+    assert cache._entries["target"].state is RuntimeState.READY
+
+    lora_file = tmp_path / "style.safetensors"
+    lora_file.write_bytes(b"fake-lora")
+
+    probe_error = RuntimeError("job repository unavailable")
+    probe_calls = {"count": 0}
+
+    def is_cancelled() -> bool:
+        probe_calls["count"] += 1
+        if probe_calls["count"] >= 2:
+            raise probe_error
+        return False
+
+    with pytest.raises(RuntimeError) as caught:
+        generator.run(
+            _request(width=64, height=64, steps=1, lora_path=str(lora_file)),
+            context=GenerationContext(is_cancelled=is_cancelled),
+        )
+
+    assert caught.value is probe_error
+    assert probe_calls["count"] == 2
+    assert pipelines["target"].load_lora_calls == []
+    assert pipelines["target"].calls == []
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY
+    assert entry.lease_count == 0
+    with service.acquire_runtime("target", "image", wait_timeout=0):
+        pass
+    assert loader.load.call_count == 1
+
+
+def test_variation_top_of_loop_probe_error_preserves_runtime(tmp_path, monkeypatch):
+    # Lane A follow-up (code-review finding): the per-variation loop's own
+    # top-of-loop cancellation check runs after _apply_lora() has already
+    # mutated the pipeline -- the same fallible-probe fault class the two
+    # earlier probes guard against reaches this site too. Observed here,
+    # before variation 0 has even started, it must skip that variation
+    # entirely, release the still-healthy (already-mutated) lease cleanly,
+    # and re-raise the exact external exception once it is gone.
+    generator, service, cache, loader, pipelines = _build(tmp_path, monkeypatch)
+    with service.acquire_runtime("target", "image"):
+        pass
+    assert cache._entries["target"].state is RuntimeState.READY
+
+    probe_error = RuntimeError("job repository unavailable")
+    call_count = {"n": 0}
+
+    def is_cancelled() -> bool:
+        call_count["n"] += 1
+        # call #1: _acquire_runtime()'s own pre-acquisition check (False)
+        # call #2: cancelled_before_mutation (False)
+        # call #3: P2-B's cancelled_before_lora probe (False)
+        # call #4: top-of-loop check for variation 0 -- raises
+        if call_count["n"] >= 4:
+            raise probe_error
+        return False
+
+    with pytest.raises(RuntimeError) as caught:
+        generator.run(
+            _request(width=64, height=64, steps=1),
+            context=GenerationContext(is_cancelled=is_cancelled),
+        )
+
+    assert caught.value is probe_error
+    assert call_count["n"] == 4
+    assert pipelines["target"].calls == []  # inference never started
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY
+    assert entry.lease_count == 0
+    with service.acquire_runtime("target", "image", wait_timeout=0):
+        pass
+    assert loader.load.call_count == 1
+
+
+def test_variation_after_provider_call_probe_error_preserves_runtime(tmp_path, monkeypatch):
+    # Lane A follow-up (code-review finding): the per-variation loop's own
+    # after-provider-call cancellation check runs after a variation's
+    # inference has already completed successfully. Observed here, it must
+    # not discard/re-invalidate the runtime that just rendered correctly --
+    # release the lease cleanly and re-raise the exact external exception
+    # once it is gone.
+    generator, service, cache, loader, pipelines = _build(tmp_path, monkeypatch)
+    with service.acquire_runtime("target", "image"):
+        pass
+    assert cache._entries["target"].state is RuntimeState.READY
+
+    probe_error = RuntimeError("job repository unavailable")
+    call_count = {"n": 0}
+
+    def is_cancelled() -> bool:
+        call_count["n"] += 1
+        # call #1: _acquire_runtime()'s own pre-acquisition check (False)
+        # call #2: cancelled_before_mutation (False)
+        # call #3: P2-B's cancelled_before_lora probe (False)
+        # call #4: top-of-loop check for variation 0 (False)
+        # call #5: the check right after the provider call returns -- raises
+        if call_count["n"] >= 5:
+            raise probe_error
+        return False
+
+    with pytest.raises(RuntimeError) as caught:
+        generator.run(
+            _request(width=64, height=64, steps=1),
+            context=GenerationContext(is_cancelled=is_cancelled),
+        )
+
+    assert caught.value is probe_error
+    assert call_count["n"] == 5
+    assert len(pipelines["target"].calls) == 1  # the provider call genuinely ran
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY
+    assert entry.lease_count == 0
+    assert list(tmp_path.glob("*.png")) == []  # nothing written post-lease either
+    with service.acquire_runtime("target", "image", wait_timeout=0):
+        pass
+    assert loader.load.call_count == 1
+
+
+class _ObservedSemaphore:
+    def __init__(self, semaphore, attempted):
+        self._semaphore = semaphore
+        self._attempted = attempted
+
+    def acquire(self, *args, **kwargs):
+        # The owner already holds the real semaphore; this is genuine contention.
+        self._attempted.set()
+        return self._semaphore.acquire(*args, **kwargs)
+
+    def release(self):
+        return self._semaphore.release()
+
+
+def test_cancellation_remains_observable_while_waiting_for_admission(tmp_path, monkeypatch):
+    generator, service, cache, loader, pipelines = _build(tmp_path, monkeypatch)
+    cancelled, attempted, finished = Event(), Event(), Event()
+    errors: list[BaseException] = []
+    owner = service.acquire_runtime("owner", "image")
+    monkeypatch.setattr(
+        service._admission,
+        "_semaphore",
+        _ObservedSemaphore(service._admission._semaphore, attempted),
+    )
+
+    def work():
+        try:
+            generator.run(
+                _request(width=64, height=64, steps=1),
+                context=GenerationContext(is_cancelled=cancelled.is_set),
+            )
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            finished.set()
+
+    worker = Thread(target=work)
+    worker.start()
+    try:
+        assert attempted.wait(2), "worker never attempted contended admission"
+        cancelled.set()
+        assert finished.wait(2), "cancelled worker still waits for unrelated inference"
+        assert len(errors) == 1 and isinstance(errors[0], GenerationCancelled)
+        assert loader.load.call_count == 1  # only the owner; target never loaded
+    finally:
+        cancelled.set()
+        owner.release()
+        worker.join(3)
+    assert not worker.is_alive()
+    # No leaked admission slot after cancellation.
+    with service.acquire_runtime("target", "image", wait_timeout=0):
+        pass
+
+
+def test_only_synchronization_deadlines_use_retryable_timeout(tmp_path, monkeypatch):
+    generator, service, cache, loader, pipelines = _build(tmp_path, monkeypatch)
+    error = RuntimeBusyError("pinned capacity cannot be resolved by waiting")
+    acquire = Mock(side_effect=error)
+    monkeypatch.setattr(service, "acquire_runtime", acquire)
+    with pytest.raises(RuntimeBusyError) as caught:
+        generator.run(
+            _request(width=64, height=64, steps=1),
+            context=GenerationContext(is_cancelled=lambda: False),
+        )
+    assert caught.value is error
+    acquire.assert_called_once()
+
+
+def test_wait_timeout_retries_and_succeeds_after_admission_is_available(tmp_path, monkeypatch):
+    # Operation-scoped polling (PR #420): the contended wait happens inside
+    # ONE checkpointed acquire_runtime() call, never a generator-side loop of
+    # public calls. The generator's own wait_checkpoint is observed instead:
+    # its second invocation can only follow a timed-out slice.
+    generator, service, cache, loader, pipelines = _build(tmp_path, monkeypatch)
+    cancelled, timed_out, retry_allowed = Event(), Event(), Event()
+    results: list[Any] = []
+    errors: list[BaseException] = []
+    acquire = service.acquire_runtime
+    owner = acquire("owner", "image")
+    acquire_calls: list[dict[str, Any]] = []
+
+    def observed_acquire(*args, **kwargs):
+        acquire_calls.append(dict(kwargs))
+        checkpoint = kwargs["wait_checkpoint"]
+        checkpoints = {"n": 0}
+
+        def observed_checkpoint():
+            checkpoints["n"] += 1
+            if checkpoints["n"] == 2:
+                timed_out.set()
+                assert retry_allowed.wait(3), "owner never permitted retry"
+            checkpoint()
+
+        kwargs["wait_checkpoint"] = observed_checkpoint
+        return acquire(*args, **kwargs)
+
+    monkeypatch.setattr(service, "acquire_runtime", observed_acquire)
+
+    def work():
+        try:
+            results.append(
+                generator.run(
+                    _request(width=64, height=64, steps=1),
+                    context=GenerationContext(is_cancelled=cancelled.is_set),
+                )
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    worker = Thread(target=work)
+    worker.start()
+    try:
+        assert timed_out.wait(2), "worker did not bound the contended wait"
+        owner.release()
+        retry_allowed.set()
+        worker.join(3)
+        assert not worker.is_alive()
+        assert errors == []
+        assert len(results) == 1 and results[0].status == "succeeded"
+        assert cache._entries["target"].lease_count == 0
+        assert len(acquire_calls) == 1
+        expected_poll_interval = image_generator_module._CANCELLATION_POLL_SECONDS
+        assert acquire_calls[0]["poll_interval"] == expected_poll_interval
+        assert "wait_timeout" not in acquire_calls[0]
+    finally:
+        cancelled.set()
+        owner.release()
+        retry_allowed.set()
+        worker.join(3)
+
+
+def test_inference_failure_follows_conservative_invalidation(tmp_path, monkeypatch):
+    generator, service, cache, loader, pipelines = _build(
+        tmp_path, monkeypatch, pipeline_cls=_FakeStepAwarePipeline
+    )
+
+    def failing_call(self, **kwargs):
+        raise RuntimeError("simulated diffusers failure mid-inference")
+
+    monkeypatch.setattr(_FakeStepAwarePipeline, "__call__", failing_call)
+
+    with pytest.raises(RuntimeError):
+        generator.run(_request(width=64, height=64, steps=2))
+
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.INVALID
+    assert entry.lease_count == 0
+    assert list(tmp_path.glob("*")) == []
+
+
+def test_cancellation_mid_inference_follows_conservative_invalidation(tmp_path, monkeypatch):
+    generator, service, cache, loader, pipelines = _build(
+        tmp_path, monkeypatch, pipeline_cls=_FakeStepAwarePipeline
+    )
+    cancellation_state = {"requested": False}
+
+    def _record_progress(fraction: float) -> None:
+        if fraction >= 0.5:
+            cancellation_state["requested"] = True
+
+    context = GenerationContext(
+        is_cancelled=lambda: cancellation_state["requested"],
+        on_progress=_record_progress,
+        min_interval_seconds=0.0,
+        min_progress_delta=0.0,
+    )
+
+    with pytest.raises(GenerationCancelled):
+        generator.run(_request(width=64, height=64, steps=4), context=context)
+
+    entry = cache._entries["target"]
+    assert pipelines["target"].steps_invoked == 2
+    assert entry.state is RuntimeState.INVALID
+    assert entry.lease_count == 0
+    assert list(tmp_path.glob("*")) == []
+
+
+def test_semantic_scoring_observes_lease_inactive(tmp_path, monkeypatch):
+    generator, service, cache, loader, pipelines = _build(tmp_path, monkeypatch)
+    observed = {}
+
+    def quality(*args):
+        entry = cache._entries["target"]
+        observed["lease_count"] = entry.lease_count
+        observed["state"] = entry.state
+        return {}
+
+    def semantics(*args):
+        entry = cache._entries["target"]
+        observed["semantic_lease_count"] = entry.lease_count
+        observed["semantic_state"] = entry.state
+        # Not nested inside the lease's own execution-lock/lease ownership:
+        # a same-thread re-acquisition of the exact entry this generation
+        # just used must succeed immediately (wait_timeout=0), which would
+        # deadlock/refuse if this call still ran under the original lease.
+        with service.acquire_runtime("target", "image", wait_timeout=0):
+            pass
+        return {}
+
+    monkeypatch.setattr("generators.image.generator.evaluate_image_output", quality)
+    monkeypatch.setattr("generators.image.generator.evaluate_image_semantics", semantics)
+
+    result = generator.run(_request(width=64, height=64, steps=1))
+
+    assert result.status == "succeeded"
+    assert observed == {
+        "lease_count": 0,
+        "state": RuntimeState.READY,
+        "semantic_lease_count": 0,
+        "semantic_state": RuntimeState.READY,
+    }
+
+
+def test_post_lease_semantic_failure_preserves_output_cleanup(tmp_path, monkeypatch):
+    generator, service, cache, loader, pipelines = _build(tmp_path, monkeypatch)
+    call_count = {"n": 0}
+
+    def flaky_semantics(output_path, *args):
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            raise RuntimeError("simulated semantic scorer failure")
+        return {}
+
+    monkeypatch.setattr(
+        "generators.image.generator.evaluate_image_semantics", flaky_semantics
+    )
+
+    with pytest.raises(RuntimeError):
+        generator.run(
+            _request(width=64, height=64, steps=1, variation_count=2)
+        )
+
+    # The first variation's file was written (post-lease) before the second
+    # variation's semantic scoring failed -- the existing cleanup contract
+    # removes it rather than leaving a partial batch on disk.
+    assert list(tmp_path.glob("*.png")) == []
+    # The generation itself succeeded (both images were rendered inside the
+    # single lease); only post-lease scoring failed.
+    assert cache._entries["target"].state is RuntimeState.READY
+    assert len(pipelines["target"].calls) == 2
+
+
+def test_late_cancellation_after_successful_provider_return_preserves_runtime(
+    tmp_path, monkeypatch
+):
+    # Safety convergence pass, Codex finding "raise late image cancellation
+    # after releasing the lease": `_FakePipeline` has no
+    # `callback_on_step_end` parameter (see `_pipeline_accepts_step_callback`),
+    # so cancellation can only become observable at the generator's own
+    # loop-boundary checks -- exactly the "pipeline without a supported step
+    # callback" scenario the finding describes.
+    generator, service, cache, loader, pipelines = _build(tmp_path, monkeypatch)
+    call_count = {"n": 0}
+
+    def is_cancelled() -> bool:
+        call_count["n"] += 1
+        # call #1: _acquire_runtime()'s own pre-acquisition check (False)
+        # call #2: cancelled_before_mutation (False)
+        # call #3: P2-B's cancelled_before_lora probe, immediately before
+        #          _apply_lora() (False)
+        # call #4: top-of-loop check for variation 0 (False)
+        # call #5: the check right after the provider call returns (True)
+        return call_count["n"] > 4
+
+    with pytest.raises(GenerationCancelled):
+        generator.run(
+            _request(width=64, height=64, steps=1),
+            context=GenerationContext(is_cancelled=is_cancelled),
+        )
+
+    # The provider call genuinely ran and returned successfully before
+    # cancellation was observed.
+    assert len(pipelines["target"].calls) == 1
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY
+    assert entry.lease_count == 0
+    assert list(tmp_path.glob("*.png")) == []  # nothing written post-lease either
+
+
+def test_post_processing_cancellation_removes_partial_outputs(tmp_path, monkeypatch):
+    # Safety convergence pass, Codex finding "keep observing cancellation
+    # during image post-processing": cancellation observed *during* the
+    # post-lease save/quality loop (after the lease has already released
+    # cleanly) must still remove whatever this loop already wrote, via the
+    # existing cleanup path, rather than leaving an orphaned PNG behind.
+    generator, service, cache, loader, pipelines = _build(tmp_path, monkeypatch)
+    call_count = {"n": 0}
+
+    def is_cancelled() -> bool:
+        call_count["n"] += 1
+        # calls 1-7: _acquire_runtime()'s pre-acquisition check,
+        # cancelled_before_mutation, P2-B's cancelled_before_lora probe, and
+        # top-of-loop/after-provider for both variations -- all inside the
+        # (uncancelled) lease.
+        # call #8: post-lease loop's own first check for the first
+        # variation (False -- it gets written and scored normally).
+        # call #9: post-lease loop's own second check, reached only after
+        # the first variation's file was already written and scored.
+        return call_count["n"] > 8
+
+    with pytest.raises(GenerationCancelled):
+        generator.run(
+            _request(width=64, height=64, steps=1, variation_count=2),
+            context=GenerationContext(is_cancelled=is_cancelled),
+        )
+
+    assert len(pipelines["target"].calls) == 2  # both variations rendered inside the lease
+    assert list(tmp_path.glob("*.png")) == []  # the first variation's file was cleaned up
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY
+    assert entry.lease_count == 0
+
+
+def test_cancellation_during_final_scoring_removes_saved_png(tmp_path, monkeypatch):
+    # Codex P2 finding "Image cancellation during quality/semantic
+    # scoring": the between-variations checkpoint only catches cancellation
+    # requested *between* iterations -- a single-variation request has no
+    # further iteration to catch a stop requested while
+    # evaluate_image_semantics() itself ran. `cancelled` is only set from
+    # *inside* the (monkeypatched) semantic scorer, right before it
+    # returns, proving the new post-scoring checkpoint -- not the existing
+    # pre-save one -- is what catches it.
+    generator, service, cache, loader, pipelines = _build(tmp_path, monkeypatch)
+    cancelled = Event()
+
+    def semantics(*args):
+        cancelled.set()
+        return {}
+
+    monkeypatch.setattr("generators.image.generator.evaluate_image_semantics", semantics)
+
+    with pytest.raises(GenerationCancelled):
+        generator.run(
+            _request(width=64, height=64, steps=1),
+            context=GenerationContext(is_cancelled=cancelled.is_set),
+        )
+
+    assert len(pipelines["target"].calls) == 1  # inference genuinely completed
+    assert list(tmp_path.glob("*.png")) == []  # the scored PNG was cleaned up
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY
+    assert entry.lease_count == 0
+
+
+def test_progress_callback_failure_after_successful_inference_preserves_runtime(
+    tmp_path, monkeypatch
+):
+    # Safety convergence pass, Codex finding "defer progress callback
+    # failures until after lease release": with no step callback support,
+    # `context.report_progress()` runs after the provider call already
+    # returned successfully, while the lease is still active. In
+    # production this hook writes through JobRepository.update_if_status();
+    # a transient DB/event-publication failure there must not invalidate
+    # a healthy runtime.
+    generator, service, cache, loader, pipelines = _build(tmp_path, monkeypatch)
+
+    def failing_progress(fraction: float) -> None:
+        raise RuntimeError("simulated job-repository write failure")
+
+    with pytest.raises(RuntimeError):
+        generator.run(
+            _request(width=64, height=64, steps=1),
+            context=GenerationContext(
+                is_cancelled=lambda: False, on_progress=failing_progress
+            ),
+        )
+
+    assert len(pipelines["target"].calls) == 1  # inference genuinely ran
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY
+    assert entry.lease_count == 0
+    assert list(tmp_path.glob("*.png")) == []  # never reached post-lease save
+
+
+def test_step_callback_progress_failure_defers_past_lease_and_reraises(
+    tmp_path, monkeypatch
+):
+    # P2 finding "Image: defer step-callback progress errors past the
+    # lease": for a pipeline that supports `callback_on_step_end`,
+    # `_on_step_end()` used to call `context.report_progress()` unguarded
+    # -- a progress-publication failure there (production: a transient
+    # JobRepository/event-publication error) would escape through the
+    # provider call still inside the active lease and cause
+    # `RuntimeHandle.__exit__` to mark an otherwise-healthy runtime
+    # INVALID, unlike the no-step-callback fallback path already covered
+    # by `test_progress_callback_failure_after_successful_inference_preserves_runtime`
+    # above. It must instead be captured, inference must be left to run to
+    # completion, and the exact error must be re-raised only once the
+    # lease has released cleanly.
+    generator, service, cache, loader, pipelines = _build(
+        tmp_path, monkeypatch, pipeline_cls=_FakeStepAwarePipeline
+    )
+    expected_error = RuntimeError("simulated job-repository write failure")
+
+    def failing_progress(fraction: float) -> None:
+        raise expected_error
+
+    with pytest.raises(RuntimeError) as exc_info:
+        generator.run(
+            _request(width=64, height=64, steps=4),
+            context=GenerationContext(
+                is_cancelled=lambda: False,
+                on_progress=failing_progress,
+                min_interval_seconds=0.0,
+                min_progress_delta=0.0,
+            ),
+        )
+
+    assert exc_info.value is expected_error  # the exact captured error
+    # Every step ran: the callback's progress failure never aborted the
+    # provider's own inference loop.
+    assert pipelines["target"].steps_invoked == 4
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY
+    assert entry.lease_count == 0
+    assert list(tmp_path.glob("*.png")) == []  # never reached post-lease save
+
+
+def test_step_callback_first_progress_error_is_retained(tmp_path, monkeypatch):
+    # "retain the first progress-publication error if multiple callbacks
+    # subsequently fail": once `report_progress()` starts failing it keeps
+    # failing for every remaining step, but only the first raised error is
+    # diagnostically useful, and only one error can be re-raised.
+    generator, service, cache, loader, pipelines = _build(
+        tmp_path, monkeypatch, pipeline_cls=_FakeStepAwarePipeline
+    )
+    calls: list[float] = []
+    first_error = RuntimeError("first simulated failure")
+
+    def failing_progress(fraction: float) -> None:
+        calls.append(fraction)
+        raise first_error if len(calls) == 1 else RuntimeError("later failure")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        generator.run(
+            _request(width=64, height=64, steps=3),
+            context=GenerationContext(
+                is_cancelled=lambda: False,
+                on_progress=failing_progress,
+                min_interval_seconds=0.0,
+                min_progress_delta=0.0,
+            ),
+        )
+
+    assert exc_info.value is first_error
+    assert len(calls) == 3  # every step's callback still ran and still tried
+    entry = cache._entries["target"]
+    assert entry.state is RuntimeState.READY
+    assert entry.lease_count == 0
+
+
+def test_step_callback_cancellation_still_invalidates_mid_inference(
+    tmp_path, monkeypatch
+):
+    # "do not catch or defer unrelated cancellation/runtime exceptions
+    # under a broad handler" / "existing cancellation behavior must remain
+    # intact": the new try/except in `_on_step_end` wraps only
+    # `context.report_progress()`; `context.raise_if_cancelled()` stays
+    # outside it and must still unwind through the lease exactly as
+    # `test_cancellation_mid_inference_follows_conservative_invalidation`
+    # already proves for the pre-existing behavior -- this re-proves it
+    # holds with the new try/except present.
+    generator, service, cache, loader, pipelines = _build(
+        tmp_path, monkeypatch, pipeline_cls=_FakeStepAwarePipeline
+    )
+    cancellation_state = {"requested": False}
+
+    def _record_progress(fraction: float) -> None:
+        if fraction >= 0.5:
+            cancellation_state["requested"] = True
+
+    context = GenerationContext(
+        is_cancelled=lambda: cancellation_state["requested"],
+        on_progress=_record_progress,
+        min_interval_seconds=0.0,
+        min_progress_delta=0.0,
+    )
+
+    with pytest.raises(GenerationCancelled):
+        generator.run(_request(width=64, height=64, steps=4), context=context)
+
+    entry = cache._entries["target"]
+    assert pipelines["target"].steps_invoked == 2
+    assert entry.state is RuntimeState.INVALID
+    assert entry.lease_count == 0
+    assert list(tmp_path.glob("*")) == []

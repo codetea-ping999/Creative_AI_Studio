@@ -24,6 +24,10 @@ htmlcov/
 outputs/
 output/
 data/*.db
+# Runtime lock written by DataDirectoryOwnership whenever the API starts.
+# Left untracked it makes scripts/build_release_artifact.sh refuse to build,
+# since the artifact is cut from a clean tree.
+data/.api-owner.lock
 data/assets/
 data/projects/
 data/feedback/

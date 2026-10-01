@@ -26,6 +26,8 @@ def _succeed_job(services, *, prompt: str, model_id: str, quality_score: float):
     output_path = services.output_dir / f"{job.id}.png"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(b"image")
+    for status in ("preparing", "running", "postprocessing"):
+        assert services.job_repository.update_status(job.id, status) is not None
     services.job_service.mark_succeeded(
         job.id,
         GenerationResult(

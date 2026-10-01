@@ -7,6 +7,7 @@ monkeypatched httpx.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import importlib.util
 import io
 import json
@@ -570,19 +571,37 @@ def test_chunk_budget_must_be_positive():
 
 
 class _FakeModelService:
-    """Minimal ModelService stand-in returning a fixed manifest and runtime."""
+    """Minimal ModelService stand-in returning a fixed manifest and runtime.
+
+    `acquire_runtime()` is a single-threaded lease spy -- cache/eviction
+    behavior has its own tests (tests/test_speech_lease_cancellation.py,
+    using a real ModelService/ModelRuntimeCache); this fixture only proves
+    SpeechGenerator acquires exactly once per request and releases exactly
+    once, mirroring TextGenerator's own `_FakeModelService` in
+    tests/test_text_generation.py.
+    """
 
     def __init__(self, manifest, runtime_obj) -> None:
         self._manifest = manifest
         self._runtime_obj = runtime_obj
-        self.resolved_with: tuple | None = None
-
-    def resolve_runtime(self, model_id, media_type, task_type=None):
-        self.resolved_with = (model_id, media_type, task_type)
-        return self._manifest, self._runtime_obj
+        self.acquired_with: tuple | None = None
+        self.lease_active = False
+        self.acquire_count = 0
+        self.release_count = 0
 
     def get_manifest(self, model_id, media_type, task_type=None):
         return self._manifest
+
+    @contextmanager
+    def acquire_runtime(self, model_id, media_type, task_type=None):
+        self.acquired_with = (model_id, media_type, task_type)
+        self.acquire_count += 1
+        self.lease_active = True
+        try:
+            yield SimpleNamespace(manifest=self._manifest, runtime=self._runtime_obj)
+        finally:
+            self.lease_active = False
+            self.release_count += 1
 
 
 def _kokoro_manifest():
@@ -646,7 +665,7 @@ def test_speech_generator_writes_a_wav_and_records_the_chain(tmp_path: Path):
 
     result = generator.run(_speech_request(source_asset_id="ast_123"))
 
-    assert service.resolved_with == ("kokoro-tts", "audio", "text-to-speech")
+    assert service.acquired_with == ("kokoro-tts", "audio", "text-to-speech")
     assert result.status == "succeeded"
 
     output_path = Path(result.outputs[0])
@@ -953,7 +972,7 @@ def test_speech_generator_rejects_an_overlong_prompt_before_loading_a_runtime(
 
     with pytest.raises(ValueError, match="20000 character limit"):
         generator.run(request)
-    assert service.resolved_with is None
+    assert service.acquired_with is None
     assert runtime["calls"] == []
 
 

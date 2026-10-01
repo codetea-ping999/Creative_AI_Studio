@@ -10,7 +10,6 @@ part of a batch.
 from __future__ import annotations
 
 import logging
-from threading import RLock
 from typing import TYPE_CHECKING
 
 from .repository import StoryRepository
@@ -64,8 +63,11 @@ class SceneBinder:
         self.asset_repository = asset_repository
         self.event_bus = event_bus
         # Two scenes of one story can finish at the same moment on different
-        # lanes; the document is a single JSON file, so writes are serialized.
-        self._lock = RLock()
+        # lanes, and the API's PATCH/apply/delete routes can write the same
+        # story concurrently too. Serializing only within this binder isn't
+        # enough to protect against those other writers, so the read-modify
+        # -write below goes through StoryRepository.mutate(), which holds a
+        # lock shared by every writer of this story document.
 
     def attach_to_event_bus(self) -> None:
         if self.event_bus is None:
@@ -86,8 +88,48 @@ class SceneBinder:
             logger.exception("Failed to bind job %s to its scene.", job_id)
 
     def bind_job(self, job_id: str) -> StoryDocument | None:
-        """Attach a job's primary asset to the scene named in its params."""
+        """Attach a job that just finished generating to the scene it targets.
 
+        This is the live path, and the only one wired to the event bus. A
+        role already holding a different asset is expected and gets
+        replaced — the user asked to regenerate it, and the newest attempt
+        should win.
+
+        Refuses to resurrect a story or scene a concurrent delete (or
+        scene-list regeneration) removed: see ``StoryRepository.mutate``.
+        """
+
+        return self._bind(job_id, replay=False)
+
+    def replay_job_safely(self, job_id: str) -> StoryDocument | None:
+        """Safely re-apply an *already-succeeded* job's binding.
+
+        This is the boundary a future job-recovery path (PR 3 of the
+        job-lifecycle-hardening series; recovery itself is not implemented
+        here) should call explicitly instead of ``bind_job`` — the two are
+        deliberately separate methods, not one method with a mode flag,
+        because the safety rules only make sense for a replay and must never
+        leak into the live path by accident:
+
+        - a scene/role already carrying *any* asset is left untouched, even
+          if it is a different asset than this job's — an old result must
+          never overwrite work that happened after it, whether that work was
+          this same job being bound already or a different, newer job;
+        - a job already recorded on the scene (``job_id in scene.job_ids``)
+          is a no-op, so replaying the same completion twice never duplicates
+          anything;
+        - a story or scene a concurrent delete (or scene-list regeneration)
+          removed is never resurrected.
+
+        It is still the caller's job to decide *which* job to replay when a
+        scene/role has more than one succeeded candidate — this method only
+        ever considers the single ``job_id`` it is given, so it makes no such
+        choice on its own.
+        """
+
+        return self._bind(job_id, replay=True)
+
+    def _bind(self, job_id: str, *, replay: bool) -> StoryDocument | None:
         job = self.job_repository.get(job_id)
         if job is None or job.status != "succeeded":
             return None
@@ -113,8 +155,7 @@ class SceneBinder:
             )
             return None
 
-        with self._lock:
-            story = self.story_repository.get(story_id)
+        def _apply_binding(story: StoryDocument | None) -> StoryDocument | None:
             if story is None:
                 logger.warning(
                     "Job %s references unknown story %s.", job_id, story_id
@@ -123,11 +164,24 @@ class SceneBinder:
 
             scenes = []
             matched = False
+            skipped = False
             for scene in story.scenes:
                 if scene.id != scene_id:
                     scenes.append(scene)
                     continue
                 matched = True
+
+                if replay and (
+                    job_id in scene.job_ids or scene.asset_ids.get(role)
+                ):
+                    # Recovery is replaying a job that either was already
+                    # bound (nothing to do) or whose role now belongs to a
+                    # different, presumably newer, asset — an old result must
+                    # never overwrite what is currently there.
+                    skipped = True
+                    scenes.append(scene)
+                    continue
+
                 asset_ids = {**scene.asset_ids, role: asset.id}
                 job_ids = list(scene.job_ids)
                 if job_id not in job_ids:
@@ -148,9 +202,19 @@ class SceneBinder:
                 )
                 return None
 
-            return self.story_repository.save(
-                story.model_copy(update={"scenes": scenes})
-            )
+            if skipped:
+                logger.info(
+                    "Recovery replay for job %s skipped: scene %s role %s is "
+                    "already resolved.",
+                    job_id,
+                    scene_id,
+                    role,
+                )
+                return None
+
+            return story.model_copy(update={"scenes": scenes})
+
+        return self.story_repository.mutate(story_id, _apply_binding)
 
 
 __all__ = [

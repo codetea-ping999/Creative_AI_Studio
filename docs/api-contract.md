@@ -14,6 +14,7 @@ http://127.0.0.1:8000
 | 分類 | メソッド | パス | Web UI の主用途 |
 | --- | --- | --- | --- |
 | System | `GET` | `/health` | dev stack 疎通確認 |
+| System | `GET` | `/version` | 実行中のリリース版数（`VERSION` と一致） |
 | System | `GET` | `/openapi.json` | 開発時の契約確認 |
 | Models | `GET` | `/models` | メディア別モデル一覧 |
 | Catalog | `GET` | `/catalog/loras` | LoRA 候補一覧 |
@@ -139,17 +140,30 @@ Web 側は `detail` 配列から `body.prompt: Field required` のような構�
 ### シーンへの自動紐付け
 
 `POST /stories/{id}/scenes/{scene_id}/generate` は `role`（`visual` / `narration` /
-`music`）だけを受け取り、必要な request を scene から組み立てます。
+`music`）と、`visual` のときだけ任意の `media_type`（`image` / `video`）を受け取り、
+必要な request を scene から組み立てます。
 
 | role | 生成対象 | 入力に使う scene のフィールド |
 | --- | --- | --- |
 | `visual` | image | `image_prompt` / `image_negative` / `bible_refs` |
+| `visual` + `media_type: "video"` | video（`text-to-video`、既定モデル `storyboard-video`） | `image_prompt` / `image_negative` / `duration_seconds` |
 | `narration` | audio（`text-to-speech`） | `narration` |
 | `music` | audio（`text-to-music`） | `bgm_mood` / `duration_seconds` |
 
 request の params には `story_id` / `scene_id` / `scene_role` が入り、job が成功すると
 `SceneBinder` が生成物を `Scene.asset_ids[role]` へ結びつけます。UI は job 完了後に
 story を読み直すだけで、素材の紐付けを自分で管理する必要がありません。
+
+`media_type: "video"` は v1.0 Stable の visual 経路です。手続き型 `storyboard-video`
+runtime（GIF、モデル重み不要）を通常の job lifecycle で実行し、生成された GIF を
+`visual` role にそのまま紐付けます。`model_id` を省略すると `storyboard-video` を明示的に
+選ぶため、後から学習済み video モデルを置いても Stable の既定は変わりません。seed 省略時は
+`story_id` / `scene_id` / prompt から決定的に導出し、サーバ再起動をまたいで同じクリップに
+なります。SDXL などの image 経路（`media_type` 省略 / `image`）は Preview のままで、Stable の
+依存にはなりません。`media_type` を `visual` 以外の role に付けると 400 です。
+
+Assembly（`POST /stories/{id}/assemble`）が必須とするのは全 scene の `visual` だけです。
+narration / music が未生成の scene は無音で書き出されます。
 
 紐付けが行われない正常系:
 
@@ -569,8 +583,13 @@ Query:
 asset 固有の seed と実効パラメータを引き継ぎます。複数生成の各 asset は
 `variation_count=1` の request snapshot を持つため、選択した1枚だけを再利用できます。
 `rerun` で `seed` を省略するか `null` にすると、新しいランダム seed で同じ request を
-再実行します。レビュー画面からの派生理由など、UI 固有の補足情報は `params` に任意の
-JSON 値として保存できます。
+再実行します。省略した項目は元 asset の request から引き継ぎます。`prompt` を省略するか
+空文字（空白のみを含む）にした場合も、元 asset の prompt を使います。Web UI の
+「Reuse and rerun」は、通常 `action: "rerun"` と `project_id` だけを送り、元 request を
+そのまま再実行します。同じ asset を「Load into composer」で読み込んだ後は、composer で
+編集した内容を `variation` として送ります。
+レビュー画面からの派生理由など、UI 固有の補足情報は `params` に任意の JSON 値として
+保存できます。
 
 Request:
 
