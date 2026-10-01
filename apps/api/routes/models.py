@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from apps.api.dependencies import get_services
 from bootstrap import ApplicationServices
+from core.model_install import install_destination
 from core.models import ModelManifest, evaluate_manifest_readiness
 from core.schemas.generation import MediaType
 
@@ -30,6 +31,11 @@ class ModelSummary(BaseModel):
     is_available: bool = False
     runtime_status: str = Field(min_length=1)
     availability_message: str = ""
+    install_path: str | None = Field(
+        default=None,
+        description="Directory the model files belong in, when the model is served from local files.",
+    )
+    supports_local_install: bool = False
 
 
 class ModelsResponse(BaseModel):
@@ -42,6 +48,11 @@ class ModelsResponse(BaseModel):
 
 def _serialize_manifest(manifest: ModelManifest) -> ModelSummary:
     readiness = evaluate_manifest_readiness(manifest)
+    destination = install_destination(
+        manifest.runtime,
+        manifest.local_path,
+        manifest.default_params,
+    )
     return ModelSummary(
         id=manifest.public_model_id,
         internal_id=manifest.id,
@@ -55,6 +66,8 @@ def _serialize_manifest(manifest: ModelManifest) -> ModelSummary:
         is_available=readiness.is_ready,
         runtime_status=readiness.status,
         availability_message=readiness.message,
+        install_path=str(destination) if destination is not None else None,
+        supports_local_install=destination is not None,
     )
 
 

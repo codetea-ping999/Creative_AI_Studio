@@ -17,6 +17,8 @@ http://127.0.0.1:8000
 | System | `GET` | `/version` | 実行中のリリース版数（`VERSION` と一致） |
 | System | `GET` | `/openapi.json` | 開発時の契約確認 |
 | Models | `GET` | `/models` | メディア別モデル一覧 |
+| Models | `POST` | `/models/pick-folder` | Finder / エクスプローラーでモデルのフォルダを選ぶ（API を動かしているマシンだけ） |
+| Models | `POST` | `/models/{model_id}/install` | 手元にあるモデルのフォルダを配置先へコピーして readiness を確認 |
 | Catalog | `GET` | `/catalog/loras` | LoRA 候補一覧 |
 | Projects | `GET` | `/projects` | プロジェクト一覧 / filter |
 | Projects | `POST` | `/projects` | プロジェクト作成 |
@@ -401,11 +403,18 @@ Behavior:
       "is_default": true,
       "is_available": true,
       "runtime_status": "ready",
-      "availability_message": "Diffusers model files are ready."
+      "availability_message": "Diffusers model files are ready.",
+      "install_path": "/Users/me/Creative_AI_Studio/models/image/sdxl",
+      "supports_local_install": true
     }
   ]
 }
 ```
+
+- `install_path`: loader がモデルを読むディレクトリの絶対パスです。learned runtime では
+  `pipeline_path`（weight の置き場所）を返します。endpoint で動くモデルは `null` です
+- `supports_local_install`: `install_path` があり、`POST /models/{model_id}/install` で
+  ファイルを置ける場合に `true` です
 
 UI の最小利用項目:
 
@@ -417,6 +426,67 @@ UI の最小利用項目:
 - `is_default`
 - `runtime_status`
 - `availability_message`
+- `install_path` / `supports_local_install`（モデルが無いときの案内と「手元のモデルを配置」ボタン）
+
+### POST /models/pick-folder
+
+API を動かしているマシンの OS 標準のフォルダ選択（macOS は Finder、Windows はエクスプローラー、
+Linux は `zenity` または `kdialog`）を開き、選ばれたフォルダを返します。
+
+```json
+{ "path": "/Users/me/Downloads/stable-diffusion-xl-base-1.0" }
+```
+
+- キャンセルされたときは `{ "path": null }` を返します
+- フォルダ選択を開けない環境（Linux で `zenity` も `kdialog` も無い場合など）は `501` です
+- ループバック（`127.0.0.1` / `::1`）からのリクエストだけを受け付けます。それ以外は `403` です
+
+### POST /models/{model_id}/install
+
+選んだフォルダを manifest の配置先（`GET /models` の `install_path`）へコピーします。
+
+```json
+{ "source_path": "/Users/me/Downloads/stable-diffusion-xl-base-1.0", "media_type": "image", "replace": false }
+```
+
+Behavior:
+
+- コピーする前に、選んだフォルダ自体が `core/model_readiness.py` の条件を満たすか確認します。
+  選んだフォルダが親フォルダ（Hugging Face のキャッシュの `snapshots/<hash>` を含むフォルダなど）
+  でも、2 階層下までは完全なモデルを探します
+- コピーは配置先の隣の一時フォルダへ行い、readiness を確認してから移動します。途中で失敗しても
+  配置先には何も残りません。Hugging Face のキャッシュのシンボリックリンクは実体をコピーします
+- 配置先にすでにファイルがある場合は `409`（`destination_not_empty`）です。`replace: true` を
+  付けると、既存のフォルダを `<名前>.replaced-<日時>` へ移してから配置します（削除はしません）
+- 配置が成功すると、そのモデルの読み込み済み runtime を解放します
+
+レスポンス:
+
+```json
+{
+  "model_id": "sdxl",
+  "destination": "/Users/me/Creative_AI_Studio/models/image/sdxl",
+  "source": "/Users/me/Downloads/stable-diffusion-xl-base-1.0",
+  "replaced_to": null,
+  "copied_bytes": 6938078334,
+  "is_available": true,
+  "runtime_status": "ready",
+  "availability_message": "Diffusers model files are ready."
+}
+```
+
+エラーは `detail` に `code` と `message` を持ちます。
+
+| status | `code` | 内容 |
+| --- | --- | --- |
+| 403 | なし | ループバック以外からのリクエスト |
+| 404 | なし | モデルが見つからない |
+| 409 | `destination_not_empty` | 配置先にファイルがある（`replace: true` で置き換え） |
+| 409 | `install_in_progress` | 別の配置が実行中 |
+| 422 | `invalid_source` | 相対パス、存在しない、ファイル、配置先と重なる |
+| 422 | `incomplete_source` | 選んだフォルダに完全なモデルがない（`missing` に不足ファイル） |
+| 422 | `not_supported` | endpoint で動くモデルでコピー先がない |
+| 507 | `insufficient_space` | 空き容量が足りない |
 
 ## Projects
 

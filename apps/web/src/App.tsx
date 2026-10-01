@@ -1,6 +1,8 @@
 import { startTransition, useCallback, useEffect, useState, type FormEvent } from "react";
 import {
   PromptForm,
+  type LocalModelInstallOptions,
+  type LocalModelInstallOutcome,
   type LoraOption,
   type MediaType,
   type ModelOption,
@@ -35,15 +37,17 @@ import {
   type GalleryItemResponse,
   type GalleryMediaType,
   type GalleryStatsResponse,
+  type InstallModelResponse,
   type JobResponse,
   type LoraCatalogResponse,
   type MetricsSummaryResponse,
   type ModelsResponse,
+  type PickFolderResponse,
   type ProjectResponse,
   type RefreshStudioOptions,
   type ReuseAssetResponse,
 } from "./studio";
-import { requestJson } from "./studioClient";
+import { ApiError, requestJson } from "./studioClient";
 import { useJobPolling } from "./hooks/useJobPolling";
 
 type ThemeMode = "light" | "dark";
@@ -521,6 +525,53 @@ function App() {
       await loadProjects();
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : "Failed to cancel job.");
+    }
+  }
+
+  async function handleInstallLocalModel(
+    modelId: string,
+    options?: LocalModelInstallOptions,
+  ): Promise<LocalModelInstallOutcome> {
+    let sourcePath = options?.sourcePath ?? "";
+    try {
+      if (!sourcePath) {
+        const picked = await requestJson<PickFolderResponse>("/models/pick-folder", {
+          method: "POST",
+        });
+        if (!picked.path) {
+          return { status: "cancelled" };
+        }
+        sourcePath = picked.path;
+      }
+      const result = await requestJson<InstallModelResponse>(
+        `/models/${encodeURIComponent(modelId)}/install`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            source_path: sourcePath,
+            media_type: mediaType,
+            replace: options?.replace ?? false,
+          }),
+        },
+      );
+      await loadModels(mediaType);
+      const moved = result.replaced_to
+        ? ` もとのファイルは ${result.replaced_to} に移しました。`
+        : "";
+      const message = result.is_available
+        ? `${modelId} を配置しました。モデル一覧から選べます。${moved}`
+        : `${modelId} を配置しましたが、まだ使えません: ${result.availability_message}`;
+      setStatusMessage(message);
+      return { status: "installed", message };
+    } catch (error) {
+      if (error instanceof ApiError && error.code === "destination_not_empty") {
+        return { status: "needs_replace", message: error.message, sourcePath };
+      }
+      return {
+        status: "error",
+        message: error instanceof Error ? error.message : String(error),
+      };
     }
   }
 
@@ -1251,6 +1302,7 @@ function App() {
             canSubmit={!isSubmitting && generationGateMessage === null}
             statusMessage={generationGateMessage ?? statusMessage}
             onDraftChange={handleDraftChange}
+            onInstallLocalModel={handleInstallLocalModel}
             onSubmit={(values) => {
               void handleSubmit(values);
             }}

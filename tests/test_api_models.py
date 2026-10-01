@@ -146,6 +146,8 @@ class ModelsApiTests(unittest.TestCase):
                         "is_available": True,
                         "runtime_status": "ready",
                         "availability_message": "Diffusers model files are ready.",
+                        "install_path": str(model_path.resolve()),
+                        "supports_local_install": True,
                     }
                 ]
             },

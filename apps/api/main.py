@@ -20,6 +20,7 @@ from apps.api.routes.generate import router as generate_router
 from apps.api.routes.health import router as health_router
 from apps.api.routes.jobs import router as jobs_router
 from apps.api.routes.metrics import router as metrics_router
+from apps.api.routes.model_install import router as model_install_router
 from apps.api.routes.models import router as models_router
 from apps.api.routes.projects import router as projects_router
 from apps.api.routes.stories import router as stories_router
@@ -259,6 +260,7 @@ def create_app(
     app.include_router(jobs_router)
     app.include_router(projects_router)
     app.include_router(models_router)
+    app.include_router(model_install_router)
     app.include_router(metrics_router)
     app.include_router(catalog_router)
     app.include_router(gallery_router)

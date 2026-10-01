@@ -9,6 +9,7 @@ import {
   imagePresets,
   videoPresets,
 } from "./promptFormConfig";
+import { ModelInstallCard } from "./ModelInstallCard";
 import type {
   AudioPreset,
   ControlMode,
@@ -23,6 +24,8 @@ import type {
 } from "./promptFormTypes";
 
 export type {
+  LocalModelInstallOptions,
+  LocalModelInstallOutcome,
   LoraOption,
   MediaType,
   ModelOption,
@@ -172,6 +175,13 @@ function getInstallGuide(
         note: "SDXL 系の anime checkpoint を取得して `models/image/anime-sdxl` に配置します。",
       };
     }
+    if (normalizedId.includes("ssd-1b")) {
+      return {
+        label: "SSD-1B",
+        url: "https://huggingface.co/segmind/SSD-1B",
+        note: "SSD-1B を取得して `models/image/ssd-1b` に配置します。",
+      };
+    }
     if (normalizedId.includes("sdxl")) {
       return {
         label: "Stable Diffusion XL Base 1.0",
@@ -182,6 +192,13 @@ function getInstallGuide(
   }
 
   if (mediaType === "audio") {
+    if (normalizedId.includes("musicgen-long-form")) {
+      return {
+        label: "MusicGen Long-form (AudioCraft)",
+        url: "https://huggingface.co/facebook/musicgen-small",
+        note: "AudioCraft 用の資材は `scripts/download_models.py --with-long-form` で `models/audio/musicgen-long-form` に配置します。",
+      };
+    }
     if (normalizedId.includes("musicgen-melody")) {
       return {
         label: "MusicGen Melody",
@@ -235,6 +252,7 @@ export function PromptForm({
   statusMessage = null,
   onSubmit,
   onDraftChange,
+  onInstallLocalModel,
 }: PromptFormProps) {
   const [formValues, setFormValues] = useState<PromptFormState>(() =>
     createInitialState(initialValues),
@@ -256,7 +274,7 @@ export function PromptForm({
     .filter((option) => !option.isAvailable)
     .map((option) => ({
       modelId: option.id,
-      displayName: option.displayName,
+      model: option,
       guide: getInstallGuide(mediaType, option),
     }))
     .filter(
@@ -264,7 +282,7 @@ export function PromptForm({
         item,
       ): item is {
         modelId: string;
-        displayName: string;
+        model: ModelOption;
         guide: ModelInstallGuide;
       } => item.guide !== null,
     );
@@ -1354,15 +1372,12 @@ export function PromptForm({
           {missingModelGuides.length > 0 ? (
             <div className="download-guide-list" aria-label="Model download guides">
               {missingModelGuides.map((item) => (
-                <div key={item.modelId} className="download-guide">
-                  <div>
-                    <strong>{item.displayName}</strong>
-                    <p>{item.guide.note}</p>
-                  </div>
-                  <a href={item.guide.url} target="_blank" rel="noreferrer">
-                    Download
-                  </a>
-                </div>
+                <ModelInstallCard
+                  key={item.modelId}
+                  model={item.model}
+                  guide={item.guide}
+                  onInstallLocalModel={onInstallLocalModel}
+                />
               ))}
             </div>
           ) : null}
