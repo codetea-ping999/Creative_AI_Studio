@@ -1934,6 +1934,10 @@ pre,
   min-width: 0;
 }
 
+.story-workspace {
+  container-type: inline-size;
+}
+
 .story-workspace__identity {
   display: flex;
   justify-content: space-between;
@@ -2166,8 +2170,8 @@ pre,
   overflow: auto;
 }
 
-/* Wide tables scroll inside their own container so the page never scrolls
-   sideways on a narrow viewport. */
+/* Wide tables scroll inside their own container when the Story workspace has
+   room for the table. Narrow workspaces use the card layout below. */
 .story-scene-table__scroll {
   overflow-x: auto;
   border: 1px solid var(--border-soft);
@@ -2912,6 +2916,48 @@ pre,
     width: 100%;
   }
 
+  .matrix-plan {
+    grid-template-columns: 1fr;
+  }
+
+  .matrix-plan > div:first-child {
+    grid-row: auto;
+  }
+
+  .matrix-progress__actions {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .matrix-progress__actions .secondary-button,
+  .matrix-inspector__header .secondary-button {
+    width: 100%;
+  }
+
+  .matrix-grid {
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    gap: 8px;
+  }
+
+  .matrix-cell__body {
+    padding: 8px;
+  }
+
+  .matrix-cell__heading {
+    display: grid;
+  }
+
+  .matrix-cell__actions {
+    grid-template-columns: 1fr;
+  }
+
+  .matrix-cell__actions .secondary-button {
+    grid-column: auto;
+  }
+}
+
+/* The table needs 720px plus the scroll container's two border pixels. */
+@container (max-width: 721px) {
   .story-scene-table__scroll {
     overflow: visible;
     border: 0;
@@ -2968,52 +3014,17 @@ pre,
     font-weight: 650;
   }
 
-  .story-scene-actions {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+  .story-scene-table td > * {
+    grid-column: 2;
+    min-width: 0;
   }
 
   .story-scene-actions .secondary-button {
-    width: 100%;
-  }
-
-  .matrix-plan {
-    grid-template-columns: 1fr;
-  }
-
-  .matrix-plan > div:first-child {
-    grid-row: auto;
-  }
-
-  .matrix-progress__actions {
-    display: grid;
-    grid-template-columns: 1fr;
-  }
-
-  .matrix-progress__actions .secondary-button,
-  .matrix-inspector__header .secondary-button {
-    width: 100%;
-  }
-
-  .matrix-grid {
-    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
-    gap: 8px;
-  }
-
-  .matrix-cell__body {
-    padding: 8px;
-  }
-
-  .matrix-cell__heading {
-    display: grid;
-  }
-
-  .matrix-cell__actions {
-    grid-template-columns: 1fr;
-  }
-
-  .matrix-cell__actions .secondary-button {
-    grid-column: auto;
+    display: block;
+    min-width: 0;
+    width: auto;
+    max-width: 100%;
+    text-align: center;
   }
 }
 
