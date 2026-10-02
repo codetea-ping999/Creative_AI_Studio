@@ -144,7 +144,7 @@ function VideoStagePreview({
  * preview, so the first frame is drawn to a canvas. `allowPlayback` adds an
  * explicit control to opt into the animation.
  */
-function MotionSafeGif({
+export function MotionSafeGif({
   src,
   alt,
   allowPlayback = false,

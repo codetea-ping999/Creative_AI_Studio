@@ -15,6 +15,8 @@ import {
   type BatchTemplate,
 } from "../lib/batchApi";
 import { createOutputUrl } from "../studioClient";
+import { isGifAsset } from "../studio";
+import { MotionSafeGif } from "./MediaPreview";
 
 export type MatrixPanelProps = {
   /** Model used for the sweep; empty falls back to the API default. */
@@ -71,7 +73,8 @@ function MatrixInspector({
   onClose: () => void;
 }) {
   const headingRef = useRef<HTMLHeadingElement>(null);
-  const previewUrl = createOutputUrl(item.preview_path ?? item.output_path);
+  const previewPath = item.preview_path ?? item.output_path;
+  const previewUrl = createOutputUrl(previewPath);
 
   useEffect(() => {
     headingRef.current?.focus();
@@ -93,7 +96,15 @@ function MatrixInspector({
       <div className="matrix-inspector__content">
         <div className="matrix-inspector__media">
           {previewUrl ? (
-            <img src={previewUrl} alt={`${item.label} の拡大プレビュー`} />
+            isGifAsset(previewPath) ? (
+              <MotionSafeGif
+                key={previewUrl}
+                src={previewUrl}
+                alt={`${item.label} の拡大プレビュー`}
+              />
+            ) : (
+              <img src={previewUrl} alt={`${item.label} の拡大プレビュー`} />
+            )
           ) : (
             <span>プレビューはありません</span>
           )}
@@ -134,7 +145,8 @@ function MatrixCell({
   onPreview: () => void;
   onInspectItem?: (item: BatchItem) => void;
 }) {
-  const previewUrl = createOutputUrl(item.preview_path ?? item.output_path);
+  const previewPath = item.preview_path ?? item.output_path;
+  const previewUrl = createOutputUrl(previewPath);
   const canInspect = item.status === "succeeded";
 
   return (
@@ -152,12 +164,16 @@ function MatrixCell({
         aria-label={`${item.label}を拡大表示`}
       >
         {previewUrl && canInspect ? (
-          <img
-            src={previewUrl}
-            alt={item.label}
-            loading="lazy"
-            decoding="async"
-          />
+          isGifAsset(previewPath) ? (
+            <MotionSafeGif key={previewUrl} src={previewUrl} alt={item.label} />
+          ) : (
+            <img
+              src={previewUrl}
+              alt={item.label}
+              loading="lazy"
+              decoding="async"
+            />
+          )
         ) : (
           <span className="matrix-cell__placeholder">
             {item.status === "failed"
