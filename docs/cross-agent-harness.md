@@ -233,6 +233,23 @@ user config、hook、plugin、app、multi-agent を無効にします。Claude w
 公開しません。Claude の write worker は Bash を持たないため、
 テスト実行は outer verifier（既存 `issue-fleet` など）の責務です。
 
+OpenCode worker（experimental）は必ず pure mode で起動します。argv に `--pure`、環境に
+`OPENCODE_PURE=1` を渡し、OpenCode は global / `~/.opencode` / 自動検出を含むすべての外部
+plugin を初期化しません（v1.18.28 の `packages/opencode/src/plugin/index.ts` は
+`flags.pure` が真のときだけ外部 plugin を読み飛ばし、`flags.pure` は
+`src/effect/runtime-flags.ts` の `OPENCODE_PURE`、CLI の `--pure` は `src/index.ts` で
+`OPENCODE_PURE=1` に変換されます）。pure mode は OpenCode 1.3.4 で導入されたため、broker は
+起動前に `opencode --version` を確認し、1.3.4 未満または版を判定できない binary は起動せず
+`unavailable` として扱います（fallback 可能、doctor では `opencode_pure` が失敗）。
+さらに `XDG_CONFIG_HOME` を attempt directory 内の空の private directory に差し替え、global
+config の plugin / MCP server / formatter / LSP 設定と provider・model 設定を継承しません。
+認証情報（`XDG_DATA_HOME/opencode/auth.json`）は差し替えないため既存 login はそのまま使えます。
+project config・default plugin・Claude Code 互換 skill/prompt・外部 skill・autoupdate も無効化し、
+worker agent の permission は `OPENCODE_CONFIG_CONTENT` で deny-by-default（read-only は
+read/glob/grep/list のみ、write はそれに worktree 内 edit を追加）に固定します。`~/.opencode`
+配下の config は OpenCode が HOME から直接読むため、plugin 以外の設定（MCP など）を置かない
+ことを運用上の前提とします。
+
 worker 環境は PATH/HOME/locale/auth storage path などの allowlist から組み立て、
 `OPENAI_API_KEY`, `CODEX_API_KEY`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` は渡しません。
 つまり v1 は既存の ChatGPT / Claude.ai subscription login だけを使い、従量課金へ暗黙に

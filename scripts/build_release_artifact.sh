@@ -85,7 +85,11 @@ echo "=== Creating tarball ==="
 COPYFILE_DISABLE=1 tar -czf "${OUT_DIR}/${ARTIFACT_NAME}.tar.gz" -C "${STAGE_DIR}" "${ARTIFACT_NAME}"
 
 echo "=== Computing SHA256 ==="
-sha256_file "${OUT_DIR}/${ARTIFACT_NAME}.tar.gz" > "${OUT_DIR}/SHA256SUMS"
+# Record the bare filename rather than this machine's absolute path: the
+# tarball and SHA256SUMS land side by side in the Release, so the documented
+# `sha256sum -c SHA256SUMS` has to resolve against the downloader's own
+# directory, not the build runner's.
+(cd "${OUT_DIR}" && sha256_file "${ARTIFACT_NAME}.tar.gz") > "${OUT_DIR}/SHA256SUMS"
 
 echo "=== Verifying artifact contents ==="
 # Write the listings to files and assert against those. Piping `tar` into

@@ -43,7 +43,7 @@
     },
     "provider": {
       "type": ["string", "null"],
-      "enum": ["codex", "claude", null]
+      "enum": ["codex", "claude", "opencode", null]
     },
     "session_id": {"type": ["string", "null"]},
     "workspace": {"type": "string"},
@@ -73,7 +73,7 @@
         ],
         "properties": {
           "attempt": {"type": "integer", "minimum": 1, "maximum": 2},
-          "provider": {"enum": ["codex", "claude"]},
+          "provider": {"enum": ["codex", "claude", "opencode"]},
           "status": {"enum": ["completed", "failed"]},
           "reason": {"type": "string"},
           "exit_code": {"type": ["integer", "null"]},

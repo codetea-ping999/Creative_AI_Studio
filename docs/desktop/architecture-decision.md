@@ -142,6 +142,28 @@ Browser runtime resolves the configured web API URL. Desktop runtime resolves th
 
 The v0.1 integration is not accepted until a packaged WebView can perform both a simple read and a preflighted JSON write against an already-running backend, including when the backend uses a supported non-default port.
 
+### 7a. Desktop Shell v0.1 runtime wiring (review follow-up)
+
+The desktop shell resolves the backend endpoint with the following precedence, all resolved at runtime (never baked into the web bundle). The port order mirrors `scripts/run_api_dev.sh`, which sources the root `.env` with `set -a` *after* inheriting the environment, so the `.env` value is the port the backend actually binds:
+
+1. `STUDIO_BACKEND_URL` — explicit full-URL override for the desktop shell;
+2. `API_PORT` from the Studio root `.env` — the file the development scripts source. As with a shell `source`, the last `API_PORT=` line wins; an empty value means the backend default (8000);
+3. `API_PORT` from the launch environment — used when `.env` has no `API_PORT` assignment;
+4. loopback default `http://127.0.0.1:8000`.
+
+The `.env` file is located at runtime on the user's machine, never from a build-time path:
+
+1. `CREATIVE_AI_STUDIO_ROOT` — explicit Studio checkout root (authoritative when set; `<root>/.env`);
+2. the nearest ancestor directory of the running executable that is a Studio checkout (contains `scripts/run_api_dev.sh` and `apps/api/`), e.g. a bundle run from `apps/desktop/src-tauri/target/...`;
+3. the per-user app config directory, `<app_config_dir>/.env` (macOS: `~/Library/Application Support/com.creativeaistudio.desktop/.env`) — the place to set `API_PORT` for an installed/moved bundle;
+4. debug builds only: the build-time checkout (`CARGO_MANIFEST_DIR/../../..`) so `cargo tauri dev` keeps following the developer's `.env`. Release builds never read the build machine's checkout.
+
+Precedence 1–3 produce an exact (non-probing) loopback endpoint. Enabling a non-default port never starts the backend; the shell only connects to an already-running instance.
+
+The global shortcut is registered after plugin initialization and a registration refusal is non-fatal: it is logged and the shell, tray, Studio window, and backend connection remain usable without the shortcut.
+
+OS autostart is disabled by default and controlled only through an explicit tray menu toggle. Flipping it never implies starting the API or model runtime.
+
 ### 8. Use OSS bricolage for infrastructure
 
 CreativeStudio-specific user experience should be implemented locally. Commodity desktop infrastructure should be adapted from audited OSS instead of rewritten without reason.

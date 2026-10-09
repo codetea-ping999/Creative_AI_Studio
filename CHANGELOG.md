@@ -2,7 +2,22 @@
 
 このファイルは利用者から見える変更を記録します。
 
-## [1.0.0] - 未リリース
+## [Unreleased]
+
+v1.1 に持ち越した項目は [#458](https://github.com/codetea-ping999/Creative_AI_Studio/issues/458) に集約しています。
+v1.0.0 の既知の制限と検証の所見のうち、次のものを v1.1 で扱う予定です。
+
+- Storyboard GIF の静止表示（`prefers-reduced-motion` 対応）
+- 日本語 Storyboard overlay の文字が MP4 で表示されない問題
+- Preview / Experimental 用の ML 依存の更新（`torch`、`diffusers`、`transformers`）
+
+### Fixed
+
+- procedural storyboard（`storyboard-video`）のフレームで日本語が □（豆腐）になる問題を修正。
+  既定フォントで描けない文字を含む行は CJK 対応のシステムフォントで描画します。
+  `STORYBOARD_FONT_PATH` で任意のフォントを指定できます（#449）。
+
+## [1.0.0] - 2026-09-30
 
 v1.0.0 は「約束する範囲を明示した最初のリリース」です。機能を Stable / Preview /
 Experimental に分類し、Stable のみをサポート対象として扱います。分類の一覧は
@@ -71,10 +86,23 @@ main の `55c4127` が生成した永続データ形式からの更新を回帰�
 - Matrix パネルが batch の stage-advance エラーを表示しません（#390）。
 - CogVideoX-2B と MusicGen の実 weight は未取得です（#421）。Stable ジャーニーには影響しません。
 - SDXL の実 weight を使った通し検証とドッグフードは未完了です（#7、#10）。
+- Preview / Experimental 用の ML 依存（`torch` 2.10、`diffusers` 0.37、`transformers` 4.57）に
+  公開済みの脆弱性情報があります（2026-09-23 の pip-audit）。Stable ジャーニーは `diffusers` と
+  `transformers` を読み込まず、`torch` はモデル runtime 解放時のアクセラレータキャッシュ
+  解放にのみ使います。SDXL などの実モデルを使う場合は、信頼できる配布元のモデルファイル
+  だけを置いてください。依存の更新は v1.1 で扱います。
+- macOS の Safari は既定でダウンロードした `.tar.gz` を自動で展開するため、tarball を
+  `SHA256SUMS` で照合できないことがあります。照合する場合は `curl -LO` で取得するか、
+  Safari の「ダウンロード後、"安全な"ファイルを開く」を無効にしてからダウンロードしてください。
+- Storyboard の GIF は Gallery で繰り返し再生され、OS の「視差効果を減らす」
+  （`prefers-reduced-motion`）設定でも止まりません。静止表示への切り替えは v1.1 で扱います。
 
 ### 検証済みプラットフォーム
 
-- Ubuntu: CI 検証済み
-- macOS Apple Silicon: 手動検証
+- Ubuntu: CI（`ubuntu-latest`、Python 3.10）で `make verify` とリリース成果物のスモークを検証
+- macOS Apple Silicon: macOS 27.0 / arm64、Python 3.14.4、Chrome で、ダウンロードした
+  リリース成果物のクリーンインストール、Stable ジャーニー、キャンセル、強制終了後の再起動、
+  二重起動の拒否、port 衝突、SIGTERM を手動検証
+- Windows: 未検証
 
 いずれも検証状況の表明であり、最終的なエンドユーザー向けサポート宣言ではありません。

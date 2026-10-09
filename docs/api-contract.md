@@ -583,8 +583,13 @@ Query:
 asset 固有の seed と実効パラメータを引き継ぎます。複数生成の各 asset は
 `variation_count=1` の request snapshot を持つため、選択した1枚だけを再利用できます。
 `rerun` で `seed` を省略するか `null` にすると、新しいランダム seed で同じ request を
-再実行します。レビュー画面からの派生理由など、UI 固有の補足情報は `params` に任意の
-JSON 値として保存できます。
+再実行します。省略した項目は元 asset の request から引き継ぎます。`prompt` を省略するか
+空文字（空白のみを含む）にした場合も、元 asset の prompt を使います。Web UI の
+「Reuse and rerun」は、通常 `action: "rerun"` と `project_id` だけを送り、元 request を
+そのまま再実行します。同じ asset を「Load into composer」で読み込んだ後は、composer で
+編集した内容を `variation` として送ります。
+レビュー画面からの派生理由など、UI 固有の補足情報は `params` に任意の JSON 値として
+保存できます。
 
 Request:
 

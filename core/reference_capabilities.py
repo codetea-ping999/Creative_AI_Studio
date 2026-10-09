@@ -154,6 +154,37 @@ class MissingReferenceAssetError(ValueError):
     """
 
 
+def select_effective_references(
+    references: list[ReferenceImageInput],
+) -> list[ReferenceImageInput]:
+    """References that actually condition generation (`strength > 0`).
+
+    `ReferenceImageInput.strength`'s own field description documents 0 as
+    leaving base generation unaffected. A zero-strength reference is
+    audit-only: it must remain visible in requested/provenance metadata, but
+    must never consume conditioning capability -- no per-role limit, no
+    total applied-image limit, no manifest capability requirement, and it is
+    never selected as the primary conditioning reference.
+
+    Callers pass this *filtered* set to `validate_reference_inputs()` and to
+    every other capability/count/primary-selection decision, never the raw
+    `references` list (#387 P1 hotfix: passing the raw list let a
+    zero-strength entry sharing a role with a real one trip
+    `max_references_per_role`, and required reference_capability even when
+    every requested reference was strength=0 and therefore had no
+    conditioning effect at all).
+
+    Shared between `JobService.validate_references()`
+    (`core/jobs/service.py`) and
+    `ImageGenerator._resolve_references_for_conditioning()`
+    (`generators/image/generator.py`) so creation-time preflight and
+    execution-time runtime cannot drift on what "effective" means -- both
+    call this one function rather than each keeping its own filter.
+    """
+
+    return [reference for reference in references if reference.strength > 0.0]
+
+
 def validate_reference_inputs(
     references: list[ReferenceImageInput],
     *,
@@ -165,6 +196,13 @@ def validate_reference_inputs(
     Called with the resolved model's `public_id` (or alias as given by the
     caller) so the message names the model the request actually chose, not an
     internal manifest id the caller never sees.
+
+    Callers must pass an already-effective (`strength > 0`) list -- see
+    `select_effective_references()`. This function itself does not filter by
+    strength; a caller that passes zero-strength entries will have them
+    counted toward `max_references_per_role` and will require
+    `capability.enabled` even for a request with no actual conditioning
+    effect.
     """
 
     if not references:
@@ -218,5 +256,6 @@ __all__ = [
     "ReferencePreprocessing",
     "ReferenceRole",
     "UnsupportedReferenceError",
+    "select_effective_references",
     "validate_reference_inputs",
 ]

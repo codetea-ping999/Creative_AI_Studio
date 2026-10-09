@@ -22,6 +22,7 @@ cd creative-ai-studio-v<VERSION>
 
 # 3. Python 環境を用意する
 python3 -m venv venv
+./venv/bin/pip install --upgrade pip   # venv 同梱の pip は古いことがあるため
 ./venv/bin/pip install -r requirements.txt
 
 # 4. 起動する（ビルド済み UI を API と同じ origin で配信）
@@ -30,6 +31,10 @@ python3 -m venv venv
 
 既定では `http://127.0.0.1:8000` で起動します。port を変える場合はルートの `.env` に
 `API_PORT` を設定してください。
+
+macOS の Safari は既定で `.tar.gz` を自動展開するため、手順 1 の照合ができないことが
+あります。その場合は `curl -LO <URL>` で tarball と `SHA256SUMS` を取得するか、Safari の
+「ダウンロード後、"安全な"ファイルを開く」を無効にしてからダウンロードしてください。
 
 ## 起動後の確認
 

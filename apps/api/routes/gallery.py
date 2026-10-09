@@ -307,7 +307,13 @@ def _build_reuse_request(
     }
     generation_request = source_request.model_copy(
         update={
-            "prompt": req.prompt if req.prompt is not None else source_request.prompt,
+            # A blank prompt can never generate anything, so it means "keep the
+            # source prompt" rather than a request that is doomed to fail.
+            "prompt": (
+                req.prompt
+                if req.prompt is not None and req.prompt.strip()
+                else source_request.prompt
+            ),
             "negative_prompt": (
                 req.negative_prompt
                 if req.negative_prompt is not None

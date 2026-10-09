@@ -146,4 +146,50 @@ describe("LatestJobPanel", () => {
         .getAttribute("aria-pressed"),
     ).toBe("true");
   });
+
+  // #447: Assembly jobs report a still `*_preview.png` preview for their MP4 output.
+  it("plays an Assembly MP4 output with its still preview as the poster", () => {
+    const assemblyJob: JobResponse = {
+      ...succeededJob,
+      id: "job-assembly",
+      media_type: "video",
+      request: { ...succeededJob.request, media_type: "video", output_format: "mp4" },
+      result: {
+        outputs: ["outputs/videos/job-assembly.mp4"],
+        previews: ["outputs/videos/job-assembly_preview.png"],
+        metadata: {},
+      },
+    };
+
+    const { container, rerender } = render(
+      <LatestJobPanel latestJob={assemblyJob} onCancel={async () => undefined} />,
+    );
+
+    const expectAssemblyVideo = () => {
+      const video = container.querySelector(".stage-surface video");
+      expect(video?.getAttribute("src")).toMatch(/job-assembly\.mp4$/);
+      expect(video?.getAttribute("poster")).toMatch(/job-assembly_preview\.png$/);
+      expect(container.querySelector(".stage-surface img")).toBeNull();
+    };
+    expectAssemblyVideo();
+
+    rerender(
+      <LatestJobPanel
+        latestJob={assemblyJob}
+        onCancel={async () => undefined}
+        jobAssets={[
+          {
+            ...baseAsset,
+            asset_id: "asset-assembly",
+            job_id: assemblyJob.id,
+            media_type: "video",
+            output_path: "outputs/videos/job-assembly.mp4",
+            preview_path: "outputs/videos/job-assembly_preview.png",
+          },
+        ]}
+        selectedAssetId="asset-assembly"
+      />,
+    );
+    expectAssemblyVideo();
+  });
 });

@@ -5,6 +5,7 @@ import {
   formatDate,
   formatPercent,
   formatScore,
+  isPlayableVideoAsset,
   terminalStatuses,
   type GalleryItemResponse,
   type JobResponse,
@@ -35,6 +36,15 @@ export function LatestJobPanel({
   const selectedJobAsset =
     orderedJobAssets.find((asset) => asset.asset_id === selectedAssetId) ??
     orderedJobAssets[0];
+  // #447: an Assembly MP4's preview is a still `*_preview.png`; play the output
+  // itself and use the still as the poster frame.
+  const stageOutputPath = selectedJobAsset
+    ? selectedJobAsset.output_path
+    : (latestJob?.result?.outputs[0] ?? null);
+  const stagePosterPath = selectedJobAsset
+    ? selectedJobAsset.preview_path
+    : (latestJob?.result?.previews[0] ?? null);
+  const stageVideoPath = isPlayableVideoAsset(stageOutputPath) ? stageOutputPath : null;
 
   async function handleCancel(): Promise<void> {
     if (cancelRequestInFlight.current) {
@@ -82,12 +92,14 @@ export function LatestJobPanel({
           <StagePreview
             mediaType={latestJob.media_type}
             outputPath={
+              stageVideoPath ??
               selectedJobAsset?.preview_path ??
               selectedJobAsset?.output_path ??
               latestJob.result?.previews[0] ??
               latestJob.result?.outputs[0] ??
               null
             }
+            posterPath={stageVideoPath ? stagePosterPath : null}
             title={latestJob.request.prompt}
             subtitle={latestJob.request.model_id || "default"}
           />

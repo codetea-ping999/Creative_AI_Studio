@@ -88,6 +88,23 @@
 5. ローカル実機（GPU + weight）が用意でき次第、GGUF Golden Path 実測（#45）、30パターン probe 実測（#54）、CogVideoX-2B smoke を行い既定パラメータを決める
 6. 制作時のhuman feedbackを蓄積し（#19）、`make calibration-report` で相関を確認する（#20）
 
+## Desktop Shell v0.1 — 次ステップ（2026-09-13 時点）
+
+状態: PR [#409](https://github.com/codetea-ping999/Creative_AI_Studio/pull/409)
+（`codex/desktop-shell-cors-runtime`）で Desktop Shell v0.1 + CORS + runtime endpoint 解決を実装・検証済み。
+レビュー指摘 3 件（shortcut 非 fatal / 非既定ポート整合 / autostart トグル）は `d97ada3` で解決。
+次にやることの行き先をこの表に固定する。検証手順は `docs/desktop/desktop-shell-runbook.md`。
+
+| 優先度 | 状態 | タスク | 内容 |
+| --- | --- | --- | --- |
+| P0 | Todo | PR #409 のマージ | レビュー解決分は検証済み（Python 1269 / Web 80 / Rust 16 / .app+DMG / smoke ALL PASS）。リリース可否をレビューして `main` へマージ。マージ前に runbook の HEAD 表記を更新する |
+| P0 | Todo | anime-sdxl / ssd-1b の weight 再配置 | `git clean -dfx` で gitignore された `models/` が消失。`scripts/setup_anime_sdxl.py` 等を再実行して復元（ローカル実機 / ネットワーク必要）。`models/` はコミットしない |
+| P1 | Todo | tray autostart トグルの実 UI 操作検証 | accessibility 権限のある GUI で「OFF 初期状態 → `Start on login` 有効化 → `~/Library/LaunchAgents/` の plist 生成 → 無効化 → plist 除去」を 1 回実施し記録 |
+| P1 | Todo | DMG 配布の署名 / notarization | ADR §11: macOS は直接配布（Mac App Store 非対応）。`cargo tauri build` の unsigned DMG を検証・配布対象にできる状態にする |
+| P2 | Future | BackendSupervisor（動的 endpoint / 起動管理） | DesktopRuntime 境界（ADR ¶3 / §7a）経由で React を変えずに動的 endpoint・backend 起動監視を提供。**Rust シェルから Python/FastAPI を spawn しない**不変条件は守る |
+| P2 | Future | Live2D companion migration | ADR §4 の分離対象。別プロセス境界で GPU 所有権を壊さない |
+| P2 | Future | バックエンド未起動時のオンボーディング UX | 接続不可時に「起動手順」を伝える導線（調査レポートの推奨対応 4） |
+
 ## v0.4 候補 — Creative 3D / Game Pipeline
 
 Tracking Epic: [#380](https://github.com/codetea-ping999/Creative_AI_Studio/issues/380)  

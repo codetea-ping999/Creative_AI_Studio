@@ -66,6 +66,10 @@ make release-smoke      # 展開 → venv → 起動 → 通し生成 → SIGTER
 `smoke_release_artifact.py` は開発用チェックアウトではなく展開した成果物に対して
 走ります。これが Gate 3 の「リリース相当の成果物からインストールする」要件です。
 
+RC（`-rc.N`）を切ったあとは、公開や本番版への昇格の前に
+[validation-window.md](validation-window.md) の検証期間を実手元環境で実施します。
+Cloud / CI の green だけでは、このゲートを満たしません。
+
 ### 3. third-party notices を再生成する
 
 ```bash
@@ -99,6 +103,8 @@ git push origin "v$(cat VERSION)"
 公開前に確認すること:
 
 - ドラフトに `creative-ai-studio-v<VERSION>.tar.gz` と `SHA256SUMS` が付いている
+- 両方をダウンロードして同じディレクトリに置き、`sha256sum -c SHA256SUMS` が通る
+- rc など接尾辞付きのタグでは、ドラフトが pre-release として印されている
 - タグが意図した SHA を指している
 - `CHANGELOG.md` の既知の問題が最新である
 

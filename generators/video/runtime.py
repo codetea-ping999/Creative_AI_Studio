@@ -7,6 +7,7 @@ import inspect
 from pathlib import Path
 import random
 import textwrap
+import unicodedata
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -16,6 +17,8 @@ from core.jobs.context import GenerationCancelled
 from core.models import ModelManifest
 from core.schemas import GenerationRequest
 from generators.common import safe_is_cancelled
+from generators.video.fonts import font_for_text
+from generators.video.subtitle_line_breaking import apply_kinsoku_rules
 
 if TYPE_CHECKING:
     from core.jobs.context import GenerationContext
@@ -23,6 +26,67 @@ if TYPE_CHECKING:
 PROCEDURAL_VIDEO_OUTPUT_FORMATS = frozenset({"gif"})
 LEARNED_VIDEO_OUTPUT_FORMATS = frozenset({"mp4"})
 SUPPORTED_VIDEO_OUTPUT_FORMATS = PROCEDURAL_VIDEO_OUTPUT_FORMATS | LEARNED_VIDEO_OUTPUT_FORMATS
+
+# Pixel size of the CJK fallback font on the storyboard text card (#449). The
+# default Latin font is 10px; CJK glyphs need a touch more to stay legible and
+# still fit the card's 18px line pitch.
+_STORYBOARD_FALLBACK_FONT_SIZE = 12
+
+
+def _is_wide(char: str) -> bool:
+    return unicodedata.east_asian_width(char) in ("W", "F")
+
+
+def _display_columns(text: str) -> int:
+    return sum(2 if _is_wide(char) else 1 for char in text)
+
+
+def _wrap_columns(text: str, width: int) -> list[str]:
+    """``textwrap.wrap`` that also breaks space-less CJK text.
+
+    Latin-only text goes through ``textwrap.wrap`` unchanged (identical output
+    to before #449). Text containing wide (CJK) characters is wrapped greedily
+    by display columns, counting a wide character as two columns, then the
+    minimum kinsoku rules are applied so closing punctuation never starts a
+    line (a pulled-back character may run one past ``width``).
+    """
+
+    if not any(_is_wide(char) for char in text):
+        return textwrap.wrap(text, width=width)
+    normalized = " ".join(text.split())
+    lines: list[str] = []
+    current = ""
+    columns = 0
+    for char in normalized:
+        char_columns = 2 if _is_wide(char) else 1
+        if current and columns + char_columns > width:
+            lines.append(current.strip())
+            current = ""
+            columns = 0
+        if not current and char == " ":
+            continue
+        current += char
+        columns += char_columns
+    if current.strip():
+        lines.append(current.strip())
+    return apply_kinsoku_rules(lines)
+
+
+def _shorten_columns(text: str, width: int, placeholder: str = "...") -> str:
+    """``textwrap.shorten`` that also truncates space-less CJK text."""
+
+    if not any(_is_wide(char) for char in text):
+        return textwrap.shorten(text, width=width, placeholder=placeholder)
+    normalized = " ".join(text.split())
+    if _display_columns(normalized) <= width:
+        return normalized
+    budget = width - len(placeholder)
+    kept = ""
+    for char in normalized:
+        if _display_columns(kept + char) > budget:
+            break
+        kept += char
+    return kept.rstrip() + placeholder
 
 
 class BaseVideoRuntime(ABC):
@@ -260,8 +324,14 @@ class ProceduralStoryboardRuntime(BaseVideoRuntime):
                 fill=self._blend_rgb((17, 24, 39), accent_a, 0.25),
             )
 
-        prompt_lines = textwrap.wrap(prompt.strip(), width=34)[:3]
+        prompt_lines = _wrap_columns(prompt.strip(), 34)[:3]
         font = ImageFont.load_default()
+
+        def font_for(text: str) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+            # Keep the default font for text it can render; fall back to a
+            # CJK-capable system font only when it would draw tofu (#449).
+            return font_for_text(text, font, _STORYBOARD_FALLBACK_FONT_SIZE)
+
         panel_x0 = 26
         panel_y0 = 24
         panel_x1 = width - 26
@@ -274,21 +344,23 @@ class ProceduralStoryboardRuntime(BaseVideoRuntime):
             width=2,
         )
         draw.text((44, 42), f"SHOT {index + 1:02d}", fill=(250, 245, 230), font=font)
-        draw.text((138, 42), visual_style.upper(), fill=(245, 197, 104), font=font)
+        style_label = visual_style.upper()
+        draw.text((138, 42), style_label, fill=(245, 197, 104), font=font_for(style_label))
         text_y = 70
         for line in prompt_lines:
-            draw.text((44, text_y), line, fill=(243, 244, 246), font=font)
+            draw.text((44, text_y), line, fill=(243, 244, 246), font=font_for(line))
             text_y += 18
         if negative_prompt:
-            negative_line = textwrap.shorten(
-                f"avoid: {negative_prompt}",
-                width=54,
-                placeholder="...",
+            negative_line = _shorten_columns(f"avoid: {negative_prompt}", 54)
+            draw.text(
+                (44, panel_y1 - 26),
+                negative_line,
+                fill=(252, 165, 165),
+                font=font_for(negative_line),
             )
-            draw.text((44, panel_y1 - 26), negative_line, fill=(252, 165, 165), font=font)
 
         footer = f"{camera_motion} | {total_frames}f | local storyboard"
-        draw.text((44, height - 42), footer, fill=(209, 213, 219), font=font)
+        draw.text((44, height - 42), footer, fill=(209, 213, 219), font=font_for(footer))
         return frame
 
     def _blend_rgb(
