@@ -16,6 +16,7 @@ import {
 import { terminalStatuses, type JobResponse, type JobStatus } from "../studio";
 import { requestJson } from "../studioClient";
 import { jobStatusLabel } from "../lib/jobStatus";
+import { useT, type Translate } from "../i18n";
 
 export type AssemblyTimelinePanelProps = {
   projectId?: string;
@@ -53,8 +54,8 @@ const roleStatusGlyphs: Record<RoleStatus, string> = {
   failed: "✕",
 };
 
-function formatSeconds(value: number): string {
-  return `${value.toFixed(1)} 秒`;
+function formatSeconds(value: number, t: Translate): string {
+  return t("{seconds} 秒", { seconds: value.toFixed(1) });
 }
 
 /**
@@ -142,6 +143,7 @@ function AssemblyTimelineScenes({
   busyRoles: Set<string>;
   onGenerateRole: (scene: StoryScene, role: SceneRole) => void;
 }) {
+  const t = useT();
   const scenes = [...detail.story.scenes].sort((left, right) => left.order - right.order);
   const totalDuration = scenes.reduce((total, scene) => total + scene.duration_seconds, 0);
 
@@ -162,25 +164,25 @@ function AssemblyTimelineScenes({
   const missingCount = hasAssetStatus ? stateCounts.missing : detail.missing_assets.length;
   const summaryParts: string[] = [];
   if (missingCount > 0) {
-    summaryParts.push(`不足素材 ${missingCount} 件`);
+    summaryParts.push(t("不足素材 {count} 件", { count: missingCount }));
   }
   if (stateCounts.generating > 0) {
-    summaryParts.push(`生成中 ${stateCounts.generating} 件`);
+    summaryParts.push(t("生成中 {count} 件", { count: stateCounts.generating }));
   }
   if (stateCounts.failed > 0) {
-    summaryParts.push(`失敗 ${stateCounts.failed} 件`);
+    summaryParts.push(t("失敗 {count} 件", { count: stateCounts.failed }));
   }
   const summarySuffix = summaryParts.length > 0
     ? ` — ${summaryParts.join(" / ")}`
-    : " — 素材はすべて揃っています";
+    : t(" — 素材はすべて揃っています");
 
   if (scenes.length === 0) {
     return (
       <div className="empty-stage story-empty-stage">
         <div>
-          <h3>並べるシーンがありません</h3>
+          <h3>{t("並べるシーンがありません")}</h3>
           <p>
-            Story パネルで Scenes を生成すると、順番・尺・素材の割り当てがここに並びます。
+            {t("ストーリー画面でシーンを生成すると、順番・尺・素材の割り当てがここに並びます。")}
           </p>
         </div>
       </div>
@@ -202,15 +204,15 @@ function AssemblyTimelineScenes({
     <div className="story-scene-table__scroll assembly-timeline-scroll">
       <table className="story-scene-table assembly-timeline-table">
         <caption>
-          {scenes.length} シーン / 合計 {formatSeconds(totalDuration)}
+          {t("{count} シーン / 合計 {duration}", { count: scenes.length, duration: formatSeconds(totalDuration, t) })}
           {summarySuffix}
         </caption>
         <thead>
           <tr>
             <th scope="col">#</th>
-            <th scope="col">シーン</th>
-            <th scope="col">開始 / 尺</th>
-            <th scope="col">素材の割り当て</th>
+            <th scope="col">{t("シーン")}</th>
+            <th scope="col">{t("開始 / 尺")}</th>
+            <th scope="col">{t("素材の割り当て")}</th>
           </tr>
         </thead>
         <tbody>
@@ -219,25 +221,25 @@ function AssemblyTimelineScenes({
             const sceneStatus = statusByScene.get(scene.id);
             return (
               <tr key={scene.id}>
-                <td data-label="順番">{index + 1}</td>
-                <td data-label="シーン">
+                <td data-label={t("順番")}>{index + 1}</td>
+                <td data-label={t("シーン")}>
                   <strong className="story-scene-title">{scene.heading || scene.id}</strong>
                   {scene.narration ? (
                     <p className="story-scene-narration">
-                      <span>ナレーション</span>
+                      <span>{t("ナレーション")}</span>
                       {scene.narration}
                     </p>
                   ) : (
-                    <p>ナレーションなし（無音のカット）</p>
+                    <p>{t("ナレーションなし（無音のカット）")}</p>
                   )}
                 </td>
-                <td data-label="開始 / 尺">
+                <td data-label={t("開始 / 尺")}>
                   <span className="story-scene-duration">
                     {startSeconds.toFixed(1)}s → {endSeconds.toFixed(1)}s
                   </span>
-                  <span>{formatSeconds(scene.duration_seconds)}</span>
+                  <span>{formatSeconds(scene.duration_seconds, t)}</span>
                 </td>
-                <td data-label="素材の割り当て">
+                <td data-label={t("素材の割り当て")}>
                   <ul className="assembly-timeline-roles">
                     {roleOrder.map((role) => {
                       const statusEntry = sceneStatus?.get(role);
@@ -256,16 +258,16 @@ function AssemblyTimelineScenes({
                             {roleStatusGlyphs[status]}
                           </span>
                           <span className="assembly-timeline-role__name">
-                            {sceneRoleLabels[role]}
+                            {t(sceneRoleLabels[role])}
                           </span>
                           <span className="assembly-timeline-role__status">
                             {assetId
-                              ? `${roleStatusLabels[status]}（${assetId}）`
-                              : roleStatusLabels[status]}
+                              ? t("{status}（{asset}）", { status: t(roleStatusLabels[status]), asset: assetId })
+                              : t(roleStatusLabels[status])}
                           </span>
                           {status === "failed" && statusEntry?.error_message ? (
                             <details className="assembly-timeline-role__reason">
-                              <summary>失敗の理由</summary>
+                              <summary>{t("失敗の理由")}</summary>
                               <p>{statusEntry.error_message}</p>
                             </details>
                           ) : null}
@@ -276,7 +278,7 @@ function AssemblyTimelineScenes({
                               disabled
                               aria-busy="true"
                             >
-                              {sceneRoleLabels[role]}を生成中…
+                              {t("{role}を生成中…", { role: t(sceneRoleLabels[role]) })}
                             </button>
                           ) : canLaunch ? (
                             <button
@@ -285,8 +287,8 @@ function AssemblyTimelineScenes({
                               onClick={() => onGenerateRole(scene, role)}
                             >
                               {status === "failed"
-                                ? `${sceneRoleLabels[role]}を再試行`
-                                : `${sceneRoleLabels[role]}を生成`}
+                                ? t("{role}を再試行", { role: t(sceneRoleLabels[role]) })
+                                : t("{role}を生成", { role: t(sceneRoleLabels[role]) })}
                             </button>
                           ) : null}
                         </li>
@@ -317,6 +319,7 @@ function AssemblyTimelineScenes({
  * generation for a missing or failed role straight from its scene row.
  */
 export function AssemblyTimelinePanel({ projectId }: AssemblyTimelinePanelProps) {
+  const t = useT();
   const [stories, setStories] = useState<StorySummary[]>([]);
   const [listState, setListState] = useState<LoadState>("loading");
   const [selectedStoryId, setSelectedStoryId] = useState("");
@@ -413,7 +416,7 @@ export function AssemblyTimelinePanel({ projectId }: AssemblyTimelinePanelProps)
         }
         if (finalStatus !== "succeeded") {
           setActionError(
-            `${sceneRoleLabels[role]}の生成が「${jobStatusLabel(finalStatus)}」で終了しました（${scene.heading || scene.id}）。`,
+            t("{role}の生成が「{status}」で終了しました（{scene}）。", { role: t(sceneRoleLabels[role]), status: t(jobStatusLabel(finalStatus)), scene: scene.heading || scene.id }),
           );
         }
       } catch (cause) {
@@ -426,7 +429,7 @@ export function AssemblyTimelinePanel({ projectId }: AssemblyTimelinePanelProps)
         });
       }
     },
-    [detail, busyRoles],
+    [detail, busyRoles, t],
   );
 
   return (
@@ -436,11 +439,11 @@ export function AssemblyTimelinePanel({ projectId }: AssemblyTimelinePanelProps)
     >
       <div className="section-card__header assembly-timeline-panel__header">
         <div>
-          <p className="eyebrow">タイムライン</p>
-          <h2 id="assembly-timeline-panel-heading">タイムライン</h2>
+          <p className="eyebrow">{t("タイムライン")}</p>
+          <h2 id="assembly-timeline-panel-heading">{t("タイムライン")}</h2>
         </div>
         <p className="section-footnote">
-          書き出し前に、シーンの順番・尺・素材の割り当てを確認します。
+          {t("書き出し前に、シーンの順番・尺・素材の割り当てを確認します。")}
         </p>
       </div>
 
@@ -454,7 +457,7 @@ export function AssemblyTimelinePanel({ projectId }: AssemblyTimelinePanelProps)
               void (selectedStoryId ? loadDetail(selectedStoryId) : refreshStories())
             }
           >
-            再試行
+            {t("再試行")}
           </button>
         </div>
       ) : null}
@@ -466,17 +469,17 @@ export function AssemblyTimelinePanel({ projectId }: AssemblyTimelinePanelProps)
       ) : null}
 
       {listState === "loading" ? (
-        <AssemblyTimelineLoading label="ストーリー一覧を読み込んでいます…" />
+        <AssemblyTimelineLoading label={t("ストーリー一覧を読み込んでいます…")} />
       ) : (
         <label className="field-group field-group--full">
-          <span>表示するストーリー</span>
+          <span>{t("表示するストーリー")}</span>
           <select
             value={selectedStoryId}
             onChange={(event) => setSelectedStoryId(event.target.value)}
             disabled={listState === "error" || stories.length === 0}
           >
             <option value="">
-              {stories.length === 0 ? "保存済みストーリーはありません" : "選択してください"}
+              {stories.length === 0 ? t("保存済みストーリーはありません") : t("選択してください")}
             </option>
             {stories.map((entry) => (
               <option key={entry.id} value={entry.id}>
@@ -490,12 +493,12 @@ export function AssemblyTimelinePanel({ projectId }: AssemblyTimelinePanelProps)
       {!selectedStoryId && listState === "ready" ? (
         <div className="empty-stage story-empty-stage">
           <div>
-            <h3>表示するストーリーがありません</h3>
-            <p>ストーリーを選択すると、シーン順のタイムラインが表示されます。</p>
+            <h3>{t("表示するストーリーがありません")}</h3>
+            <p>{t("ストーリーを選択すると、シーン順のタイムラインが表示されます。")}</p>
           </div>
         </div>
       ) : detailState === "loading" ? (
-        <AssemblyTimelineLoading label="タイムラインを読み込んでいます…" />
+        <AssemblyTimelineLoading label={t("タイムラインを読み込んでいます…")} />
       ) : detail ? (
         <AssemblyTimelineScenes
           detail={detail}

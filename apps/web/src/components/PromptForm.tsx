@@ -19,6 +19,7 @@ import type {
   PromptFormSubmitValues,
   VideoPreset,
 } from "./promptFormTypes";
+import { useT } from "../i18n";
 
 export type {
   LoraOption,
@@ -162,13 +163,14 @@ export function PromptForm({
   modelOptions = [],
   loraOptions = [],
   initialValues,
-  submitLabel = "生成する",
+  submitLabel,
   disabled = false,
   canSubmit = true,
   statusMessage = null,
   onSubmit,
   onDraftChange,
 }: PromptFormProps) {
+  const t = useT();
   const [formValues, setFormValues] = useState<PromptFormState>(() =>
     createInitialState(initialValues),
   );
@@ -410,28 +412,28 @@ export function PromptForm({
     <section className="form-section">
       <div className="form-section__header">
         <div>
-          <h3>プロンプト</h3>
+          <h3>{t("プロンプト")}</h3>
           <p>
             {mediaType === "image"
-              ? "細かな設定の前に、まず主役を言葉で決めます"
+              ? t("細かな設定の前に、まず主役を言葉で決めます")
               : mediaType === "audio"
-                ? "細かな設定の前に、まず雰囲気を言葉で決めます"
-                : "細かな設定の前に、まず見せたい場面を言葉で決めます"}
+                ? t("細かな設定の前に、まず雰囲気を言葉で決めます")
+                : t("細かな設定の前に、まず見せたい場面を言葉で決めます")}
           </p>
         </div>
       </div>
 
       <label className="field-group field-group--full">
-        <span>プロンプト</span>
+        <span>{t("プロンプト")}</span>
         <textarea
           name="prompt"
           rows={controlMode === "quick" ? 4 : 5}
           placeholder={
             mediaType === "image"
-              ? "作りたい画像を書いてください"
+              ? t("作りたい画像を書いてください")
               : mediaType === "audio"
-                ? "作りたい音楽を書いてください"
-                : "作りたい動画（絵コンテ）の場面を書いてください"
+                ? t("作りたい音楽を書いてください")
+                : t("作りたい動画（絵コンテ）の場面を書いてください")
           }
           value={formValues.prompt}
           onChange={(event) => setFieldValue("prompt", event.target.value)}
@@ -442,11 +444,11 @@ export function PromptForm({
       {(controlMode === "advanced" || mediaType === "video") &&
       (mediaType === "image" || mediaType === "video") ? (
         <label className="field-group field-group--full">
-          <span>避けたい要素</span>
+          <span>{t("避けたい要素")}</span>
           <textarea
             name="negativePrompt"
             rows={4}
-            placeholder="例：ぼやけ、余分な人物、文字"
+            placeholder={t("例：ぼやけ、余分な人物、文字")}
             value={formValues.negativePrompt}
             onChange={(event) => setFieldValue("negativePrompt", event.target.value)}
             disabled={disabled}
@@ -465,11 +467,11 @@ export function PromptForm({
       <section className="form-section simple-brief">
         <div className="form-section__header">
           <div>
-            <h3>何を作りたいですか？</h3>
-            <p>用途、主役、雰囲気を選ぶと、送信する内容を下に組み立てます。</p>
+            <h3>{t("何を作りたいですか？")}</h3>
+            <p>{t("用途、主役、雰囲気を選ぶと、送信する内容を下に組み立てます。")}</p>
           </div>
         </div>
-        <div className="preset-row" role="group" aria-label="制作目的">
+        <div className="preset-row" role="group" aria-label={t("制作目的")}>
           {["SNS投稿", "キャラクター", "商品イメージ", "YouTube サムネイル", "自由入力"].map((purpose) => (
             <button
               key={purpose}
@@ -479,50 +481,50 @@ export function PromptForm({
               aria-pressed={formValues.imageBriefPurpose === purpose}
               disabled={disabled}
             >
-              {purpose}
+              {t(purpose)}
             </button>
           ))}
         </div>
         <div className="field-grid field-grid--balanced">
           <label className="field-group">
-            <span>1. 主役・内容</span>
+            <span>{t("1. 主役・内容")}</span>
             <input
               type="text"
               value={formValues.imageBriefSubject}
               onChange={(event) => setFieldValue("imageBriefSubject", event.target.value)}
-              placeholder="例：夕暮れのカフェで本を読む人物"
+              placeholder={t("例：夕暮れのカフェで本を読む人物")}
               disabled={disabled}
             />
           </label>
           <label className="field-group">
-            <span>2. 雰囲気</span>
+            <span>{t("2. 雰囲気")}</span>
             <select
               value={formValues.imageBriefMood}
               onChange={(event) => setFieldValue("imageBriefMood", event.target.value)}
               disabled={disabled}
             >
-              <option value="やわらかい光">やわらかい光</option>
-              <option value="明るくクリーン">明るくクリーン</option>
-              <option value="映画のような光">映画のような光</option>
-              <option value="落ち着いたトーン">落ち着いたトーン</option>
+              <option value="やわらかい光">{t("やわらかい光")}</option>
+              <option value="明るくクリーン">{t("明るくクリーン")}</option>
+              <option value="映画のような光">{t("映画のような光")}</option>
+              <option value="落ち着いたトーン">{t("落ち着いたトーン")}</option>
             </select>
           </label>
         </div>
         <label className="field-group field-group--full">
-          <span>避けたい要素</span>
+          <span>{t("避けたい要素")}</span>
           <input
             type="text"
             value={formValues.negativePrompt}
             onChange={(event) => setFieldValue("negativePrompt", event.target.value)}
-            placeholder="例：文字、ぼやけ、余分な人物"
+            placeholder={t("例：文字、ぼやけ、余分な人物")}
             disabled={disabled}
           />
         </label>
         <div className="simple-brief__summary">
           <div>
-            <span>作られる内容の要約</span>
+            <span>{t("作られる内容の要約")}</span>
             <strong>{[
-              formValues.imageBriefSubject || "主役を入力",
+              formValues.imageBriefSubject || t("主役を入力"),
               formValues.imageBriefPurpose,
               formValues.imageBriefMood,
             ].join("、")}</strong>
@@ -533,7 +535,7 @@ export function PromptForm({
             onClick={applySimpleBrief}
             disabled={disabled || !formValues.imageBriefSubject.trim()}
           >
-            プロンプトに反映
+            {t("プロンプトに反映")}
           </button>
         </div>
       </section>
@@ -546,14 +548,14 @@ export function PromptForm({
         <section className="form-section">
           <div className="form-section__header">
             <div>
-              <h3>基本の設定</h3>
-              <p>縦横比と画風だけ決めれば作れます</p>
+              <h3>{t("基本の設定")}</h3>
+              <p>{t("縦横比と画風だけ決めれば作れます")}</p>
             </div>
           </div>
 
           <div className="field-grid field-grid--balanced">
             <label className="field-group">
-              <span>縦横比</span>
+              <span>{t("縦横比")}</span>
               <select
                 name="imageFormat"
                 value={imageFormatValue}
@@ -571,16 +573,16 @@ export function PromptForm({
               >
                 {imageFormatPresets.map((preset) => (
                   <option key={preset.value} value={preset.value}>
-                    {preset.label}
+                    {t(preset.label)}
                   </option>
                 ))}
-                <option value="custom">カスタム</option>
+                <option value="custom">{t("カスタム")}</option>
               </select>
             </label>
 
             {loraOptions.length > 0 ? (
               <label className="field-group">
-                <span>画風（LoRA）</span>
+                <span>{t("画風（LoRA）")}</span>
                 <select
                   name="loraPreset"
                   value={
@@ -591,7 +593,7 @@ export function PromptForm({
                   onChange={(event) => setFieldValue("loraPath", event.target.value)}
                   disabled={disabled}
                 >
-                  <option value="">ベースモデルのみ</option>
+                  <option value="">{t("ベースモデルのみ")}</option>
                   {loraOptions.map((option) => (
                     <option key={option.id} value={option.path}>
                       {option.displayName}
@@ -610,14 +612,14 @@ export function PromptForm({
         <section className="form-section">
           <div className="form-section__header">
             <div>
-              <h3>基本の設定</h3>
-              <p>長さ、テンポ、雰囲気、構成を決めます</p>
+              <h3>{t("基本の設定")}</h3>
+              <p>{t("長さ、テンポ、雰囲気、構成を決めます")}</p>
             </div>
           </div>
 
           <div className="field-grid field-grid--controls">
             <label className="field-group">
-              <span>長さ（秒）</span>
+              <span>{t("長さ（秒）")}</span>
               <input
                 type="number"
                 inputMode="numeric"
@@ -632,7 +634,7 @@ export function PromptForm({
             </label>
             {isLongFormAudio ? (
               <label className="field-group">
-                <span>延長の間隔（秒）</span>
+                <span>{t("延長の間隔（秒）")}</span>
                 <input
                   type="number"
                   inputMode="numeric"
@@ -640,7 +642,7 @@ export function PromptForm({
                   max="29"
                   step="1"
                   name="extendStrideSeconds"
-                  aria-label="延長の間隔（秒）"
+                  aria-label={t("延長の間隔（秒）")}
                   aria-describedby="audio-extend-stride-help"
                   value={formValues.extendStrideSeconds}
                   onChange={(event) =>
@@ -649,7 +651,7 @@ export function PromptForm({
                   disabled={disabled}
                 />
                 <small id="audio-extend-stride-help" className="field-help">
-                  生成区間を重ねる間隔です。小さいほど文脈を保ちますが処理時間が増えます。
+                  {t("生成区間を重ねる間隔です。小さいほど文脈を保ちますが処理時間が増えます。")}
                 </small>
               </label>
             ) : null}
@@ -668,7 +670,7 @@ export function PromptForm({
               />
             </label>
             <label className="field-group">
-              <span>雰囲気</span>
+              <span>{t("雰囲気")}</span>
               <select
                 name="mood"
                 value={formValues.mood}
@@ -676,17 +678,17 @@ export function PromptForm({
                 disabled={disabled}
               >
                 {formValues.mood && !hasOption(audioMoodOptions, formValues.mood) ? (
-                  <option value={formValues.mood}>{formValues.mood}（復元）</option>
+                  <option value={formValues.mood}>{t("{value}（復元）", { value: formValues.mood })}</option>
                 ) : null}
                 {audioMoodOptions.map((option) => (
                   <option key={option.value} value={option.value}>
-                    {option.label}
+                    {t(option.label)}
                   </option>
                 ))}
               </select>
             </label>
             <label className="field-group">
-              <span>ジャンル</span>
+              <span>{t("ジャンル")}</span>
               <select
                 name="genre"
                 value={formValues.genre}
@@ -694,17 +696,17 @@ export function PromptForm({
                 disabled={disabled}
               >
                 {formValues.genre && !hasOption(audioGenreOptions, formValues.genre) ? (
-                  <option value={formValues.genre}>{formValues.genre}（復元）</option>
+                  <option value={formValues.genre}>{t("{value}（復元）", { value: formValues.genre })}</option>
                 ) : null}
                 {audioGenreOptions.map((option) => (
                   <option key={option.value} value={option.value}>
-                    {option.label}
+                    {t(option.label)}
                   </option>
                 ))}
               </select>
             </label>
             <label className="field-group">
-              <span>構成</span>
+              <span>{t("構成")}</span>
               <select
                 name="structure"
                 value={formValues.structure}
@@ -714,12 +716,12 @@ export function PromptForm({
                 {formValues.structure &&
                 !hasOption(audioStructureOptions, formValues.structure) ? (
                   <option value={formValues.structure}>
-                    {formValues.structure}（復元）
+                    {t("{value}（復元）", { value: formValues.structure })}
                   </option>
                 ) : null}
                 {audioStructureOptions.map((option) => (
                   <option key={option.value} value={option.value}>
-                    {option.label}
+                    {t(option.label)}
                   </option>
                 ))}
               </select>
@@ -727,19 +729,19 @@ export function PromptForm({
           </div>
 
           <label className="field-group field-group--full">
-            <span>楽器</span>
+            <span>{t("楽器")}</span>
             <input
               type="text"
               name="instruments"
-              aria-label="楽器"
+              aria-label={t("楽器")}
               aria-describedby="audio-instruments-help"
-              placeholder="例：warm synth, soft percussion, electric bass"
+              placeholder={t("例：warm synth, soft percussion, electric bass")}
               value={formValues.instruments}
               onChange={(event) => setFieldValue("instruments", event.target.value)}
               disabled={disabled}
             />
             <small id="audio-instruments-help" className="field-help">
-              カンマ区切りの楽器指定を、ジャンル・構成・BPMと一緒にMusicGenへ渡します。
+              {t("カンマ区切りの楽器指定を、ジャンル・構成・BPMと一緒にMusicGenへ渡します。")}
             </small>
           </label>
         </section>
@@ -750,14 +752,14 @@ export function PromptForm({
       <section className="form-section">
         <div className="form-section__header">
           <div>
-            <h3>基本の設定</h3>
-            <p>長さ、カメラの動き、絵コンテの見た目を決めます</p>
+            <h3>{t("基本の設定")}</h3>
+            <p>{t("長さ、カメラの動き、絵コンテの見た目を決めます")}</p>
           </div>
         </div>
 
         <div className="field-grid field-grid--controls">
           <label className="field-group">
-            <span>長さ（秒）</span>
+            <span>{t("長さ（秒）")}</span>
             <input
               type="number"
               inputMode="numeric"
@@ -770,31 +772,31 @@ export function PromptForm({
             />
           </label>
           <label className="field-group">
-            <span>カメラの動き</span>
+            <span>{t("カメラの動き")}</span>
             <select
               name="cameraMotion"
               value={formValues.cameraMotion}
               onChange={(event) => setFieldValue("cameraMotion", event.target.value)}
               disabled={disabled}
             >
-              <option value="push-in">寄る</option>
-              <option value="orbit">回り込む</option>
-              <option value="tilt-up">見上げる</option>
-              <option value="lateral">横に流す</option>
+              <option value="push-in">{t("寄る")}</option>
+              <option value="orbit">{t("回り込む")}</option>
+              <option value="tilt-up">{t("見上げる")}</option>
+              <option value="lateral">{t("横に流す")}</option>
             </select>
           </label>
           <label className="field-group">
-            <span>絵コンテの見た目</span>
+            <span>{t("絵コンテの見た目")}</span>
             <select
               name="visualStyle"
               value={formValues.visualStyle}
               onChange={(event) => setFieldValue("visualStyle", event.target.value)}
               disabled={disabled}
             >
-              <option value="storyboard">絵コンテ</option>
-              <option value="editorial-board">エディトリアル</option>
-              <option value="animatic">アニマティック</option>
-              <option value="blocking-pass">配置確認</option>
+              <option value="storyboard">{t("絵コンテ")}</option>
+              <option value="editorial-board">{t("エディトリアル")}</option>
+              <option value="animatic">{t("アニマティック")}</option>
+              <option value="blocking-pass">{t("配置確認")}</option>
             </select>
           </label>
         </div>
@@ -808,14 +810,14 @@ export function PromptForm({
         <section className="form-section">
           <div className="form-section__header">
             <div>
-              <h3>詳細設定</h3>
-              <p>サイズ、ステップ数、シード、LoRA の強さを調整します</p>
+              <h3>{t("詳細設定")}</h3>
+              <p>{t("サイズ、ステップ数、シード、LoRA の強さを調整します")}</p>
             </div>
           </div>
 
           <div className="field-grid field-grid--controls">
             <label className="field-group">
-              <span>幅</span>
+              <span>{t("幅")}</span>
               <input
                 type="number"
                 inputMode="numeric"
@@ -828,7 +830,7 @@ export function PromptForm({
               />
             </label>
             <label className="field-group">
-              <span>高さ</span>
+              <span>{t("高さ")}</span>
               <input
                 type="number"
                 inputMode="numeric"
@@ -841,7 +843,7 @@ export function PromptForm({
               />
             </label>
             <label className="field-group">
-              <span>ステップ数</span>
+              <span>{t("ステップ数")}</span>
               <input
                 type="number"
                 inputMode="numeric"
@@ -854,7 +856,7 @@ export function PromptForm({
               />
             </label>
             <label className="field-group">
-              <span>プロンプトへの忠実さ</span>
+              <span>{t("プロンプトへの忠実さ")}</span>
               <input
                 type="number"
                 inputMode="decimal"
@@ -867,20 +869,20 @@ export function PromptForm({
               />
             </label>
             <label className="field-group">
-              <span>シード</span>
+              <span>{t("シード")}</span>
               <input
                 type="number"
                 inputMode="numeric"
                 step="1"
                 name="seed"
-                placeholder="ランダム"
+                placeholder={t("ランダム")}
                 value={formValues.seed}
                 onChange={(event) => setFieldValue("seed", event.target.value)}
                 disabled={disabled}
               />
             </label>
             <div className="field-group">
-              <label htmlFor="variation-count">作る枚数</label>
+              <label htmlFor="variation-count">{t("作る枚数")}</label>
               <input
                 id="variation-count"
                 type="number"
@@ -897,11 +899,11 @@ export function PromptForm({
                 disabled={disabled}
               />
               <small id="variation-count-hint" className="field-hint">
-                1〜4 枚。シードを変えて再現できる形で作ります。
+                {t("1〜4 枚。シードを変えて再現できる形で作ります。")}
               </small>
             </div>
             <label className="field-group">
-              <span>LoRA の強さ</span>
+              <span>{t("LoRA の強さ")}</span>
               <input
                 type="number"
                 inputMode="decimal"
@@ -916,7 +918,7 @@ export function PromptForm({
           </div>
 
           <label className="field-group field-group--full">
-            <span>LoRA のパス</span>
+            <span>{t("LoRA のパス")}</span>
             <input
               type="text"
               name="loraPath"
@@ -935,14 +937,14 @@ export function PromptForm({
         <section className="form-section">
           <div className="form-section__header">
             <div>
-              <h3>詳細設定</h3>
-              <p>プロンプトへの忠実さと、ばらつきを調整します</p>
+              <h3>{t("詳細設定")}</h3>
+              <p>{t("プロンプトへの忠実さと、ばらつきを調整します")}</p>
             </div>
           </div>
 
           <div className="field-grid field-grid--balanced">
             <label className="field-group">
-              <span>プロンプトへの忠実さ</span>
+              <span>{t("プロンプトへの忠実さ")}</span>
               <input
                 type="number"
                 inputMode="decimal"
@@ -956,7 +958,7 @@ export function PromptForm({
               />
             </label>
             <label className="field-group">
-              <span>ばらつき（Temperature）</span>
+              <span>{t("ばらつき（Temperature）")}</span>
               <input
                 type="number"
                 inputMode="decimal"
@@ -998,13 +1000,13 @@ export function PromptForm({
               />
             </label>
             <label className="field-group">
-              <span>シード</span>
+              <span>{t("シード")}</span>
               <input
                 type="number"
                 inputMode="numeric"
                 step="1"
                 name="seed"
-                placeholder="ランダム"
+                placeholder={t("ランダム")}
                 value={formValues.seed}
                 onChange={(event) => setFieldValue("seed", event.target.value)}
                 disabled={disabled}
@@ -1019,14 +1021,14 @@ export function PromptForm({
       <section className="form-section">
         <div className="form-section__header">
           <div>
-            <h3>詳細設定</h3>
-            <p>サイズとシードを指定して、同じ結果を作り直せるようにします</p>
+            <h3>{t("詳細設定")}</h3>
+            <p>{t("サイズとシードを指定して、同じ結果を作り直せるようにします")}</p>
           </div>
         </div>
 
         <div className="field-grid field-grid--controls">
           <label className="field-group">
-            <span>幅</span>
+            <span>{t("幅")}</span>
             <input
               type="number"
               inputMode="numeric"
@@ -1039,7 +1041,7 @@ export function PromptForm({
             />
           </label>
           <label className="field-group">
-            <span>高さ</span>
+            <span>{t("高さ")}</span>
             <input
               type="number"
               inputMode="numeric"
@@ -1052,13 +1054,13 @@ export function PromptForm({
             />
           </label>
           <label className="field-group">
-            <span>シード</span>
+            <span>{t("シード")}</span>
             <input
               type="number"
               inputMode="numeric"
               step="1"
               name="seed"
-              placeholder="ランダム"
+              placeholder={t("ランダム")}
               value={formValues.seed}
               onChange={(event) => setFieldValue("seed", event.target.value)}
               disabled={disabled}
@@ -1075,22 +1077,22 @@ export function PromptForm({
         <div>
           <p className="eyebrow">
             {mediaType === "image"
-              ? "画像の下書き"
+              ? t("画像の下書き")
               : mediaType === "audio"
-                ? "音楽の下書き"
-                : "動画の下書き"}
+                ? t("音楽の下書き")
+                : t("動画の下書き")}
           </p>
           <p className="toolbar-copy">
             {mediaType === "image"
-              ? "短い言葉で主役を決め、モデルと LoRA で画風を寄せます。"
+              ? t("短い言葉で主役を決め、モデルと LoRA で画風を寄せます。")
               : mediaType === "audio"
-                ? "雰囲気、テンポ、長さを先に決めて、すぐに再生できるローカルループを作ります。"
-                : "プロンプトを絵コンテ動画にして、構図とカメラの動きをすばやく確かめます。"}
+                ? t("雰囲気、テンポ、長さを先に決めて、すぐに再生できるローカルループを作ります。")
+                : t("プロンプトを絵コンテ動画にして、構図とカメラの動きをすばやく確かめます。")}
           </p>
         </div>
 
         <div className="toolbar-actions">
-          <div className="preset-row" role="group" aria-label="プリセット">
+          <div className="preset-row" role="group" aria-label={t("プリセット")}>
             {mediaType === "image"
               ? imagePresets.map((preset) => (
                   <button
@@ -1100,7 +1102,7 @@ export function PromptForm({
                     onClick={() => applyImagePreset(preset)}
                     disabled={disabled}
                   >
-                    {preset.name}
+                    {t(preset.name)}
                   </button>
                 ))
               : mediaType === "audio"
@@ -1112,7 +1114,7 @@ export function PromptForm({
                       onClick={() => applyAudioPreset(preset)}
                       disabled={disabled}
                     >
-                      {preset.name}
+                      {t(preset.name)}
                     </button>
                   ))
                 : videoPresets.map((preset) => (
@@ -1123,12 +1125,12 @@ export function PromptForm({
                       onClick={() => applyVideoPreset(preset)}
                       disabled={disabled}
                     >
-                      {preset.name}
+                      {t(preset.name)}
                     </button>
                   ))}
           </div>
 
-          <div className="mode-toggle" role="tablist" aria-label="設定の細かさ">
+          <div className="mode-toggle" role="tablist" aria-label={t("設定の細かさ")}>
             <button
               type="button"
               role="tab"
@@ -1139,7 +1141,7 @@ export function PromptForm({
               onClick={() => setControlMode("quick")}
               disabled={disabled}
             >
-              かんたん
+              {t("かんたん")}
             </button>
             <button
               type="button"
@@ -1151,7 +1153,7 @@ export function PromptForm({
               onClick={() => setControlMode("advanced")}
               disabled={disabled}
             >
-              詳細
+              {t("詳細")}
             </button>
           </div>
         </div>
@@ -1176,27 +1178,27 @@ export function PromptForm({
             <div>
               <h3>
                 {mediaType === "image"
-                  ? "モデルを選ぶ"
+                  ? t("モデルを選ぶ")
                   : mediaType === "audio"
-                    ? "モデルを選ぶ"
-                    : "モデルを選ぶ"}
+                    ? t("モデルを選ぶ")
+                    : t("モデルを選ぶ")}
               </h3>
               <p>
                 {mediaType === "image"
-                  ? "使える画像モデルから選びます"
+                  ? t("使える画像モデルから選びます")
                   : mediaType === "audio"
-                    ? "使える音声モデルから選びます"
-                    : "使える動画モデルから選びます。重みがなくても絵コンテは作れます"}
+                    ? t("使える音声モデルから選びます")
+                    : t("使える動画モデルから選びます。重みがなくても絵コンテは作れます")}
               </p>
             </div>
             {modelOptions.length > 0 ? (
-              <div className="form-inline-stats" aria-label="モデルの配置状況">
+              <div className="form-inline-stats" aria-label={t("モデルの配置状況")}>
                 <span className="form-inline-stats__item">
-                  配置済み {availableModelCount}/{modelOptions.length}
+                  {t("配置済み {count}/{total}", { count: availableModelCount, total: modelOptions.length })}
                 </span>
                 {unavailableModelCount > 0 ? (
                   <span className="form-inline-stats__item">
-                    未配置 {unavailableModelCount}
+                    {t("未配置 {count}", { count: unavailableModelCount })}
                   </span>
                 ) : null}
               </div>
@@ -1206,7 +1208,7 @@ export function PromptForm({
           <div className="field-grid field-grid--balanced">
             {modelOptions.length > 0 ? (
               <label className="field-group field-group--full">
-                <span>モデル</span>
+                <span>{t("モデル")}</span>
                 <select
                   name="modelId"
                   value={formValues.modelId}
@@ -1214,7 +1216,7 @@ export function PromptForm({
                   disabled={disabled || availableModelCount === 0}
                 >
                   {availableModelCount === 0 ? (
-                    <option value="">使えるモデルがありません</option>
+                    <option value="">{t("使えるモデルがありません")}</option>
                   ) : null}
                   {modelOptions.map((option) => (
                     <option
@@ -1232,7 +1234,7 @@ export function PromptForm({
 
             {controlMode === "advanced" && mediaType === "image" && loraOptions.length > 0 ? (
               <label className="field-group field-group--full">
-                <span>LoRA 一覧</span>
+                <span>{t("LoRA 一覧")}</span>
                 <select
                   name="loraPreset"
                   value={
@@ -1243,7 +1245,7 @@ export function PromptForm({
                   onChange={(event) => setFieldValue("loraPath", event.target.value)}
                   disabled={disabled}
                 >
-                  <option value="">使わない</option>
+                  <option value="">{t("使わない")}</option>
                   {loraOptions.map((option) => (
                     <option key={option.id} value={option.path}>
                       {option.displayName} ({option.relativePath})
@@ -1251,7 +1253,7 @@ export function PromptForm({
                   ))}
                 </select>
                 <small className="field-help">
-                  ローカル配置済み LoRA を選択できます。必要なら下で手入力も可能です。
+                  {t("ローカル配置済み LoRA を選択できます。必要なら下で手入力も可能です。")}
                 </small>
               </label>
             ) : null}
@@ -1259,8 +1261,9 @@ export function PromptForm({
 
           {unavailableModels.length > 0 ? (
             <p className="model-availability-note" role="status" aria-live="polite">
-              未配置: {unavailableModels.map((option) => option.displayName).join("、")}
-              。配置先と必要なファイルは「準備」画面で確認できます。
+              {t("未配置: {names}。配置先と必要なファイルは「準備」画面で確認できます。", {
+                names: unavailableModels.map((option) => option.displayName).join(t("、")),
+              })}
             </p>
           ) : null}
         </section>
@@ -1271,7 +1274,7 @@ export function PromptForm({
           type="submit" 
           disabled={disabled || !canSubmit}
         >
-          {submitLabel}
+          {submitLabel ?? t("生成する")}
         </button>
       </div>
     </form>

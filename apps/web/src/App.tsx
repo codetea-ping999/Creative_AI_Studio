@@ -67,6 +67,7 @@ import {
   viewHref,
 } from "./hooks/useStudioView";
 import { jobStatusLabel } from "./lib/jobStatus";
+import { localeLabels, supportedLocales, useLocale, useT } from "./i18n";
 
 type ThemeMode = "light" | "dark";
 const MEDIA_STORAGE_KEY = "creative-ai-studio.media-type";
@@ -115,6 +116,8 @@ type AssetReuseOptions = {
 };
 
 function App() {
+  const t = useT();
+  const { locale, setLocale } = useLocale();
   const [view, setView] = useStudioView();
   const [themeMode, setThemeMode] = useState<ThemeMode>("dark");
   const [mediaType, setMediaTypeState] = useState<MediaType>(
@@ -183,20 +186,20 @@ function App() {
         setIsSubmitting(false);
         setStatusMessage(
           payload.status === "succeeded"
-            ? "生成が終わりました。"
-            : payload.error_message || `ジョブは${jobStatusLabel(payload.status)}になりました。`,
+            ? t("生成が終わりました。")
+            : payload.error_message || t("ジョブは{status}になりました。", { status: t(jobStatusLabel(payload.status)) }),
         );
         if (refreshAfterFinish) {
           await refreshStudio(payload.media_type, { preferredJobId: payload.id });
           await loadProjects();
         }
       } else {
-        setStatusMessage(`${jobStatusLabel(payload.status)}…`);
+        setStatusMessage(t("{status}…", { status: t(jobStatusLabel(payload.status)) }));
       }
     },
     onJobError: (error) => {
       setIsSubmitting(false);
-      setErrorMessage(error instanceof Error ? error.message : "ジョブの状態を読み込めませんでした。");
+      setErrorMessage(error instanceof Error ? error.message : t("ジョブの状態を読み込めませんでした。"));
     },
   });
 
@@ -238,14 +241,14 @@ function App() {
         selectedAudioModel.tags.includes("melody-conditioning"),
     );
   const melodyConditioningMessage = canConditionMelody
-    ? `この WAV を参照して ${selectedAudioModel?.displayName ?? "選んだモデル"} で作ります。`
+    ? t("この WAV を参照して {model} で作ります。", { model: selectedAudioModel?.displayName ?? t("選んだモデル") })
     : mediaType !== "audio"
-      ? "メロディ参照は「音声」に切り替えると使えます。"
+      ? t("メロディ参照は「音声」に切り替えると使えます。")
       : !selectedAudioModel?.tags.includes("melody-conditioning")
-        ? "音声の入力欄で、メロディ参照に対応したモデルを選んでください。"
+        ? t("音声の入力欄で、メロディ参照に対応したモデルを選んでください。")
         : !selectedAudioModel.isAvailable
-          ? selectedAudioModel.availabilityMessage || "選んだメロディ参照モデルは使えません。"
-          : "メロディ参照にはライブラリの WAV が必要です。";
+          ? selectedAudioModel.availabilityMessage || t("選んだメロディ参照モデルは使えません。")
+          : t("メロディ参照にはライブラリの WAV が必要です。");
   const readinessState =
     apiReachable === null
       ? "checking"
@@ -260,21 +263,21 @@ function App() {
               : "models-unavailable";
   const readinessCopy =
     readinessState === "ready"
-      ? `${mediaKindLabels[mediaType]}モデル ${activeAvailableModelCount} 件を利用できます。初回生成は準備に時間がかかる場合があります。`
+      ? t("{media}モデル {count} 件を利用できます。初回生成は準備に時間がかかる場合があります。", { media: t(mediaKindLabels[mediaType]), count: activeAvailableModelCount })
       : readinessState === "models-loading"
-        ? `${mediaKindLabels[mediaType]}モデルを読み込んでいます。`
+        ? t("{media}モデルを読み込んでいます。", { media: t(mediaKindLabels[mediaType]) })
         : readinessState === "models-unavailable"
-          ? `利用可能な${mediaKindLabels[mediaType]}モデルがありません。モデルを配置してから再試行してください。`
+          ? t("利用可能な{media}モデルがありません。モデルを配置してから再試行してください。", { media: t(mediaKindLabels[mediaType]) })
           : readinessState === "models-error"
-            ? `${mediaKindLabels[mediaType]}モデルの一覧を読み込めません。再試行してください。`
+            ? t("{media}モデルの一覧を読み込めません。再試行してください。", { media: t(mediaKindLabels[mediaType]) })
             : readinessState === "offline"
-              ? "API に接続できません。./scripts/start_studio.sh の起動状態を確認してください。"
-              : "API とローカルモデルを確認しています。";
+              ? t("API に接続できません。./scripts/start_studio.sh の起動状態を確認してください。")
+              : t("API とローカルモデルを確認しています。");
   const generationGateMessage =
     readinessState !== "ready"
       ? readinessCopy
       : !selectedModelAvailable
-        ? "選択中のモデルは利用できません。利用可能なモデルを選択してください。"
+        ? t("選択中のモデルは利用できません。利用可能なモデルを選択してください。")
         : null;
   const selectedProject =
     projects.find((project) => project.id === selectedProjectId) ?? null;
@@ -449,6 +452,7 @@ function App() {
         ...current,
         [targetMediaType]: "error",
       }));
+      // Translated at render time so this loader stays free of reactive values.
       setReadinessError(error instanceof Error ? error.message : "モデル一覧を読み込めませんでした。");
     }
   }
@@ -470,7 +474,7 @@ function App() {
         setSelectedAssetProjectId(payload.project_id ?? "");
       });
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : "成果物の詳細を読み込めませんでした。");
+      setErrorMessage(error instanceof Error ? error.message : t("成果物の詳細を読み込めませんでした。"));
     }
   }
 
@@ -542,7 +546,7 @@ function App() {
         setSelectedAssetProjectId(detailPayload?.project_id ?? "");
       });
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : "最新の状態を読み込めませんでした。");
+      setErrorMessage(error instanceof Error ? error.message : t("最新の状態を読み込めませんでした。"));
     }
   }
 
@@ -573,7 +577,7 @@ function App() {
     }
 
     setErrorMessage(null);
-    setStatusMessage("中断しています…");
+    setStatusMessage(t("中断しています…"));
 
     try {
       const payload = await requestJson<JobResponse>(`/jobs/${latestJob.id}/cancel`, {
@@ -584,11 +588,11 @@ function App() {
       });
       setActiveJobId(null);
       setIsSubmitting(false);
-      setStatusMessage("ジョブを中断しました。");
+      setStatusMessage(t("ジョブを中断しました。"));
       await refreshStudio(payload.media_type);
       await loadProjects();
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : "ジョブを中断できませんでした。");
+      setErrorMessage(error instanceof Error ? error.message : t("ジョブを中断できませんでした。"));
     }
   }
 
@@ -600,14 +604,14 @@ function App() {
       setStatusMessage(
         readinessState !== "ready"
           ? readinessCopy
-          : "選択中のモデルは利用できません。利用可能なモデルを選択してください。",
+          : t("選択中のモデルは利用できません。利用可能なモデルを選択してください。"),
       );
       return;
     }
 
     setIsSubmitting(true);
     setErrorMessage(null);
-    setStatusMessage("生成を受け付けています…");
+    setStatusMessage(t("生成を受け付けています…"));
     setAssetMessage(null);
 
     try {
@@ -620,11 +624,11 @@ function App() {
       });
 
       setActiveJobId(created.job_id);
-      setStatusMessage("生成を受け付けました。順番に処理します。");
+      setStatusMessage(t("生成を受け付けました。順番に処理します。"));
       await loadJob(created.job_id);
     } catch (error) {
       setIsSubmitting(false);
-      setErrorMessage(error instanceof Error ? error.message : "生成を始められませんでした。");
+      setErrorMessage(error instanceof Error ? error.message : t("生成を始められませんでした。"));
       setStatusMessage(null);
     }
   }
@@ -633,7 +637,7 @@ function App() {
     event.preventDefault();
     const trimmedName = newProjectName.trim();
     if (!trimmedName) {
-      setErrorMessage("プロジェクト名を入力してください。");
+      setErrorMessage(t("プロジェクト名を入力してください。"));
       return;
     }
 
@@ -658,10 +662,10 @@ function App() {
         setNewProjectName("");
         setNewProjectDescription("");
       });
-      setAssetMessage(`プロジェクト「${project.name}」を作成しました。`);
+      setAssetMessage(t("プロジェクト「{name}」を作成しました。", { name: project.name }));
       await refreshStudio(mediaType);
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : "プロジェクトを作成できませんでした。");
+      setErrorMessage(error instanceof Error ? error.message : t("プロジェクトを作成できませんでした。"));
     } finally {
       setIsProjectBusy(false);
     }
@@ -695,10 +699,10 @@ function App() {
           current.map((item) => (item.id === project.id ? project : item)),
         );
       });
-      setAssetMessage(`プロジェクト「${project.name}」を更新しました。`);
+      setAssetMessage(t("プロジェクト「{name}」を更新しました。", { name: project.name }));
       await refreshStudio(mediaType);
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : "プロジェクトを更新できませんでした。");
+      setErrorMessage(error instanceof Error ? error.message : t("プロジェクトを更新できませんでした。"));
     } finally {
       setIsProjectBusy(false);
     }
@@ -728,9 +732,9 @@ function App() {
           current.map((item) => (item.id === project.id ? project : item)),
         );
       });
-      setAssetMessage(`「${project.name}」に固定しました。`);
+      setAssetMessage(t("「{name}」に固定しました。", { name: project.name }));
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : "成果物を固定できませんでした。");
+      setErrorMessage(error instanceof Error ? error.message : t("成果物を固定できませんでした。"));
     } finally {
       setIsProjectBusy(false);
     }
@@ -766,13 +770,13 @@ function App() {
           },
         }),
       });
-      setAssetMessage("評価を保存しました。");
+      setAssetMessage(t("評価を保存しました。"));
       await refreshStudio(toComposerMediaType(selectedAssetDetail.media_type), {
         preferredAssetId: selectedAssetDetail.asset_id,
       });
       return true;
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : "評価を保存できませんでした。");
+      setErrorMessage(error instanceof Error ? error.message : t("評価を保存できませんでした。"));
       return false;
     } finally {
       setIsFeedbackBusy(false);
@@ -807,12 +811,12 @@ function App() {
           reuse_intent: kind !== "accept",
           export_ready: kind === "accept",
           issue_tags: applicableIssueTags,
-          comments: kind === "accept" ? "採用" : kind === "rerun" ? "作り直す" : "少し直す",
+          comments: kind === "accept" ? t("採用") : kind === "rerun" ? t("作り直す") : t("少し直す"),
           metadata: { source: "quick-review", decision: kind },
         }),
       });
       if (kind === "accept") {
-        setAssetMessage("採用として保存しました。書き出しまたはプロジェクトへの保存を続けられます。");
+        setAssetMessage(t("採用として保存しました。書き出しまたはプロジェクトへの保存を続けられます。"));
         await refreshStudio(toComposerMediaType(reviewedAsset.media_type), {
           preferredAssetId: reviewedAsset.asset_id,
         });
@@ -826,7 +830,7 @@ function App() {
         basis: "source-snapshot",
       });
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : "判定を保存できませんでした。");
+      setErrorMessage(error instanceof Error ? error.message : t("判定を保存できませんでした。"));
       return false;
     } finally {
       setIsFeedbackBusy(false);
@@ -855,7 +859,7 @@ function App() {
       setSelectedProjectId(selectedAssetDetail.project_id ?? "");
       setMediaType(composerMediaType);
       setComposerRevision((current) => current + 1);
-      setAssetMessage("入力欄に読み込みました。直してから生成すると別案として作ります。");
+      setAssetMessage(t("入力欄に読み込みました。直してから生成すると別案として作ります。"));
     });
   }
 
@@ -927,23 +931,23 @@ function App() {
       setActiveJobId(payload.job_id);
       setStatusMessage(
         action === "rerun"
-          ? "同じ条件での作り直しを受け付けました。"
+          ? t("同じ条件での作り直しを受け付けました。")
           : action === "melody"
-            ? "メロディ参照での生成を受け付けました。"
-            : "別案の生成を受け付けました。",
+            ? t("メロディ参照での生成を受け付けました。")
+            : t("別案の生成を受け付けました。"),
       );
       setAssetMessage(
         action === "rerun"
-          ? "選んだ成果物と同じ条件で作り直します。"
+          ? t("選んだ成果物と同じ条件で作り直します。")
           : action === "melody"
-            ? "選んだ成果物をメロディの参照に使います。"
-          : "判定を反映した別案を作ります。",
+            ? t("選んだ成果物をメロディの参照に使います。")
+          : t("判定を反映した別案を作ります。"),
       );
       await loadJob(payload.job_id);
       await loadProjects();
       return true;
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : "選んだ成果物を再利用できませんでした。");
+      setErrorMessage(error instanceof Error ? error.message : t("選んだ成果物を再利用できませんでした。"));
       return false;
     } finally {
       setIsAssetBusy(false);
@@ -969,12 +973,12 @@ function App() {
           body: JSON.stringify({ include_metadata: true }),
         },
       );
-      setAssetMessage(`書き出しました: ${payload.export_path}`);
+      setAssetMessage(t("書き出しました: {path}", { path: payload.export_path }));
       await refreshStudio(toComposerMediaType(selectedAssetDetail.media_type), {
         preferredAssetId: selectedAssetDetail.asset_id,
       });
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : "選んだ成果物を書き出せませんでした。");
+      setErrorMessage(error instanceof Error ? error.message : t("選んだ成果物を書き出せませんでした。"));
     } finally {
       setIsAssetBusy(false);
     }
@@ -1010,14 +1014,14 @@ function App() {
       setSelectedProjectId(payload.project_id ?? "");
       setAssetMessage(
         payload.project_id
-          ? "成果物をプロジェクトに入れました。"
-          : "成果物をプロジェクトから外しました。",
+          ? t("成果物をプロジェクトに入れました。")
+          : t("成果物をプロジェクトから外しました。"),
       );
       await refreshStudio(toComposerMediaType(payload.media_type), { preferredAssetId: payload.asset_id });
       await loadProjects();
     } catch (error) {
       setErrorMessage(
-        error instanceof Error ? error.message : "成果物のプロジェクトを変更できませんでした。",
+        error instanceof Error ? error.message : t("成果物のプロジェクトを変更できませんでした。"),
       );
     } finally {
       setIsAssetBusy(false);
@@ -1030,9 +1034,9 @@ function App() {
         <section className="section-card section-card--nav">
           <div className="sidebar-brand">
             <p className="eyebrow">Creative AI Studio</p>
-            <h1>ローカル制作スタジオ</h1>
+            <h1>{t("ローカル制作スタジオ")}</h1>
           </div>
-          <nav className="view-nav" aria-label="画面">
+          <nav className="view-nav" aria-label={t("画面")}>
             {studioViews.map((option) => (
               <a
                 key={option}
@@ -1044,8 +1048,8 @@ function App() {
                   setView(option);
                 }}
               >
-                <strong>{studioViewLabels[option]}</strong>
-                <span className="view-nav__meta">{studioViewDescriptions[option]}</span>
+                <strong>{t(studioViewLabels[option])}</strong>
+                <span className="view-nav__meta">{t(studioViewDescriptions[option])}</span>
               </a>
             ))}
           </nav>
@@ -1055,19 +1059,19 @@ function App() {
       <main className="studio-main">
         <header className="studio-topbar">
           <div className="studio-topbar__identity">
-            <h1>{studioViewLabels[view]}</h1>
-            <p>{studioViewDescriptions[view]}</p>
+            <h1>{t(studioViewLabels[view])}</h1>
+            <p>{t(studioViewDescriptions[view])}</p>
           </div>
           <label className="field-group topbar-project">
-            <span>保存先</span>
+            <span>{t("保存先")}</span>
             <select
               value={selectedProjectId}
               onChange={(event) => setSelectedProjectId(event.target.value)}
             >
-              <option value="">プロジェクトなし</option>
+              <option value="">{t("プロジェクトなし")}</option>
               {projects.map((project) => (
                 <option key={project.id} value={project.id}>
-                  {project.name}（{project.asset_count} 件）
+                  {t("{name}（{count} 件）", { name: project.name, count: project.asset_count })}
                 </option>
               ))}
             </select>
@@ -1077,7 +1081,7 @@ function App() {
         {view === "create" ? (
           <>
             <div className="view-toolbar">
-              <span className="view-toolbar__label" id="media-switch-label">種類</span>
+              <span className="view-toolbar__label" id="media-switch-label">{t("種類")}</span>
               <div className="mode-toggle media-switch" role="group" aria-labelledby="media-switch-label">
                 {(["image", "audio", "video"] as MediaType[]).map((option) => (
                   <button
@@ -1087,9 +1091,9 @@ function App() {
                     onClick={() => setMediaType(option)}
                     aria-pressed={mediaType === option}
                   >
-                    {mediaKindLabels[option]}
+                    {t(mediaKindLabels[option])}
                     {readinessByMedia[option] === "missing" ? (
-                      <span className="media-switch__note">準備が必要</span>
+                      <span className="media-switch__note">{t("準備が必要")}</span>
                     ) : null}
                   </button>
                 ))}
@@ -1097,24 +1101,25 @@ function App() {
             </div>
 
             {errorMessage ? <p className="error-banner" role="alert">{errorMessage}</p> : null}
-            {readinessError ? <p className="error-banner" role="alert">{readinessError}</p> : null}
+            {readinessError ? <p className="error-banner" role="alert">{t(readinessError)}</p> : null}
 
             {readinessState === "models-unavailable" ? (
               <>
                 <section className="section-card setup-callout" aria-labelledby="setup-callout-heading">
-                  <p className="eyebrow">準備が必要</p>
+                  <p className="eyebrow">{t("準備が必要")}</p>
                   <h2 id="setup-callout-heading">
-                    {mediaKindLabels[mediaType]}のモデルがまだ置かれていません
+                    {t("{media}のモデルがまだ置かれていません", { media: t(mediaKindLabels[mediaType]) })}
                   </h2>
                   <p>
-                    {mediaKindLabels[mediaType]}を作るには、次のどれかのモデルを models/
-                    に置いてから「再確認」を押してください。
+                    {t("{media}を作るには、次のどれかのモデルを models/ に置いてから「再確認」を押してください。", {
+                      media: t(mediaKindLabels[mediaType]),
+                    })}
                   </p>
                   <ul className="setup-callout__models">
                     {activeModels.map((model) => (
                       <li key={model.id}>
                         <strong>{model.displayName}</strong>
-                        <span>{getInstallGuide(mediaType, model)?.note ?? "配置先は準備画面で確認できます。"}</span>
+                        <span>{t(getInstallGuide(mediaType, model)?.note ?? "配置先は準備画面で確認できます。")}</span>
                       </li>
                     ))}
                   </ul>
@@ -1126,7 +1131,7 @@ function App() {
                         className="primary-button"
                         onClick={() => setMediaType(media)}
                       >
-                        {mediaKindLabels[media]}をつくる
+                        {t("{media}をつくる", { media: t(mediaKindLabels[media]) })}
                       </button>
                     ))}
                     <button
@@ -1134,7 +1139,7 @@ function App() {
                       className="secondary-button"
                       onClick={() => setView("setup")}
                     >
-                      準備画面で詳しく見る
+                      {t("準備画面で詳しく見る")}
                     </button>
                     <button
                       type="button"
@@ -1144,7 +1149,7 @@ function App() {
                       }}
                       disabled={activeModelLoadState === "loading"}
                     >
-                      再確認
+                      {t("再確認")}
                     </button>
                   </div>
                 </section>
@@ -1160,10 +1165,10 @@ function App() {
                     <span className="readiness-banner__copy">
                       <strong>
                         {readinessState === "offline"
-                          ? "接続できません"
+                          ? t("接続できません")
                           : readinessState === "models-error"
-                            ? "モデルを確認できません"
-                            : "準備状況を確認中"}
+                            ? t("モデルを確認できません")
+                            : t("準備状況を確認中")}
                       </strong>
                       <span>{readinessCopy}</span>
                     </span>
@@ -1175,7 +1180,7 @@ function App() {
                       }}
                       disabled={activeModelLoadState === "loading"}
                     >
-                      再試行
+                      {t("再試行")}
                     </button>
                   </p>
                 ) : null}
@@ -1183,8 +1188,8 @@ function App() {
                 <section className="section-card section-card--stage">
                   <div className="section-card__header">
                     <div>
-                      <p className="eyebrow">かんたん作成</p>
-                      <h2>{mediaKindLabels[mediaType]}を作る</h2>
+                      <p className="eyebrow">{t("かんたん作成")}</p>
+                      <h2>{t("{media}を作る", { media: t(mediaKindLabels[mediaType]) })}</h2>
                     </div>
                   </div>
                   <PromptForm
@@ -1194,7 +1199,7 @@ function App() {
                     modelOptions={activeModels}
                     loraOptions={mediaType === "image" ? loraOptions : []}
                     initialValues={drafts[mediaType]}
-                    submitLabel={isSubmitting ? "生成中..." : "生成する"}
+                    submitLabel={isSubmitting ? t("生成中...") : t("生成する")}
                     disabled={isSubmitting}
                     canSubmit={!isSubmitting && generationGateMessage === null}
                     statusMessage={generationGateMessage ?? statusMessage}
@@ -1224,8 +1229,8 @@ function App() {
             <section className="section-card" id="selected-asset">
               <div className="section-card__header">
                 <div>
-                  <p className="eyebrow">選んだ成果物</p>
-                  <h2>判定・再利用・書き出し</h2>
+                  <p className="eyebrow">{t("選んだ成果物")}</p>
+                  <h2>{t("判定・再利用・書き出し")}</h2>
                 </div>
                 {assetMessage ? <p className="section-footnote">{assetMessage}</p> : null}
               </div>
@@ -1269,8 +1274,8 @@ function App() {
               ) : (
                 <div className="empty-stage">
                   <div>
-                    <h3>まだ選ばれていません</h3>
-                    <p>生成が終わるとここに結果が出ます。過去の成果物はライブラリから選べます。</p>
+                    <h3>{t("まだ選ばれていません")}</h3>
+                    <p>{t("生成が終わるとここに結果が出ます。過去の成果物はライブラリから選べます。")}</p>
                   </div>
                 </div>
               )}
@@ -1284,7 +1289,7 @@ function App() {
                   setView("library");
                 }}
               >
-                ライブラリで{mediaKindLabels[mediaType]}の一覧を見る
+                {t("ライブラリで{media}の一覧を見る", { media: t(mediaKindLabels[mediaType]) })}
               </a>
             </p>
           </>
@@ -1293,7 +1298,7 @@ function App() {
         {view === "library" ? (
           <>
             <div className="view-toolbar">
-              <span className="view-toolbar__label" id="library-media-label">種類</span>
+              <span className="view-toolbar__label" id="library-media-label">{t("種類")}</span>
               <div className="mode-toggle media-switch" role="group" aria-labelledby="library-media-label">
                 {(["image", "audio", "video"] as MediaType[]).map((option) => (
                   <button
@@ -1303,7 +1308,7 @@ function App() {
                     onClick={() => setMediaType(option)}
                     aria-pressed={mediaType === option}
                   >
-                    {mediaKindLabels[option]}
+                    {t(mediaKindLabels[option])}
                   </button>
                 ))}
               </div>
@@ -1329,8 +1334,8 @@ function App() {
             <section className="section-card" id="selected-asset">
               <div className="section-card__header">
                 <div>
-                  <p className="eyebrow">選んだ成果物</p>
-                  <h2>判定・再利用・書き出し</h2>
+                  <p className="eyebrow">{t("選んだ成果物")}</p>
+                  <h2>{t("判定・再利用・書き出し")}</h2>
                 </div>
                 {assetMessage ? <p className="section-footnote">{assetMessage}</p> : null}
               </div>
@@ -1374,8 +1379,8 @@ function App() {
               ) : (
                 <div className="empty-stage">
                   <div>
-                    <h3>まだ選ばれていません</h3>
-                    <p>生成が終わるとここに結果が出ます。過去の成果物はライブラリから選べます。</p>
+                    <h3>{t("まだ選ばれていません")}</h3>
+                    <p>{t("生成が終わるとここに結果が出ます。過去の成果物はライブラリから選べます。")}</p>
                   </div>
                 </div>
               )}
@@ -1406,7 +1411,7 @@ function App() {
                   });
                 });
                 setStatusMessage(
-                  `シーン「${scene.heading || scene.id}」を入力欄に読み込みました。`,
+                  t("シーン「{name}」を入力欄に読み込みました。", { name: scene.heading || scene.id }),
                 );
               }}
               onGenerateSceneNarration={(scene) => {
@@ -1418,7 +1423,7 @@ function App() {
                   });
                 });
                 setStatusMessage(
-                  `シーン「${scene.heading || scene.id}」のナレーションを音声の入力欄に読み込みました。`,
+                  t("シーン「{name}」のナレーションを音声の入力欄に読み込みました。", { name: scene.heading || scene.id }),
                 );
               }}
             />
@@ -1456,35 +1461,35 @@ function App() {
             <section className="section-card section-card--projects">
               <div className="section-card__header">
                 <div>
-                  <p className="eyebrow">保存先</p>
-                  <h2>プロジェクト</h2>
+                  <p className="eyebrow">{t("保存先")}</p>
+                  <h2>{t("プロジェクト")}</h2>
                 </div>
               </div>
               <p className="section-footnote">
                 {projects.length > 0
-                  ? `${projects.length} 件のプロジェクトがあります。生成の保存先は画面上部で選べます。`
-                  : "プロジェクトを作ると、生成した成果物をまとめて管理できます。"}
+                  ? t("{count} 件のプロジェクトがあります。生成の保存先は画面上部で選べます。", { count: projects.length })
+                  : t("プロジェクトを作ると、生成した成果物をまとめて管理できます。")}
               </p>
               <details className="project-disclosure">
-                <summary>新しいプロジェクト</summary>
+                <summary>{t("新しいプロジェクト")}</summary>
                 <form className="project-create-form" onSubmit={(event) => void handleCreateProject(event)}>
                   <label className="field-group field-group--full">
-                    <span>プロジェクト名</span>
+                    <span>{t("プロジェクト名")}</span>
                     <input
                       type="text"
                       value={newProjectName}
                       onChange={(event) => setNewProjectName(event.target.value)}
-                      placeholder="例: 春のキャンペーン"
+                      placeholder={t("例: 春のキャンペーン")}
                       disabled={isProjectBusy}
                     />
                   </label>
                   <label className="field-group field-group--full">
-                    <span>メモ</span>
+                    <span>{t("メモ")}</span>
                     <textarea
                       rows={3}
                       value={newProjectDescription}
                       onChange={(event) => setNewProjectDescription(event.target.value)}
-                      placeholder="任意"
+                      placeholder={t("任意")}
                       disabled={isProjectBusy}
                     />
                   </label>
@@ -1493,7 +1498,7 @@ function App() {
                     className="secondary-button secondary-button--block"
                     disabled={isProjectBusy || !newProjectName.trim()}
                   >
-                    {isProjectBusy ? "作成中..." : "作成して保存先にする"}
+                    {isProjectBusy ? t("作成中...") : t("作成して保存先にする")}
                   </button>
                 </form>
               </details>
@@ -1501,12 +1506,12 @@ function App() {
                 <div className="form-section">
                   <div className="form-section__header">
                     <div>
-                      <p className="eyebrow">選択中のプロジェクト</p>
+                      <p className="eyebrow">{t("選択中のプロジェクト")}</p>
                       <h3>{selectedProject.name}</h3>
                     </div>
                   </div>
                   <label className="field-group field-group--full">
-                    <span>状態</span>
+                    <span>{t("状態")}</span>
                     <input
                       type="text"
                       value={projectStatusDraft}
@@ -1515,12 +1520,12 @@ function App() {
                     />
                   </label>
                   <label className="field-group field-group--full">
-                    <span>タグ</span>
+                    <span>{t("タグ")}</span>
                     <input
                       type="text"
                       value={projectTagsDraft}
                       onChange={(event) => setProjectTagsDraft(event.target.value)}
-                      placeholder="例: 下書き, 確認中, 納品"
+                      placeholder={t("例: 下書き, 確認中, 納品")}
                       disabled={isProjectBusy}
                     />
                   </label>
@@ -1533,7 +1538,7 @@ function App() {
                       }}
                       disabled={isProjectBusy}
                     >
-                      更新する
+                      {t("更新する")}
                     </button>
                     <button
                       type="button"
@@ -1548,12 +1553,14 @@ function App() {
                         selectedProject.pinned_asset_ids.includes(selectedAssetDetail.asset_id)
                       }
                     >
-                      選択中の成果物を固定
+                      {t("選択中の成果物を固定")}
                     </button>
                   </div>
                   <p className="section-footnote">
-                    固定した成果物 {selectedProject.pinned_asset_ids.length} 件・状態{" "}
-                    {selectedProject.status}
+                    {t("固定した成果物 {count} 件・状態 {status}", {
+                      count: selectedProject.pinned_asset_ids.length,
+                      status: selectedProject.status,
+                    })}
                   </p>
                 </div>
               ) : null}
@@ -1562,17 +1569,17 @@ function App() {
             <section className="section-card" aria-labelledby="setup-display-heading">
               <div className="section-card__header">
                 <div>
-                  <p className="eyebrow">表示</p>
-                  <h2 id="setup-display-heading">画面の明るさ</h2>
+                  <p className="eyebrow">{t("表示")}</p>
+                  <h2 id="setup-display-heading">{t("画面の明るさ")}</h2>
                 </div>
-                <div className="mode-toggle" role="group" aria-label="画面の明るさ">
+                <div className="mode-toggle" role="group" aria-label={t("画面の明るさ")}>
                   <button
                     type="button"
                     className={`mode-toggle__button ${themeMode === "light" ? "is-active" : ""}`}
                     onClick={() => setThemeMode("light")}
                     aria-pressed={themeMode === "light"}
                   >
-                    ライト
+                    {t("ライト")}
                   </button>
                   <button
                     type="button"
@@ -1580,8 +1587,31 @@ function App() {
                     onClick={() => setThemeMode("dark")}
                     aria-pressed={themeMode === "dark"}
                   >
-                    ダーク
+                    {t("ダーク")}
                   </button>
+                </div>
+              </div>
+            </section>
+
+            <section className="section-card" aria-labelledby="setup-language-heading">
+              <div className="section-card__header">
+                <div>
+                  <p className="eyebrow">{t("表示")}</p>
+                  <h2 id="setup-language-heading">{t("言語")}</h2>
+                </div>
+                <div className="mode-toggle" role="group" aria-label={t("言語")}>
+                  {supportedLocales.map((option) => (
+                    <button
+                      key={option}
+                      type="button"
+                      lang={option}
+                      className={`mode-toggle__button ${locale === option ? "is-active" : ""}`}
+                      onClick={() => setLocale(option)}
+                      aria-pressed={locale === option}
+                    >
+                      {localeLabels[option]}
+                    </button>
+                  ))}
                 </div>
               </div>
             </section>
