@@ -435,7 +435,7 @@ export function AssemblyTimelinePanel({ projectId }: AssemblyTimelinePanelProps)
     >
       <div className="section-card__header assembly-timeline-panel__header">
         <div>
-          <p className="eyebrow">Assembly</p>
+          <p className="eyebrow">タイムライン</p>
           <h2 id="assembly-timeline-panel-heading">タイムライン</h2>
         </div>
         <p className="section-footnote">

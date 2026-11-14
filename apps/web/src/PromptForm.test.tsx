@@ -80,7 +80,7 @@ describe("PromptForm", () => {
     await user.type(screen.getByLabelText("1. 主役・内容"), "夕暮れの花束");
     await user.click(screen.getByRole("button", { name: "プロンプトに反映" }));
 
-    expect((screen.getByLabelText("Prompt") as HTMLTextAreaElement).value).toContain(
+    expect((screen.getByLabelText("プロンプト") as HTMLTextAreaElement).value).toContain(
       "夕暮れの花束",
     );
     expect(screen.getByText("作られる内容の要約")).toBeTruthy();
@@ -113,16 +113,16 @@ describe("PromptForm", () => {
       />,
     );
 
-    await user.selectOptions(screen.getByLabelText("Genre"), "cinematic");
+    await user.selectOptions(screen.getByLabelText("ジャンル"), "cinematic");
     await user.selectOptions(
-      screen.getByLabelText("Structure"),
+      screen.getByLabelText("構成"),
       "intro, development, climax",
     );
-    await user.clear(screen.getByLabelText("Instruments"));
-    await user.type(screen.getByLabelText("Instruments"), "low strings, brass");
-    await user.click(screen.getByRole("tab", { name: "Advanced" }));
-    await user.clear(screen.getByLabelText("Temperature"));
-    await user.type(screen.getByLabelText("Temperature"), "0.8");
+    await user.clear(screen.getByLabelText("楽器"));
+    await user.type(screen.getByLabelText("楽器"), "low strings, brass");
+    await user.click(screen.getByRole("tab", { name: "詳細" }));
+    await user.clear(screen.getByLabelText("ばらつき（Temperature）"));
+    await user.type(screen.getByLabelText("ばらつき（Temperature）"), "0.8");
     await user.clear(screen.getByLabelText("Top K"));
     await user.type(screen.getByLabelText("Top K"), "180");
     await user.clear(screen.getByLabelText("Top P"));
@@ -155,10 +155,10 @@ describe("PromptForm", () => {
       />,
     );
 
-    await user.click(screen.getByRole("tab", { name: "Advanced" }));
-    await user.clear(screen.getByLabelText("Variations"));
-    await user.type(screen.getByLabelText("Variations"), "3");
-    await user.click(screen.getByRole("button", { name: "Generate" }));
+    await user.click(screen.getByRole("tab", { name: "詳細" }));
+    await user.clear(screen.getByLabelText("作る枚数"));
+    await user.type(screen.getByLabelText("作る枚数"), "3");
+    await user.click(screen.getByRole("button", { name: "生成する" }));
 
     expect(handleSubmit).toHaveBeenCalledWith(
       expect.objectContaining({ variationCount: 3 }),
@@ -196,11 +196,11 @@ describe("PromptForm", () => {
       />,
     );
 
-    expect(screen.queryByLabelText("Extend stride (sec)")).toBeNull();
-    await user.selectOptions(screen.getByLabelText("Model"), "musicgen-long-form");
+    expect(screen.queryByLabelText("延長の間隔（秒）")).toBeNull();
+    await user.selectOptions(screen.getByLabelText("モデル"), "musicgen-long-form");
 
-    const duration = screen.getByLabelText("Duration (sec)") as HTMLInputElement;
-    const stride = screen.getByLabelText("Extend stride (sec)") as HTMLInputElement;
+    const duration = screen.getByLabelText("長さ（秒）") as HTMLInputElement;
+    const stride = screen.getByLabelText("延長の間隔（秒）") as HTMLInputElement;
     expect(duration.min).toBe("31");
     expect(duration.max).toBe("120");
     expect(duration.value).toBe("45");
@@ -221,9 +221,9 @@ describe("PromptForm", () => {
       }),
     );
 
-    await user.selectOptions(screen.getByLabelText("Model"), "musicgen-small");
-    expect(screen.queryByLabelText("Extend stride (sec)")).toBeNull();
-    expect((screen.getByLabelText("Duration (sec)") as HTMLInputElement).max).toBe("30");
+    await user.selectOptions(screen.getByLabelText("モデル"), "musicgen-small");
+    expect(screen.queryByLabelText("延長の間隔（秒）")).toBeNull();
+    expect((screen.getByLabelText("長さ（秒）") as HTMLInputElement).max).toBe("30");
   });
 
   it("applies and preserves long-form defaults when it is the first available audio model", async () => {
@@ -256,18 +256,18 @@ describe("PromptForm", () => {
     );
 
     await waitFor(() => {
-      expect((screen.getByLabelText("Model") as HTMLSelectElement).value).toBe(
+      expect((screen.getByLabelText("モデル") as HTMLSelectElement).value).toBe(
         "musicgen-long-form",
       );
     });
-    expect((screen.getByLabelText("Duration (sec)") as HTMLInputElement).value).toBe(
+    expect((screen.getByLabelText("長さ（秒）") as HTMLInputElement).value).toBe(
       "45",
     );
     expect(
-      (screen.getByLabelText("Extend stride (sec)") as HTMLInputElement).value,
+      (screen.getByLabelText("延長の間隔（秒）") as HTMLInputElement).value,
     ).toBe("18");
-    await user.click(screen.getByRole("button", { name: "Dreamy Loop" }));
-    expect((screen.getByLabelText("Duration (sec)") as HTMLInputElement).value).toBe(
+    await user.click(screen.getByRole("button", { name: "夢見心地なループ" }));
+    expect((screen.getByLabelText("長さ（秒）") as HTMLInputElement).value).toBe(
       "45",
     );
   });
@@ -298,14 +298,14 @@ describe("PromptForm", () => {
       />,
     );
 
-    expect((screen.getByLabelText("Mood") as HTMLSelectElement).value).toBe("warm");
-    expect(screen.getByRole("option", { name: "warm (restored)" })).toBeTruthy();
-    expect((screen.getByLabelText("Genre") as HTMLSelectElement).value).toBe("lo-fi");
-    expect(screen.getByRole("option", { name: "lo-fi (restored)" })).toBeTruthy();
-    expect((screen.getByLabelText("Structure") as HTMLSelectElement).value).toBe(
+    expect((screen.getByLabelText("雰囲気") as HTMLSelectElement).value).toBe("warm");
+    expect(screen.getByRole("option", { name: "warm（復元）" })).toBeTruthy();
+    expect((screen.getByLabelText("ジャンル") as HTMLSelectElement).value).toBe("lo-fi");
+    expect(screen.getByRole("option", { name: "lo-fi（復元）" })).toBeTruthy();
+    expect((screen.getByLabelText("構成") as HTMLSelectElement).value).toBe(
       "intro-outro",
     );
-    expect(screen.getByRole("option", { name: "intro-outro (restored)" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "intro-outro（復元）" })).toBeTruthy();
 
     await user.click(screen.getByRole("button", { name: "Create music" }));
 
@@ -412,7 +412,7 @@ describe("PromptForm", () => {
     );
 
     await waitFor(() => {
-      expect((screen.getByLabelText("Model") as HTMLSelectElement).value).toBe(
+      expect((screen.getByLabelText("モデル") as HTMLSelectElement).value).toBe(
         "storyboard-video",
       );
     });

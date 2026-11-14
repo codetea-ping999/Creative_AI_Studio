@@ -210,7 +210,7 @@ describe("Gallery Reuse and rerun", () => {
     render(<App />);
 
     await user.click(await screen.findByRole("button", { name: "動画" }));
-    await user.click(await screen.findByRole("button", { name: "Reuse and rerun" }));
+    await user.click(await screen.findByRole("button", { name: "同じ条件で作り直す" }));
 
     await waitFor(() => {
       expect(findReuseRequest(requests, asset)).toBeDefined();
@@ -222,7 +222,7 @@ describe("Gallery Reuse and rerun", () => {
       project_id: asset.project_id,
     });
     expect(
-      await screen.findByText(`Created a fresh rerun from ${asset.asset_id}.`),
+      await screen.findByText("選んだ成果物と同じ条件で作り直します。"),
     ).toBeTruthy();
   });
 
@@ -233,14 +233,14 @@ describe("Gallery Reuse and rerun", () => {
     render(<App />);
 
     await user.click(await screen.findByRole("button", { name: "動画" }));
-    await user.click(await screen.findByRole("button", { name: "Load into composer" }));
-    const promptField = await screen.findByRole("textbox", { name: "Prompt" });
+    await user.click(await screen.findByRole("button", { name: "入力欄に読み込む" }));
+    const promptField = await screen.findByRole("textbox", { name: "プロンプト" });
     await waitFor(() => {
       expect((promptField as HTMLTextAreaElement).value).toBe(SOURCE_PROMPT);
     });
     await user.clear(promptField);
     await user.type(promptField, "雨上がりの駅");
-    await user.click(screen.getByRole("button", { name: "Reuse and rerun" }));
+    await user.click(screen.getByRole("button", { name: "同じ条件で作り直す" }));
 
     await waitFor(() => {
       expect(findReuseRequest(requests, asset)).toBeDefined();
@@ -276,7 +276,7 @@ describe("Studio screens", () => {
 
     expect(window.location.hash).toBe("#/story");
     expect(await screen.findByRole("button", { name: "ストーリーを作成" })).toBeTruthy();
-    expect(screen.queryByRole("textbox", { name: "Prompt" })).toBeNull();
+    expect(screen.queryByRole("textbox", { name: "プロンプト" })).toBeNull();
   });
 
   it("opens the screen named in the hash on load", async () => {
@@ -323,10 +323,10 @@ describe("Model readiness", () => {
       await screen.findByRole("heading", { name: "画像のモデルがまだ置かれていません" }),
     ).toBeTruthy();
     expect(screen.getByText("SDXL Local")).toBeTruthy();
-    expect(screen.queryByRole("textbox", { name: "Prompt" })).toBeNull();
+    expect(screen.queryByRole("textbox", { name: "プロンプト" })).toBeNull();
 
     await user.click(await screen.findByRole("button", { name: "動画をつくる" }));
-    expect(await screen.findByRole("textbox", { name: "Prompt" })).toBeTruthy();
+    expect(await screen.findByRole("textbox", { name: "プロンプト" })).toBeTruthy();
     expect(window.localStorage.getItem("creative-ai-studio.media-type")).toBe("video");
   });
 
@@ -360,7 +360,7 @@ describe("Library screen", () => {
     render(<App />);
 
     expect(await screen.findByRole("heading", { name: "判定・再利用・書き出し" })).toBeTruthy();
-    expect(await screen.findByRole("button", { name: "Reuse and rerun" })).toBeTruthy();
-    expect(screen.queryByRole("textbox", { name: "Prompt" })).toBeNull();
+    expect(await screen.findByRole("button", { name: "同じ条件で作り直す" })).toBeTruthy();
+    expect(screen.queryByRole("textbox", { name: "プロンプト" })).toBeNull();
   });
 });

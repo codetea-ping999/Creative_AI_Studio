@@ -66,6 +66,7 @@ import {
   useStudioView,
   viewHref,
 } from "./hooks/useStudioView";
+import { jobStatusLabel } from "./lib/jobStatus";
 
 type ThemeMode = "light" | "dark";
 const MEDIA_STORAGE_KEY = "creative-ai-studio.media-type";
@@ -182,20 +183,20 @@ function App() {
         setIsSubmitting(false);
         setStatusMessage(
           payload.status === "succeeded"
-            ? "Generation finished."
-            : payload.error_message || `Job ${payload.status}.`,
+            ? "生成が終わりました。"
+            : payload.error_message || `ジョブは${jobStatusLabel(payload.status)}になりました。`,
         );
         if (refreshAfterFinish) {
           await refreshStudio(payload.media_type, { preferredJobId: payload.id });
           await loadProjects();
         }
       } else {
-        setStatusMessage(`Job ${payload.status}...`);
+        setStatusMessage(`${jobStatusLabel(payload.status)}…`);
       }
     },
     onJobError: (error) => {
       setIsSubmitting(false);
-      setErrorMessage(error instanceof Error ? error.message : "Failed to load job state.");
+      setErrorMessage(error instanceof Error ? error.message : "ジョブの状態を読み込めませんでした。");
     },
   });
 
@@ -237,14 +238,14 @@ function App() {
         selectedAudioModel.tags.includes("melody-conditioning"),
     );
   const melodyConditioningMessage = canConditionMelody
-    ? `Use ${selectedAudioModel?.displayName ?? "the selected model"} with this WAV reference.`
+    ? `この WAV を参照して ${selectedAudioModel?.displayName ?? "選んだモデル"} で作ります。`
     : mediaType !== "audio"
-      ? "Switch to Audio before using melody conditioning."
+      ? "メロディ参照は「音声」に切り替えると使えます。"
       : !selectedAudioModel?.tags.includes("melody-conditioning")
-        ? "Select an available melody-conditioning model in the Audio composer."
+        ? "音声の入力欄で、メロディ参照に対応したモデルを選んでください。"
         : !selectedAudioModel.isAvailable
-          ? selectedAudioModel.availabilityMessage || "The selected melody model is unavailable."
-          : "Melody conditioning requires a Gallery WAV asset.";
+          ? selectedAudioModel.availabilityMessage || "選んだメロディ参照モデルは使えません。"
+          : "メロディ参照にはライブラリの WAV が必要です。";
   const readinessState =
     apiReachable === null
       ? "checking"
@@ -448,7 +449,7 @@ function App() {
         ...current,
         [targetMediaType]: "error",
       }));
-      setReadinessError(error instanceof Error ? error.message : "Failed to load models.");
+      setReadinessError(error instanceof Error ? error.message : "モデル一覧を読み込めませんでした。");
     }
   }
 
@@ -469,7 +470,7 @@ function App() {
         setSelectedAssetProjectId(payload.project_id ?? "");
       });
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : "Failed to load asset detail.");
+      setErrorMessage(error instanceof Error ? error.message : "成果物の詳細を読み込めませんでした。");
     }
   }
 
@@ -541,7 +542,7 @@ function App() {
         setSelectedAssetProjectId(detailPayload?.project_id ?? "");
       });
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : "Failed to refresh studio data.");
+      setErrorMessage(error instanceof Error ? error.message : "最新の状態を読み込めませんでした。");
     }
   }
 
@@ -572,7 +573,7 @@ function App() {
     }
 
     setErrorMessage(null);
-    setStatusMessage("Cancelling job...");
+    setStatusMessage("中断しています…");
 
     try {
       const payload = await requestJson<JobResponse>(`/jobs/${latestJob.id}/cancel`, {
@@ -583,11 +584,11 @@ function App() {
       });
       setActiveJobId(null);
       setIsSubmitting(false);
-      setStatusMessage(`Job ${payload.id} cancelled.`);
+      setStatusMessage("ジョブを中断しました。");
       await refreshStudio(payload.media_type);
       await loadProjects();
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : "Failed to cancel job.");
+      setErrorMessage(error instanceof Error ? error.message : "ジョブを中断できませんでした。");
     }
   }
 
@@ -606,7 +607,7 @@ function App() {
 
     setIsSubmitting(true);
     setErrorMessage(null);
-    setStatusMessage("Queueing generation...");
+    setStatusMessage("生成を受け付けています…");
     setAssetMessage(null);
 
     try {
@@ -619,11 +620,11 @@ function App() {
       });
 
       setActiveJobId(created.job_id);
-      setStatusMessage(`Job ${created.job_id} queued.`);
+      setStatusMessage("生成を受け付けました。順番に処理します。");
       await loadJob(created.job_id);
     } catch (error) {
       setIsSubmitting(false);
-      setErrorMessage(error instanceof Error ? error.message : "Failed to submit generation.");
+      setErrorMessage(error instanceof Error ? error.message : "生成を始められませんでした。");
       setStatusMessage(null);
     }
   }
@@ -632,7 +633,7 @@ function App() {
     event.preventDefault();
     const trimmedName = newProjectName.trim();
     if (!trimmedName) {
-      setErrorMessage("Project name is required.");
+      setErrorMessage("プロジェクト名を入力してください。");
       return;
     }
 
@@ -657,10 +658,10 @@ function App() {
         setNewProjectName("");
         setNewProjectDescription("");
       });
-      setAssetMessage(`Created project ${project.name}.`);
+      setAssetMessage(`プロジェクト「${project.name}」を作成しました。`);
       await refreshStudio(mediaType);
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : "Failed to create project.");
+      setErrorMessage(error instanceof Error ? error.message : "プロジェクトを作成できませんでした。");
     } finally {
       setIsProjectBusy(false);
     }
@@ -694,10 +695,10 @@ function App() {
           current.map((item) => (item.id === project.id ? project : item)),
         );
       });
-      setAssetMessage(`Updated project ${project.name}.`);
+      setAssetMessage(`プロジェクト「${project.name}」を更新しました。`);
       await refreshStudio(mediaType);
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : "Failed to update project.");
+      setErrorMessage(error instanceof Error ? error.message : "プロジェクトを更新できませんでした。");
     } finally {
       setIsProjectBusy(false);
     }
@@ -727,9 +728,9 @@ function App() {
           current.map((item) => (item.id === project.id ? project : item)),
         );
       });
-      setAssetMessage(`Pinned ${selectedAssetDetail.asset_id} to ${project.name}.`);
+      setAssetMessage(`「${project.name}」に固定しました。`);
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : "Failed to pin asset.");
+      setErrorMessage(error instanceof Error ? error.message : "成果物を固定できませんでした。");
     } finally {
       setIsProjectBusy(false);
     }
@@ -744,7 +745,7 @@ function App() {
     setErrorMessage(null);
 
     try {
-      const feedback = await requestJson<FeedbackResponse>("/feedback", {
+      await requestJson<FeedbackResponse>("/feedback", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -765,13 +766,13 @@ function App() {
           },
         }),
       });
-      setAssetMessage(`Saved feedback ${feedback.id}.`);
+      setAssetMessage("評価を保存しました。");
       await refreshStudio(toComposerMediaType(selectedAssetDetail.media_type), {
         preferredAssetId: selectedAssetDetail.asset_id,
       });
       return true;
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : "Failed to submit feedback.");
+      setErrorMessage(error instanceof Error ? error.message : "評価を保存できませんでした。");
       return false;
     } finally {
       setIsFeedbackBusy(false);
@@ -825,7 +826,7 @@ function App() {
         basis: "source-snapshot",
       });
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : "Failed to save review.");
+      setErrorMessage(error instanceof Error ? error.message : "判定を保存できませんでした。");
       return false;
     } finally {
       setIsFeedbackBusy(false);
@@ -854,7 +855,7 @@ function App() {
       setSelectedProjectId(selectedAssetDetail.project_id ?? "");
       setMediaType(composerMediaType);
       setComposerRevision((current) => current + 1);
-      setAssetMessage(`Loaded ${selectedAssetDetail.asset_id} into the composer.`);
+      setAssetMessage("入力欄に読み込みました。直してから生成すると別案として作ります。");
     });
   }
 
@@ -926,23 +927,23 @@ function App() {
       setActiveJobId(payload.job_id);
       setStatusMessage(
         action === "rerun"
-          ? `Queued rerun job ${payload.job_id}.`
+          ? "同じ条件での作り直しを受け付けました。"
           : action === "melody"
-            ? `Queued melody-conditioned job ${payload.job_id}.`
-            : `Queued variation job ${payload.job_id}.`,
+            ? "メロディ参照での生成を受け付けました。"
+            : "別案の生成を受け付けました。",
       );
       setAssetMessage(
         action === "rerun"
-          ? `Created a fresh rerun from ${sourceAsset.asset_id}.`
+          ? "選んだ成果物と同じ条件で作り直します。"
           : action === "melody"
-            ? `Using ${sourceAsset.asset_id} as the melody reference.`
-          : `Created a reviewed variation from ${sourceAsset.asset_id}.`,
+            ? "選んだ成果物をメロディの参照に使います。"
+          : "判定を反映した別案を作ります。",
       );
       await loadJob(payload.job_id);
       await loadProjects();
       return true;
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : "Failed to reuse the selected asset.");
+      setErrorMessage(error instanceof Error ? error.message : "選んだ成果物を再利用できませんでした。");
       return false;
     } finally {
       setIsAssetBusy(false);
@@ -968,12 +969,12 @@ function App() {
           body: JSON.stringify({ include_metadata: true }),
         },
       );
-      setAssetMessage(`Exported asset to ${payload.export_path}.`);
+      setAssetMessage(`書き出しました: ${payload.export_path}`);
       await refreshStudio(toComposerMediaType(selectedAssetDetail.media_type), {
         preferredAssetId: selectedAssetDetail.asset_id,
       });
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : "Failed to export the selected asset.");
+      setErrorMessage(error instanceof Error ? error.message : "選んだ成果物を書き出せませんでした。");
     } finally {
       setIsAssetBusy(false);
     }
@@ -1009,14 +1010,14 @@ function App() {
       setSelectedProjectId(payload.project_id ?? "");
       setAssetMessage(
         payload.project_id
-          ? `Bound asset ${payload.asset_id} to the selected project.`
-          : `Removed project binding from asset ${payload.asset_id}.`,
+          ? "成果物をプロジェクトに入れました。"
+          : "成果物をプロジェクトから外しました。",
       );
       await refreshStudio(toComposerMediaType(payload.media_type), { preferredAssetId: payload.asset_id });
       await loadProjects();
     } catch (error) {
       setErrorMessage(
-        error instanceof Error ? error.message : "Failed to update the asset project binding.",
+        error instanceof Error ? error.message : "成果物のプロジェクトを変更できませんでした。",
       );
     } finally {
       setIsAssetBusy(false);
@@ -1405,7 +1406,7 @@ function App() {
                   });
                 });
                 setStatusMessage(
-                  `Scene "${scene.heading || scene.id}" をコンポーザに読み込みました。`,
+                  `シーン「${scene.heading || scene.id}」を入力欄に読み込みました。`,
                 );
               }}
               onGenerateSceneNarration={(scene) => {
@@ -1417,7 +1418,7 @@ function App() {
                   });
                 });
                 setStatusMessage(
-                  `Scene "${scene.heading || scene.id}" のナレーションを音声コンポーザに読み込みました。`,
+                  `シーン「${scene.heading || scene.id}」のナレーションを音声の入力欄に読み込みました。`,
                 );
               }}
             />

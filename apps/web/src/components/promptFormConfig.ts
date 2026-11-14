@@ -38,14 +38,14 @@ export const defaultPromptFormValues: PromptFormSubmitValues = {
 
 export const imagePresets: ImagePreset[] = [
   {
-    name: "Anime Portrait",
+    name: "アニメ風の人物",
     prompt:
       "anime style, Sakurajima Mai, solo, long straight black hair, purple eyes, blunt bangs, small bunny hair clip, beige cardigan, white shirt, red necktie, grey pleated skirt, black pantyhose, school hallway, soft window light, detailed anime face",
     negativePrompt:
       "bad anatomy, extra fingers, red eyes, blue hair, missing hair clip, text, watermark, blurry, low quality",
   },
   {
-    name: "Key Visual",
+    name: "キービジュアル",
     prompt:
       "cinematic key visual, futuristic creative studio, mixed reality control room, glowing screens, large window light, polished hardware, editorial composition, dramatic contrast, highly detailed",
     negativePrompt:
@@ -55,7 +55,7 @@ export const imagePresets: ImagePreset[] = [
 
 export const audioPresets: AudioPreset[] = [
   {
-    name: "Dreamy Loop",
+    name: "夢見心地なループ",
     prompt: "dreamy ambient synth loop, soft arp, night city glow, floating texture",
     mood: "dreamy",
     genre: "ambient",
@@ -65,7 +65,7 @@ export const audioPresets: AudioPreset[] = [
     durationSeconds: 8,
   },
   {
-    name: "Pulse Driver",
+    name: "ノリのいいビート",
     prompt: "energetic electronic loop, punchy bass, bright lead, creative momentum",
     mood: "energetic",
     genre: "electronic",
@@ -75,7 +75,7 @@ export const audioPresets: AudioPreset[] = [
     durationSeconds: 10,
   },
   {
-    name: "Cinematic Cue",
+    name: "映画風の 1 曲",
     prompt: "cinematic tension cue, restrained opening, emotional rise, decisive ending",
     mood: "dark",
     genre: "cinematic",
@@ -87,37 +87,37 @@ export const audioPresets: AudioPreset[] = [
 ];
 
 export const audioMoodOptions = [
-  { value: "dreamy", label: "Dreamy" },
-  { value: "bright", label: "Bright" },
-  { value: "dark", label: "Dark" },
-  { value: "energetic", label: "Energetic" },
-  { value: "gentle", label: "Gentle" },
+  { value: "dreamy", label: "夢のような" },
+  { value: "bright", label: "明るい" },
+  { value: "dark", label: "暗い" },
+  { value: "energetic", label: "力強い" },
+  { value: "gentle", label: "やさしい" },
 ] as const;
 
 export const audioGenreOptions = [
-  { value: "ambient", label: "Ambient" },
-  { value: "electronic", label: "Electronic" },
-  { value: "lo-fi hip hop", label: "Lo-fi Hip Hop" },
-  { value: "cinematic", label: "Cinematic" },
-  { value: "jazz", label: "Jazz" },
-  { value: "rock", label: "Rock" },
-  { value: "orchestral", label: "Orchestral" },
+  { value: "ambient", label: "アンビエント" },
+  { value: "electronic", label: "エレクトロニック" },
+  { value: "lo-fi hip hop", label: "ローファイ・ヒップホップ" },
+  { value: "cinematic", label: "映画音楽" },
+  { value: "jazz", label: "ジャズ" },
+  { value: "rock", label: "ロック" },
+  { value: "orchestral", label: "オーケストラ" },
 ] as const;
 
 export const audioStructureOptions = [
-  { value: "seamless loop", label: "Seamless Loop" },
-  { value: "intro, build, drop", label: "Intro / Build / Drop" },
+  { value: "seamless loop", label: "つなぎ目のないループ" },
+  { value: "intro, build, drop", label: "導入 / 盛り上げ / ドロップ" },
   {
     value: "intro, development, climax",
-    label: "Intro / Development / Climax",
+    label: "導入 / 展開 / クライマックス",
   },
-  { value: "ambient bed", label: "Ambient Bed" },
-  { value: "full cue with a clear ending", label: "Full Cue" },
+  { value: "ambient bed", label: "背景の音" },
+  { value: "full cue with a clear ending", label: "終わりのある 1 曲" },
 ] as const;
 
 export const videoPresets: VideoPreset[] = [
   {
-    name: "Mood Reel",
+    name: "雰囲気リール",
     prompt:
       "cinematic storyboard, night drive through neon city, reflective asphalt, elevated camera, bold contrast",
     negativePrompt: "low motion, flat composition, cluttered frame",
@@ -128,7 +128,7 @@ export const videoPresets: VideoPreset[] = [
     visualStyle: "storyboard",
   },
   {
-    name: "Brand Opener",
+    name: "ブランドのオープニング",
     prompt:
       "editorial motion board, premium product reveal, clean geometry, strong center framing, warm accent glow",
     negativePrompt: "chaotic movement, muddy lighting, text overlays",
@@ -141,8 +141,8 @@ export const videoPresets: VideoPreset[] = [
 ];
 
 export const imageFormatPresets = [
-  { value: "square", label: "Square 1:1", width: 1024, height: 1024 },
-  { value: "portrait", label: "Portrait 4:5", width: 832, height: 1024 },
-  { value: "landscape", label: "Landscape 4:3", width: 1024, height: 768 },
-  { value: "wide", label: "Wide 16:9", width: 1344, height: 768 },
+  { value: "square", label: "正方形 1:1", width: 1024, height: 1024 },
+  { value: "portrait", label: "縦長 4:5", width: 832, height: 1024 },
+  { value: "landscape", label: "横長 4:3", width: 1024, height: 768 },
+  { value: "wide", label: "ワイド 16:9", width: 1344, height: 768 },
 ] as const;

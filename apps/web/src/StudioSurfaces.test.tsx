@@ -399,10 +399,10 @@ describe("StoryPanel", () => {
 
     await waitFor(() => {
       expect(
-        screen.getByRole("button", { name: "Logline" }).hasAttribute("disabled"),
+        screen.getByRole("button", { name: "ログライン" }).hasAttribute("disabled"),
       ).toBe(false);
     });
-    expect(screen.getByRole("button", { name: "Scenes" }).hasAttribute("disabled")).toBe(
+    expect(screen.getByRole("button", { name: "シーン" }).hasAttribute("disabled")).toBe(
       true,
     );
   });
@@ -430,9 +430,9 @@ describe("StoryPanel", () => {
     });
     await user.selectOptions(screen.getByLabelText("編集中のストーリー"), "story_1");
 
-    const target = await screen.findByLabelText("Script の対象シーン");
+    const target = await screen.findByLabelText("台本の対象シーン");
     await user.selectOptions(target, "scene_02");
-    await user.click(screen.getByRole("button", { name: "Script" }));
+    await user.click(screen.getByRole("button", { name: "台本" }));
 
     await waitFor(() => {
       expect(calls.some((call) => call.url.includes("/expand"))).toBe(true);

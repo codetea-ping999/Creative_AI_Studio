@@ -15,6 +15,7 @@ import {
   type BatchTemplate,
 } from "../lib/batchApi";
 import { createOutputUrl } from "../studioClient";
+import { jobStatusLabel } from "../lib/jobStatus";
 
 export type MatrixPanelProps = {
   /** Model used for the sweep; empty falls back to the API default. */
@@ -29,17 +30,6 @@ type LoadState = "loading" | "ready" | "error";
 type ItemFilter = "all" | "succeeded" | "failed" | "promoted" | "rated";
 type QuickRating = "" | "keep" | "maybe" | "reject";
 
-const statusLabels: Record<string, string> = {
-  pending: "待機",
-  queued: "待機",
-  preparing: "準備中",
-  running: "生成中",
-  postprocessing: "仕上げ中",
-  succeeded: "完了",
-  partial: "一部完了",
-  failed: "失敗",
-  cancelled: "中断",
-};
 
 const ratingLabels: Record<QuickRating, string> = {
   "": "未評価",
@@ -48,9 +38,7 @@ const ratingLabels: Record<QuickRating, string> = {
   reject: "除外",
 };
 
-function statusLabel(status: string): string {
-  return statusLabels[status] ?? status;
-}
+const statusLabel = jobStatusLabel;
 
 function MatrixLoadingGrid() {
   return (
@@ -81,7 +69,7 @@ function MatrixInspector({
     <section className="matrix-inspector" aria-labelledby="matrix-inspector-heading">
       <div className="matrix-inspector__header">
         <div>
-          <p className="eyebrow">Preview</p>
+          <p className="eyebrow">プレビュー</p>
           <h3 id="matrix-inspector-heading" ref={headingRef} tabIndex={-1}>
             {item.label}
           </h3>
@@ -428,7 +416,7 @@ export function MatrixPanel({
     <section className="section-card matrix-panel" aria-labelledby="matrix-panel-heading">
       <div className="section-card__header matrix-panel__header">
         <div>
-          <p className="eyebrow">Matrix</p>
+          <p className="eyebrow">比較</p>
           <h2 id="matrix-panel-heading">多重生成して比較する</h2>
         </div>
         <p className="section-footnote">

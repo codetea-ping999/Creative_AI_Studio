@@ -1550,7 +1550,8 @@ pre,
   color: var(--text-dim);
 }
 
-.setup-row__details summary {
+.setup-row__details summary,
+.request-snapshot summary {
   color: var(--text-soft);
   font-size: 0.82rem;
   cursor: pointer;
@@ -3286,4 +3287,8 @@ pre,
   .assembly-timeline-role__status {
     grid-column: 1 / -1;
   }
+}
+
+.request-snapshot pre {
+  margin-top: 8px;
 }

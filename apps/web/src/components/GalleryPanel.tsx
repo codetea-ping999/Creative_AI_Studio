@@ -89,15 +89,15 @@ export function GalleryPanel({
         <OutputThumbnail mediaType={item.media_type} outputPath={item.preview_path} />
         <div className="gallery-item__body">
           <div className="gallery-item__topline">
-            <span className="history-item__media">{item.project_name || "Unassigned"}</span>
+            <span className="history-item__media">{item.project_name || "プロジェクトなし"}</span>
             <span className="history-score">
               {formatScore(item.quality_score_calibrated ?? item.quality_score)}
             </span>
           </div>
           <strong>{item.batch_label || item.prompt}</strong>
           <p>
-            {item.model_id} | feedback {item.feedback_count} | reuse {item.reuse_count} |
-            export {item.export_count}
+            {item.model_id} ・評価 {item.feedback_count} ・再利用 {item.reuse_count} ・書き出し{" "}
+            {item.export_count}
           </p>
         </div>
       </button>
@@ -108,28 +108,28 @@ export function GalleryPanel({
     <section className="section-card section-card--gallery">
       <div className="section-card__header">
         <div>
-          <p className="eyebrow">Gallery</p>
-          <h2>Recent {mediaLabel.toLowerCase()} assets</h2>
+          <p className="eyebrow">ライブラリ</p>
+          <h2>これまでの{mediaLabel}</h2>
         </div>
         <p className="section-footnote">
-          {items.length} items loaded
+          {items.length} 件
           {projectName ? ` | ${projectName}` : ""}
         </p>
       </div>
       <label className="field-group field-group--full">
-        <span>Search current gallery</span>
+        <span>探す</span>
         <input
           type="search"
           value={search}
           onChange={(event) => onSearchChange(event.target.value)}
-          placeholder="prompt, model, project, metadata"
+          placeholder="プロンプト、モデル、プロジェクトなど"
         />
       </label>
       {activeBatchId ? (
         <div className="gallery-batch-filter">
-          <span>Showing one batch only</span>
+          <span>1 つのまとまりだけ表示中</span>
           <button type="button" className="secondary-button secondary-button--chip" onClick={() => onFilterByBatch(null)}>
-            Clear batch filter ×
+            絞り込みを解除 ×
           </button>
         </div>
       ) : null}
@@ -165,7 +165,7 @@ export function GalleryPanel({
                       </span>
                     </div>
                     <strong>{row.label}</strong>
-                    <p>{isExpanded ? "Tap to collapse" : "Tap to expand this batch"}</p>
+                    <p>{isExpanded ? "押すと閉じます" : "押すとこのまとまりを開きます"}</p>
                   </div>
                 </button>
                 {isExpanded ? (
@@ -175,7 +175,7 @@ export function GalleryPanel({
                       className="secondary-button secondary-button--chip"
                       onClick={() => onFilterByBatch(row.batchId)}
                     >
-                      Show only this batch
+                      このまとまりだけ表示
                     </button>
                     {row.items.map((item) => renderItemButton(item, true))}
                   </div>
@@ -185,7 +185,7 @@ export function GalleryPanel({
           })
         ) : (
           <div className="history-empty">
-            Successful jobs will appear here after the runner finishes them.
+            生成が終わった成果物がここに並びます。
           </div>
         )}
       </div>

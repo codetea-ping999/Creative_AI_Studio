@@ -142,7 +142,7 @@ export function AssetDetailPanel({
           outputPath={playsVideo ? detail.output_path : detail.preview_path}
           posterPath={playsVideo ? detail.preview_path : null}
           title={detail.prompt}
-          subtitle={detail.project_name || "Unassigned"}
+          subtitle={detail.project_name || "プロジェクトなし"}
         />
         <div className="asset-actions">
           <button
@@ -227,7 +227,7 @@ export function AssetDetailPanel({
             onClick={onReuse}
             disabled={isAssetBusy}
           >
-            Reuse and rerun
+            同じ条件で作り直す
           </button>
           <button
             type="button"
@@ -235,7 +235,7 @@ export function AssetDetailPanel({
             onClick={onLoadIntoComposer}
             disabled={isAssetBusy}
           >
-            Load into composer
+            入力欄に読み込む
           </button>
           <button
             type="button"
@@ -243,7 +243,7 @@ export function AssetDetailPanel({
             onClick={onExport}
             disabled={isAssetBusy}
           >
-            Export asset
+            書き出す
           </button>
         </div>
         {detail.media_type === "audio" ? (
@@ -255,7 +255,7 @@ export function AssetDetailPanel({
               disabled={isAssetBusy || !canConditionMelody}
               aria-describedby="melody-conditioning-help"
             >
-              Use as melody reference
+              メロディの参照に使う
             </button>
             <p id="melody-conditioning-help" className="section-footnote">
               {melodyConditioningMessage}
@@ -265,18 +265,18 @@ export function AssetDetailPanel({
         <div className="form-section">
           <div className="form-section__header">
             <div>
-              <p className="eyebrow">Project Binding</p>
-              <h3>Move the source job and asset between projects</h3>
+              <p className="eyebrow">プロジェクト</p>
+              <h3>この成果物を入れるプロジェクト</h3>
             </div>
           </div>
           <label className="field-group field-group--full">
-            <span>Asset project</span>
+            <span>プロジェクト</span>
             <select
               value={assetProjectId}
               onChange={(event) => onAssetProjectIdChange(event.target.value)}
               disabled={isAssetBusy}
             >
-              <option value="">Unassigned</option>
+              <option value="">プロジェクトなし</option>
               {projects.map((project) => (
                 <option key={project.id} value={project.id}>
                   {project.name}
@@ -290,7 +290,7 @@ export function AssetDetailPanel({
             onClick={onBindProject}
             disabled={isAssetBusy}
           >
-            Update asset project
+            プロジェクトを変更
           </button>
         </div>
       </div>
@@ -298,29 +298,29 @@ export function AssetDetailPanel({
       <div className="monitor-stack">
         <div className="metadata-grid">
           <div className="metadata-item">
-            <span>Asset</span>
+            <span>成果物 ID</span>
             <strong>{detail.asset_id}</strong>
           </div>
           <div className="metadata-item">
-            <span>Model</span>
+            <span>モデル</span>
             <strong>{detail.model_id}</strong>
           </div>
           <div className="metadata-item">
-            <span>Created</span>
+            <span>作成</span>
             <strong>{formatDate(detail.created_at)}</strong>
           </div>
           <div className="metadata-item">
-            <span>Updated</span>
+            <span>更新</span>
             <strong>{formatDate(detail.updated_at)}</strong>
           </div>
           <div className="metadata-item">
-            <span>Quality</span>
+            <span>品質</span>
             <strong>
               {formatScore(detail.quality_score_calibrated ?? detail.quality_score)}
             </strong>
           </div>
           <div className="metadata-item">
-            <span>Semantic</span>
+            <span>内容の一致</span>
             <strong>
               {formatScore(
                 detail.semantic_alignment_score_calibrated ?? detail.semantic_alignment_score,
@@ -328,7 +328,7 @@ export function AssetDetailPanel({
             </strong>
           </div>
           <div className="metadata-item">
-            <span>Creative</span>
+            <span>表現</span>
             <strong>
               {formatScore(
                 detail.creative_alignment_score_calibrated ?? detail.creative_alignment_score,
@@ -336,7 +336,7 @@ export function AssetDetailPanel({
             </strong>
           </div>
           <div className="metadata-item">
-            <span>Feedback</span>
+            <span>評価</span>
             <strong>{detail.feedback_count}</strong>
           </div>
         </div>
@@ -344,28 +344,28 @@ export function AssetDetailPanel({
         <div className="form-section">
           <div className="form-section__header">
             <div>
-              <p className="eyebrow">Lineage</p>
-              <h3>Trace reuse and export state</h3>
+              <p className="eyebrow">来歴</p>
+              <h3>元にした成果物と書き出し</h3>
             </div>
           </div>
           <div className="asset-chip-row">
-            <span className="form-section__mode">reuse {detail.reuse_count}</span>
-            <span className="form-section__mode">export {detail.export_count}</span>
-            <span className="form-section__mode">feedback {detail.feedback_count}</span>
+            <span className="form-section__mode">再利用 {detail.reuse_count}</span>
+            <span className="form-section__mode">書き出し {detail.export_count}</span>
+            <span className="form-section__mode">評価 {detail.feedback_count}</span>
           </div>
           <div className="asset-list">
             <div className="asset-path">
-              <span>Parent Asset</span>
-              <code>{detail.parent_asset_id ?? "none"}</code>
+              <span>元の成果物</span>
+              <code>{detail.parent_asset_id ?? "なし"}</code>
             </div>
             <div className="asset-path">
-              <span>Lineage</span>
-              <code>{detail.lineage.length > 0 ? detail.lineage.join(", ") : "none"}</code>
+              <span>来歴</span>
+              <code>{detail.lineage.length > 0 ? detail.lineage.join(", ") : "なし"}</code>
             </div>
             <div className="asset-path">
-              <span>Exports</span>
+              <span>書き出し</span>
               <code>
-                {detail.export_paths.length > 0 ? detail.export_paths.join(", ") : "none"}
+                {detail.export_paths.length > 0 ? detail.export_paths.join(", ") : "なし"}
               </code>
             </div>
           </div>
@@ -374,13 +374,13 @@ export function AssetDetailPanel({
         <form className="form-section" onSubmit={(event) => void handleFeedbackSubmit(event)}>
           <div className="form-section__header">
             <div>
-              <p className="eyebrow">Human Feedback</p>
-              <h3>Record review signal for calibration and reuse decisions</h3>
+              <p className="eyebrow">詳しい評価</p>
+              <h3>点数とメモを残す</h3>
             </div>
           </div>
           <div className="field-grid field-grid--controls">
             <label className="field-group">
-              <span>Quality</span>
+              <span>品質</span>
               <select
                 value={feedbackQuality}
                 onChange={(event) => setFeedbackQuality(event.target.value)}
@@ -394,7 +394,7 @@ export function AssetDetailPanel({
               </select>
             </label>
             <label className="field-group">
-              <span>Semantic</span>
+              <span>内容の一致</span>
               <select
                 value={feedbackSemantic}
                 onChange={(event) => setFeedbackSemantic(event.target.value)}
@@ -408,7 +408,7 @@ export function AssetDetailPanel({
               </select>
             </label>
             <label className="field-group">
-              <span>Creative</span>
+              <span>表現</span>
               <select
                 value={feedbackCreative}
                 onChange={(event) => setFeedbackCreative(event.target.value)}
@@ -430,7 +430,7 @@ export function AssetDetailPanel({
                 onChange={(event) => setFeedbackReuseIntent(event.target.checked)}
                 disabled={isFeedbackBusy}
               />
-              Reuse candidate
+              再利用の候補
             </label>
             <label>
               <input
@@ -439,35 +439,38 @@ export function AssetDetailPanel({
                 onChange={(event) => setFeedbackExportReady(event.target.checked)}
                 disabled={isFeedbackBusy}
               />
-              Export ready
+              書き出してよい
             </label>
           </div>
           <label className="field-group field-group--full">
-            <span>Issue tags</span>
+            <span>気になる点（カンマ区切り）</span>
             <input
               type="text"
               value={feedbackIssueTags}
               onChange={(event) => setFeedbackIssueTags(event.target.value)}
-              placeholder="composition, lighting"
+              placeholder="例：構図, 光"
               disabled={isFeedbackBusy}
             />
           </label>
           <label className="field-group field-group--full">
-            <span>Comments</span>
+            <span>メモ</span>
             <textarea
               rows={3}
               value={feedbackComments}
               onChange={(event) => setFeedbackComments(event.target.value)}
-              placeholder="What should change before production use?"
+              placeholder="使う前に直したいところ"
               disabled={isFeedbackBusy}
             />
           </label>
           <button type="submit" className="dock-submit" disabled={isFeedbackBusy}>
-            {isFeedbackBusy ? "Saving..." : "Save feedback"}
+            {isFeedbackBusy ? "保存中..." : "評価を保存"}
           </button>
         </form>
 
-        <pre>{JSON.stringify(detail.request_snapshot, null, 2)}</pre>
+        <details className="request-snapshot">
+          <summary>送信した設定（JSON）</summary>
+          <pre>{JSON.stringify(detail.request_snapshot, null, 2)}</pre>
+        </details>
       </div>
     </div>
   );

@@ -84,11 +84,11 @@ describe("LatestJobPanel", () => {
 
     render(<LatestJobPanel latestJob={runningJob} onCancel={onCancel} />);
 
-    await user.dblClick(screen.getByRole("button", { name: "Cancel job" }));
+    await user.dblClick(screen.getByRole("button", { name: "中断する" }));
 
     expect(onCancel).toHaveBeenCalledTimes(1);
     const pendingButton = screen.getByRole("button", {
-      name: "Cancelling job...",
+      name: "中断しています...",
     }) as HTMLButtonElement;
     expect(pendingButton.disabled).toBe(true);
     expect(pendingButton.getAttribute("aria-busy")).toBe("true");
@@ -96,7 +96,7 @@ describe("LatestJobPanel", () => {
     finishCancel?.();
     await waitFor(() => {
       expect(
-        (screen.getByRole("button", { name: "Cancel job" }) as HTMLButtonElement)
+        (screen.getByRole("button", { name: "中断する" }) as HTMLButtonElement)
           .disabled,
       ).toBe(false);
     });
