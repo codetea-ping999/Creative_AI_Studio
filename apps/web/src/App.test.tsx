@@ -285,6 +285,11 @@ describe("Studio screens", () => {
     render(<App />);
 
     expect(await screen.findByRole("heading", { level: 1, name: "準備" })).toBeTruthy();
+    // Project management and theme live on the setup screen; choosing where
+    // new work is saved stays in the top bar on every screen.
+    expect(screen.getByRole("heading", { name: "プロジェクト" })).toBeTruthy();
+    expect(screen.getByRole("group", { name: "画面の明るさ" })).toBeTruthy();
+    expect(screen.getByRole("combobox", { name: "保存先" })).toBeTruthy();
   });
 });
 
