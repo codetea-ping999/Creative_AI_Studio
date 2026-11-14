@@ -4,12 +4,10 @@
 
 ## [Unreleased]
 
-v1.1 に持ち越した項目は [#458](https://github.com/codetea-ping999/Creative_AI_Studio/issues/458) に集約しています。
-v1.0.0 の既知の制限と検証の所見のうち、次のものを v1.1 で扱う予定です。
+## [1.1.0]
 
-- Storyboard GIF の静止表示（`prefers-reduced-motion` 対応）
-- 日本語 Storyboard overlay の文字が MP4 で表示されない問題
-- Preview / Experimental 用の ML 依存の更新（`torch`、`diffusers`、`transformers`）
+v1.1.0 は Studio の画面を用途ごとに分け直したリリースです。v1.0.0 から持ち越した残りの項目は
+[#458](https://github.com/codetea-ping999/Creative_AI_Studio/issues/458) で引き続き扱います。
 
 ### Changed
 
