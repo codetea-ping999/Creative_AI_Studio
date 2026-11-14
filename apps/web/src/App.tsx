@@ -1,4 +1,10 @@
-import { startTransition, useCallback, useEffect, useState, type FormEvent } from "react";
+import {
+  startTransition,
+  useCallback,
+  useEffect,
+  useState,
+  type FormEvent,
+} from "react";
 import {
   PromptForm,
   type LoraOption,
@@ -11,8 +17,17 @@ import { AssetDetailPanel, type FeedbackFormValues } from "./components/AssetDet
 import { GalleryPanel } from "./components/GalleryPanel";
 import { LatestJobPanel } from "./components/LatestJobPanel";
 import { MatrixPanel } from "./components/MatrixPanel";
-import { ModelsSummaryPanel } from "./components/ModelsSummaryPanel";
+import { SetupPanel } from "./components/SetupPanel";
 import { StoryPanel } from "./components/StoryPanel";
+import {
+  getMediaReadiness,
+  mediaKindLabels,
+  pickStartingMedia,
+  startingMediaOrder,
+  type MediaReadiness,
+  type ModelLoadState,
+} from "./lib/mediaReadiness";
+import { getInstallGuide } from "./lib/modelInstallGuide";
 import { buildGeneratePayload, buildReusePayload } from "./lib/payloads";
 import {
   buildQuickReviewPrompt,
@@ -54,13 +69,24 @@ import {
 } from "./hooks/useStudioView";
 
 type ThemeMode = "light" | "dark";
-type ModelLoadState = "idle" | "loading" | "loaded" | "error";
+const MEDIA_STORAGE_KEY = "creative-ai-studio.media-type";
 
-const mediaTypeReadinessLabels: Record<MediaType, string> = {
-  image: "画像",
-  audio: "音声",
-  video: "動画",
-};
+function readStoredMediaType(): MediaType | null {
+  try {
+    const stored = window.localStorage.getItem(MEDIA_STORAGE_KEY);
+    return stored === "image" || stored === "audio" || stored === "video" ? stored : null;
+  } catch {
+    return null;
+  }
+}
+
+function storeMediaType(mediaType: MediaType): void {
+  try {
+    window.localStorage.setItem(MEDIA_STORAGE_KEY, mediaType);
+  } catch {
+    // Private windows can refuse storage; the choice just is not remembered.
+  }
+}
 
 /**
  * Gallery assets can be `media_type: "text"` (Story surface output), but the
@@ -91,7 +117,17 @@ type AssetReuseOptions = {
 function App() {
   const [view, setView] = useStudioView();
   const [themeMode, setThemeMode] = useState<ThemeMode>("dark");
-  const [mediaType, setMediaType] = useState<MediaType>("image");
+  const [mediaType, setMediaTypeState] = useState<MediaType>(
+    () => readStoredMediaType() ?? "image",
+  );
+  // Once someone picks a media type (or the studio picked a working one for
+  // them), stop moving the composer on its own.
+  const [mediaDecided, setMediaDecided] = useState(() => readStoredMediaType() !== null);
+  const setMediaType = useCallback((next: MediaType) => {
+    setMediaDecided(true);
+    storeMediaType(next);
+    setMediaTypeState(next);
+  }, []);
   const [composerRevision, setComposerRevision] = useState(0);
   const [modelOptionsByMedia, setModelOptionsByMedia] = useState<
     Record<MediaType, ModelOption[]>
@@ -165,6 +201,25 @@ function App() {
   });
 
   const activeModels = modelOptionsByMedia[mediaType];
+  const readinessByMedia: Record<MediaType, MediaReadiness> = {
+    image: getMediaReadiness(modelLoadState.image, modelOptionsByMedia.image),
+    audio: getMediaReadiness(modelLoadState.audio, modelOptionsByMedia.audio),
+    video: getMediaReadiness(modelLoadState.video, modelOptionsByMedia.video),
+  };
+  if (!mediaDecided) {
+    // Adjusting state while rendering (not in an effect) avoids painting the
+    // unusable lane first: open on a media type that can actually generate.
+    const startingMedia = pickStartingMedia(mediaType, readinessByMedia);
+    if (startingMedia !== null) {
+      setMediaDecided(true);
+      if (startingMedia !== mediaType) {
+        setMediaTypeState(startingMedia);
+      }
+    }
+  }
+  const readyAlternatives = startingMediaOrder.filter(
+    (media) => media !== mediaType && readinessByMedia[media] === "ready",
+  );
   const activeModelLoadState = modelLoadState[mediaType];
   const activeDraft = drafts[mediaType] ?? defaultSubmitValues[mediaType];
   const selectedModelAvailable = activeModels.some(
@@ -205,13 +260,13 @@ function App() {
               : "models-unavailable";
   const readinessCopy =
     readinessState === "ready"
-      ? `${mediaTypeReadinessLabels[mediaType]}モデル ${activeAvailableModelCount} 件を利用できます。初回生成は準備に時間がかかる場合があります。`
+      ? `${mediaKindLabels[mediaType]}モデル ${activeAvailableModelCount} 件を利用できます。初回生成は準備に時間がかかる場合があります。`
       : readinessState === "models-loading"
-        ? `${mediaTypeReadinessLabels[mediaType]}モデルを読み込んでいます。`
+        ? `${mediaKindLabels[mediaType]}モデルを読み込んでいます。`
         : readinessState === "models-unavailable"
-          ? `利用可能な${mediaTypeReadinessLabels[mediaType]}モデルがありません。モデルを配置してから再試行してください。`
+          ? `利用可能な${mediaKindLabels[mediaType]}モデルがありません。モデルを配置してから再試行してください。`
           : readinessState === "models-error"
-            ? `${mediaTypeReadinessLabels[mediaType]}モデルの一覧を読み込めません。再試行してください。`
+            ? `${mediaKindLabels[mediaType]}モデルの一覧を読み込めません。再試行してください。`
             : readinessState === "offline"
               ? "API に接続できません。./scripts/start_studio.sh の起動状態を確認してください。"
               : "API とローカルモデルを確認しています。";
@@ -221,7 +276,6 @@ function App() {
       : !selectedModelAvailable
         ? "選択中のモデルは利用できません。利用可能なモデルを選択してください。"
         : null;
-  const activeMetrics = metrics?.by_media[mediaType] ?? null;
   const selectedProject =
     projects.find((project) => project.id === selectedProjectId) ?? null;
   const handleDraftChange = useCallback(
@@ -254,7 +308,7 @@ function App() {
       setMediaType(targetMedia);
       setComposerRevision((current) => current + 1);
     },
-    [],
+    [setMediaType],
   );
 
   useEffect(() => {
@@ -287,7 +341,13 @@ function App() {
     }
     void loadProjects();
     void loadLoras();
+    // Every lane, not just the composer's, so the media switch and the setup
+    // screen can say what works on this machine.
+    for (const media of startingMediaOrder) {
+      void loadModels(media);
+    }
   }, [apiReachable]);
+
 
   useEffect(() => {
     if (!apiReachable) {
@@ -397,7 +457,7 @@ function App() {
     setReadinessError(null);
     const isReachable = await loadReadiness();
     if (isReachable) {
-      await loadModels(mediaType);
+      await Promise.all(startingMediaOrder.map((media) => loadModels(media)));
     }
   }
 
@@ -1169,75 +1229,131 @@ function App() {
                     onClick={() => setMediaType(option)}
                     aria-pressed={mediaType === option}
                   >
-                    {mediaTypeReadinessLabels[option]}
+                    {mediaKindLabels[option]}
+                    {readinessByMedia[option] === "missing" ? (
+                      <span className="media-switch__note">準備が必要</span>
+                    ) : null}
                   </button>
                 ))}
               </div>
             </div>
 
-            <p
-              className={`readiness-banner ${readinessState === "ready" ? "is-ready" : "is-warning"}`}
-              role="status"
-              aria-live="polite"
-            >
-              <span className="readiness-banner__copy">
-                <strong>
-                  {readinessState === "ready"
-                    ? "準備完了"
-                    : readinessState === "offline"
-                      ? "接続できません"
-                      : readinessState === "models-unavailable"
-                        ? "モデルが未配置です"
-                        : readinessState === "models-error"
-                          ? "モデルを確認できません"
-                          : "準備状況を確認中"}
-                </strong>
-                <span>{readinessCopy}</span>
-              </span>
-              {readinessState !== "ready" ? (
-                <button
-                  type="button"
-                  className="secondary-button readiness-banner__retry"
-                  onClick={() => {
-                    void handleReadinessRetry();
-                  }}
-                  disabled={activeModelLoadState === "loading"}
-                >
-                  再試行
-                </button>
-              ) : null}
-            </p>
-
             {errorMessage ? <p className="error-banner" role="alert">{errorMessage}</p> : null}
             {readinessError ? <p className="error-banner" role="alert">{readinessError}</p> : null}
 
-            <section className="section-card section-card--stage">
-              <div className="section-card__header">
-                <div>
-                  <p className="eyebrow">かんたん作成</p>
-                  <h2>{mediaType === "image" ? "画像を作る" : `${mediaTypeLabels[mediaType]} generation`}</h2>
-                </div>
-                <p className="section-footnote">
-                  Model manifests and local availability are loaded live from the registry.
+            {readinessState === "models-unavailable" ? (
+              <>
+                <section className="section-card setup-callout" aria-labelledby="setup-callout-heading">
+                  <p className="eyebrow">準備が必要</p>
+                  <h2 id="setup-callout-heading">
+                    {mediaKindLabels[mediaType]}のモデルがまだ置かれていません
+                  </h2>
+                  <p>
+                    {mediaKindLabels[mediaType]}を作るには、次のどれかのモデルを models/
+                    に置いてから「再確認」を押してください。
+                  </p>
+                  <ul className="setup-callout__models">
+                    {activeModels.map((model) => (
+                      <li key={model.id}>
+                        <strong>{model.displayName}</strong>
+                        <span>{getInstallGuide(mediaType, model)?.note ?? "配置先は準備画面で確認できます。"}</span>
+                      </li>
+                    ))}
+                  </ul>
+                  <div className="setup-callout__actions">
+                    {readyAlternatives.map((media) => (
+                      <button
+                        key={media}
+                        type="button"
+                        className="primary-button"
+                        onClick={() => setMediaType(media)}
+                      >
+                        {mediaKindLabels[media]}をつくる
+                      </button>
+                    ))}
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={() => setView("setup")}
+                    >
+                      準備画面で詳しく見る
+                    </button>
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={() => {
+                        void handleReadinessRetry();
+                      }}
+                      disabled={activeModelLoadState === "loading"}
+                    >
+                      再確認
+                    </button>
+                  </div>
+                </section>
+              </>
+            ) : (
+              <>
+                <p
+                  className={`readiness-banner ${readinessState === "ready" ? "is-ready" : "is-warning"}`}
+                  role="status"
+                  aria-live="polite"
+                >
+                  <span className="readiness-banner__copy">
+                    <strong>
+                      {readinessState === "ready"
+                        ? "準備完了"
+                        : readinessState === "offline"
+                          ? "接続できません"
+                          : readinessState === "models-error"
+                            ? "モデルを確認できません"
+                            : "準備状況を確認中"}
+                    </strong>
+                    <span>{readinessCopy}</span>
+                  </span>
+                  {readinessState !== "ready" ? (
+                    <button
+                      type="button"
+                      className="secondary-button readiness-banner__retry"
+                      onClick={() => {
+                        void handleReadinessRetry();
+                      }}
+                      disabled={activeModelLoadState === "loading"}
+                    >
+                      再試行
+                    </button>
+                  ) : null}
                 </p>
-              </div>
-              <PromptForm
-                key={`${mediaType}:${composerRevision}`}
-                formId="studio-prompt-form"
-                mediaType={mediaType}
-                modelOptions={activeModels}
-                loraOptions={mediaType === "image" ? loraOptions : []}
-                initialValues={drafts[mediaType]}
-                submitLabel={isSubmitting ? "生成中..." : "生成する"}
-                disabled={isSubmitting}
-                canSubmit={!isSubmitting && generationGateMessage === null}
-                statusMessage={generationGateMessage ?? statusMessage}
-                onDraftChange={handleDraftChange}
-                onSubmit={(values) => {
-                  void handleSubmit(values);
-                }}
-              />
-            </section>
+
+
+                <section className="section-card section-card--stage">
+                  <div className="section-card__header">
+                    <div>
+                      <p className="eyebrow">かんたん作成</p>
+                      <h2>{mediaKindLabels[mediaType]}を作る</h2>
+                    </div>
+                    <p className="section-footnote">
+                      Model manifests and local availability are loaded live from the registry.
+                    </p>
+                  </div>
+                  <PromptForm
+                    key={`${mediaType}:${composerRevision}`}
+                    formId="studio-prompt-form"
+                    mediaType={mediaType}
+                    modelOptions={activeModels}
+                    loraOptions={mediaType === "image" ? loraOptions : []}
+                    initialValues={drafts[mediaType]}
+                    submitLabel={isSubmitting ? "生成中..." : "生成する"}
+                    disabled={isSubmitting}
+                    canSubmit={!isSubmitting && generationGateMessage === null}
+                    statusMessage={generationGateMessage ?? statusMessage}
+                    onDraftChange={handleDraftChange}
+                    onSubmit={(values) => {
+                      void handleSubmit(values);
+                    }}
+                  />
+                </section>
+              </>
+            )}
 
             <div className="workspace-grid story-matrix-workspace">
               <LatestJobPanel
@@ -1386,35 +1502,16 @@ function App() {
 
         {view === "setup" ? (
           <>
-            <ModelsSummaryPanel
-              models={activeModels}
+            <SetupPanel
+              modelsByMedia={modelOptionsByMedia}
+              readinessByMedia={readinessByMedia}
               metrics={metrics}
-              activeMetrics={activeMetrics}
-              mediaLabel={mediaTypeLabels[mediaType]}
+              galleryStats={galleryStats}
+              onRetry={() => {
+                void handleReadinessRetry();
+              }}
+              isRetrying={Object.values(modelLoadState).includes("loading")}
             />
-
-            <section className="section-card section-card--activity">
-              <div className="section-card__header">
-                <div>
-                  <p className="eyebrow">Asset Workflow</p>
-                  <h2>Library activity</h2>
-                </div>
-              </div>
-              <div className="monitor-stack">
-                <div className="metric-pill">
-                  <strong>{galleryStats?.total_items ?? 0}</strong>
-                  <p>Total tracked assets</p>
-                </div>
-                <div className="metric-pill">
-                  <strong>{galleryStats?.total_reuse_count ?? 0}</strong>
-                  <p>Reuse actions recorded</p>
-                </div>
-                <div className="metric-pill">
-                  <strong>{galleryStats?.total_export_count ?? 0}</strong>
-                  <p>Exports written out</p>
-                </div>
-              </div>
-            </section>
           </>
         ) : null}
       </main>
