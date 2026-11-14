@@ -1206,42 +1206,25 @@ function App() {
               </>
             )}
 
-            <div className="workspace-grid story-matrix-workspace">
-              <LatestJobPanel
-                latestJob={latestJob}
-                onCancel={handleCancelLatestJob}
-                jobAssets={
-                  latestJob
-                    ? galleryItems.filter((item) => item.job_id === latestJob.id)
-                    : []
-                }
-                selectedAssetId={selectedAssetId}
-                onSelectAsset={(assetId) => {
-                  void loadAssetDetail(assetId);
-                }}
-              />
+            <LatestJobPanel
+              latestJob={latestJob}
+              onCancel={handleCancelLatestJob}
+              jobAssets={
+                latestJob
+                  ? galleryItems.filter((item) => item.job_id === latestJob.id)
+                  : []
+              }
+              selectedAssetId={selectedAssetId}
+              onSelectAsset={(assetId) => {
+                void loadAssetDetail(assetId);
+              }}
+            />
 
-              <GalleryPanel
-                mediaLabel={mediaTypeLabels[mediaType]}
-                items={galleryItems}
-                projectName={selectedProject?.name ?? null}
-                search={gallerySearch}
-                onSearchChange={setGallerySearch}
-                selectedAssetId={selectedAssetId}
-                onSelect={(assetId) => {
-                  void loadAssetDetail(assetId);
-                }}
-                disabled={isAssetBusy || isFeedbackBusy}
-                activeBatchId={galleryBatchFilter}
-                onFilterByBatch={setGalleryBatchFilter}
-              />
-            </div>
-
-            <section className="section-card">
+            <section className="section-card" id="selected-asset">
               <div className="section-card__header">
                 <div>
-                  <p className="eyebrow">Selected Asset</p>
-                  <h2>Inspect, bind, export, and reuse</h2>
+                  <p className="eyebrow">選んだ成果物</p>
+                  <h2>判定・再利用・書き出し</h2>
                 </div>
                 {assetMessage ? <p className="section-footnote">{assetMessage}</p> : null}
               </div>
@@ -1285,8 +1268,113 @@ function App() {
               ) : (
                 <div className="empty-stage">
                   <div>
-                    <h3>No asset selected</h3>
-                    <p>Select an item from the gallery to inspect its detail and actions.</p>
+                    <h3>まだ選ばれていません</h3>
+                    <p>生成が終わるとここに結果が出ます。過去の成果物はライブラリから選べます。</p>
+                  </div>
+                </div>
+              )}
+            </section>
+
+            <p className="view-footer-link">
+              <a
+                href={viewHref("library")}
+                onClick={(event) => {
+                  event.preventDefault();
+                  setView("library");
+                }}
+              >
+                ライブラリで{mediaKindLabels[mediaType]}の一覧を見る
+              </a>
+            </p>
+          </>
+        ) : null}
+
+        {view === "library" ? (
+          <>
+            <div className="view-toolbar">
+              <span className="view-toolbar__label" id="library-media-label">種類</span>
+              <div className="mode-toggle media-switch" role="group" aria-labelledby="library-media-label">
+                {(["image", "audio", "video"] as MediaType[]).map((option) => (
+                  <button
+                    key={option}
+                    type="button"
+                    className={`mode-toggle__button ${mediaType === option ? "is-active" : ""}`}
+                    onClick={() => setMediaType(option)}
+                    aria-pressed={mediaType === option}
+                  >
+                    {mediaKindLabels[option]}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <GalleryPanel
+              mediaLabel={mediaTypeLabels[mediaType]}
+              items={galleryItems}
+              projectName={selectedProject?.name ?? null}
+              search={gallerySearch}
+              onSearchChange={setGallerySearch}
+              selectedAssetId={selectedAssetId}
+              onSelect={(assetId) => {
+                void loadAssetDetail(assetId).then(() => {
+                  document.getElementById("selected-asset")?.scrollIntoView?.({ block: "start" });
+                });
+              }}
+              disabled={isAssetBusy || isFeedbackBusy}
+              activeBatchId={galleryBatchFilter}
+              onFilterByBatch={setGalleryBatchFilter}
+            />
+
+            <section className="section-card" id="selected-asset">
+              <div className="section-card__header">
+                <div>
+                  <p className="eyebrow">選んだ成果物</p>
+                  <h2>判定・再利用・書き出し</h2>
+                </div>
+                {assetMessage ? <p className="section-footnote">{assetMessage}</p> : null}
+              </div>
+              {selectedAssetDetail ? (
+                <AssetDetailPanel
+                  key={selectedAssetDetail.asset_id}
+                  detail={selectedAssetDetail}
+                  projects={projects}
+                  assetProjectId={selectedAssetProjectId}
+                  onAssetProjectIdChange={setSelectedAssetProjectId}
+                  isAssetBusy={isAssetBusy}
+                  isFeedbackBusy={isFeedbackBusy}
+                  onOpenQuickReview={() => setErrorMessage(null)}
+                  onQuickReview={handleQuickReview}
+                  onReuse={() => {
+                    // Edits made after "Load into composer" go out as a variation;
+                    // otherwise the asset's own saved request reruns with a new seed.
+                    const loadedIntoComposer =
+                      composerAssetIds[toComposerMediaType(selectedAssetDetail.media_type)] ===
+                      selectedAssetDetail.asset_id;
+                    void handleAssetReuse(
+                      loadedIntoComposer
+                        ? { basis: "composer" }
+                        : { action: "rerun", basis: "source-request" },
+                    );
+                  }}
+                  canConditionMelody={canConditionMelody}
+                  melodyConditioningMessage={melodyConditioningMessage}
+                  onConditionMelody={() => {
+                    void handleAssetReuse({ action: "melody" });
+                  }}
+                  onLoadIntoComposer={loadSelectedAssetIntoComposer}
+                  onExport={() => {
+                    void handleAssetExport();
+                  }}
+                  onBindProject={() => {
+                    void handleAssetProjectBinding();
+                  }}
+                  onSubmitFeedback={handleFeedbackSubmit}
+                />
+              ) : (
+                <div className="empty-stage">
+                  <div>
+                    <h3>まだ選ばれていません</h3>
+                    <p>生成が終わるとここに結果が出ます。過去の成果物はライブラリから選べます。</p>
                   </div>
                 </div>
               )}

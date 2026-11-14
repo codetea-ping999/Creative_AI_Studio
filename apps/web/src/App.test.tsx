@@ -344,3 +344,23 @@ describe("Model readiness", () => {
     expect(within(section).getByText("未配置のモデル 1 件と配置先")).toBeTruthy();
   });
 });
+
+describe("Library screen", () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    window.location.hash = "";
+    window.localStorage.clear();
+  });
+
+  it("lists past assets with their detail, apart from the composer", async () => {
+    window.localStorage.setItem("creative-ai-studio.media-type", "video");
+    window.location.hash = "#/library";
+    stubStudioApi(makeVideoAsset());
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "判定・再利用・書き出し" })).toBeTruthy();
+    expect(await screen.findByRole("button", { name: "Reuse and rerun" })).toBeTruthy();
+    expect(screen.queryByRole("textbox", { name: "Prompt" })).toBeNull();
+  });
+});
