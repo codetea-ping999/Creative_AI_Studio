@@ -45,6 +45,13 @@ import {
 } from "./studio";
 import { requestJson } from "./studioClient";
 import { useJobPolling } from "./hooks/useJobPolling";
+import {
+  studioViewDescriptions,
+  studioViewLabels,
+  studioViews,
+  useStudioView,
+  viewHref,
+} from "./hooks/useStudioView";
 
 type ThemeMode = "light" | "dark";
 type ModelLoadState = "idle" | "loading" | "loaded" | "error";
@@ -82,6 +89,7 @@ type AssetReuseOptions = {
 };
 
 function App() {
+  const [view, setView] = useStudioView();
   const [themeMode, setThemeMode] = useState<ThemeMode>("dark");
   const [mediaType, setMediaType] = useState<MediaType>("image");
   const [composerRevision, setComposerRevision] = useState(0);
@@ -962,12 +970,25 @@ function App() {
         <section className="section-card section-card--nav">
           <div className="sidebar-brand">
             <p className="eyebrow">Creative AI Studio</p>
-            <h1>Asset-aware local studio</h1>
-            <p className="sidebar-copy">
-              Compose prompts, inspect generated assets, and move from output to reuse
-              without leaving the studio.
-            </p>
+            <h1>ローカル制作スタジオ</h1>
           </div>
+          <nav className="view-nav" aria-label="画面">
+            {studioViews.map((option) => (
+              <a
+                key={option}
+                href={viewHref(option)}
+                className={`view-nav__item ${view === option ? "is-active" : ""}`}
+                aria-current={view === option ? "page" : undefined}
+                onClick={(event) => {
+                  event.preventDefault();
+                  setView(option);
+                }}
+              >
+                <strong>{studioViewLabels[option]}</strong>
+                <span className="view-nav__meta">{studioViewDescriptions[option]}</span>
+              </a>
+            ))}
+          </nav>
           <div className="theme-switch">
             <span className="theme-switch__label">Theme</span>
             <div className="theme-switch__group">
@@ -988,39 +1009,6 @@ function App() {
                 Dark
               </button>
             </div>
-          </div>
-        </section>
-
-        <section className="section-card section-card--media">
-          <div className="section-card__header">
-            <div>
-              <p className="eyebrow">Surface</p>
-              <h2>Choose a media lane</h2>
-            </div>
-          </div>
-          <div className="surface-nav">
-            {(["image", "audio", "video"] as MediaType[]).map((option) => (
-              <button
-                key={option}
-                type="button"
-                className={`surface-nav__item ${mediaType === option ? "is-active" : ""}`}
-                onClick={() => setMediaType(option)}
-                aria-pressed={mediaType === option}
-              >
-                <div className="surface-nav__topline">
-                  <span className="surface-pill">{mediaTypeLabels[option]}</span>
-                  <span className="surface-state surface-state--live">Live</span>
-                </div>
-                <strong>{mediaTypeLabels[option]} workflows</strong>
-                <p className="sidebar-meta">
-                  {option === "image"
-                    ? "Render stills with SDXL and optional LoRA."
-                    : option === "audio"
-                      ? "Sketch loop ideas and audition playback."
-                      : "Generate boards and learned-runtime variations."}
-                </p>
-              </button>
-            ))}
           </div>
         </section>
 
@@ -1143,39 +1131,14 @@ function App() {
             </div>
           ) : null}
         </section>
-
-        <section className="section-card section-card--activity">
-          <div className="section-card__header">
-            <div>
-              <p className="eyebrow">Asset Workflow</p>
-              <h2>Library activity</h2>
-            </div>
-          </div>
-          <div className="monitor-stack">
-            <div className="metric-pill">
-              <strong>{galleryStats?.total_items ?? 0}</strong>
-              <p>Total tracked assets</p>
-            </div>
-            <div className="metric-pill">
-              <strong>{galleryStats?.total_reuse_count ?? 0}</strong>
-              <p>Reuse actions recorded</p>
-            </div>
-            <div className="metric-pill">
-              <strong>{galleryStats?.total_export_count ?? 0}</strong>
-              <p>Exports written out</p>
-            </div>
-          </div>
-        </section>
       </aside>
 
       <main className="studio-main">
         <header className="studio-topbar">
           <div className="studio-topbar__identity">
-            <p className="eyebrow">Workspace / {mediaTypeLabels[mediaType]}</p>
-            <h1>{selectedProject?.name ?? "Unassigned workspace"}</h1>
-            <p>
-              Compose, review, and route local {mediaTypeLabels[mediaType].toLowerCase()} assets.
-            </p>
+            <p className="eyebrow">{selectedProject?.name ?? "プロジェクトなし"}</p>
+            <h1>{studioViewLabels[view]}</h1>
+            <p>{studioViewDescriptions[view]}</p>
           </div>
           <dl className="studio-topbar__stats" aria-label="Workspace summary">
             <div>
@@ -1193,208 +1156,267 @@ function App() {
           </dl>
         </header>
 
-        <p
-          className={`readiness-banner ${readinessState === "ready" ? "is-ready" : "is-warning"}`}
-          role="status"
-          aria-live="polite"
-        >
-          <span className="readiness-banner__copy">
-            <strong>
-              {readinessState === "ready"
-                ? "準備完了"
-                : readinessState === "offline"
-                  ? "接続できません"
-                  : readinessState === "models-unavailable"
-                    ? "モデルが未配置です"
-                    : readinessState === "models-error"
-                      ? "モデルを確認できません"
-                      : "準備状況を確認中"}
-            </strong>
-            <span>{readinessCopy}</span>
-          </span>
-          {readinessState !== "ready" ? (
-            <button
-              type="button"
-              className="secondary-button readiness-banner__retry"
-              onClick={() => {
-                void handleReadinessRetry();
-              }}
-              disabled={activeModelLoadState === "loading"}
-            >
-              再試行
-            </button>
-          ) : null}
-        </p>
-
-        {errorMessage ? <p className="error-banner" role="alert">{errorMessage}</p> : null}
-        {readinessError ? <p className="error-banner" role="alert">{readinessError}</p> : null}
-
-        <section className="section-card section-card--stage">
-          <div className="section-card__header">
-            <div>
-              <p className="eyebrow">かんたん作成</p>
-              <h2>{mediaType === "image" ? "画像を作る" : `${mediaTypeLabels[mediaType]} generation`}</h2>
-            </div>
-            <p className="section-footnote">
-              Model manifests and local availability are loaded live from the registry.
-            </p>
-          </div>
-          <PromptForm
-            key={`${mediaType}:${composerRevision}`}
-            formId="studio-prompt-form"
-            mediaType={mediaType}
-            modelOptions={activeModels}
-            loraOptions={mediaType === "image" ? loraOptions : []}
-            initialValues={drafts[mediaType]}
-            submitLabel={isSubmitting ? "生成中..." : "生成する"}
-            disabled={isSubmitting}
-            canSubmit={!isSubmitting && generationGateMessage === null}
-            statusMessage={generationGateMessage ?? statusMessage}
-            onDraftChange={handleDraftChange}
-            onSubmit={(values) => {
-              void handleSubmit(values);
-            }}
-          />
-        </section>
-
-        <div className="workspace-grid story-matrix-workspace">
-          <LatestJobPanel
-            latestJob={latestJob}
-            onCancel={handleCancelLatestJob}
-            jobAssets={
-              latestJob
-                ? galleryItems.filter((item) => item.job_id === latestJob.id)
-                : []
-            }
-            selectedAssetId={selectedAssetId}
-            onSelectAsset={(assetId) => {
-              void loadAssetDetail(assetId);
-            }}
-          />
-
-          <GalleryPanel
-            mediaLabel={mediaTypeLabels[mediaType]}
-            items={galleryItems}
-            projectName={selectedProject?.name ?? null}
-            search={gallerySearch}
-            onSearchChange={setGallerySearch}
-            selectedAssetId={selectedAssetId}
-            onSelect={(assetId) => {
-              void loadAssetDetail(assetId);
-            }}
-            disabled={isAssetBusy || isFeedbackBusy}
-            activeBatchId={galleryBatchFilter}
-            onFilterByBatch={setGalleryBatchFilter}
-          />
-        </div>
-
-        <section className="section-card">
-          <div className="section-card__header">
-            <div>
-              <p className="eyebrow">Selected Asset</p>
-              <h2>Inspect, bind, export, and reuse</h2>
-            </div>
-            {assetMessage ? <p className="section-footnote">{assetMessage}</p> : null}
-          </div>
-          {selectedAssetDetail ? (
-            <AssetDetailPanel
-              key={selectedAssetDetail.asset_id}
-              detail={selectedAssetDetail}
-              projects={projects}
-              assetProjectId={selectedAssetProjectId}
-              onAssetProjectIdChange={setSelectedAssetProjectId}
-              isAssetBusy={isAssetBusy}
-              isFeedbackBusy={isFeedbackBusy}
-              onOpenQuickReview={() => setErrorMessage(null)}
-              onQuickReview={handleQuickReview}
-              onReuse={() => {
-                // Edits made after "Load into composer" go out as a variation;
-                // otherwise the asset's own saved request reruns with a new seed.
-                const loadedIntoComposer =
-                  composerAssetIds[toComposerMediaType(selectedAssetDetail.media_type)] ===
-                  selectedAssetDetail.asset_id;
-                void handleAssetReuse(
-                  loadedIntoComposer
-                    ? { basis: "composer" }
-                    : { action: "rerun", basis: "source-request" },
-                );
-              }}
-              canConditionMelody={canConditionMelody}
-              melodyConditioningMessage={melodyConditioningMessage}
-              onConditionMelody={() => {
-                void handleAssetReuse({ action: "melody" });
-              }}
-              onLoadIntoComposer={loadSelectedAssetIntoComposer}
-              onExport={() => {
-                void handleAssetExport();
-              }}
-              onBindProject={() => {
-                void handleAssetProjectBinding();
-              }}
-              onSubmitFeedback={handleFeedbackSubmit}
-            />
-          ) : (
-            <div className="empty-stage">
-              <div>
-                <h3>No asset selected</h3>
-                <p>Select an item from the gallery to inspect its detail and actions.</p>
+        {view === "create" ? (
+          <>
+            <div className="view-toolbar">
+              <span className="view-toolbar__label" id="media-switch-label">種類</span>
+              <div className="mode-toggle media-switch" role="group" aria-labelledby="media-switch-label">
+                {(["image", "audio", "video"] as MediaType[]).map((option) => (
+                  <button
+                    key={option}
+                    type="button"
+                    className={`mode-toggle__button ${mediaType === option ? "is-active" : ""}`}
+                    onClick={() => setMediaType(option)}
+                    aria-pressed={mediaType === option}
+                  >
+                    {mediaTypeReadinessLabels[option]}
+                  </button>
+                ))}
               </div>
             </div>
-          )}
-        </section>
 
-        <div className="workspace-grid">
-          <StoryPanel
-            modelId=""
-            projectId={selectedProjectId}
-            awaitJob={awaitJobCompletion}
-            // Empty ids let the API pick each media type's default model, so a
-            // scene can be filled without first choosing models by hand.
-            sceneModelIds={{ visual: "", narration: "", music: "" }}
-            onGenerateSceneImage={(scene) => {
-              startTransition(() => {
-                loadDraftIntoComposer("image", {
-                  prompt: scene.image_prompt,
-                  negativePrompt: scene.image_negative,
-                  imageBriefSubject: scene.heading,
-                });
-              });
-              setStatusMessage(
-                `Scene "${scene.heading || scene.id}" をコンポーザに読み込みました。`,
-              );
-            }}
-            onGenerateSceneNarration={(scene) => {
-              startTransition(() => {
-                loadDraftIntoComposer("audio", {
-                  prompt: scene.narration,
-                  mood: scene.bgm_mood,
-                });
-              });
-              setStatusMessage(
-                `Scene "${scene.heading || scene.id}" のナレーションを音声コンポーザに読み込みました。`,
-              );
-            }}
-          />
+            <p
+              className={`readiness-banner ${readinessState === "ready" ? "is-ready" : "is-warning"}`}
+              role="status"
+              aria-live="polite"
+            >
+              <span className="readiness-banner__copy">
+                <strong>
+                  {readinessState === "ready"
+                    ? "準備完了"
+                    : readinessState === "offline"
+                      ? "接続できません"
+                      : readinessState === "models-unavailable"
+                        ? "モデルが未配置です"
+                        : readinessState === "models-error"
+                          ? "モデルを確認できません"
+                          : "準備状況を確認中"}
+                </strong>
+                <span>{readinessCopy}</span>
+              </span>
+              {readinessState !== "ready" ? (
+                <button
+                  type="button"
+                  className="secondary-button readiness-banner__retry"
+                  onClick={() => {
+                    void handleReadinessRetry();
+                  }}
+                  disabled={activeModelLoadState === "loading"}
+                >
+                  再試行
+                </button>
+              ) : null}
+            </p>
 
+            {errorMessage ? <p className="error-banner" role="alert">{errorMessage}</p> : null}
+            {readinessError ? <p className="error-banner" role="alert">{readinessError}</p> : null}
+
+            <section className="section-card section-card--stage">
+              <div className="section-card__header">
+                <div>
+                  <p className="eyebrow">かんたん作成</p>
+                  <h2>{mediaType === "image" ? "画像を作る" : `${mediaTypeLabels[mediaType]} generation`}</h2>
+                </div>
+                <p className="section-footnote">
+                  Model manifests and local availability are loaded live from the registry.
+                </p>
+              </div>
+              <PromptForm
+                key={`${mediaType}:${composerRevision}`}
+                formId="studio-prompt-form"
+                mediaType={mediaType}
+                modelOptions={activeModels}
+                loraOptions={mediaType === "image" ? loraOptions : []}
+                initialValues={drafts[mediaType]}
+                submitLabel={isSubmitting ? "生成中..." : "生成する"}
+                disabled={isSubmitting}
+                canSubmit={!isSubmitting && generationGateMessage === null}
+                statusMessage={generationGateMessage ?? statusMessage}
+                onDraftChange={handleDraftChange}
+                onSubmit={(values) => {
+                  void handleSubmit(values);
+                }}
+              />
+            </section>
+
+            <div className="workspace-grid story-matrix-workspace">
+              <LatestJobPanel
+                latestJob={latestJob}
+                onCancel={handleCancelLatestJob}
+                jobAssets={
+                  latestJob
+                    ? galleryItems.filter((item) => item.job_id === latestJob.id)
+                    : []
+                }
+                selectedAssetId={selectedAssetId}
+                onSelectAsset={(assetId) => {
+                  void loadAssetDetail(assetId);
+                }}
+              />
+
+              <GalleryPanel
+                mediaLabel={mediaTypeLabels[mediaType]}
+                items={galleryItems}
+                projectName={selectedProject?.name ?? null}
+                search={gallerySearch}
+                onSearchChange={setGallerySearch}
+                selectedAssetId={selectedAssetId}
+                onSelect={(assetId) => {
+                  void loadAssetDetail(assetId);
+                }}
+                disabled={isAssetBusy || isFeedbackBusy}
+                activeBatchId={galleryBatchFilter}
+                onFilterByBatch={setGalleryBatchFilter}
+              />
+            </div>
+
+            <section className="section-card">
+              <div className="section-card__header">
+                <div>
+                  <p className="eyebrow">Selected Asset</p>
+                  <h2>Inspect, bind, export, and reuse</h2>
+                </div>
+                {assetMessage ? <p className="section-footnote">{assetMessage}</p> : null}
+              </div>
+              {selectedAssetDetail ? (
+                <AssetDetailPanel
+                  key={selectedAssetDetail.asset_id}
+                  detail={selectedAssetDetail}
+                  projects={projects}
+                  assetProjectId={selectedAssetProjectId}
+                  onAssetProjectIdChange={setSelectedAssetProjectId}
+                  isAssetBusy={isAssetBusy}
+                  isFeedbackBusy={isFeedbackBusy}
+                  onOpenQuickReview={() => setErrorMessage(null)}
+                  onQuickReview={handleQuickReview}
+                  onReuse={() => {
+                    // Edits made after "Load into composer" go out as a variation;
+                    // otherwise the asset's own saved request reruns with a new seed.
+                    const loadedIntoComposer =
+                      composerAssetIds[toComposerMediaType(selectedAssetDetail.media_type)] ===
+                      selectedAssetDetail.asset_id;
+                    void handleAssetReuse(
+                      loadedIntoComposer
+                        ? { basis: "composer" }
+                        : { action: "rerun", basis: "source-request" },
+                    );
+                  }}
+                  canConditionMelody={canConditionMelody}
+                  melodyConditioningMessage={melodyConditioningMessage}
+                  onConditionMelody={() => {
+                    void handleAssetReuse({ action: "melody" });
+                  }}
+                  onLoadIntoComposer={loadSelectedAssetIntoComposer}
+                  onExport={() => {
+                    void handleAssetExport();
+                  }}
+                  onBindProject={() => {
+                    void handleAssetProjectBinding();
+                  }}
+                  onSubmitFeedback={handleFeedbackSubmit}
+                />
+              ) : (
+                <div className="empty-stage">
+                  <div>
+                    <h3>No asset selected</h3>
+                    <p>Select an item from the gallery to inspect its detail and actions.</p>
+                  </div>
+                </div>
+              )}
+            </section>
+          </>
+        ) : null}
+
+        {view !== "create" && errorMessage ? (
+          <p className="error-banner" role="alert">{errorMessage}</p>
+        ) : null}
+
+        {view === "story" ? (
+          <>
+            <StoryPanel
+              modelId=""
+              projectId={selectedProjectId}
+              awaitJob={awaitJobCompletion}
+              // Empty ids let the API pick each media type's default model, so a
+              // scene can be filled without first choosing models by hand.
+              sceneModelIds={{ visual: "", narration: "", music: "" }}
+              onGenerateSceneImage={(scene) => {
+                setView("create");
+                startTransition(() => {
+                  loadDraftIntoComposer("image", {
+                    prompt: scene.image_prompt,
+                    negativePrompt: scene.image_negative,
+                    imageBriefSubject: scene.heading,
+                  });
+                });
+                setStatusMessage(
+                  `Scene "${scene.heading || scene.id}" をコンポーザに読み込みました。`,
+                );
+              }}
+              onGenerateSceneNarration={(scene) => {
+                setView("create");
+                startTransition(() => {
+                  loadDraftIntoComposer("audio", {
+                    prompt: scene.narration,
+                    mood: scene.bgm_mood,
+                  });
+                });
+                setStatusMessage(
+                  `Scene "${scene.heading || scene.id}" のナレーションを音声コンポーザに読み込みました。`,
+                );
+              }}
+            />
+
+            <AssemblyTimelinePanel projectId={selectedProjectId} />
+          </>
+        ) : null}
+
+        {view === "compare" ? (
           <MatrixPanel
             modelId=""
             projectId={selectedProjectId}
             onInspectItem={(item) => {
               if (item.job_id) {
+                setView("create");
                 void loadJob(item.job_id);
               }
             }}
           />
-        </div>
+        ) : null}
 
-        <AssemblyTimelinePanel projectId={selectedProjectId} />
+        {view === "setup" ? (
+          <>
+            <ModelsSummaryPanel
+              models={activeModels}
+              metrics={metrics}
+              activeMetrics={activeMetrics}
+              mediaLabel={mediaTypeLabels[mediaType]}
+            />
 
-        <ModelsSummaryPanel
-          models={activeModels}
-          metrics={metrics}
-          activeMetrics={activeMetrics}
-          mediaLabel={mediaTypeLabels[mediaType]}
-        />
+            <section className="section-card section-card--activity">
+              <div className="section-card__header">
+                <div>
+                  <p className="eyebrow">Asset Workflow</p>
+                  <h2>Library activity</h2>
+                </div>
+              </div>
+              <div className="monitor-stack">
+                <div className="metric-pill">
+                  <strong>{galleryStats?.total_items ?? 0}</strong>
+                  <p>Total tracked assets</p>
+                </div>
+                <div className="metric-pill">
+                  <strong>{galleryStats?.total_reuse_count ?? 0}</strong>
+                  <p>Reuse actions recorded</p>
+                </div>
+                <div className="metric-pill">
+                  <strong>{galleryStats?.total_export_count ?? 0}</strong>
+                  <p>Exports written out</p>
+                </div>
+              </div>
+            </section>
+          </>
+        ) : null}
       </main>
     </div>
   );
