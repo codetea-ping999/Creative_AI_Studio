@@ -81,7 +81,41 @@ function stubStudioApi(asset: GalleryAssetDetailResponse): RecordedRequest[] {
         return json({ status: "ok" });
       }
       if (url.pathname === "/models") {
-        return json({ models: [] });
+        // Only the weight-free storyboard runtime is installed, as on a fresh
+        // checkout: image and audio have nothing usable.
+        const mediaType = url.searchParams.get("media_type");
+        return json({
+          models:
+            mediaType === "video"
+              ? [
+                  {
+                    id: "storyboard-video",
+                    display_name: "Storyboard Video",
+                    media_type: "video",
+                    default_params: {},
+                    tags: [],
+                    is_default: true,
+                    is_available: true,
+                    runtime_status: "ready",
+                    availability_message: "",
+                  },
+                ]
+              : mediaType === "image"
+                ? [
+                    {
+                      id: "sdxl",
+                      display_name: "SDXL Local",
+                      media_type: "image",
+                      default_params: {},
+                      tags: [],
+                      is_default: true,
+                      is_available: false,
+                      runtime_status: "missing_files",
+                      availability_message: "Diffusers model files are missing",
+                    },
+                  ]
+                : [],
+        });
       }
       if (url.pathname === "/catalog/loras") {
         return json({ items: [] });
@@ -162,6 +196,7 @@ describe("Gallery Reuse and rerun", () => {
   afterEach(() => {
     cleanup();
     vi.unstubAllGlobals();
+    window.localStorage.clear();
   });
 
   it("re-runs the selected asset's own request, not the composer's empty draft", async () => {
@@ -223,6 +258,7 @@ describe("Studio screens", () => {
     cleanup();
     vi.unstubAllGlobals();
     window.location.hash = "";
+    window.localStorage.clear();
   });
 
   it("shows one screen at a time and keeps it in the URL hash", async () => {
@@ -249,5 +285,57 @@ describe("Studio screens", () => {
     render(<App />);
 
     expect(await screen.findByRole("heading", { level: 1, name: "準備" })).toBeTruthy();
+  });
+});
+
+describe("Model readiness", () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    window.location.hash = "";
+    window.localStorage.clear();
+  });
+
+  it("opens on a media type that can generate when nobody chose one", async () => {
+    stubStudioApi(makeVideoAsset());
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /動画/ }).getAttribute("aria-pressed")).toBe(
+        "true",
+      );
+    });
+    expect(screen.getByRole("button", { name: /画像/ }).textContent).toContain("準備が必要");
+  });
+
+  it("replaces the composer with one setup card for a media type without models", async () => {
+    window.localStorage.setItem("creative-ai-studio.media-type", "image");
+    stubStudioApi(makeVideoAsset());
+    const user = userEvent.setup();
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", { name: "画像のモデルがまだ置かれていません" }),
+    ).toBeTruthy();
+    expect(screen.getByText("SDXL Local")).toBeTruthy();
+    expect(screen.queryByRole("textbox", { name: "Prompt" })).toBeNull();
+
+    await user.click(await screen.findByRole("button", { name: "動画をつくる" }));
+    expect(await screen.findByRole("textbox", { name: "Prompt" })).toBeTruthy();
+    expect(window.localStorage.getItem("creative-ai-studio.media-type")).toBe("video");
+  });
+
+  it("lists every media type's readiness on the setup screen", async () => {
+    window.location.hash = "#/setup";
+    stubStudioApi(makeVideoAsset());
+    render(<App />);
+
+    const list = await screen.findByRole("heading", { name: "この端末で使えるもの" });
+    const section = list.closest("section") as HTMLElement;
+    await waitFor(() => {
+      expect(within(section).getByText("Storyboard Video")).toBeTruthy();
+    });
+    expect(within(section).getAllByText(/準備が必要/).length).toBe(2);
+    expect(within(section).getByText("未配置のモデル 1 件と配置先")).toBeTruthy();
   });
 });
