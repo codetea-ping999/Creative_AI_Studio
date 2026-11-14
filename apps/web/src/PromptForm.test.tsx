@@ -359,7 +359,7 @@ describe("PromptForm", () => {
     );
   });
 
-  it("announces why a learned runtime is unavailable", () => {
+  it("names an unavailable runtime and points to the setup screen", () => {
     render(
       <PromptForm
         mediaType="video"
@@ -379,9 +379,9 @@ describe("PromptForm", () => {
       />,
     );
 
-    expect(screen.getByRole("status").textContent).toContain(
-      "CogVideoX-2B: CogVideoX model_index.json is missing.",
-    );
+    const note = screen.getByRole("status").textContent ?? "";
+    expect(note).toContain("未配置: CogVideoX-2B");
+    expect(note).toContain("「準備」画面");
     expect(
       (screen.getByRole("option", { name: /CogVideoX-2B/ }) as HTMLOptionElement)
         .disabled,

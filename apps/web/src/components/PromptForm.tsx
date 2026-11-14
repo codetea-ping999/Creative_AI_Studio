@@ -1,5 +1,4 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { getInstallGuide } from "../lib/modelInstallGuide";
 import {
   audioGenreOptions,
   audioMoodOptions,
@@ -15,7 +14,6 @@ import type {
   ControlMode,
   ImagePreset,
   MediaType,
-  ModelInstallGuide,
   PromptFormProps,
   PromptFormState,
   PromptFormSubmitValues,
@@ -187,22 +185,6 @@ export function PromptForm({
     parseRequiredInteger(formValues.width, defaultValues.width),
     parseRequiredInteger(formValues.height, defaultValues.height),
   );
-  const missingModelGuides = modelOptions
-    .filter((option) => !option.isAvailable)
-    .map((option) => ({
-      modelId: option.id,
-      displayName: option.displayName,
-      guide: getInstallGuide(mediaType, option),
-    }))
-    .filter(
-      (
-        item,
-      ): item is {
-        modelId: string;
-        displayName: string;
-        guide: ModelInstallGuide;
-      } => item.guide !== null,
-    );
 
   useEffect(() => {
     onDraftChange?.(serializeDraft(mediaType, formValues));
@@ -1189,6 +1171,9 @@ export function PromptForm({
       ) : null}
 
       <div className="form-grid">
+        {renderSimpleImageBrief()}
+        {renderPromptSection()}
+        {controlMode === "quick" ? renderQuickControls() : renderAdvancedControls()}
         <section className="form-section">
           <div className="form-section__header">
             <div>
@@ -1276,36 +1261,12 @@ export function PromptForm({
           </div>
 
           {unavailableModels.length > 0 ? (
-            <div className="model-availability-list" role="status" aria-live="polite">
-              {unavailableModels.map((option) => (
-                <p key={option.id}>
-                  <strong>{option.displayName}:</strong>{" "}
-                  {option.availabilityMessage || "Required local model files are missing."}
-                </p>
-              ))}
-            </div>
-          ) : null}
-
-          {missingModelGuides.length > 0 ? (
-            <div className="download-guide-list" aria-label="Model download guides">
-              {missingModelGuides.map((item) => (
-                <div key={item.modelId} className="download-guide">
-                  <div>
-                    <strong>{item.displayName}</strong>
-                    <p>{item.guide.note}</p>
-                  </div>
-                  <a href={item.guide.url} target="_blank" rel="noreferrer">
-                    Download
-                  </a>
-                </div>
-              ))}
-            </div>
+            <p className="model-availability-note" role="status" aria-live="polite">
+              未配置: {unavailableModels.map((option) => option.displayName).join("、")}
+              。配置先と必要なファイルは「準備」画面で確認できます。
+            </p>
           ) : null}
         </section>
-
-        {renderSimpleImageBrief()}
-        {renderPromptSection()}
-        {controlMode === "quick" ? renderQuickControls() : renderAdvancedControls()}
       </div>
 
       <div className="form-actions form-actions--footer">

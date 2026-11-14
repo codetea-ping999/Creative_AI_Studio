@@ -37,7 +37,6 @@ import {
 import {
   createDraftFromRequestSnapshot,
   defaultSubmitValues,
-  formatPercent,
   mediaTypeLabels,
   mergeDraftWithDefaults,
   normalizeLoraOption,
@@ -1049,171 +1048,29 @@ function App() {
               </a>
             ))}
           </nav>
-          <div className="theme-switch">
-            <span className="theme-switch__label">Theme</span>
-            <div className="theme-switch__group">
-              <button
-                type="button"
-                className={`theme-switch__button ${themeMode === "light" ? "is-active" : ""}`}
-                onClick={() => setThemeMode("light")}
-                aria-pressed={themeMode === "light"}
-              >
-                Light
-              </button>
-              <button
-                type="button"
-                className={`theme-switch__button ${themeMode === "dark" ? "is-active" : ""}`}
-                onClick={() => setThemeMode("dark")}
-                aria-pressed={themeMode === "dark"}
-              >
-                Dark
-              </button>
-            </div>
-          </div>
-        </section>
-
-        <section className="section-card section-card--snapshot section-card--projects">
-          <div className="section-card__header">
-            <div>
-              <p className="eyebrow">Project Binding</p>
-              <h2>Route the next job</h2>
-            </div>
-          </div>
-          <label className="field-group field-group--full">
-            <span>Composer project</span>
-            <select
-              value={selectedProjectId}
-              onChange={(event) => setSelectedProjectId(event.target.value)}
-            >
-              <option value="">No project</option>
-              {projects.map((project) => (
-                <option key={project.id} value={project.id}>
-                  {project.name} ({project.asset_count} assets)
-                </option>
-              ))}
-            </select>
-          </label>
-          <p className="section-footnote">
-            {projects.length > 0
-              ? `${projects.length} projects can receive new jobs or reused assets.`
-              : "Create a project to start grouping jobs and assets."}
-          </p>
-          <details className="project-disclosure">
-            <summary>New project</summary>
-            <form className="project-create-form" onSubmit={(event) => void handleCreateProject(event)}>
-              <label className="field-group field-group--full">
-                <span>New project name</span>
-                <input
-                  type="text"
-                  value={newProjectName}
-                  onChange={(event) => setNewProjectName(event.target.value)}
-                  placeholder="Campaign explorations"
-                  disabled={isProjectBusy}
-                />
-              </label>
-              <label className="field-group field-group--full">
-                <span>Description</span>
-                <textarea
-                  rows={3}
-                  value={newProjectDescription}
-                  onChange={(event) => setNewProjectDescription(event.target.value)}
-                  placeholder="Optional production note"
-                  disabled={isProjectBusy}
-                />
-              </label>
-              <button
-                type="submit"
-                className="secondary-button secondary-button--block"
-                disabled={isProjectBusy || !newProjectName.trim()}
-              >
-                {isProjectBusy ? "Creating..." : "Create and select project"}
-              </button>
-            </form>
-          </details>
-          {selectedProject ? (
-            <div className="form-section">
-              <div className="form-section__header">
-                <div>
-                  <p className="eyebrow">Project Metadata</p>
-                  <h3>{selectedProject.name}</h3>
-                </div>
-              </div>
-              <label className="field-group field-group--full">
-                <span>Status</span>
-                <input
-                  type="text"
-                  value={projectStatusDraft}
-                  onChange={(event) => setProjectStatusDraft(event.target.value)}
-                  disabled={isProjectBusy}
-                />
-              </label>
-              <label className="field-group field-group--full">
-                <span>Tags</span>
-                <input
-                  type="text"
-                  value={projectTagsDraft}
-                  onChange={(event) => setProjectTagsDraft(event.target.value)}
-                  placeholder="draft, review, delivery"
-                  disabled={isProjectBusy}
-                />
-              </label>
-              <div className="asset-actions">
-                <button
-                  type="button"
-                  className="secondary-button"
-                  onClick={() => {
-                    void handleUpdateSelectedProject();
-                  }}
-                  disabled={isProjectBusy}
-                >
-                  Update project
-                </button>
-                <button
-                  type="button"
-                  className="secondary-button"
-                  onClick={() => {
-                    void handlePinSelectedAssetToProject();
-                  }}
-                  disabled={
-                    isProjectBusy ||
-                    !selectedAssetDetail ||
-                    selectedAssetDetail.project_id !== selectedProject.id ||
-                    selectedProject.pinned_asset_ids.includes(selectedAssetDetail.asset_id)
-                  }
-                >
-                  Pin selected asset
-                </button>
-              </div>
-              <p className="section-footnote">
-                {selectedProject.pinned_asset_ids.length} pinned assets | status{" "}
-                {selectedProject.status}
-              </p>
-            </div>
-          ) : null}
         </section>
       </aside>
 
       <main className="studio-main">
         <header className="studio-topbar">
           <div className="studio-topbar__identity">
-            <p className="eyebrow">{selectedProject?.name ?? "プロジェクトなし"}</p>
             <h1>{studioViewLabels[view]}</h1>
             <p>{studioViewDescriptions[view]}</p>
           </div>
-          <dl className="studio-topbar__stats" aria-label="Workspace summary">
-            <div>
-              <dt>Assets</dt>
-              <dd>{galleryStats?.total_items ?? 0}</dd>
-            </div>
-            <div>
-              <dt>Success</dt>
-              <dd>{formatPercent(metrics?.success_rate)}</dd>
-            </div>
-            <div>
-              <dt>Models</dt>
-              <dd>{activeModels.filter((model) => model.isAvailable).length}</dd>
-            </div>
-          </dl>
+          <label className="field-group topbar-project">
+            <span>保存先</span>
+            <select
+              value={selectedProjectId}
+              onChange={(event) => setSelectedProjectId(event.target.value)}
+            >
+              <option value="">プロジェクトなし</option>
+              {projects.map((project) => (
+                <option key={project.id} value={project.id}>
+                  {project.name}（{project.asset_count} 件）
+                </option>
+              ))}
+            </select>
+          </label>
         </header>
 
         {view === "create" ? (
@@ -1293,24 +1150,22 @@ function App() {
               </>
             ) : (
               <>
-                <p
-                  className={`readiness-banner ${readinessState === "ready" ? "is-ready" : "is-warning"}`}
-                  role="status"
-                  aria-live="polite"
-                >
-                  <span className="readiness-banner__copy">
-                    <strong>
-                      {readinessState === "ready"
-                        ? "準備完了"
-                        : readinessState === "offline"
+                {readinessState !== "ready" ? (
+                  <p
+                    className="readiness-banner is-warning"
+                    role="status"
+                    aria-live="polite"
+                  >
+                    <span className="readiness-banner__copy">
+                      <strong>
+                        {readinessState === "offline"
                           ? "接続できません"
                           : readinessState === "models-error"
                             ? "モデルを確認できません"
                             : "準備状況を確認中"}
-                    </strong>
-                    <span>{readinessCopy}</span>
-                  </span>
-                  {readinessState !== "ready" ? (
+                      </strong>
+                      <span>{readinessCopy}</span>
+                    </span>
                     <button
                       type="button"
                       className="secondary-button readiness-banner__retry"
@@ -1321,9 +1176,8 @@ function App() {
                     >
                       再試行
                     </button>
-                  ) : null}
-                </p>
-
+                  </p>
+                ) : null}
 
                 <section className="section-card section-card--stage">
                   <div className="section-card__header">
@@ -1331,9 +1185,6 @@ function App() {
                       <p className="eyebrow">かんたん作成</p>
                       <h2>{mediaKindLabels[mediaType]}を作る</h2>
                     </div>
-                    <p className="section-footnote">
-                      Model manifests and local availability are loaded live from the registry.
-                    </p>
                   </div>
                   <PromptForm
                     key={`${mediaType}:${composerRevision}`}
@@ -1512,6 +1363,139 @@ function App() {
               }}
               isRetrying={Object.values(modelLoadState).includes("loading")}
             />
+
+            <section className="section-card section-card--projects">
+              <div className="section-card__header">
+                <div>
+                  <p className="eyebrow">保存先</p>
+                  <h2>プロジェクト</h2>
+                </div>
+              </div>
+              <p className="section-footnote">
+                {projects.length > 0
+                  ? `${projects.length} 件のプロジェクトがあります。生成の保存先は画面上部で選べます。`
+                  : "プロジェクトを作ると、生成した成果物をまとめて管理できます。"}
+              </p>
+              <details className="project-disclosure">
+                <summary>新しいプロジェクト</summary>
+                <form className="project-create-form" onSubmit={(event) => void handleCreateProject(event)}>
+                  <label className="field-group field-group--full">
+                    <span>プロジェクト名</span>
+                    <input
+                      type="text"
+                      value={newProjectName}
+                      onChange={(event) => setNewProjectName(event.target.value)}
+                      placeholder="例: 春のキャンペーン"
+                      disabled={isProjectBusy}
+                    />
+                  </label>
+                  <label className="field-group field-group--full">
+                    <span>メモ</span>
+                    <textarea
+                      rows={3}
+                      value={newProjectDescription}
+                      onChange={(event) => setNewProjectDescription(event.target.value)}
+                      placeholder="任意"
+                      disabled={isProjectBusy}
+                    />
+                  </label>
+                  <button
+                    type="submit"
+                    className="secondary-button secondary-button--block"
+                    disabled={isProjectBusy || !newProjectName.trim()}
+                  >
+                    {isProjectBusy ? "作成中..." : "作成して保存先にする"}
+                  </button>
+                </form>
+              </details>
+              {selectedProject ? (
+                <div className="form-section">
+                  <div className="form-section__header">
+                    <div>
+                      <p className="eyebrow">選択中のプロジェクト</p>
+                      <h3>{selectedProject.name}</h3>
+                    </div>
+                  </div>
+                  <label className="field-group field-group--full">
+                    <span>状態</span>
+                    <input
+                      type="text"
+                      value={projectStatusDraft}
+                      onChange={(event) => setProjectStatusDraft(event.target.value)}
+                      disabled={isProjectBusy}
+                    />
+                  </label>
+                  <label className="field-group field-group--full">
+                    <span>タグ</span>
+                    <input
+                      type="text"
+                      value={projectTagsDraft}
+                      onChange={(event) => setProjectTagsDraft(event.target.value)}
+                      placeholder="例: 下書き, 確認中, 納品"
+                      disabled={isProjectBusy}
+                    />
+                  </label>
+                  <div className="asset-actions">
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={() => {
+                        void handleUpdateSelectedProject();
+                      }}
+                      disabled={isProjectBusy}
+                    >
+                      更新する
+                    </button>
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={() => {
+                        void handlePinSelectedAssetToProject();
+                      }}
+                      disabled={
+                        isProjectBusy ||
+                        !selectedAssetDetail ||
+                        selectedAssetDetail.project_id !== selectedProject.id ||
+                        selectedProject.pinned_asset_ids.includes(selectedAssetDetail.asset_id)
+                      }
+                    >
+                      選択中の成果物を固定
+                    </button>
+                  </div>
+                  <p className="section-footnote">
+                    固定した成果物 {selectedProject.pinned_asset_ids.length} 件・状態{" "}
+                    {selectedProject.status}
+                  </p>
+                </div>
+              ) : null}
+            </section>
+
+            <section className="section-card" aria-labelledby="setup-display-heading">
+              <div className="section-card__header">
+                <div>
+                  <p className="eyebrow">表示</p>
+                  <h2 id="setup-display-heading">画面の明るさ</h2>
+                </div>
+                <div className="mode-toggle" role="group" aria-label="画面の明るさ">
+                  <button
+                    type="button"
+                    className={`mode-toggle__button ${themeMode === "light" ? "is-active" : ""}`}
+                    onClick={() => setThemeMode("light")}
+                    aria-pressed={themeMode === "light"}
+                  >
+                    ライト
+                  </button>
+                  <button
+                    type="button"
+                    className={`mode-toggle__button ${themeMode === "dark" ? "is-active" : ""}`}
+                    onClick={() => setThemeMode("dark")}
+                    aria-pressed={themeMode === "dark"}
+                  >
+                    ダーク
+                  </button>
+                </div>
+              </div>
+            </section>
           </>
         ) : null}
       </main>

@@ -19,7 +19,7 @@ export const studioViewDescriptions: Record<StudioView, string> = {
   create: "種類を選んで生成し、結果を確かめて直す",
   story: "構想から絵コンテ、シーン素材、タイムラインまで",
   compare: "条件を振って一括生成し、並べて選ぶ",
-  setup: "モデルの準備状況と利用実績",
+  setup: "モデル、プロジェクト、表示の設定と利用実績",
 };
 
 const DEFAULT_VIEW: StudioView = "create";
