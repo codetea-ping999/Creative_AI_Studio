@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
@@ -174,7 +174,7 @@ describe("Gallery Reuse and rerun", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole("button", { name: /Video workflows/ }));
+    await user.click(await screen.findByRole("button", { name: "動画" }));
     await user.click(await screen.findByRole("button", { name: "Reuse and rerun" }));
 
     await waitFor(() => {
@@ -197,7 +197,7 @@ describe("Gallery Reuse and rerun", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole("button", { name: /Video workflows/ }));
+    await user.click(await screen.findByRole("button", { name: "動画" }));
     await user.click(await screen.findByRole("button", { name: "Load into composer" }));
     const promptField = await screen.findByRole("textbox", { name: "Prompt" });
     await waitFor(() => {
@@ -215,5 +215,39 @@ describe("Gallery Reuse and rerun", () => {
       prompt: "雨上がりの駅",
       project_id: asset.project_id,
     });
+  });
+});
+
+describe("Studio screens", () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    window.location.hash = "";
+  });
+
+  it("shows one screen at a time and keeps it in the URL hash", async () => {
+    stubStudioApi(makeVideoAsset());
+    const user = userEvent.setup();
+    render(<App />);
+
+    const nav = await screen.findByRole("navigation", { name: "画面" });
+    expect(within(nav).getByRole("link", { name: /つくる/ }).getAttribute("aria-current")).toBe(
+      "page",
+    );
+    expect(screen.queryByRole("button", { name: "ストーリーを作成" })).toBeNull();
+
+    await user.click(within(nav).getByRole("link", { name: /ストーリー/ }));
+
+    expect(window.location.hash).toBe("#/story");
+    expect(await screen.findByRole("button", { name: "ストーリーを作成" })).toBeTruthy();
+    expect(screen.queryByRole("textbox", { name: "Prompt" })).toBeNull();
+  });
+
+  it("opens the screen named in the hash on load", async () => {
+    window.location.hash = "#/setup";
+    stubStudioApi(makeVideoAsset());
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { level: 1, name: "準備" })).toBeTruthy();
   });
 });
