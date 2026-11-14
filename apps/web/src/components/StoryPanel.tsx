@@ -214,7 +214,7 @@ function StoryScenes({
                     </span>
                   ) : (
                     <span className="status-chip status-chip--queued">
-                      不足: {missing.join(", ")}
+                      不足: {missing.map((role) => sceneRoleLabels[role as SceneRole] ?? role).join("、")}
                     </span>
                   )}
                   {assets.length > 0 ? (
@@ -284,13 +284,13 @@ function StoryScenes({
                                     aria-busy={isProceduralBusy}
                                     title={
                                       hasSource
-                                        ? "モデル不要の手続き型ストーリーボード動画（Stable）を生成してこのシーンに紐付ける"
+                                        ? "モデル不要の絵コンテ動画を生成して、このシーンに紐付ける"
                                         : "ビジュアルのもとになる画像プロンプトがありません"
                                     }
                                   >
                                     {isProceduralBusy
-                                      ? "手続き型ビジュアル…"
-                                      : "手続き型ビジュアルを生成（Stable）"}
+                                      ? "絵コンテ動画を生成中…"
+                                      : "絵コンテ動画を生成（モデル不要）"}
                                   </button>
                                 ) : null}
                               </Fragment>
@@ -306,11 +306,11 @@ function StoryScenes({
                         disabled={!scene.image_prompt.trim()}
                         title={
                           scene.image_prompt
-                            ? "画像プロンプトをコンポーザに読み込んで調整する"
+                            ? "画像プロンプトを入力欄に読み込んで調整する"
                             : "画像プロンプトがありません"
                         }
                       >
-                        画像をコンポーザへ
+                        画像を入力欄へ
                       </button>
                     ) : null}
                     {onGenerateSceneNarration ? (
@@ -321,11 +321,11 @@ function StoryScenes({
                         disabled={!scene.narration.trim()}
                         title={
                           scene.narration
-                            ? "ナレーションを音声コンポーザに読み込んで調整する"
+                            ? "ナレーションを音声の入力欄に読み込んで調整する"
                             : "ナレーションがありません"
                         }
                       >
-                        音声をコンポーザへ
+                        音声を入力欄へ
                       </button>
                     ) : null}
                   </div>
@@ -480,7 +480,7 @@ export function StoryPanel({
   ) {
     if (!story) return;
     const label =
-      mediaType === "video" ? "手続き型ビジュアル" : sceneRoleLabels[role];
+      mediaType === "video" ? "絵コンテ動画" : sceneRoleLabels[role];
     setError("");
     setNotice("");
     setBusyScene({ sceneId: scene.id, role, mediaType });
@@ -833,7 +833,7 @@ export function StoryPanel({
                 </select>
               </label>
               <p id="story-script-target-help" className="section-footnote">
-                Script はこのシーンにだけ台詞を書き込みます。台詞は動画には合成されず、
+                台本はこのシーンにだけ台詞を書き込みます。台詞は動画には合成されず、
                 シーンの台本として保存されます。
               </p>
             </div>

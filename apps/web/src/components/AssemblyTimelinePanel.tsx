@@ -15,6 +15,7 @@ import {
 } from "../lib/storyApi";
 import { terminalStatuses, type JobResponse, type JobStatus } from "../studio";
 import { requestJson } from "../studioClient";
+import { jobStatusLabel } from "../lib/jobStatus";
 
 export type AssemblyTimelinePanelProps = {
   projectId?: string;
@@ -412,7 +413,7 @@ export function AssemblyTimelinePanel({ projectId }: AssemblyTimelinePanelProps)
         }
         if (finalStatus !== "succeeded") {
           setActionError(
-            `${sceneRoleLabels[role]}の生成が ${finalStatus} で終了しました（${scene.heading || scene.id}）。`,
+            `${sceneRoleLabels[role]}の生成が「${jobStatusLabel(finalStatus)}」で終了しました（${scene.heading || scene.id}）。`,
           );
         }
       } catch (cause) {
