@@ -4,12 +4,13 @@ import { useCallback, useEffect, useState } from "react";
  * Top-level screens of the studio. Each one owns a single task so the page
  * no longer stacks every panel into one long scroll.
  */
-export type StudioView = "create" | "story" | "compare" | "setup";
+export type StudioView = "create" | "library" | "story" | "compare" | "setup";
 
-export const studioViews: readonly StudioView[] = ["create", "story", "compare", "setup"];
+export const studioViews: readonly StudioView[] = ["create", "library", "story", "compare", "setup"];
 
 export const studioViewLabels: Record<StudioView, string> = {
   create: "つくる",
+  library: "ライブラリ",
   story: "ストーリー",
   compare: "比較",
   setup: "準備",
@@ -17,6 +18,7 @@ export const studioViewLabels: Record<StudioView, string> = {
 
 export const studioViewDescriptions: Record<StudioView, string> = {
   create: "種類を選んで生成し、結果を確かめて直す",
+  library: "作ったものを探して、詳しく見る・使う",
   story: "構想から絵コンテ、シーン素材、タイムラインまで",
   compare: "条件を振って一括生成し、並べて選ぶ",
   setup: "モデル、プロジェクト、表示の設定と利用実績",

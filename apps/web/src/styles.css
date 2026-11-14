@@ -482,6 +482,16 @@ pre,
   line-height: 1.4;
 }
 
+.view-footer-link {
+  margin: 0;
+  text-align: right;
+}
+
+.view-footer-link a {
+  color: var(--accent);
+  font-weight: 600;
+}
+
 .view-toolbar {
   display: flex;
   flex-wrap: wrap;
@@ -1643,7 +1653,7 @@ pre,
   }
 
   .view-nav {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(5, minmax(0, 1fr));
   }
 
   .section-card--activity .monitor-stack {
@@ -1727,6 +1737,11 @@ pre,
 
   .view-nav__meta {
     display: none;
+  }
+
+  .view-nav__item strong {
+    font-size: 0.78rem;
+    white-space: nowrap;
   }
 
   .section-card--nav .sidebar-brand {
