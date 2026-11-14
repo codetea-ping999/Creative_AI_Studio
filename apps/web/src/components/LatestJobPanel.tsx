@@ -11,6 +11,7 @@ import {
   type JobResponse,
 } from "../studio";
 import { jobStatusLabel } from "../lib/jobStatus";
+import { useT } from "../i18n";
 
 type LatestJobPanelProps = {
   latestJob: JobResponse | null;
@@ -27,6 +28,7 @@ export function LatestJobPanel({
   selectedAssetId = null,
   onSelectAsset,
 }: LatestJobPanelProps) {
+  const t = useT();
   const cancelRequestInFlight = useRef(false);
   const [isCancelling, setIsCancelling] = useState(false);
   const orderedJobAssets = [...jobAssets].sort(
@@ -65,8 +67,8 @@ export function LatestJobPanel({
     <section className="section-card section-card--monitor">
       <div className="section-card__header">
         <div>
-          <p className="eyebrow">最新のジョブ</p>
-          <h2>進み具合と結果</h2>
+          <p className="eyebrow">{t("最新のジョブ")}</p>
+          <h2>{t("進み具合と結果")}</h2>
         </div>
       </div>
       {latestJob ? (
@@ -87,7 +89,7 @@ export function LatestJobPanel({
               disabled={isCancelling}
               aria-busy={isCancelling}
             >
-              {isCancelling ? "中断しています..." : "中断する"}
+              {isCancelling ? t("中断しています...") : t("中断する")}
             </button>
           ) : null}
           <StagePreview
@@ -108,10 +110,10 @@ export function LatestJobPanel({
             <div
               className="variation-comparison"
               role="group"
-              aria-label="作った別案"
+              aria-label={t("作った別案")}
             >
               <div className="variation-comparison__header">
-                <strong>別案を見比べる</strong>
+                <strong>{t("別案を見比べる")}</strong>
                 <span>{orderedJobAssets.length} outputs</span>
               </div>
               <div className="variation-comparison__grid">
@@ -135,9 +137,9 @@ export function LatestJobPanel({
                         mediaType={asset.media_type}
                         outputPath={asset.preview_path ?? asset.output_path}
                       />
-                      <span>Variation {variationNumber}</span>
+                      <span>{t("別案 {number}", { number: variationNumber })}</span>
                       <small>
-                        {asset.seed === null ? "シード不明" : `シード ${asset.seed}`}
+                        {asset.seed === null ? t("シード不明") : t("シード {seed}", { seed: asset.seed })}
                       </small>
                     </button>
                   );
@@ -147,19 +149,19 @@ export function LatestJobPanel({
           ) : null}
           <div className="metadata-grid">
             <div className="metadata-item">
-              <span>プロンプト</span>
+              <span>{t("プロンプト")}</span>
               <strong>{latestJob.request.prompt}</strong>
             </div>
             <div className="metadata-item">
-              <span>プロジェクト</span>
-              <strong>{latestJob.project_id ?? "プロジェクトなし"}</strong>
+              <span>{t("プロジェクト")}</span>
+              <strong>{latestJob.project_id ?? t("プロジェクトなし")}</strong>
             </div>
             <div className="metadata-item">
-              <span>品質</span>
+              <span>{t("品質")}</span>
               <strong>{formatScore(extractJobQualityScore(latestJob))}</strong>
             </div>
             <div className="metadata-item">
-              <span>更新</span>
+              <span>{t("更新")}</span>
               <strong>{formatDate(latestJob.updated_at)}</strong>
             </div>
           </div>
@@ -167,8 +169,8 @@ export function LatestJobPanel({
       ) : (
         <div className="empty-stage">
           <div>
-            <h3>まだ生成していません</h3>
-            <p>上の入力欄から生成すると、進み具合と結果がここに出ます。</p>
+            <h3>{t("まだ生成していません")}</h3>
+            <p>{t("上の入力欄から生成すると、進み具合と結果がここに出ます。")}</p>
           </div>
         </div>
       )}

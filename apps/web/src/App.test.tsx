@@ -2,6 +2,8 @@ import { cleanup, render, screen, waitFor, within } from "@testing-library/react
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
+import { LOCALE_STORAGE_KEY } from "./i18n";
+import { LocaleProvider } from "./i18n/LocaleProvider";
 import type { GalleryAssetDetailResponse } from "./studio";
 
 const SOURCE_PROMPT = "時を巻き戻せる少女が雨の駅に立つ";
@@ -290,6 +292,33 @@ describe("Studio screens", () => {
     expect(screen.getByRole("heading", { name: "プロジェクト" })).toBeTruthy();
     expect(screen.getByRole("group", { name: "画面の明るさ" })).toBeTruthy();
     expect(screen.getByRole("combobox", { name: "保存先" })).toBeTruthy();
+  });
+
+  it("switches the interface to English from the setup screen and remembers it", async () => {
+    window.location.hash = "#/setup";
+    stubStudioApi(makeVideoAsset());
+    const user = userEvent.setup();
+    render(
+      <LocaleProvider>
+        <App />
+      </LocaleProvider>,
+    );
+
+    const language = await screen.findByRole("group", { name: "言語" });
+    await user.click(within(language).getByRole("button", { name: "English" }));
+
+    expect(await screen.findByRole("heading", { level: 1, name: "Setup" })).toBeTruthy();
+    expect(screen.getByRole("group", { name: "Language" })).toBeTruthy();
+    expect(
+      within(screen.getByRole("group", { name: "Language" }))
+        .getByRole("button", { name: "English" })
+        .getAttribute("aria-pressed"),
+    ).toBe("true");
+    expect(document.documentElement.lang).toBe("en");
+    expect(window.localStorage.getItem(LOCALE_STORAGE_KEY)).toBe("en");
+
+    await user.click(screen.getByRole("button", { name: "日本語" }));
+    expect(await screen.findByRole("heading", { level: 1, name: "準備" })).toBeTruthy();
   });
 });
 
