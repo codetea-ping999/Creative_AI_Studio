@@ -144,7 +144,7 @@ function StoryScenes({
       <div className="empty-stage story-empty-stage">
         <div>
           <h3>シーン表はまだありません</h3>
-          <p>Scenes を生成すると、尺、ナレーション、素材の不足が並びます。</p>
+          <p>シーンを生成すると、尺、ナレーション、素材の不足が並びます。</p>
         </div>
       </div>
     );
@@ -214,7 +214,7 @@ function StoryScenes({
                     </span>
                   ) : (
                     <span className="status-chip status-chip--queued">
-                      不足: {missing.join(", ")}
+                      不足: {missing.map((role) => sceneRoleLabels[role as SceneRole] ?? role).join("、")}
                     </span>
                   )}
                   {assets.length > 0 ? (
@@ -284,13 +284,13 @@ function StoryScenes({
                                     aria-busy={isProceduralBusy}
                                     title={
                                       hasSource
-                                        ? "モデル不要の手続き型ストーリーボード動画（Stable）を生成してこのシーンに紐付ける"
+                                        ? "モデル不要の絵コンテ動画を生成して、このシーンに紐付ける"
                                         : "ビジュアルのもとになる画像プロンプトがありません"
                                     }
                                   >
                                     {isProceduralBusy
-                                      ? "手続き型ビジュアル…"
-                                      : "手続き型ビジュアルを生成（Stable）"}
+                                      ? "絵コンテ動画を生成中…"
+                                      : "絵コンテ動画を生成（モデル不要）"}
                                   </button>
                                 ) : null}
                               </Fragment>
@@ -306,11 +306,11 @@ function StoryScenes({
                         disabled={!scene.image_prompt.trim()}
                         title={
                           scene.image_prompt
-                            ? "画像プロンプトをコンポーザに読み込んで調整する"
+                            ? "画像プロンプトを入力欄に読み込んで調整する"
                             : "画像プロンプトがありません"
                         }
                       >
-                        画像をコンポーザへ
+                        画像を入力欄へ
                       </button>
                     ) : null}
                     {onGenerateSceneNarration ? (
@@ -321,11 +321,11 @@ function StoryScenes({
                         disabled={!scene.narration.trim()}
                         title={
                           scene.narration
-                            ? "ナレーションを音声コンポーザに読み込んで調整する"
+                            ? "ナレーションを音声の入力欄に読み込んで調整する"
                             : "ナレーションがありません"
                         }
                       >
-                        音声をコンポーザへ
+                        音声を入力欄へ
                       </button>
                     ) : null}
                   </div>
@@ -447,7 +447,7 @@ export function StoryPanel({
     setIsCreating(true);
     try {
       const created = await createStory({
-        title: title.trim() || premise.trim().slice(0, 40) || "Untitled story",
+        title: title.trim() || premise.trim().slice(0, 40) || "無題のストーリー",
         premise: premise.trim(),
         project_id: projectId,
         format: storyFormat,
@@ -480,7 +480,7 @@ export function StoryPanel({
   ) {
     if (!story) return;
     const label =
-      mediaType === "video" ? "手続き型ビジュアル" : sceneRoleLabels[role];
+      mediaType === "video" ? "絵コンテ動画" : sceneRoleLabels[role];
     setError("");
     setNotice("");
     setBusyScene({ sceneId: scene.id, role, mediaType });
@@ -600,7 +600,7 @@ export function StoryPanel({
     <section className="section-card story-panel" aria-labelledby="story-panel-heading">
       <div className="section-card__header story-panel__header">
         <div>
-          <p className="eyebrow">Story</p>
+          <p className="eyebrow">ストーリー</p>
           <h2 id="story-panel-heading">構想から絵コンテまで</h2>
         </div>
         <p className="section-footnote">
@@ -817,7 +817,7 @@ export function StoryPanel({
           {orderedScenes.length > 0 ? (
             <div className="story-script-target">
               <label className="field-group field-group--full">
-                <span>Script の対象シーン</span>
+                <span>台本の対象シーン</span>
                 <select
                   value={scriptTargetId}
                   onChange={(event) => setScriptSceneId(event.target.value)}
@@ -833,7 +833,7 @@ export function StoryPanel({
                 </select>
               </label>
               <p id="story-script-target-help" className="section-footnote">
-                Script はこのシーンにだけ台詞を書き込みます。台詞は動画には合成されず、
+                台本はこのシーンにだけ台詞を書き込みます。台詞は動画には合成されず、
                 シーンの台本として保存されます。
               </p>
             </div>
@@ -841,15 +841,15 @@ export function StoryPanel({
 
           <dl className="story-summary" aria-label="ストーリーの進捗">
             <div>
-              <dt>Logline</dt>
+              <dt>ログライン</dt>
               <dd>{story.logline || "未生成"}</dd>
             </div>
             <div>
-              <dt>Beats</dt>
+              <dt>構成</dt>
               <dd>{story.beats.length}</dd>
             </div>
             <div>
-              <dt>Scenes</dt>
+              <dt>シーン</dt>
               <dd>{story.scenes.length}</dd>
             </div>
             <div>
@@ -892,7 +892,7 @@ export function StoryPanel({
 
           {candidates.length > 0 ? (
             <details className="story-disclosure" open>
-              <summary>Logline 候補 {candidates.length} 件</summary>
+              <summary>ログライン候補 {candidates.length} 件</summary>
               <ol className="story-candidate-list">
                 {candidates.map((candidate, index) => (
                   <li key={`${index}-${candidate.slice(0, 24)}`}>

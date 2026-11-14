@@ -142,12 +142,12 @@ describe("MediaPreview", () => {
     expect(getByRole("img", { name: "Assembly" }).getAttribute("src")).toMatch(
       /\/outputs\/videos\/missing_preview\.png$/,
     );
-    expect(getByRole("alert").textContent).toMatch(/could not be loaded/);
+    expect(getByRole("alert").textContent).toMatch(/読み込めなかった/);
 
     // The still can be missing too; then explain rather than show a broken image.
     fireEvent.error(getByRole("img", { name: "Assembly" }));
     expect(container.querySelector("img")).toBeNull();
-    expect(getByRole("heading", { name: "Video unavailable" })).toBeTruthy();
+    expect(getByRole("heading", { name: "動画を表示できません" })).toBeTruthy();
   });
 
   it("explains a failed video without a poster and recovers for the next source", () => {
@@ -161,7 +161,7 @@ describe("MediaPreview", () => {
     );
 
     fireEvent.error(container.querySelector("video") as HTMLVideoElement);
-    expect(getByRole("heading", { name: "Video unavailable" })).toBeTruthy();
+    expect(getByRole("heading", { name: "動画を表示できません" })).toBeTruthy();
     expect(getByRole("alert")).toBeTruthy();
 
     rerender(
@@ -203,12 +203,12 @@ describe("MediaPreview", () => {
       expect(container.querySelector("img")).toBeNull();
       expect(screen.getByRole("img", { name: "Scene 1 storyboard" }).tagName).toBe("CANVAS");
 
-      await user.click(screen.getByRole("button", { name: "Play animation" }));
+      await user.click(screen.getByRole("button", { name: "再生する" }));
       expect(container.querySelector("img")?.getAttribute("src")).toMatch(
         /storyboard_scene_1\.gif$/,
       );
 
-      await user.click(screen.getByRole("button", { name: "Show still frame" }));
+      await user.click(screen.getByRole("button", { name: "止める" }));
       expect(container.querySelector("img")).toBeNull();
     });
 
@@ -256,8 +256,8 @@ describe("MediaPreview", () => {
       act(() => FakeImage.instances[0].onerror?.());
 
       expect(container.querySelector("canvas")).toBeNull();
-      expect(screen.getByRole("alert").textContent).toContain("Preview frame unavailable");
-      expect(screen.getByRole("button", { name: "Play animation" })).toBeTruthy();
+      expect(screen.getByRole("alert").textContent).toContain("プレビューを表示できません");
+      expect(screen.getByRole("button", { name: "再生する" })).toBeTruthy();
     });
 
     it("shows a text fallback when a thumbnail still frame fails to load", () => {
@@ -271,7 +271,7 @@ describe("MediaPreview", () => {
       act(() => FakeImage.instances[0].onerror?.());
 
       expect(container.querySelector("canvas")).toBeNull();
-      expect(screen.getByText("No preview")).toBeTruthy();
+      expect(screen.getByText("プレビューなし")).toBeTruthy();
     });
 
     it("treats GIF URLs with a query string or fragment as GIFs", () => {
@@ -311,7 +311,7 @@ describe("MediaPreview", () => {
 
     expect(container.querySelector("img")?.getAttribute("src")).toMatch(/storyboard_scene_1\.gif$/);
     expect(container.querySelector("canvas")).toBeNull();
-    expect(screen.queryByRole("button", { name: "Play animation" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "再生する" })).toBeNull();
   });
 });
 

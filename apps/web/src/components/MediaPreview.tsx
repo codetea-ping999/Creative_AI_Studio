@@ -34,8 +34,8 @@ export function StagePreview({
       <div className="stage-surface">
         <div className="empty-stage">
           <div>
-            <h3>Preview unavailable</h3>
-            <p>{outputPath ?? "No output path was returned by the API."}</p>
+            <h3>プレビューを表示できません</h3>
+            <p>{outputPath ?? "出力ファイルの場所が返ってきませんでした。"}</p>
           </div>
         </div>
       </div>
@@ -47,7 +47,7 @@ export function StagePreview({
       <div className="stage-surface stage-surface--audio">
         <div className="audio-preview">
           <div className="audio-preview__header">
-            <p className="eyebrow">Audio Preview</p>
+            <p className="eyebrow">音声</p>
             <strong>{title}</strong>
             <p className="sidebar-copy">{subtitle}</p>
           </div>
@@ -103,8 +103,8 @@ function VideoStagePreview({
         <div className="stage-surface">
           <div className="empty-stage">
             <div>
-              <h3>Video unavailable</h3>
-              <p role="alert">The video could not be loaded.</p>
+              <h3>動画を表示できません</h3>
+              <p role="alert">動画を読み込めませんでした。</p>
             </div>
           </div>
         </div>
@@ -116,7 +116,7 @@ function VideoStagePreview({
           <img src={poster} alt={title} onError={() => setPosterFailed(true)} />
         </div>
         <p className="error-banner" role="alert">
-          The video could not be loaded. Showing its still frame instead.
+          動画を読み込めなかったため、静止画を表示しています。
         </p>
       </>
     );
@@ -173,7 +173,7 @@ function MotionSafeGif({
           className="secondary-button stage-surface__motion-toggle"
           onClick={() => setIsPlaying((current) => !current)}
         >
-          {isPlaying ? "Show still frame" : "Play animation"}
+          {isPlaying ? "止める" : "再生する"}
         </button>
       ) : null}
     </>
@@ -252,8 +252,8 @@ function GifStillFrame({
           !
         </span>
         <div>
-          <strong>Preview frame unavailable</strong>
-          <p>The GIF could not be loaded or decoded.</p>
+          <strong>プレビューを表示できません</strong>
+          <p>GIF を読み込めませんでした。</p>
         </div>
       </div>
     ) : (
@@ -261,7 +261,7 @@ function GifStillFrame({
         <span className="media-still-error__mark" aria-hidden="true">
           !
         </span>
-        <span>No preview</span>
+        <span>プレビューなし</span>
       </div>
     );
   }
@@ -287,17 +287,17 @@ function TextStagePreview({
     <div className="stage-surface stage-surface--text">
       <div className="text-preview">
         <div className="text-preview__header">
-          <p className="eyebrow">Text Preview</p>
+          <p className="eyebrow">文章</p>
           <strong>{title}</strong>
           <p className="sidebar-copy">{subtitle}</p>
         </div>
         <div className="text-preview__body">
           {isLoading ? (
-            <p className="markdown-lite__paragraph">Loading…</p>
+            <p className="markdown-lite__paragraph">読み込み中…</p>
           ) : content ? (
             renderMarkdownLite(content)
           ) : (
-            <p className="markdown-lite__paragraph">Preview unavailable.</p>
+            <p className="markdown-lite__paragraph">プレビューを表示できません。</p>
           )}
         </div>
       </div>
@@ -316,7 +316,7 @@ export function OutputThumbnail({ mediaType, outputPath }: OutputThumbnailProps)
   if (!src) {
     return (
       <div className="gallery-item__thumb is-audio">
-        <span className="gallery-item__audio-badge">None</span>
+        <span className="gallery-item__audio-badge">なし</span>
       </div>
     );
   }
@@ -324,7 +324,7 @@ export function OutputThumbnail({ mediaType, outputPath }: OutputThumbnailProps)
   if (mediaType === "audio" || isAudioAsset(outputPath)) {
     return (
       <div className="gallery-item__thumb is-audio">
-        <span className="gallery-item__audio-badge">Audio</span>
+        <span className="gallery-item__audio-badge">音声</span>
       </div>
     );
   }
@@ -361,7 +361,7 @@ function TextThumbnail({ src }: { src: string }) {
   return (
     <div className="gallery-item__thumb gallery-item__thumb--text">
       <p className="gallery-item__text-excerpt">
-        {isLoading ? "Loading…" : content ? excerptFromMarkdown(content) : "No preview"}
+        {isLoading ? "読み込み中…" : content ? excerptFromMarkdown(content) : "プレビューなし"}
       </p>
     </div>
   );

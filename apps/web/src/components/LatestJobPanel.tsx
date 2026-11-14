@@ -10,6 +10,7 @@ import {
   type GalleryItemResponse,
   type JobResponse,
 } from "../studio";
+import { jobStatusLabel } from "../lib/jobStatus";
 
 type LatestJobPanelProps = {
   latestJob: JobResponse | null;
@@ -64,15 +65,15 @@ export function LatestJobPanel({
     <section className="section-card section-card--monitor">
       <div className="section-card__header">
         <div>
-          <p className="eyebrow">Latest Job</p>
-          <h2>Run state and output preview</h2>
+          <p className="eyebrow">最新のジョブ</p>
+          <h2>進み具合と結果</h2>
         </div>
       </div>
       {latestJob ? (
         <div className="monitor-stack">
           <div className="gallery-item__topline">
             <span className={`status-chip status-chip--${latestJob.status}`} role="status">
-              {latestJob.status}
+              {jobStatusLabel(latestJob.status)}
             </span>
             <span className="history-score">{formatPercent(latestJob.progress * 100)}</span>
           </div>
@@ -86,7 +87,7 @@ export function LatestJobPanel({
               disabled={isCancelling}
               aria-busy={isCancelling}
             >
-              {isCancelling ? "Cancelling job..." : "Cancel job"}
+              {isCancelling ? "中断しています..." : "中断する"}
             </button>
           ) : null}
           <StagePreview
@@ -107,10 +108,10 @@ export function LatestJobPanel({
             <div
               className="variation-comparison"
               role="group"
-              aria-label="Generated variations"
+              aria-label="作った別案"
             >
               <div className="variation-comparison__header">
-                <strong>Compare variations</strong>
+                <strong>別案を見比べる</strong>
                 <span>{orderedJobAssets.length} outputs</span>
               </div>
               <div className="variation-comparison__grid">
@@ -136,7 +137,7 @@ export function LatestJobPanel({
                       />
                       <span>Variation {variationNumber}</span>
                       <small>
-                        {asset.seed === null ? "Seed unavailable" : `Seed ${asset.seed}`}
+                        {asset.seed === null ? "シード不明" : `シード ${asset.seed}`}
                       </small>
                     </button>
                   );
@@ -146,19 +147,19 @@ export function LatestJobPanel({
           ) : null}
           <div className="metadata-grid">
             <div className="metadata-item">
-              <span>Prompt</span>
+              <span>プロンプト</span>
               <strong>{latestJob.request.prompt}</strong>
             </div>
             <div className="metadata-item">
-              <span>Project</span>
-              <strong>{latestJob.project_id ?? "Unassigned"}</strong>
+              <span>プロジェクト</span>
+              <strong>{latestJob.project_id ?? "プロジェクトなし"}</strong>
             </div>
             <div className="metadata-item">
-              <span>Quality</span>
+              <span>品質</span>
               <strong>{formatScore(extractJobQualityScore(latestJob))}</strong>
             </div>
             <div className="metadata-item">
-              <span>Updated</span>
+              <span>更新</span>
               <strong>{formatDate(latestJob.updated_at)}</strong>
             </div>
           </div>
@@ -166,8 +167,8 @@ export function LatestJobPanel({
       ) : (
         <div className="empty-stage">
           <div>
-            <h3>No job selected</h3>
-            <p>Queue a generation or reuse an existing asset to populate the stage.</p>
+            <h3>まだ生成していません</h3>
+            <p>上の入力欄から生成すると、進み具合と結果がここに出ます。</p>
           </div>
         </div>
       )}

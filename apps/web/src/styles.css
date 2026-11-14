@@ -1550,7 +1550,8 @@ pre,
   color: var(--text-dim);
 }
 
-.setup-row__details summary {
+.setup-row__details summary,
+.request-snapshot summary {
   color: var(--text-soft);
   font-size: 0.82rem;
   cursor: pointer;
@@ -3063,14 +3064,17 @@ pre,
     background: var(--surface-raised);
   }
 
+  /* The label sits above the value so a cell with several blocks (summary,
+     narration, action buttons) keeps the full card width at phone sizes. */
   .story-scene-table td {
     display: grid;
-    grid-template-columns: 88px minmax(0, 1fr);
-    gap: 8px;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 6px;
     padding: 10px 12px;
   }
 
   .story-scene-table td:first-child {
+    grid-template-columns: 88px minmax(0, 1fr);
     border-top: 0;
   }
 
@@ -3286,4 +3290,8 @@ pre,
   .assembly-timeline-role__status {
     grid-column: 1 / -1;
   }
+}
+
+.request-snapshot pre {
+  margin-top: 8px;
 }
