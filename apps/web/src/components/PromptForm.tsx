@@ -1171,6 +1171,9 @@ export function PromptForm({
       ) : null}
 
       <div className="form-grid">
+        {renderSimpleImageBrief()}
+        {renderPromptSection()}
+        {controlMode === "quick" ? renderQuickControls() : renderAdvancedControls()}
         <section className="form-section">
           <div className="form-section__header">
             <div>
@@ -1264,10 +1267,6 @@ export function PromptForm({
             </p>
           ) : null}
         </section>
-
-        {renderSimpleImageBrief()}
-        {renderPromptSection()}
-        {controlMode === "quick" ? renderQuickControls() : renderAdvancedControls()}
       </div>
 
       <div className="form-actions form-actions--footer">
