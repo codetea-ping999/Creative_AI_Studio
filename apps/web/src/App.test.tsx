@@ -290,8 +290,26 @@ describe("Studio screens", () => {
     // Project management and theme live on the setup screen; choosing where
     // new work is saved stays in the top bar on every screen.
     expect(screen.getByRole("heading", { name: "プロジェクト" })).toBeTruthy();
-    expect(screen.getByRole("group", { name: "画面の明るさ" })).toBeTruthy();
+    expect(screen.getByRole("group", { name: "画面のテーマ" })).toBeTruthy();
     expect(screen.getByRole("combobox", { name: "保存先" })).toBeTruthy();
+  });
+
+  it("opens in the Arcane Tech theme and remembers a quieter choice", async () => {
+    window.location.hash = "#/setup";
+    stubStudioApi(makeVideoAsset());
+    const user = userEvent.setup();
+    render(<App />);
+
+    const theme = await screen.findByRole("group", { name: "画面のテーマ" });
+    expect(within(theme).getByRole("button", { name: "魔法工学" }).getAttribute("aria-pressed")).toBe("true");
+    expect(document.documentElement.dataset.flair).toBe("hud");
+    expect(document.documentElement.dataset.theme).toBe("dark");
+
+    await user.click(within(theme).getByRole("button", { name: "ライト" }));
+
+    expect(document.documentElement.dataset.flair).toBeUndefined();
+    expect(document.documentElement.dataset.theme).toBe("light");
+    expect(window.localStorage.getItem("creative-ai-studio.theme")).toBe("light");
   });
 
   it("switches the interface to English from the setup screen and remembers it", async () => {

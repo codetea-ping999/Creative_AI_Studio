@@ -137,3 +137,28 @@ Pill shapes are reserved for short status indicators and segmented controls.
 - Decorative charts and invented KPIs
 - Hover lift/translate animation
 - Unscoped colors or spacing values inside React components
+
+## Arcane Tech theme (魔法工学) and playful layer
+
+Added after v1.1.0 at the owner's request: the studio should feel exciting,
+with a Japanese tokusatsu / anime / light-novel flavour. The references are
+mood only. Never use a real work's name, logo, characters, catchphrases or
+signature motifs.
+
+- **Theme**: `魔法工学` is the default of three themes (魔法工学 / ライト /
+  ダーク), stored under `creative-ai-studio.theme`. It sets
+  `data-theme="dark"` plus `data-flair="hud"`, so every dark rule still applies
+  and `apps/web/src/theme-hud.css` only adds the HUD layer: indigo surfaces,
+  cyan lines with a gold second accent, corner brackets on panels, monospace
+  eyebrows, slanted primary buttons and a faint scanline.
+- **Moments**: a short cut-in (`CastOverlay`) when a generation starts (展開！),
+  finishes (完成！) or raises the creator level (レベルアップ！). It is
+  decorative (`aria-hidden`, no pointer events); the same news is always in the
+  status text. While a job runs, the latest job panel shows a spell-circle
+  progress ring. Neither appears in the light or dark theme, and both stop under
+  `prefers-reduced-motion`.
+- **Creator rank**: `lib/creatorRank.ts` turns finished generations into a level
+  and a light-novel-style title, shown in the sidebar in every theme. New titles
+  need an English entry in `i18n/en.ts` (a test checks this).
+- Keep the playful layer to these places. Forms, model setup and error text stay
+  plain so the studio remains quick to operate.
