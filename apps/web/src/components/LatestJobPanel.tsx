@@ -84,11 +84,11 @@ export function LatestJobPanel({
               <svg viewBox="0 0 200 200">
                 <g className="cast-circle__ring--outer">
                   <circle cx="100" cy="100" r="92" fill="none" stroke="var(--hud-line)" strokeWidth="1" strokeDasharray="2 6" />
-                  <polygon points="100,14 175,143 25,143" fill="none" stroke="var(--hud-gold)" strokeOpacity="0.45" strokeWidth="1" />
+                  <polygon points="100,14 175,143 25,143" fill="none" stroke="var(--hud-rune)" strokeWidth="1" />
                 </g>
                 <g className="cast-circle__ring--inner">
                   <circle cx="100" cy="100" r="80" fill="none" stroke="var(--hud-line)" strokeWidth="6" strokeDasharray="1 9" />
-                  <polygon points="100,186 25,57 175,57" fill="none" stroke="var(--hud-gold)" strokeOpacity="0.45" strokeWidth="1" />
+                  <polygon points="100,186 25,57 175,57" fill="none" stroke="var(--hud-rune)" strokeWidth="1" />
                 </g>
                 <circle cx="100" cy="100" r="70" fill="none" stroke="var(--border-soft)" strokeWidth="5" />
                 <circle

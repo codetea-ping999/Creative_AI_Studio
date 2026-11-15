@@ -148,9 +148,13 @@ signature motifs.
 - **Theme**: `魔法工学` is the default of three themes (魔法工学 / ライト /
   ダーク), stored under `creative-ai-studio.theme`. It sets
   `data-theme="dark"` plus `data-flair="hud"`, so every dark rule still applies
-  and `apps/web/src/theme-hud.css` only adds the HUD layer: indigo surfaces,
-  cyan lines with a gold second accent, corner brackets on panels, monospace
-  eyebrows, slanted primary buttons and a faint scanline.
+  and `apps/web/src/theme-hud.css` only adds the HUD layer: corner brackets on
+  panels, monospace eyebrows, slanted primary buttons and a faint scanline.
+- **Palette 紫電** (chosen for colour-psychology reasons): 60% near-black
+  surfaces, 30% violet (`--accent`, mystery / magic / creativity) for frames,
+  selection and progress, and 10% amber (`--hud-cta`) reserved for the main
+  action. Amber is violet's complement, so the generate button stands out on
+  its own; do not use `--hud-cta` for anything else. Keep text at 4.5:1 or more.
 - **Moments**: a short cut-in (`CastOverlay`) when a generation starts (展開！),
   finishes (完成！) or raises the creator level (レベルアップ！). It is
   decorative (`aria-hidden`, no pointer events); the same news is always in the
