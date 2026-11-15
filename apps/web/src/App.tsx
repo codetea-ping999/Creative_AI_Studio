@@ -2,6 +2,7 @@ import {
   startTransition,
   useCallback,
   useEffect,
+  useRef,
   useState,
   type FormEvent,
 } from "react";
@@ -13,6 +14,8 @@ import {
   type PromptFormSubmitValues,
 } from "./components/PromptForm";
 import { AssemblyTimelinePanel } from "./components/AssemblyTimelinePanel";
+import { CastOverlay, type CastCue } from "./components/CastOverlay";
+import { RankBadge } from "./components/RankBadge";
 import { AssetDetailPanel, type FeedbackFormValues } from "./components/AssetDetailPanel";
 import { GalleryPanel } from "./components/GalleryPanel";
 import { LatestJobPanel } from "./components/LatestJobPanel";
@@ -67,9 +70,27 @@ import {
   viewHref,
 } from "./hooks/useStudioView";
 import { jobStatusLabel } from "./lib/jobStatus";
+import { creatorRank } from "./lib/creatorRank";
 import { localeLabels, supportedLocales, useLocale, useT } from "./i18n";
 
-type ThemeMode = "light" | "dark";
+type ThemeMode = "hud" | "light" | "dark";
+
+const THEME_STORAGE_KEY = "creative-ai-studio.theme";
+const themeModes: ThemeMode[] = ["hud", "light", "dark"];
+const themeModeLabels: Record<ThemeMode, string> = {
+  hud: "魔法工学",
+  light: "ライト",
+  dark: "ダーク",
+};
+
+function readStoredTheme(): ThemeMode {
+  try {
+    const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
+    return stored === "light" || stored === "dark" || stored === "hud" ? stored : "hud";
+  } catch {
+    return "hud";
+  }
+}
 const MEDIA_STORAGE_KEY = "creative-ai-studio.media-type";
 
 function readStoredMediaType(): MediaType | null {
@@ -119,7 +140,15 @@ function App() {
   const t = useT();
   const { locale, setLocale } = useLocale();
   const [view, setView] = useStudioView();
-  const [themeMode, setThemeMode] = useState<ThemeMode>("dark");
+  const [themeMode, setThemeMode] = useState<ThemeMode>(readStoredTheme);
+  const [castCue, setCastCue] = useState<CastCue | null>(null);
+  const castCueId = useRef(0);
+  const lastRankLevel = useRef<number | null>(null);
+  const cast = useCallback((kind: CastCue["kind"], extra: Partial<CastCue> = {}) => {
+    castCueId.current += 1;
+    setCastCue({ id: castCueId.current, kind, ...extra });
+  }, []);
+  const clearCast = useCallback(() => setCastCue(null), []);
   const [mediaType, setMediaTypeState] = useState<MediaType>(
     () => readStoredMediaType() ?? "image",
   );
@@ -184,6 +213,9 @@ function App() {
     onJobUpdate: async (payload, refreshAfterFinish) => {
       if (terminalStatuses.has(payload.status)) {
         setIsSubmitting(false);
+        if (payload.status === "succeeded" && refreshAfterFinish) {
+          cast("complete");
+        }
         setStatusMessage(
           payload.status === "succeeded"
             ? t("生成が終わりました。")
@@ -315,8 +347,41 @@ function App() {
   );
 
   useEffect(() => {
-    document.documentElement.dataset.theme = themeMode;
+    const root = document.documentElement;
+    root.dataset.theme = themeMode === "light" ? "light" : "dark";
+    if (themeMode === "hud") {
+      root.dataset.flair = "hud";
+    } else {
+      delete root.dataset.flair;
+    }
+    try {
+      window.localStorage.setItem(THEME_STORAGE_KEY, themeMode);
+    } catch {
+      // Storage can be unavailable (private mode); the choice still applies.
+    }
   }, [themeMode]);
+
+  // Celebrate a new creator level once the finished count crosses a threshold.
+  const finishedCount = metrics ? metrics.succeeded_jobs : null;
+  useEffect(() => {
+    if (finishedCount === null) {
+      return;
+    }
+    const rank = creatorRank(finishedCount);
+    const previous = lastRankLevel.current;
+    lastRankLevel.current = rank.level;
+    if (previous !== null && rank.level > previous) {
+      setStatusMessage(
+        t("創作レベルが {level} に上がりました。称号「{title}」を手に入れました。", {
+          level: rank.level,
+          title: t(rank.title),
+        }),
+      );
+      cast("levelup", { level: rank.level, title: rank.title });
+    }
+    // Only a change in the finished count should trigger this.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [finishedCount]);
 
   useEffect(() => {
     void loadReadiness();
@@ -624,6 +689,7 @@ function App() {
       });
 
       setActiveJobId(created.job_id);
+      cast("start");
       setStatusMessage(t("生成を受け付けました。順番に処理します。"));
       await loadJob(created.job_id);
     } catch (error) {
@@ -1030,12 +1096,14 @@ function App() {
 
   return (
     <div className="app-shell app-shell--studio">
+      {themeMode === "hud" ? <CastOverlay cue={castCue} onDone={clearCast} /> : null}
       <aside className="studio-sidebar">
         <section className="section-card section-card--nav">
           <div className="sidebar-brand">
             <p className="eyebrow">Creative AI Studio</p>
             <h1>{t("ローカル制作スタジオ")}</h1>
           </div>
+          <RankBadge finished={finishedCount} />
           <nav className="view-nav" aria-label={t("画面")}>
             {studioViews.map((option) => (
               <a
@@ -1570,27 +1638,25 @@ function App() {
               <div className="section-card__header">
                 <div>
                   <p className="eyebrow">{t("表示")}</p>
-                  <h2 id="setup-display-heading">{t("画面の明るさ")}</h2>
+                  <h2 id="setup-display-heading">{t("画面のテーマ")}</h2>
                 </div>
-                <div className="mode-toggle" role="group" aria-label={t("画面の明るさ")}>
-                  <button
-                    type="button"
-                    className={`mode-toggle__button ${themeMode === "light" ? "is-active" : ""}`}
-                    onClick={() => setThemeMode("light")}
-                    aria-pressed={themeMode === "light"}
-                  >
-                    {t("ライト")}
-                  </button>
-                  <button
-                    type="button"
-                    className={`mode-toggle__button ${themeMode === "dark" ? "is-active" : ""}`}
-                    onClick={() => setThemeMode("dark")}
-                    aria-pressed={themeMode === "dark"}
-                  >
-                    {t("ダーク")}
-                  </button>
+                <div className="mode-toggle" role="group" aria-label={t("画面のテーマ")}>
+                  {themeModes.map((option) => (
+                    <button
+                      key={option}
+                      type="button"
+                      className={`mode-toggle__button ${themeMode === option ? "is-active" : ""}`}
+                      onClick={() => setThemeMode(option)}
+                      aria-pressed={themeMode === option}
+                    >
+                      {t(themeModeLabels[option])}
+                    </button>
+                  ))}
                 </div>
               </div>
+              <p className="section-footnote">
+                {t("魔法工学は生成の開始と完了に演出が入ります。端末で動きを減らす設定にしていると演出は出ません。")}
+              </p>
             </section>
 
             <section className="section-card" aria-labelledby="setup-language-heading">

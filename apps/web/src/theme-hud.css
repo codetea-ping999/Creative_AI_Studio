@@ -1,0 +1,437 @@
+/*
+ * 魔法工学 (HUD) theme and the playful layer on top of the studio.
+ *
+ * The HUD theme runs on top of the dark theme: App sets
+ * data-theme="dark" plus data-flair="hud", so every dark rule in
+ * styles.css still applies and this file only adds the HUD look.
+ * The rank badge is shown in every theme; the cut-in overlay and the
+ * spell-circle progress only appear in the HUD theme.
+ */
+
+/* ---------- Rank badge (all themes) ---------- */
+
+.rank-badge {
+  display: grid;
+  gap: 6px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+  background: var(--surface-soft);
+}
+
+.rank-badge__head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.rank-badge__level {
+  flex: none;
+  color: var(--accent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+}
+
+.rank-badge__title {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 0.86rem;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rank-badge__bar {
+  height: 6px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--border-soft);
+}
+
+.rank-badge__bar > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width var(--transition-normal);
+}
+
+.rank-badge__next {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 0.72rem;
+}
+
+.cast-circle {
+  display: none;
+}
+
+@media (max-width: 560px) {
+  .rank-badge {
+    grid-template-columns: minmax(0, 1fr) 72px;
+    align-items: center;
+    margin-top: 10px;
+    padding: 8px 10px;
+  }
+
+  .rank-badge__next {
+    display: none;
+  }
+}
+
+/* ---------- HUD tokens ---------- */
+
+:root[data-flair="hud"] {
+  --page-bg: #060a1a;
+  --surface-base: #0b1230;
+  --surface-raised: #0f1838;
+  --surface-strong: #0c1433;
+  --surface-soft: #111c42;
+  --surface-accent: #10284f;
+  --border-soft: #1f3263;
+  --border-strong: #3a7fb0;
+  --text-primary: #e4f6ff;
+  --text-soft: #a8bfd8;
+  --text-dim: #7f97b6;
+  --accent: #5ee8ff;
+  --accent-strong: #9af2ff;
+  --accent-soft: #7ccfe0;
+  --hud-gold: #e8c46a;
+  --hud-glow: rgba(94, 232, 255, 0.35);
+  --hud-line: rgba(94, 232, 255, 0.22);
+  --success: #6be3b0;
+  --warning: #f0c56a;
+  --danger: #ff8f9e;
+  --focus-ring: #e8c46a;
+}
+
+:root[data-flair="hud"] {
+  background:
+    radial-gradient(90% 60% at 85% -10%, rgba(40, 90, 190, 0.32), transparent 60%),
+    radial-gradient(70% 50% at -10% 110%, rgba(232, 196, 106, 0.08), transparent 60%),
+    var(--page-bg);
+  background-attachment: fixed;
+}
+
+:root[data-flair="hud"] body {
+  background: transparent;
+}
+
+/* A faint scanline over the whole canvas; never takes clicks. */
+:root[data-flair="hud"] body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  background: repeating-linear-gradient(0deg, rgba(94, 232, 255, 0.025) 0 1px, transparent 1px 4px);
+  pointer-events: none;
+}
+
+/* ---------- Panels with corner brackets ---------- */
+
+:root[data-flair="hud"] .section-card {
+  position: relative;
+  border-color: var(--border-soft);
+  background: linear-gradient(180deg, rgba(17, 28, 66, 0.92), rgba(11, 18, 48, 0.94));
+  box-shadow: inset 0 1px 0 rgba(94, 232, 255, 0.06);
+}
+
+:root[data-flair="hud"] .section-card::before,
+:root[data-flair="hud"] .section-card::after {
+  content: "";
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--accent);
+  opacity: 0.85;
+  pointer-events: none;
+}
+
+:root[data-flair="hud"] .section-card::before {
+  top: -1px;
+  left: -1px;
+  border-right: 0;
+  border-bottom: 0;
+  border-top-left-radius: var(--radius-xl);
+}
+
+:root[data-flair="hud"] .section-card::after {
+  right: -1px;
+  bottom: -1px;
+  border-top: 0;
+  border-left: 0;
+  border-bottom-right-radius: var(--radius-xl);
+}
+
+:root[data-flair="hud"] .eyebrow {
+  color: var(--accent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  letter-spacing: 0.18em;
+}
+
+:root[data-flair="hud"] .studio-topbar__identity h1 {
+  letter-spacing: 0.04em;
+  text-shadow: 0 0 18px var(--hud-glow);
+}
+
+:root[data-flair="hud"] .studio-topbar__identity h1::after {
+  content: "";
+  display: block;
+  width: 56px;
+  height: 2px;
+  margin-top: 6px;
+  background: linear-gradient(90deg, var(--accent), var(--hud-gold));
+}
+
+/* ---------- Brand and navigation ---------- */
+
+:root[data-flair="hud"] .sidebar-brand::before {
+  background: linear-gradient(135deg, var(--accent), var(--hud-gold));
+  color: #06101f;
+  clip-path: polygon(50% 0, 100% 25%, 100% 75%, 50% 100%, 0 75%, 0 25%);
+  border-radius: 0;
+}
+
+:root[data-flair="hud"] .view-nav__item.is-active {
+  border-color: var(--hud-line);
+  background: linear-gradient(90deg, rgba(94, 232, 255, 0.16), rgba(94, 232, 255, 0.02));
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+:root[data-flair="hud"] .view-nav__item.is-active strong {
+  color: var(--accent-strong);
+}
+
+:root[data-flair="hud"] .rank-badge {
+  border-color: var(--hud-line);
+  background: rgba(6, 12, 32, 0.6);
+}
+
+:root[data-flair="hud"] .rank-badge__level {
+  color: var(--hud-gold);
+}
+
+:root[data-flair="hud"] .rank-badge__bar {
+  border-radius: 0;
+  background: rgba(94, 232, 255, 0.12);
+}
+
+:root[data-flair="hud"] .rank-badge__bar > span {
+  border-radius: 0;
+  background: repeating-linear-gradient(90deg, var(--accent) 0 8px, transparent 8px 10px);
+}
+
+/* ---------- Controls ---------- */
+
+:root[data-flair="hud"] .mode-toggle {
+  border-color: var(--hud-line);
+  background: rgba(6, 12, 32, 0.6);
+}
+
+:root[data-flair="hud"] .mode-toggle__button.is-active {
+  background: var(--accent);
+  color: #06101f;
+}
+
+:root[data-flair="hud"] .form-actions button,
+:root[data-flair="hud"] .dock-submit,
+:root[data-flair="hud"] .primary-button {
+  border-color: transparent;
+  background: linear-gradient(90deg, var(--accent), var(--hud-gold));
+  color: #06101f;
+  font-weight: 750;
+  letter-spacing: 0.08em;
+  clip-path: polygon(10px 0, 100% 0, calc(100% - 10px) 100%, 0 100%);
+  box-shadow: 0 0 18px var(--hud-glow);
+}
+
+:root[data-flair="hud"] .form-actions button:hover:not(:disabled),
+:root[data-flair="hud"] .dock-submit:hover:not(:disabled),
+:root[data-flair="hud"] .primary-button:hover:not(:disabled) {
+  border-color: transparent;
+  background: linear-gradient(90deg, var(--accent-strong), var(--hud-gold));
+}
+
+/* clip-path would cut the focus ring, so draw it inside instead. */
+:root[data-flair="hud"] .form-actions button:focus-visible,
+:root[data-flair="hud"] .dock-submit:focus-visible,
+:root[data-flair="hud"] .primary-button:focus-visible {
+  outline: 2px solid #06101f;
+  outline-offset: -5px;
+}
+
+:root[data-flair="hud"] input,
+:root[data-flair="hud"] textarea,
+:root[data-flair="hud"] select {
+  border-color: var(--border-soft);
+  background-color: rgba(6, 12, 32, 0.7);
+}
+
+:root[data-flair="hud"] input:focus,
+:root[data-flair="hud"] textarea:focus,
+:root[data-flair="hud"] select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent), 0 0 14px var(--hud-glow);
+}
+
+/* ---------- Spell-circle progress (latest job, while running) ---------- */
+
+:root[data-flair="hud"] .cast-circle {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: min(168px, 50vw);
+  aspect-ratio: 1;
+  max-width: 100%;
+  margin: 4px auto;
+}
+
+.cast-circle svg {
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.cast-circle__ring--outer {
+  transform-origin: 100px 100px;
+  animation: hud-spin 9s linear infinite;
+}
+
+.cast-circle__ring--inner {
+  transform-origin: 100px 100px;
+  animation: hud-spin 13s linear infinite reverse;
+}
+
+.cast-circle__arc {
+  transition: stroke-dashoffset var(--transition-normal);
+}
+
+.cast-circle__label {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  text-align: center;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 1.5rem;
+  font-weight: 700;
+  line-height: 1.15;
+}
+
+.cast-circle__label small {
+  color: var(--accent);
+  font-size: 0.66rem;
+  letter-spacing: 0.2em;
+}
+
+@keyframes hud-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ---------- Cut-in overlay ---------- */
+
+.cast-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  pointer-events: none;
+  animation: cast-fade 1.4s ease both;
+}
+
+.cast-overlay__band {
+  position: absolute;
+  left: -10%;
+  right: -10%;
+  top: 50%;
+  height: clamp(96px, 18vh, 160px);
+  margin-top: calc(clamp(96px, 18vh, 160px) / -2);
+  background: linear-gradient(90deg, #ff3b5c, #2f7bff 55%, #5ee8ff);
+  box-shadow: 0 0 40px rgba(94, 232, 255, 0.45);
+  transform: rotate(-7deg);
+  animation: cast-band 0.55s cubic-bezier(0.2, 0.9, 0.2, 1) both;
+}
+
+.cast-overlay--complete .cast-overlay__band {
+  background: linear-gradient(90deg, #e8c46a, #ff7a3b 50%, #ff3b5c);
+}
+
+.cast-overlay--levelup .cast-overlay__band {
+  background: linear-gradient(90deg, #5ee8ff, #e8c46a 50%, #fff36b);
+}
+
+.cast-overlay__text {
+  position: relative;
+  display: grid;
+  justify-items: center;
+  gap: 2px;
+  transform: rotate(-7deg) skewX(-8deg);
+  animation: cast-word 0.6s 0.12s cubic-bezier(0.2, 1.4, 0.4, 1) both;
+}
+
+.cast-overlay__word {
+  color: #ffffff;
+  font-size: clamp(2.4rem, 9vw, 4.6rem);
+  font-weight: 900;
+  letter-spacing: 0.04em;
+  line-height: 1;
+  text-shadow: 3px 3px 0 #06101f, -2px -2px 0 rgba(255, 243, 107, 0.9);
+  white-space: nowrap;
+}
+
+.cast-overlay__sub {
+  color: #06101f;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: clamp(0.8rem, 2.4vw, 1rem);
+  font-weight: 800;
+  letter-spacing: 0.3em;
+}
+
+@keyframes cast-band {
+  from {
+    transform: rotate(-7deg) translateX(-110%);
+  }
+  to {
+    transform: rotate(-7deg) translateX(0);
+  }
+}
+
+@keyframes cast-word {
+  from {
+    opacity: 0;
+    transform: rotate(-7deg) skewX(-8deg) scale(2);
+  }
+  to {
+    opacity: 1;
+    transform: rotate(-7deg) skewX(-8deg) scale(1);
+  }
+}
+
+@keyframes cast-fade {
+  0%,
+  78% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cast-overlay {
+    display: none;
+  }
+
+  .cast-circle__ring--outer,
+  .cast-circle__ring--inner {
+    animation: none;
+  }
+}

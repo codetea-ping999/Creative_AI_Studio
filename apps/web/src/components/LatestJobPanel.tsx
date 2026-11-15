@@ -80,6 +80,38 @@ export function LatestJobPanel({
             <span className="history-score">{formatPercent(latestJob.progress * 100)}</span>
           </div>
           {!terminalStatuses.has(latestJob.status) ? (
+            <div className="cast-circle" aria-hidden="true">
+              <svg viewBox="0 0 200 200">
+                <g className="cast-circle__ring--outer">
+                  <circle cx="100" cy="100" r="92" fill="none" stroke="var(--hud-line)" strokeWidth="1" strokeDasharray="2 6" />
+                  <polygon points="100,14 175,143 25,143" fill="none" stroke="var(--hud-gold)" strokeOpacity="0.45" strokeWidth="1" />
+                </g>
+                <g className="cast-circle__ring--inner">
+                  <circle cx="100" cy="100" r="80" fill="none" stroke="var(--hud-line)" strokeWidth="6" strokeDasharray="1 9" />
+                  <polygon points="100,186 25,57 175,57" fill="none" stroke="var(--hud-gold)" strokeOpacity="0.45" strokeWidth="1" />
+                </g>
+                <circle cx="100" cy="100" r="70" fill="none" stroke="var(--border-soft)" strokeWidth="5" />
+                <circle
+                  className="cast-circle__arc"
+                  cx="100"
+                  cy="100"
+                  r="70"
+                  fill="none"
+                  stroke="var(--accent)"
+                  strokeWidth="5"
+                  strokeLinecap="round"
+                  strokeDasharray="440"
+                  strokeDashoffset={440 - 440 * Math.min(1, Math.max(0, latestJob.progress))}
+                  transform="rotate(-90 100 100)"
+                />
+              </svg>
+              <div className="cast-circle__label">
+                {Math.round(Math.min(1, Math.max(0, latestJob.progress)) * 100)}%
+                <small>{t("構築中")}</small>
+              </div>
+            </div>
+          ) : null}
+          {!terminalStatuses.has(latestJob.status) ? (
             <button
               type="button"
               className="secondary-button"
@@ -114,7 +146,7 @@ export function LatestJobPanel({
             >
               <div className="variation-comparison__header">
                 <strong>{t("別案を見比べる")}</strong>
-                <span>{orderedJobAssets.length} outputs</span>
+                <span>{t("{count} 件", { count: orderedJobAssets.length })}</span>
               </div>
               <div className="variation-comparison__grid">
                 {orderedJobAssets.map((asset, index) => {
