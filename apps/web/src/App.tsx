@@ -71,24 +71,22 @@ import {
 } from "./hooks/useStudioView";
 import { jobStatusLabel } from "./lib/jobStatus";
 import { creatorRank } from "./lib/creatorRank";
+import {
+  DEFAULT_THEME,
+  palettes,
+  parseThemeChoice,
+  themeAttributes,
+  type ThemeChoice,
+} from "./lib/themes";
 import { localeLabels, supportedLocales, useLocale, useT } from "./i18n";
 
-type ThemeMode = "hud" | "light" | "dark";
-
 const THEME_STORAGE_KEY = "creative-ai-studio.theme";
-const themeModes: ThemeMode[] = ["hud", "light", "dark"];
-const themeModeLabels: Record<ThemeMode, string> = {
-  hud: "魔法工学",
-  light: "ライト",
-  dark: "ダーク",
-};
 
-function readStoredTheme(): ThemeMode {
+function readStoredTheme(): ThemeChoice {
   try {
-    const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
-    return stored === "light" || stored === "dark" || stored === "hud" ? stored : "hud";
+    return parseThemeChoice(window.localStorage.getItem(THEME_STORAGE_KEY));
   } catch {
-    return "hud";
+    return DEFAULT_THEME;
   }
 }
 const MEDIA_STORAGE_KEY = "creative-ai-studio.media-type";
@@ -140,7 +138,8 @@ function App() {
   const t = useT();
   const { locale, setLocale } = useLocale();
   const [view, setView] = useStudioView();
-  const [themeMode, setThemeMode] = useState<ThemeMode>(readStoredTheme);
+  const [themeMode, setThemeMode] = useState<ThemeChoice>(readStoredTheme);
+  const themeFlair = themeAttributes(themeMode).palette !== null;
   const [castCue, setCastCue] = useState<CastCue | null>(null);
   const castCueId = useRef(0);
   const lastRankLevel = useRef<number | null>(null);
@@ -348,11 +347,14 @@ function App() {
 
   useEffect(() => {
     const root = document.documentElement;
-    root.dataset.theme = themeMode === "light" ? "light" : "dark";
-    if (themeMode === "hud") {
+    const { theme, palette } = themeAttributes(themeMode);
+    root.dataset.theme = theme;
+    if (palette) {
       root.dataset.flair = "hud";
+      root.dataset.palette = palette;
     } else {
       delete root.dataset.flair;
+      delete root.dataset.palette;
     }
     try {
       window.localStorage.setItem(THEME_STORAGE_KEY, themeMode);
@@ -1096,7 +1098,7 @@ function App() {
 
   return (
     <div className="app-shell app-shell--studio">
-      {themeMode === "hud" ? <CastOverlay cue={castCue} onDone={clearCast} /> : null}
+      {themeFlair ? <CastOverlay cue={castCue} onDone={clearCast} /> : null}
       <aside className="studio-sidebar">
         <section className="section-card section-card--nav">
           <div className="sidebar-brand">
@@ -1640,8 +1642,28 @@ function App() {
                   <p className="eyebrow">{t("表示")}</p>
                   <h2 id="setup-display-heading">{t("画面のテーマ")}</h2>
                 </div>
-                <div className="mode-toggle" role="group" aria-label={t("画面のテーマ")}>
-                  {themeModes.map((option) => (
+              </div>
+              <div className="theme-picker" role="group" aria-label={t("画面のテーマ")}>
+                {palettes.map((palette) => (
+                  <button
+                    key={palette.id}
+                    type="button"
+                    className={`theme-option ${themeMode === palette.id ? "is-active" : ""}`}
+                    onClick={() => setThemeMode(palette.id)}
+                    aria-pressed={themeMode === palette.id}
+                  >
+                    <span className={`theme-swatch theme-swatch--${palette.id}`} aria-hidden="true" />
+                    <span className="theme-option__name">{t(palette.name)}</span>
+                    <span className="theme-option__meta">{t(palette.keywords)}</span>
+                  </button>
+                ))}
+              </div>
+              <div className="theme-plain">
+                <span className="theme-plain__label" id="theme-plain-label">
+                  {t("演出なしの標準表示")}
+                </span>
+                <div className="mode-toggle" role="group" aria-labelledby="theme-plain-label">
+                  {(["light", "dark"] as const).map((option) => (
                     <button
                       key={option}
                       type="button"
@@ -1649,13 +1671,13 @@ function App() {
                       onClick={() => setThemeMode(option)}
                       aria-pressed={themeMode === option}
                     >
-                      {t(themeModeLabels[option])}
+                      {option === "light" ? t("ライト") : t("ダーク")}
                     </button>
                   ))}
                 </div>
               </div>
               <p className="section-footnote">
-                {t("魔法工学は生成の開始と完了に演出が入ります。端末で動きを減らす設定にしていると演出は出ません。")}
+                {t("色付きのテーマは生成の開始と完了に演出が入ります。端末で動きを減らす設定にしていると演出は出ません。")}
               </p>
             </section>
 
