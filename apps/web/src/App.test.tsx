@@ -294,22 +294,31 @@ describe("Studio screens", () => {
     expect(screen.getByRole("combobox", { name: "保存先" })).toBeTruthy();
   });
 
-  it("opens in the Arcane Tech theme and remembers a quieter choice", async () => {
+  it("opens in the 紫電 palette and switches palettes or the plain themes", async () => {
     window.location.hash = "#/setup";
     stubStudioApi(makeVideoAsset());
     const user = userEvent.setup();
     render(<App />);
 
     const theme = await screen.findByRole("group", { name: "画面のテーマ" });
-    expect(within(theme).getByRole("button", { name: "魔法工学" }).getAttribute("aria-pressed")).toBe("true");
-    expect(document.documentElement.dataset.flair).toBe("hud");
-    expect(document.documentElement.dataset.theme).toBe("dark");
+    expect(within(theme).getAllByRole("button")).toHaveLength(10);
+    expect(within(theme).getByRole("button", { name: /紫電/ }).getAttribute("aria-pressed")).toBe("true");
+    const root = document.documentElement;
+    expect(root.dataset.flair).toBe("hud");
+    expect(root.dataset.palette).toBe("shiden");
+    expect(root.dataset.theme).toBe("dark");
 
-    await user.click(within(theme).getByRole("button", { name: "ライト" }));
+    await user.click(within(theme).getByRole("button", { name: /白藍/ }));
+    expect(root.dataset.palette).toBe("hakuai");
+    expect(root.dataset.theme).toBe("light");
+    expect(window.localStorage.getItem("creative-ai-studio.theme")).toBe("hakuai");
 
-    expect(document.documentElement.dataset.flair).toBeUndefined();
-    expect(document.documentElement.dataset.theme).toBe("light");
-    expect(window.localStorage.getItem("creative-ai-studio.theme")).toBe("light");
+    const plain = screen.getByRole("group", { name: "演出なしの標準表示" });
+    await user.click(within(plain).getByRole("button", { name: "ダーク" }));
+    expect(root.dataset.flair).toBeUndefined();
+    expect(root.dataset.palette).toBeUndefined();
+    expect(root.dataset.theme).toBe("dark");
+    expect(window.localStorage.getItem("creative-ai-studio.theme")).toBe("dark");
   });
 
   it("switches the interface to English from the setup screen and remembers it", async () => {

@@ -643,7 +643,7 @@ export function StoryPanel({
               type="text"
               value={title}
               onChange={(event) => setTitle(event.target.value)}
-              placeholder={t("例: Rewind")}
+              placeholder={t("例: 巻き戻しの夏")}
               disabled={isCreating}
             />
           </label>
