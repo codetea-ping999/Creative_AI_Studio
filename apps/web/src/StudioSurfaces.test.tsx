@@ -279,11 +279,11 @@ describe("StoryPanel", () => {
 
     const table = await screen.findByRole("table");
     expect(within(table).getByText("屋上の朝")).toBeTruthy();
-    expect(within(table).getByText(/不足: visual/)).toBeTruthy();
+    expect(within(table).getByText(/不足: 画像/)).toBeTruthy();
     expect(screen.getByText(/不足素材 1 件/)).toBeTruthy();
 
     await user.click(
-      within(table).getByRole("button", { name: "画像をコンポーザへ" }),
+      within(table).getByRole("button", { name: "画像を入力欄へ" }),
     );
     expect(onGenerate).toHaveBeenCalledWith(
       expect.objectContaining({ id: "scene_01", image_prompt: "rooftop at dawn" }),
@@ -329,7 +329,7 @@ describe("StoryPanel", () => {
     await user.selectOptions(screen.getByLabelText("編集中のストーリー"), "story_1");
 
     await user.click(
-      await screen.findByRole("button", { name: "手続き型ビジュアルを生成（Stable）" }),
+      await screen.findByRole("button", { name: "絵コンテ動画を生成（モデル不要）" }),
     );
 
     const generate = calls.find((call) => call.url.includes("/scenes/scene_01/generate"));
@@ -399,10 +399,10 @@ describe("StoryPanel", () => {
 
     await waitFor(() => {
       expect(
-        screen.getByRole("button", { name: "Logline" }).hasAttribute("disabled"),
+        screen.getByRole("button", { name: "ログライン" }).hasAttribute("disabled"),
       ).toBe(false);
     });
-    expect(screen.getByRole("button", { name: "Scenes" }).hasAttribute("disabled")).toBe(
+    expect(screen.getByRole("button", { name: "シーン" }).hasAttribute("disabled")).toBe(
       true,
     );
   });
@@ -430,9 +430,9 @@ describe("StoryPanel", () => {
     });
     await user.selectOptions(screen.getByLabelText("編集中のストーリー"), "story_1");
 
-    const target = await screen.findByLabelText("Script の対象シーン");
+    const target = await screen.findByLabelText("台本の対象シーン");
     await user.selectOptions(target, "scene_02");
-    await user.click(screen.getByRole("button", { name: "Script" }));
+    await user.click(screen.getByRole("button", { name: "台本" }));
 
     await waitFor(() => {
       expect(calls.some((call) => call.url.includes("/expand"))).toBe(true);

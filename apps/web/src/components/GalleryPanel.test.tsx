@@ -107,7 +107,7 @@ describe("GalleryPanel", () => {
     expect(screen.getByText("tense")).toBeTruthy();
     expect(screen.getByText("playful")).toBeTruthy();
 
-    await user.click(screen.getByRole("button", { name: "Show only this batch" }));
+    await user.click(screen.getByRole("button", { name: "このまとまりだけ表示" }));
     expect(onFilterByBatch).toHaveBeenCalledWith("batch-1");
 
     await user.click(screen.getByText("tense"));
@@ -133,7 +133,7 @@ describe("GalleryPanel", () => {
       />,
     );
 
-    await user.click(screen.getByRole("button", { name: /Clear batch filter/ }));
+    await user.click(screen.getByRole("button", { name: /絞り込みを解除/ }));
     expect(onFilterByBatch).toHaveBeenCalledWith(null);
   });
 });
