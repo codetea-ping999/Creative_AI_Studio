@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { OutputThumbnail } from "./MediaPreview";
 import { formatScore, type GalleryItemResponse } from "../studio";
+import { useT } from "../i18n";
 
 type GalleryPanelProps = {
   mediaLabel: string;
@@ -60,6 +61,7 @@ export function GalleryPanel({
   activeBatchId,
   onFilterByBatch,
 }: GalleryPanelProps) {
+  const t = useT();
   const [expandedBatchIds, setExpandedBatchIds] = useState<Set<string>>(new Set());
   const rows = useMemo(() => groupByBatch(items), [items]);
 
@@ -89,15 +91,19 @@ export function GalleryPanel({
         <OutputThumbnail mediaType={item.media_type} outputPath={item.preview_path} />
         <div className="gallery-item__body">
           <div className="gallery-item__topline">
-            <span className="history-item__media">{item.project_name || "Unassigned"}</span>
+            <span className="history-item__media">{item.project_name || t("プロジェクトなし")}</span>
             <span className="history-score">
               {formatScore(item.quality_score_calibrated ?? item.quality_score)}
             </span>
           </div>
           <strong>{item.batch_label || item.prompt}</strong>
           <p>
-            {item.model_id} | feedback {item.feedback_count} | reuse {item.reuse_count} |
-            export {item.export_count}
+            {t("{model} ・評価 {feedback} ・再利用 {reuse} ・書き出し {exports}", {
+              model: item.model_id,
+              feedback: item.feedback_count,
+              reuse: item.reuse_count,
+              exports: item.export_count,
+            })}
           </p>
         </div>
       </button>
@@ -108,28 +114,28 @@ export function GalleryPanel({
     <section className="section-card section-card--gallery">
       <div className="section-card__header">
         <div>
-          <p className="eyebrow">Gallery</p>
-          <h2>Recent {mediaLabel.toLowerCase()} assets</h2>
+          <p className="eyebrow">{t("ライブラリ")}</p>
+          <h2>{t("これまでの{media}", { media: t(mediaLabel) })}</h2>
         </div>
         <p className="section-footnote">
-          {items.length} items loaded
+          {t("{count} 件", { count: items.length })}
           {projectName ? ` | ${projectName}` : ""}
         </p>
       </div>
       <label className="field-group field-group--full">
-        <span>Search current gallery</span>
+        <span>{t("探す")}</span>
         <input
           type="search"
           value={search}
           onChange={(event) => onSearchChange(event.target.value)}
-          placeholder="prompt, model, project, metadata"
+          placeholder={t("プロンプト、モデル、プロジェクトなど")}
         />
       </label>
       {activeBatchId ? (
         <div className="gallery-batch-filter">
-          <span>Showing one batch only</span>
+          <span>{t("1 つのまとまりだけ表示中")}</span>
           <button type="button" className="secondary-button secondary-button--chip" onClick={() => onFilterByBatch(null)}>
-            Clear batch filter ×
+            {t("絞り込みを解除 ×")}
           </button>
         </div>
       ) : null}
@@ -165,7 +171,7 @@ export function GalleryPanel({
                       </span>
                     </div>
                     <strong>{row.label}</strong>
-                    <p>{isExpanded ? "Tap to collapse" : "Tap to expand this batch"}</p>
+                    <p>{isExpanded ? t("押すと閉じます") : t("押すとこのまとまりを開きます")}</p>
                   </div>
                 </button>
                 {isExpanded ? (
@@ -175,7 +181,7 @@ export function GalleryPanel({
                       className="secondary-button secondary-button--chip"
                       onClick={() => onFilterByBatch(row.batchId)}
                     >
-                      Show only this batch
+                      {t("このまとまりだけ表示")}
                     </button>
                     {row.items.map((item) => renderItemButton(item, true))}
                   </div>
@@ -185,7 +191,7 @@ export function GalleryPanel({
           })
         ) : (
           <div className="history-empty">
-            Successful jobs will appear here after the runner finishes them.
+            {t("生成が終わった成果物がここに並びます。")}
           </div>
         )}
       </div>
