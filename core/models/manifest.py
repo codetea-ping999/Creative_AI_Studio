@@ -7,6 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from core.models.image_pipelines import IMAGE_PIPELINE_FAMILIES
 from core.reference_capabilities import ReferenceCapability
 from core.schemas.generation import MediaType
 
@@ -99,6 +100,13 @@ class ModelManifest(BaseModel):
     tags: list[str] = Field(default_factory=list)
     is_default: bool = False
     enabled: bool = True
+    pipeline_class: str | None = Field(
+        default=None,
+        description=(
+            "Diffusers pipeline class for an image manifest (e.g. FluxPipeline). "
+            "Absent means StableDiffusionXLPipeline -- never inferred from the id."
+        ),
+    )
     reference_capability: ReferenceCapability | None = Field(
         default=None,
         description=(
@@ -120,6 +128,17 @@ class ModelManifest(BaseModel):
             raise ValueError(
                 f"Public model id must not be duplicated in aliases: {self.public_model_id}"
             )
+        if self.pipeline_class is not None:
+            if self.media_type != "image":
+                raise ValueError(
+                    f"Manifest {self.id!r}: pipeline_class is only valid for image manifests."
+                )
+            if self.pipeline_class not in IMAGE_PIPELINE_FAMILIES:
+                supported = ", ".join(sorted(IMAGE_PIPELINE_FAMILIES))
+                raise ValueError(
+                    f"Manifest {self.id!r}: unsupported pipeline_class "
+                    f"{self.pipeline_class!r}. Use one of: {supported}."
+                )
         reject_literal_credential_fields(self.default_params, manifest_label=self.id)
         return self
 
