@@ -52,6 +52,28 @@ print_step() {
     STEP=$((STEP + 1))
 }
 
+# 依存パッケージのインストールなど出力が多いコマンドを静かに実行する。
+# 成功時は何も表示せず、失敗時はフェーズ・コマンド・ログ末尾・次の手順を表示して終了する。
+run_quiet() {
+    local hint="$1"
+    shift
+    local log_file
+    log_file="$(mktemp "${TMPDIR:-/tmp}/creative-ai-setup.XXXXXX")"
+    local exit_code=0
+    "$@" > "$log_file" 2>&1 || exit_code=$?
+    if [ "$exit_code" -ne 0 ]; then
+        trap - ERR
+        printf '\n--- %s の出力（末尾 40 行）---\n' "$*" >&2
+        tail -n 40 "$log_file" >&2
+        printf -- '--- ここまで（全文: %s）---\n' "$log_file" >&2
+        print_failure_context "$*"
+        printf '   終了コード: %s\n' "$exit_code" >&2
+        printf '   次の手順: %s\n' "$hint" >&2
+        exit "$exit_code"
+    fi
+    rm -f "$log_file"
+}
+
 print_success() {
     echo -e "${GREEN}✓${NC} $1"
 }
@@ -113,10 +135,12 @@ echo ""
 # ステップ 3: Python パッケージインストール
 print_step "Python パッケージをインストールしています..."
 
-pip install --upgrade pip setuptools wheel > /dev/null 2>&1
+run_quiet "ネットワーク接続を確認し、venv を有効にして pip install --upgrade pip setuptools wheel を再実行してください" \
+    pip install --upgrade pip setuptools wheel
 print_success "pip をアップグレードしました"
 
-pip install -r requirements.txt > /dev/null 2>&1
+run_quiet "上のエラーで失敗したパッケージを確認してください。Python のバージョンが 3.10 以上か、ビルドに必要なツール（コンパイラなど）が入っているかを確認し、venv を有効にして pip install -r requirements.txt を再実行してください" \
+    pip install -r requirements.txt
 print_success "requirements.txt からパッケージをインストールしました"
 
 echo ""
@@ -161,7 +185,8 @@ echo ""
 print_step "Web UI パッケージをインストールしています..."
 
 cd apps/web
-npm ci > /dev/null 2>&1
+run_quiet "Node.js のバージョンを確認し、apps/web で npm ci を再実行してください。package-lock.json と package.json が食い違う場合は npm install でロックを更新してください" \
+    npm ci
 print_success "Web UI のロック済み依存パッケージをインストールしました"
 
 cd - > /dev/null

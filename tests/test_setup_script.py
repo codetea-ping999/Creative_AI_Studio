@@ -100,6 +100,82 @@ class SetupScriptTests(unittest.TestCase):
             self.assertIn("pip install -r requirements.txt", calls)
             self.assertIn("npm ci", calls)
 
+    def _run_setup_with_failing_installer(self, failing: str) -> subprocess.CompletedProcess[str]:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            web_dir = root / "apps" / "web"
+            web_dir.mkdir(parents=True)
+            (web_dir / ".env.example").write_text("VITE_API_BASE_URL=\n", encoding="utf-8")
+            setup_script = root / "setup.sh"
+            setup_script.write_text(SETUP_SCRIPT_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+            setup_script.chmod(0o755)
+            (fake_bin / "python3").write_text(
+                "#!/usr/bin/env bash\n"
+                "if [[ \"$1\" == \"--version\" ]]; then printf 'Python 3.11.0\\n'; exit 0; fi\n"
+                "if [[ \"$1\" == \"-c\" ]]; then exit 0; fi\n"
+                "if [[ \"$1\" == \"-m\" && \"$2\" == \"venv\" ]]; then\n"
+                "  mkdir -p \"$3/bin\"; : > \"$3/bin/activate\"\n"
+                "fi\n"
+                "if [[ \"$#\" == \"0\" ]]; then : > data/jobs.db; fi\n",
+                encoding="utf-8",
+            )
+            (fake_bin / "node").write_text(
+                "#!/usr/bin/env bash\n"
+                "if [[ \"$1\" == \"--version\" ]]; then printf 'v20.19.0\\n'; fi\n",
+                encoding="utf-8",
+            )
+            for tool in ("pip", "npm"):
+                if tool == failing:
+                    script = (
+                        "#!/usr/bin/env bash\n"
+                        "if [[ \"$*\" == *requirements.txt* || \"$1\" == \"ci\" ]]; then\n"
+                        "  printf 'noise line\\n'\n"
+                        f"  printf '{tool} underlying error sentinel\\n' >&2\n"
+                        "  exit 23\n"
+                        "fi\n"
+                    )
+                else:
+                    script = "#!/usr/bin/env bash\nprintf 'quiet success\\n'\n"
+                (fake_bin / tool).write_text(script, encoding="utf-8")
+            for executable in fake_bin.iterdir():
+                executable.chmod(0o755)
+
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+            environment["TMPDIR"] = str(root)
+            return subprocess.run(
+                ["bash", str(setup_script)],
+                cwd=root,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+
+    def test_python_dependency_failure_shows_underlying_error_and_phase(self) -> None:
+        result = self._run_setup_with_failing_installer("pip")
+
+        self.assertEqual(result.returncode, 23)
+        self.assertIn("pip underlying error sentinel", result.stderr)
+        self.assertIn("Python パッケージをインストールしています", result.stderr)
+        self.assertIn("pip install -r requirements.txt", result.stderr)
+        self.assertIn("次の手順", result.stderr)
+        self.assertNotIn("requirements.txt からパッケージをインストールしました", result.stdout)
+        self.assertNotIn("Web UI のロック済み依存パッケージ", result.stdout)
+
+    def test_web_dependency_failure_shows_underlying_error_and_phase(self) -> None:
+        result = self._run_setup_with_failing_installer("npm")
+
+        self.assertEqual(result.returncode, 23)
+        self.assertIn("npm underlying error sentinel", result.stderr)
+        self.assertIn("Web UI パッケージをインストールしています", result.stderr)
+        self.assertIn("npm ci", result.stderr)
+        self.assertIn("次の手順", result.stderr)
+        self.assertNotIn("Web UI のロック済み依存パッケージをインストールしました", result.stdout)
+
     def test_python_version_lookup_failure_reports_phase_and_stops(self) -> None:
         """A failed version lookup cannot be hidden inside a success message."""
 
