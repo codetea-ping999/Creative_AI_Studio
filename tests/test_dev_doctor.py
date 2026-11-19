@@ -7,6 +7,7 @@ import io
 import json
 from pathlib import Path
 import subprocess
+import sys
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
@@ -96,6 +97,43 @@ class DevDoctorTests(unittest.TestCase):
         self.assertEqual(report["exit_code"], 2)
         self.assertNotIn("dependency conflict", json.dumps(report))
 
+    def test_supported_venv_version_mismatch_warns(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._prepare_repo(root)
+            alternate = (3, 10, 0) if sys.version_info[:2] != (3, 10) else (3, 11, 0)
+
+            def runner(argv: tuple[str, ...]) -> dev_doctor.CommandResult:
+                if tuple(argv) == (str(root / "venv" / "bin" / "python"), "--version"):
+                    return dev_doctor.CommandResult(0, f"Python {alternate[0]}.{alternate[1]}.0\n")
+                return self._successful_result(root, argv)
+
+            checks = dev_doctor._python_checks(root, runner)
+
+        alignment = next(check for check in checks if check.name == "Python interpreter alignment")
+        self.assertEqual(alignment.status, dev_doctor.WARN)
+        self.assertIn("major/minor differs", alignment.summary)
+
+    def test_environment_missing_names_are_safe_and_actionable(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / ".env.example").write_text(
+                "API_HOST=127.0.0.1\nAPI_PORT=8000\n"
+                "SAFE_MISSING=value\nEXAMPLE_TOKEN=secret-value\n",
+                encoding="utf-8",
+            )
+            (root / ".env").write_text("API_HOST=127.0.0.1\n", encoding="utf-8")
+
+            checks = dev_doctor._environment_checks(root)
+
+        environment = next(check for check in checks if check.name == "Environment template")
+        details = "\n".join(environment.details)
+        self.assertEqual(environment.status, dev_doctor.WARN)
+        self.assertIn("add missing safe keys to .env: SAFE_MISSING", details)
+        self.assertNotIn("API_PORT", details)
+        self.assertNotIn("EXAMPLE_TOKEN", details)
+        self.assertNotIn("secret-value", details)
+
     def test_broken_model_symlink_is_a_failure(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -142,7 +180,8 @@ class DevDoctorTests(unittest.TestCase):
             ("git", "status", "--porcelain=v1"): "",
             ("git", "worktree", "list", "--porcelain"): "worktree /repo\nHEAD abc\n",
             ("git", "worktree", "prune", "--dry-run"): "",
-            (str(root / "venv" / "bin" / "python"), "--version"): "Python 3.12.0\n",
+            (str(root / "venv" / "bin" / "python"), "--version"):
+                f"Python {sys.version_info.major}.{sys.version_info.minor}.0\n",
             (str(root / "venv" / "bin" / "python"), "-m", "pip", "--version"): "pip 24.0\n",
             (str(root / "venv" / "bin" / "python"), "-m", "pip", "check"):
                 "No broken requirements found.\n",

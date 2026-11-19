@@ -252,7 +252,7 @@ def _python_checks(root: Path, run: CommandRunner) -> list[DoctorCheck]:
             _check(
                 "Python virtual environment",
                 FAIL,
-                "repository venv Python executable is missing",
+                "repository venv Python executable is missing; run ./setup.sh",
             ),
             _check("Python dependencies", WARN, "not checked because repository venv is missing"),
             _check(
@@ -267,9 +267,20 @@ def _python_checks(root: Path, run: CommandRunner) -> list[DoctorCheck]:
             ),
         ]
     requirement = f"Python {_version_text(MIN_PYTHON_VERSION)}+"
+    venv_version_result = run((str(executable), "--version"))
     version = _version_check(
-        "Python virtual environment", run((str(executable), "--version")),
+        "Python virtual environment", venv_version_result,
         supported=is_supported_python, requirement=requirement,
+    )
+    venv_version = parse_version(venv_version_result.stdout)
+    alignment = _check(
+        "Python interpreter alignment",
+        WARN
+        if venv_version is not None and venv_version[:2] != system_version[:2]
+        else PASS,
+        "repository venv Python major/minor differs from system Python"
+        if venv_version is not None and venv_version[:2] != system_version[:2]
+        else "repository venv Python major/minor matches system Python",
     )
     pip = _result_problem(run((str(executable), "-m", "pip", "--version")))
     pip_check = _check(
@@ -295,7 +306,7 @@ def _python_checks(root: Path, run: CommandRunner) -> list[DoctorCheck]:
         "FastAPI and Pydantic import successfully" if imports_ok else
         f"runtime import check {import_problem or 'returned an unexpected result'}",
     )
-    return [system_check, version, pip_check, dependency_check, import_check]
+    return [system_check, version, alignment, pip_check, dependency_check, import_check]
 
 
 def _node_checks(root: Path, run: CommandRunner) -> list[DoctorCheck]:
@@ -313,7 +324,13 @@ def _node_checks(root: Path, run: CommandRunner) -> list[DoctorCheck]:
         _version_check("npm", run(("npm", "--version"))),
     ]
     if not (root / "apps" / "web" / "node_modules").is_dir():
-        checks.append(_check("Web dependencies", FAIL, "apps/web/node_modules is missing"))
+        checks.append(
+            _check(
+                "Web dependencies",
+                FAIL,
+                "apps/web/node_modules is missing; run npm --prefix apps/web ci",
+            )
+        )
         return checks
     listing = run(("npm", "--prefix", str(root / "apps" / "web"), "ls", "--depth=0", "--json"))
     problem = _result_problem(listing)
@@ -424,17 +441,28 @@ def _environment_checks(root: Path) -> list[DoctorCheck]:
     if defaults is None:
         return [_check("Environment template", FAIL, ".env.example could not be read")]
     if actual is None:
-        env_check = _check("Environment template", WARN, ".env is missing; defaults are in use")
         actual = {}
+        missing = set(defaults)
+        summary = ".env is missing; defaults are in use"
     else:
         missing = set(defaults).difference(actual)
-        env_check = _check(
-            "Environment template", WARN if missing else PASS,
+        summary = (
             f"{len(missing)} .env.example key(s) are absent from .env"
             if missing
-            else ".env includes every .env.example key",
-            "secret and port names and values are intentionally not reported",
+            else ".env includes every .env.example key"
         )
+    safe_missing = tuple(sorted(key for key in missing if _safe_environment_key(key)))
+    details = ["secret and port names and values are intentionally not reported"]
+    if safe_missing:
+        details.append(f"add missing safe keys to .env: {', '.join(safe_missing)}")
+    elif missing:
+        details.append("add missing configuration to .env; sensitive names stay redacted")
+    env_check = _check(
+        "Environment template",
+        WARN if missing else PASS,
+        summary,
+        *details,
+    )
     present = tuple(key for key in SAFE_ENVIRONMENT_KEYS if key in actual or key in os.environ)
     key_check = _check(
         "Environment keys", PASS if present else WARN,
