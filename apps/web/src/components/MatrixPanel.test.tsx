@@ -190,10 +190,10 @@ describe("MatrixPanel GIF previews", () => {
       .find((image) => image.src.endsWith("first.gif") && image.onerror);
     expect(firstInspectorImage).toBeTruthy();
     act(() => firstInspectorImage?.onerror?.());
-    expect(within(screen.getByRole("region", { name: "First" })).getByText("No preview")).toBeTruthy();
+    expect(within(screen.getByRole("region", { name: "First" })).getByText("プレビューなし")).toBeTruthy();
 
     await user.click(screen.getByRole("button", { name: "Secondを拡大表示" }));
-    expect(within(screen.getByRole("region", { name: "Second" })).queryByText("No preview")).toBeNull();
+    expect(within(screen.getByRole("region", { name: "Second" })).queryByText("プレビューなし")).toBeNull();
     expect(screen.getByRole("img", { name: "Second の拡大プレビュー" }).tagName).toBe("CANVAS");
     expect(within(screen.getByRole("button", { name: "Secondを拡大表示" })).getByRole("img", { name: "Second" }).tagName).toBe("CANVAS");
   });
