@@ -3102,6 +3102,8 @@ class ModelSystemTests(unittest.TestCase):
                             "top_p": 0.9,
                             "source_asset_id": "asset-audio-source",
                             "reuse_action": "variation",
+                            "review_issue_tags": ["mood"],
+                            "review_source": "quick-review",
                         },
                     )
                 )
@@ -3134,8 +3136,12 @@ class ModelSystemTests(unittest.TestCase):
             self.assertEqual(runtime["model"].calls[0]["top_p"], 0.9)
             self.assertNotIn("source_asset_id", runtime["model"].calls[0])
             self.assertNotIn("reuse_action", runtime["model"].calls[0])
+            self.assertNotIn("review_issue_tags", runtime["model"].calls[0])
+            self.assertNotIn("review_source", runtime["model"].calls[0])
             self.assertEqual(result.metadata["source_asset_id"], "asset-audio-source")
             self.assertEqual(result.metadata["reuse_action"], "variation")
+            self.assertEqual(result.metadata["review_issue_tags"], ["mood"])
+            self.assertEqual(result.metadata["review_source"], "quick-review")
             self.assertEqual(result.metadata["params"]["structure"], "seamless loop")
             self.assertEqual(result.metadata["params"]["postprocess"], True)
             self.assertEqual(result.metadata["audio_postprocess"]["preset"], "music")
