@@ -100,6 +100,13 @@ export const en: Record<string, string> = {
   "やわらかい光": "Soft light",
   "アニマティック": "Animatic",
   "アニメ風の人物": "Anime portrait",
+  "ポートレート": "Portrait",
+  "アニメ": "Anime",
+  "シネマティック": "Cinematic",
+  "プリセット「{name}」の設定: {model} / {width}×{height} / {steps} ステップ / CFG {guidance}。値は下の欄でそのまま変更できます。":
+    "Preset \"{name}\": {model} / {width}×{height} / {steps} steps / CFG {guidance}. You can change any value below.",
+  "推奨モデル {model} が未配置のため、選択中のモデルのまま適用しました。":
+    "The recommended model {model} is not installed, so the current model was kept.",
   "アンビエント": "Ambient",
   "エディトリアル": "Editorial",
   "エレクトロニック": "Electronic",
