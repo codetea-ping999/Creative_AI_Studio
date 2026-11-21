@@ -9,6 +9,8 @@ export type ModelOption = {
   isDefault: boolean;
   runtimeStatus: string;
   availabilityMessage: string;
+  /** False when the model's pipeline (e.g. FLUX) cannot apply a negative prompt. */
+  supportsNegativePrompt?: boolean;
 };
 
 export type LoraOption = {

@@ -46,6 +46,36 @@ describe("PromptForm", () => {
     );
   });
 
+  it("tells the user a FLUX negative prompt is not applied, and leaves SDXL unchanged", async () => {
+    const user = userEvent.setup();
+    const sdxlModel: ModelOption = {
+      ...storyboardModel,
+      id: "sdxl",
+      displayName: "SDXL",
+      tags: ["image"],
+    };
+    const fluxModel: ModelOption = {
+      ...sdxlModel,
+      id: "flux-1-dev",
+      displayName: "FLUX.1-dev",
+      isDefault: false,
+      supportsNegativePrompt: false,
+    };
+
+    render(<PromptForm mediaType="image" modelOptions={[sdxlModel, fluxModel]} />);
+
+    expect(screen.queryByRole("note")).toBeNull();
+    await user.selectOptions(screen.getByLabelText("モデル"), "flux-1-dev");
+    const note = await screen.findByRole("note");
+    expect(note.textContent).toContain("flux-1-dev");
+    expect(screen.getByLabelText("避けたい要素").getAttribute("aria-describedby")).toBe(
+      "negative-prompt-unsupported",
+    );
+
+    await user.selectOptions(screen.getByLabelText("モデル"), "sdxl");
+    expect(screen.queryByRole("note")).toBeNull();
+  });
+
   it("keeps free-form purpose out of the generated prompt and preserves negatives", async () => {
     const user = userEvent.setup();
     const handleSubmit = vi.fn();
