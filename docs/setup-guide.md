@@ -118,6 +118,18 @@ API smoke check をまとめて行います。DB、project/feedback、生成出�
 python3 scripts/check_local_setup.py
 ```
 
+### Read-only environment doctor
+
+```bash
+make doctor
+make doctor-json
+```
+
+The doctor only performs bounded read-only inspection (including version and
+dependency queries); it never installs dependencies, starts services, cleans
+worktrees, or downloads models. Its exit code is `0` for PASS, `1` for WARN,
+and `2` for FAIL. `doctor-json` emits one JSON object on standard output.
+
 ### API ヘルスチェック
 
 ```bash
