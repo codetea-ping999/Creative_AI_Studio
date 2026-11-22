@@ -1,6 +1,6 @@
 PYTHON ?= ./venv/bin/python
 
-.PHONY: verify verify-lite setup-check web-build test web-test npm-audit lint typecheck test-coverage web-test-coverage api-smoke calibration-report cogvideox-smoke musicgen-smoke download-models release-artifact release-smoke third-party-notices desktop-smoke
+.PHONY: verify verify-lite setup-check doctor doctor-json web-build test web-test npm-audit lint typecheck test-coverage web-test-coverage api-smoke calibration-report cogvideox-smoke musicgen-smoke download-models release-artifact release-smoke third-party-notices desktop-smoke
 
 verify:
 	$(PYTHON) scripts/verify_local_stack.py --start-api
@@ -9,6 +9,12 @@ verify-lite: setup-check web-build test web-test npm-audit lint typecheck test-c
 
 setup-check:
 	$(PYTHON) scripts/check_local_setup.py --skip-runtime-files
+
+doctor:
+	python3 scripts/dev_doctor.py
+
+doctor-json:
+	@python3 scripts/dev_doctor.py --json
 
 web-build:
 	npm --prefix apps/web run build

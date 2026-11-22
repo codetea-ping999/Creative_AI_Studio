@@ -132,6 +132,68 @@ class VerifyLocalStackTests(unittest.TestCase):
             self.assertTrue((runtime_root / "outputs" / "audio").is_dir())
             self.assertTrue((runtime_root / "outputs" / "videos").is_dir())
 
+    def test_failed_phase_reports_phase_name_and_recovery_hint(self) -> None:
+        def _fail_web_build(
+            command: list[str],
+            *,
+            cwd: Path = MODULE.ROOT,
+            env: dict[str, str] | None = None,
+        ) -> None:
+            del cwd, env
+            if command == ["npm", "run", "build"]:
+                raise MODULE.VerificationError("Command failed with exit code 2: npm run build")
+
+        with (
+            TemporaryDirectory() as tmp_dir,
+            patch.object(MODULE, "run_command", side_effect=_fail_web_build),
+            patch.object(MODULE, "run_api_smoke_checks"),
+            patch.object(
+                MODULE,
+                "parse_args",
+                return_value=MODULE.argparse.Namespace(
+                    skip_setup_check=True,
+                    skip_web_build=False,
+                    skip_web_tests=False,
+                    skip_tests=True,
+                    skip_api_smoke=True,
+                    skip_npm_audit=True,
+                    skip_eslint=True,
+                    skip_ruff=True,
+                    skip_mypy=True,
+                    skip_coverage=True,
+                    skip_web_coverage=True,
+                    start_api=False,
+                    api_base_url="http://127.0.0.1:8123",
+                    api_timeout=1.0,
+                    check_runtime_files=False,
+                    runtime_root=Path(tmp_dir),
+                ),
+            ),
+            patch("builtins.print") as printed,
+        ):
+            self.assertEqual(MODULE.main(), 1)
+
+        output = "\n".join(
+            " ".join(str(arg) for arg in call.args) for call in printed.call_args_list
+        )
+        self.assertIn("[FAIL] phase: web build", output)
+        self.assertIn("npm run build", output)
+        self.assertIn("[HINT]", output)
+        self.assertNotIn("[OK] Verification suite completed.", output)
+
+    def test_every_phase_has_a_recovery_hint(self) -> None:
+        source = SCRIPT_PATH.read_text(encoding="utf-8")
+        for phase in MODULE.PHASE_HINTS:
+            self.assertIn(f'verification_phase("{phase}")', source)
+        self.assertEqual(source.count("verification_phase(\""), len(MODULE.PHASE_HINTS))
+
+    def test_explicit_phase_and_hint_are_not_overwritten(self) -> None:
+        with self.assertRaises(MODULE.VerificationError) as caught:
+            with MODULE.verification_phase("pytest"):
+                raise MODULE.VerificationError("boom", phase="custom", hint="do this")
+        self.assertEqual(caught.exception.phase, "custom")
+        self.assertEqual(caught.exception.hint, "do this")
+
     def test_standard_verification_runs_web_tests(self) -> None:
         commands: list[tuple[list[str], Path]] = []
 

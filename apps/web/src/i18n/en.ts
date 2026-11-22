@@ -102,6 +102,13 @@ export const en: Record<string, string> = {
   "アニメ風の人物": "Anime portrait",
   "このモデル（{model}）は避けたい要素に対応していないため、入力しても生成には使われません。":
     "This model ({model}) does not support a negative prompt, so anything entered here is not used.",
+  "ポートレート": "Portrait",
+  "アニメ": "Anime",
+  "シネマティック": "Cinematic",
+  "プリセット「{name}」の設定: {model} / {width}×{height} / {steps} ステップ / CFG {guidance}。値は下の欄でそのまま変更できます。":
+    "Preset \"{name}\": {model} / {width}×{height} / {steps} steps / CFG {guidance}. You can change any value below.",
+  "推奨モデル {model} が未配置のため、選択中のモデルのまま適用しました。":
+    "The recommended model {model} is not installed, so the current model was kept.",
   "アンビエント": "Ambient",
   "エディトリアル": "Editorial",
   "エレクトロニック": "Electronic",

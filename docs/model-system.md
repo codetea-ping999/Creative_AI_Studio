@@ -208,10 +208,19 @@ runtime が evict される」といった race を型として塞いでいま�
   `ModelService.resolve_runtime()` の docstring を参照
 - 再発防止は静的 guard で機械的に担保します：
   `tests/test_runtime_surface_guard.py` が AST で `apps/` `bootstrap/`
-  `core/` `generators/` `scripts/` 全体を走査し、bare API 呼び出し・
-  `getattr()` 経由の間接呼び出し・`runtime_cache` / `loader` への
-  直接アクセス・`with` を伴わない generator の runtime 取得を検出します
-  （定義・docstring・同名の無関係 method は誤検知しません）
+  `core/` `generators/` `scripts/` 全体を走査し、bare API 属性の load
+  （local や dict などの container に保存してから呼ぶ形を含む）・定数名の
+  `getattr()` 経由の間接参照・`runtime_cache` / `loader` への直接アクセスと
+  単純な local alias・`with` を伴わない generator の runtime 取得を検出します
+  （定義・docstring・`_resolve_runtime_dtype` のような類似名は誤検知しません）。
+  一方、receiver の型を推論しないため、正確に `resolve_runtime` / `get_runtime`
+  という属性 load は receiver にかかわらず保守的に検出します。production で
+  正当な例外が必要なら、理由を書いた明示的な allowlist を追加します。これは
+  意図的に whole-program dataflow engine ではありません。例えば
+  `getattr(service, method_name)` の可変属性名、container から取り出した値の
+  追跡、関数へ渡す・関数から返す alias、または条件分岐・mutation による一般の
+  dataflow は解決しません。guard をすり抜けるような間接化を production code に
+  導入せず、その必要がある場合は boundary contract の review を要求します
 - 新しい `ModelService.acquire_runtime(model_id, media_type, task_type=None,
   *, wait_timeout=None, wait_checkpoint=None, poll_interval=0.1) -> RuntimeHandle`
   が安全な取得経路です（`wait_checkpoint`/`poll_interval`は後述の
