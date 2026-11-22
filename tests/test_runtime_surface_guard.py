@@ -17,7 +17,7 @@ guard rather than a coverage artifact.
 Deliberately *not* string matching: a `rg` for "resolve_runtime" matches the
 method definition, every docstring that names it, this module's own comments,
 and unrelated identifiers like `_resolve_runtime_dtype`. The AST walk below
-counts only real call expressions and `getattr()` indirection.
+counts restricted attribute loads and constant-name `getattr()` indirection.
 """
 
 from __future__ import annotations
@@ -70,48 +70,139 @@ def _relative(path: Path) -> str:
     return path.relative_to(REPO_ROOT).as_posix()
 
 
-def _bare_api_calls(tree: ast.AST) -> list[tuple[str, int]]:
-    """Real call/getattr uses of the bare runtime API, not definitions."""
+def _bare_api_uses(tree: ast.AST) -> list[tuple[str, int]]:
+    """Restricted bare API loads and constant-name ``getattr`` uses.
+
+    Looking for the attribute load, rather than only its immediate call, also
+    catches a method saved to a local or container before it is invoked. A
+    definition is an ``ast.FunctionDef``, not an ``ast.Attribute`` load, so it
+    remains outside this deliberately syntactic check.
+    """
 
     found: list[tuple[str, int]] = []
     for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            func = node.func
-            # obj.resolve_runtime(...) / obj.get_runtime(...)
-            if isinstance(func, ast.Attribute) and func.attr in BARE_RUNTIME_API:
-                found.append((func.attr, node.lineno))
-            # getattr(obj, "resolve_runtime") -- indirection still counts
-            elif (
-                isinstance(func, ast.Name)
-                and func.id == "getattr"
-                and len(node.args) >= 2
-                and isinstance(node.args[1], ast.Constant)
-                and node.args[1].value in BARE_RUNTIME_API
-            ):
-                found.append((node.args[1].value, node.lineno))
+        # obj.resolve_runtime / obj.get_runtime, whether called immediately,
+        # assigned to a local, or stored in a container for a later call.
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.ctx, ast.Load)
+            and node.attr in BARE_RUNTIME_API
+        ):
+            found.append((node.attr, node.lineno))
+        # getattr(obj, "resolve_runtime") -- constant-name indirection still
+        # counts. Variable attribute names are documented as a deliberate
+        # limitation below rather than guessed at.
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) >= 2
+            and isinstance(node.args[1], ast.Constant)
+            and node.args[1].value in BARE_RUNTIME_API
+        ):
+            found.append((node.args[1].value, node.lineno))
     return found
+
+
+_CACHE_LOADER_METHODS = {
+    "runtime_cache": {"get", "put"},
+    "loader": {"load"},
+}
+
+
+class _CacheLoaderBypassVisitor(ast.NodeVisitor):
+    """Find direct cache/loader calls and simple lexical local aliases.
+
+    This intentionally recognizes only assignments whose right-hand side is a
+    cache/loader attribute or an already-known local alias. It is enough to
+    prevent the easy ``c = self.runtime_cache; c.get(...)`` escape without
+    claiming whole-program dataflow analysis.
+    """
+
+    def __init__(self) -> None:
+        self.found: list[tuple[str, int]] = []
+        self._aliases: list[dict[str, str | None]] = [{}]
+
+    def _receiver_role(self, value: ast.expr) -> str | None:
+        if isinstance(value, ast.Attribute) and value.attr in _CACHE_LOADER_METHODS:
+            return value.attr
+        if isinstance(value, ast.Name):
+            # Preserve the direct-receiver matching the prior guard used:
+            # `runtime_cache` is specific enough, while bare `cache` is not.
+            for role in _CACHE_LOADER_METHODS:
+                if value.id.endswith(role):
+                    return role
+            for scope in reversed(self._aliases):
+                if value.id in scope:
+                    return scope[value.id]
+        return None
+
+    def _record_alias(self, target: ast.expr, value: ast.expr) -> None:
+        if isinstance(target, ast.Name):
+            # Record non-matches too: a reassignment shadows an outer alias.
+            self._aliases[-1][target.id] = self._receiver_role(value)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        self.visit(node.value)
+        for target in node.targets:
+            self._record_alias(target, node.value)
+            self.visit(target)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        if node.value is not None:
+            self.visit(node.value)
+            self._record_alias(node.target, node.value)
+        self.visit(node.target)
+        self.visit(node.annotation)
+
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        self.visit(node.value)
+        self._record_alias(node.target, node.value)
+        self.visit(node.target)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._visit_scoped_body(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._visit_scoped_body(node)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self._visit_scoped_body(node)
+
+    def _visit_scoped_body(
+        self, node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
+    ) -> None:
+        # Decorators and defaults execute in the enclosing scope.
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            self.visit(node.args)
+            if node.returns is not None:
+                self.visit(node.returns)
+        else:
+            for base in node.bases:
+                self.visit(base)
+            for keyword in node.keywords:
+                self.visit(keyword.value)
+        self._aliases.append({})
+        for statement in node.body:
+            self.visit(statement)
+        self._aliases.pop()
+
+    def visit_Call(self, node: ast.Call) -> None:
+        if isinstance(node.func, ast.Attribute):
+            role = self._receiver_role(node.func.value)
+            if role is not None and node.func.attr in _CACHE_LOADER_METHODS[role]:
+                self.found.append((f"{ast.unparse(node.func.value)}.{node.func.attr}", node.lineno))
+        self.generic_visit(node)
 
 
 def _cache_loader_bypasses(tree: ast.AST) -> list[tuple[str, int]]:
-    """Direct runtime-cache / loader use, which bypasses admission entirely."""
+    """Cache/loader calls that bypass admission, including simple aliases."""
 
-    found: list[tuple[str, int]] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
-            continue
-        attr = node.func.attr
-        try:
-            receiver = ast.unparse(node.func.value)
-        except Exception:  # pragma: no cover - defensive, unparse is total in 3.9+
-            continue
-        # `runtime_cache` is the ModelRuntimeCache; deliberately NOT a bare
-        # `cache`, which also names unrelated caches (the semantic ScoreCache,
-        # the assembly font cache) whose get/put have nothing to do with G.
-        if attr in {"get", "put"} and receiver.endswith("runtime_cache"):
-            found.append((f"{receiver}.{attr}", node.lineno))
-        elif attr == "load" and receiver.endswith("loader"):
-            found.append((f"{receiver}.{attr}", node.lineno))
-    return found
+    visitor = _CacheLoaderBypassVisitor()
+    visitor.visit(tree)
+    return visitor.found
 
 
 def test_no_production_module_calls_the_bare_runtime_api() -> None:
@@ -119,11 +210,11 @@ def test_no_production_module_calls_the_bare_runtime_api() -> None:
     for path in _production_files():
         rel = _relative(path)
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=rel)
-        for attr, line in _bare_api_calls(tree):
+        for attr, line in _bare_api_uses(tree):
             if (rel, attr) in BARE_API_ALLOWLIST:
                 continue
             violations.append(
-                f"{rel}:{line} calls bare {attr}() -- production generation must "
+                f"{rel}:{line} uses bare {attr} -- production generation must "
                 "use ModelService.acquire_runtime() (issue #414). If this call "
                 "genuinely cannot execute, mutate, or retain the runtime, add it "
                 "to BARE_API_ALLOWLIST with a written reason."
@@ -217,18 +308,23 @@ def test_the_guard_itself_detects_a_planted_violation(tmp_path) -> None:
 
     planted = tmp_path / "planted.py"
     planted.write_text(
-        "def run(service, cache, loader):\n"
-        "    manifest, runtime = service.resolve_runtime('m', 'image')\n"
-        "    other = service.get_runtime('m', 'image')\n"
-        "    indirect = getattr(service, 'resolve_runtime')('m', 'image')\n"
-        "    cached = self.runtime_cache.get('m')\n"
-        "    loaded = loader.load(item)\n"
-        "    return manifest, runtime, other, indirect, cached, loaded\n",
+        "def run(service, item):\n"
+        "    fn = service.resolve_runtime\n"
+        "    calls = {'get': service.get_runtime}\n"
+        "    indirect = getattr(service, 'resolve_runtime')\n"
+        "    c = self.runtime_cache\n"
+        "    l = self.loader\n"
+        "    runtime = fn('m', 'image')\n"
+        "    other = calls['get']('m', 'image')\n"
+        "    deferred = indirect('m', 'image')\n"
+        "    cached = c.get('m')\n"
+        "    loaded = l.load(item)\n"
+        "    return runtime, other, deferred, cached, loaded\n",
         encoding="utf-8",
     )
     tree = ast.parse(planted.read_text(encoding="utf-8"), filename="planted.py")
 
-    bare = _bare_api_calls(tree)
+    bare = _bare_api_uses(tree)
     assert sorted(name for name, _ in bare) == [
         "get_runtime",
         "resolve_runtime",
@@ -237,12 +333,12 @@ def test_the_guard_itself_detects_a_planted_violation(tmp_path) -> None:
 
     bypasses = _cache_loader_bypasses(tree)
     assert sorted(name for name, _ in bypasses) == [
-        "loader.load",
-        "self.runtime_cache.get",
+        "c.get",
+        "l.load",
     ]
 
 
-def test_guard_ignores_definitions_docstrings_and_unrelated_same_named_methods() -> None:
+def test_guard_ignores_definitions_docstrings_and_similarly_named_methods() -> None:
     """No false positives on the shapes that legitimately mention the API."""
 
     source = (
@@ -263,7 +359,22 @@ def test_guard_ignores_definitions_docstrings_and_unrelated_same_named_methods()
         "\n"
         "def caller(helper):\n"
         "    return helper._resolve_runtime_dtype(1, 'cpu', None)\n"
+        "\n"
+        "def unrelated_cache(cache):\n"
+        "    return cache.get('unrelated')\n"
     )
     tree = ast.parse(source, filename="unrelated.py")
-    assert _bare_api_calls(tree) == []
+    assert _bare_api_uses(tree) == []
     assert _cache_loader_bypasses(tree) == []
+
+
+def test_guard_conservatively_flags_any_exact_restricted_attribute_load() -> None:
+    """Receiver type is not inferred; an exact restricted name needs review."""
+
+    tree = ast.parse(
+        "def caller(unrelated):\n"
+        "    fn = unrelated.resolve_runtime\n"
+        "    return fn()\n",
+        filename="conservative.py",
+    )
+    assert _bare_api_uses(tree) == [("resolve_runtime", 2)]
