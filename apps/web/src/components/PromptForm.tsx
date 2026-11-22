@@ -20,6 +20,11 @@ import type {
   VideoPreset,
 } from "./promptFormTypes";
 import { useT } from "../i18n";
+import {
+  applyPresetPrompt,
+  productionImagePresets,
+  type ImagePresetSpec,
+} from "../lib/imagePresets";
 
 export type {
   LoraOption,
@@ -175,6 +180,10 @@ export function PromptForm({
     createInitialState(initialValues),
   );
   const [controlMode, setControlMode] = useState<ControlMode>("quick");
+  const [activeImagePreset, setActiveImagePreset] = useState<{
+    preset: ImagePresetSpec;
+    modelFallback: boolean;
+  } | null>(null);
   const availableModelCount = modelOptions.filter((option) => option.isAvailable).length;
   const unavailableModelCount = modelOptions.length - availableModelCount;
   const unavailableModels = modelOptions.filter((option) => !option.isAvailable);
@@ -259,6 +268,36 @@ export function PromptForm({
     setFieldValue("prompt", buildSimpleImagePrompt(formValues));
   };
 
+  const applyProductionImagePreset = (preset: ImagePresetSpec) => {
+    const presetModel = modelOptions.find(
+      (option) => option.id === preset.modelId && option.isAvailable,
+    );
+    // Without a model list (tests, early render) the preset model is used as-is; with a list,
+    // an unplaced preset model keeps the current model so the job can still run.
+    const useCurrentModel = modelOptions.length > 0 && !presetModel;
+    setFormValues((current) => ({
+      ...current,
+      modelId: useCurrentModel ? current.modelId : preset.modelId,
+      // An empty prompt falls back to the simple brief, as submit does, so the subject
+      // typed into the brief is kept when a preset adds its style words.
+      prompt: applyPresetPrompt(
+        current.prompt.trim() ||
+          (current.imageBriefSubject.trim() ? buildSimpleImagePrompt(current) : ""),
+        preset,
+      ),
+      negativePrompt: preset.negativePrompt,
+      width: String(preset.width),
+      height: String(preset.height),
+      steps: String(preset.steps),
+      guidanceScale: String(preset.guidanceScale),
+      loraScale:
+        preset.loraScale !== undefined && current.loraPath.trim()
+          ? String(preset.loraScale)
+          : current.loraScale,
+    }));
+    setActiveImagePreset({ preset, modelFallback: useCurrentModel });
+  };
+
   const applyImagePreset = (preset: ImagePreset) => {
     setFormValues((current) => ({
       ...current,
@@ -297,6 +336,9 @@ export function PromptForm({
 
   const handleModelChange = (modelId: string) => {
     const selectedModel = modelOptions.find((option) => option.id === modelId);
+    setActiveImagePreset((current) =>
+      current ? { ...current, modelFallback: false } : current,
+    );
     setFormValues((current) => ({
       ...current,
       modelId,
@@ -1094,6 +1136,21 @@ export function PromptForm({
         <div className="toolbar-actions">
           <div className="preset-row" role="group" aria-label={t("プリセット")}>
             {mediaType === "image"
+              ? productionImagePresets.map((preset) => (
+                  <button
+                    key={preset.id}
+                    type="button"
+                    className="secondary-button"
+                    onClick={() => applyProductionImagePreset(preset)}
+                    disabled={disabled}
+                    aria-pressed={activeImagePreset?.preset.id === preset.id}
+                    title={preset.intent}
+                  >
+                    {t(preset.name)}
+                  </button>
+                ))
+              : null}
+            {mediaType === "image"
               ? imagePresets.map((preset) => (
                   <button
                     key={preset.name}
@@ -1158,6 +1215,27 @@ export function PromptForm({
           </div>
         </div>
       </div>
+
+      {mediaType === "image" && activeImagePreset ? (
+        <p className="form-status preset-summary" role="status" aria-live="polite">
+          {t(
+            "プリセット「{name}」の設定: {model} / {width}×{height} / {steps} ステップ / CFG {guidance}。値は下の欄でそのまま変更できます。",
+            {
+              name: t(activeImagePreset.preset.name),
+              model: formValues.modelId || "-",
+              width: formValues.width,
+              height: formValues.height,
+              steps: formValues.steps,
+              guidance: formValues.guidanceScale,
+            },
+          )}
+          {activeImagePreset.modelFallback
+            ? ` ${t("推奨モデル {model} が未配置のため、選択中のモデルのまま適用しました。", {
+                model: activeImagePreset.preset.modelId,
+              })}`
+            : null}
+        </p>
+      ) : null}
 
       {statusMessage ? (
         <p

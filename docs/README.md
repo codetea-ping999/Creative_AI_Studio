@@ -74,6 +74,7 @@ Creative AI Studio のドキュメント案内です。
 - [model-download-guide.md](./model-download-guide.md)
 - [MusicGen v0.2 real-model validation](./validation/musicgen-v0.2.md)
 - [MusicGen long-form validation](./validation/musicgen-long-form-v0.2.md)
+- [image-presets.md](./image-presets.md) — 画像プリセット（Portrait / Anime / Cinematic）の項目と検証ルール
 
 ### メモリと性能を測りたい
 

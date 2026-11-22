@@ -17,6 +17,24 @@ const storyboardModel: ModelOption = {
   availabilityMessage: "Ready",
 };
 
+const sdxlModel: ModelOption = {
+  id: "sdxl",
+  displayName: "SDXL",
+  defaultParams: { width: 1024, height: 1024, steps: 30, guidance_scale: 7.5 },
+  tags: ["image"],
+  isAvailable: true,
+  isDefault: true,
+  runtimeStatus: "ready",
+  availabilityMessage: "Ready",
+};
+
+const animeModel: ModelOption = {
+  ...sdxlModel,
+  id: "anime-sdxl",
+  displayName: "Anime SDXL",
+  isDefault: false,
+};
+
 afterEach(() => {
   cleanup();
 });
@@ -42,6 +60,90 @@ describe("PromptForm", () => {
       expect.objectContaining({
         prompt: "夕暮れの花束, SNS投稿, やわらかい光",
         imageBriefSubject: "夕暮れの花束",
+      }),
+    );
+  });
+
+  it("applies a production image preset to visible controls and submits user overrides", async () => {
+    const user = userEvent.setup();
+    const handleSubmit = vi.fn();
+
+    render(
+      <PromptForm
+        mediaType="image"
+        modelOptions={[sdxlModel, animeModel]}
+        submitLabel="生成する"
+        onSubmit={handleSubmit}
+      />,
+    );
+
+    await user.type(screen.getByLabelText("1. 主役・内容"), "夕暮れの花束");
+    await user.click(screen.getByRole("button", { name: "ポートレート" }));
+
+    expect(screen.getByRole("button", { name: "ポートレート" }).getAttribute("aria-pressed")).toBe(
+      "true",
+    );
+    expect(screen.getByText(/プリセット「ポートレート」の設定: sdxl \/ 832×1024 \/ 30 ステップ/)).toBeTruthy();
+
+    await user.click(screen.getByRole("tab", { name: "詳細" }));
+    const steps = screen.getByLabelText("ステップ数") as HTMLInputElement;
+    expect(steps.value).toBe("30");
+    await user.clear(steps);
+    await user.type(steps, "12");
+    expect(screen.getByText(/832×1024 \/ 12 ステップ \/ CFG 6.5/)).toBeTruthy();
+
+    await user.click(screen.getByRole("button", { name: "生成する" }));
+
+    expect(handleSubmit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        modelId: "sdxl",
+        width: 832,
+        height: 1024,
+        steps: 12,
+        guidanceScale: 6.5,
+        prompt: expect.stringMatching(/^夕暮れの花束, SNS投稿, やわらかい光, portrait photograph/),
+        negativePrompt: expect.stringContaining("deformed face"),
+      }),
+    );
+  });
+
+  it("switches to the preset model and keeps the current one when it is not installed", async () => {
+    const user = userEvent.setup();
+    const handleSubmit = vi.fn();
+    const { unmount } = render(
+      <PromptForm
+        mediaType="image"
+        modelOptions={[sdxlModel, animeModel]}
+        submitLabel="生成する"
+        onSubmit={handleSubmit}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "アニメ" }));
+    await user.click(screen.getByRole("button", { name: "生成する" }));
+    expect(handleSubmit).toHaveBeenLastCalledWith(
+      expect.objectContaining({ modelId: "anime-sdxl", width: 1024, steps: 28 }),
+    );
+    unmount();
+
+    render(
+      <PromptForm
+        mediaType="image"
+        modelOptions={[sdxlModel, { ...animeModel, isAvailable: false }]}
+        submitLabel="生成する"
+        onSubmit={handleSubmit}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "シネマティック" }));
+    await user.click(screen.getByRole("button", { name: "アニメ" }));
+    expect(screen.getByText(/推奨モデル anime-sdxl が未配置のため/)).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "生成する" }));
+    expect(handleSubmit).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        modelId: "sdxl",
+        width: 1024,
+        height: 1024,
+        prompt: expect.not.stringContaining("cinematic film still"),
       }),
     );
   });
