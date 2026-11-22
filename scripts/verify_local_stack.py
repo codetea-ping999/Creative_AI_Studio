@@ -25,6 +25,65 @@ ROOT = Path(__file__).resolve().parents[1]
 class VerificationError(RuntimeError):
     """Raised when the verification flow fails."""
 
+    def __init__(self, message: str, *, phase: str | None = None, hint: str | None = None) -> None:
+        super().__init__(message)
+        self.phase = phase
+        self.hint = hint
+
+
+# Stable phase names and recovery hints, printed when a phase fails.
+PHASE_HINTS: dict[str, str] = {
+    "setup check": (
+        "Run `python scripts/check_local_setup.py --skip-runtime-files` and fix the reported item; "
+        "re-run ./setup.sh if the venv, .env, or web dependencies are missing."
+    ),
+    "web tests": (
+        "Run `npm --prefix apps/web test` to see the failing test; run `npm --prefix apps/web ci` "
+        "first if node_modules is missing or out of date."
+    ),
+    "web lint": "Run `npm --prefix apps/web run lint` and fix the reported ESLint errors.",
+    "web coverage": (
+        "Run `npm --prefix apps/web run test:coverage`; add tests or fix failures until the "
+        "coverage thresholds in apps/web pass."
+    ),
+    "web build": (
+        "Run `npm --prefix apps/web run build` to see the TypeScript/Vite error; run "
+        "`npm --prefix apps/web ci` if dependencies are missing."
+    ),
+    "npm audit": (
+        "Run `npm --prefix apps/web audit` and update the affected package "
+        "(`npm --prefix apps/web audit fix` or a targeted version bump)."
+    ),
+    "ruff": "Run `./venv/bin/ruff check core generators` (add `--fix` for auto-fixable rules).",
+    "mypy": "Run `./venv/bin/mypy core generators` and fix the reported type errors.",
+    "pytest": (
+        "Run `./venv/bin/python -m pytest -q -x` to stop at the first failure; run "
+        "`./venv/bin/pip install -r requirements.txt` if an import fails."
+    ),
+    "pytest coverage": (
+        "Run `./venv/bin/python -m pytest --cov=core --cov=generators -q` and add tests "
+        "until the pyproject.toml coverage floor passes."
+    ),
+    "API smoke": (
+        "Start the API with `./scripts/run_api_dev.sh` and open /health and /models; check the "
+        "API log above for import errors, a port conflict, or a missing models/manifests/ file."
+    ),
+}
+
+
+@contextmanager
+def verification_phase(name: str):
+    """Tag any VerificationError raised inside the block with its phase and hint."""
+
+    try:
+        yield
+    except VerificationError as exc:
+        if exc.phase is None:
+            exc.phase = name
+        if exc.hint is None:
+            exc.hint = PHASE_HINTS.get(name)
+        raise
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -397,77 +456,97 @@ def main() -> int:
             )
 
             if not args.skip_setup_check:
-                command = [venv_python(), "scripts/check_local_setup.py"]
-                if not args.check_runtime_files:
-                    command.append("--skip-runtime-files")
-                run_command(command, env=isolated_env)
+                with verification_phase("setup check"):
+                    command = [venv_python(), "scripts/check_local_setup.py"]
+                    if not args.check_runtime_files:
+                        command.append("--skip-runtime-files")
+                    run_command(command, env=isolated_env)
 
             if not args.skip_web_tests:
-                run_command(["npm", "test"], cwd=ROOT / "apps" / "web", env=isolated_env)
+                with verification_phase("web tests"):
+                    run_command(["npm", "test"], cwd=ROOT / "apps" / "web", env=isolated_env)
 
             if not args.skip_eslint:
-                run_command(["npm", "run", "lint"], cwd=ROOT / "apps" / "web", env=isolated_env)
+                with verification_phase("web lint"):
+                    run_command(["npm", "run", "lint"], cwd=ROOT / "apps" / "web", env=isolated_env)
 
             if not args.skip_web_coverage:
-                run_command(
-                    ["npm", "run", "test:coverage"],
-                    cwd=ROOT / "apps" / "web",
-                    env=isolated_env,
-                )
+                with verification_phase("web coverage"):
+                    run_command(
+                        ["npm", "run", "test:coverage"],
+                        cwd=ROOT / "apps" / "web",
+                        env=isolated_env,
+                    )
 
             if not args.skip_web_build:
-                run_command(["npm", "run", "build"], cwd=ROOT / "apps" / "web", env=isolated_env)
+                with verification_phase("web build"):
+                    run_command(
+                        ["npm", "run", "build"], cwd=ROOT / "apps" / "web", env=isolated_env
+                    )
 
             if not args.skip_npm_audit:
-                run_command(
-                    ["npm", "audit", "--audit-level=high"],
-                    cwd=ROOT / "apps" / "web",
-                    env=isolated_env,
-                )
+                with verification_phase("npm audit"):
+                    run_command(
+                        ["npm", "audit", "--audit-level=high"],
+                        cwd=ROOT / "apps" / "web",
+                        env=isolated_env,
+                    )
 
             if not args.skip_ruff:
-                run_command([venv_executable("ruff"), "check", "core", "generators"], env=isolated_env)
+                with verification_phase("ruff"):
+                    run_command(
+                        [venv_executable("ruff"), "check", "core", "generators"],
+                        env=isolated_env,
+                    )
 
             if not args.skip_mypy:
-                run_command([venv_executable("mypy"), "core", "generators"], env=isolated_env)
+                with verification_phase("mypy"):
+                    run_command([venv_executable("mypy"), "core", "generators"], env=isolated_env)
 
             if not args.skip_tests:
-                run_command([venv_python(), "-m", "pytest", "-q"], env=isolated_env)
+                with verification_phase("pytest"):
+                    run_command([venv_python(), "-m", "pytest", "-q"], env=isolated_env)
 
             if not args.skip_coverage:
-                run_command(
-                    [
-                        venv_python(),
-                        "-m",
-                        "pytest",
-                        "--cov=core",
-                        "--cov=generators",
-                        "-q",
-                    ],
-                    env=isolated_env,
-                )
+                with verification_phase("pytest coverage"):
+                    run_command(
+                        [
+                            venv_python(),
+                            "-m",
+                            "pytest",
+                            "--cov=core",
+                            "--cov=generators",
+                            "-q",
+                        ],
+                        env=isolated_env,
+                    )
 
             if not args.skip_api_smoke:
-                if args.start_api:
-                    with managed_api_process(api_base_url, base_env=isolated_env) as process:
-                        try:
-                            run_api_smoke_checks(api_base_url, timeout=args.api_timeout)
-                        except Exception as exc:
-                            if process.poll() is None:
-                                process.send_signal(signal.SIGTERM)
-                                try:
-                                    process.wait(timeout=5)
-                                except subprocess.TimeoutExpired:
-                                    process.kill()
-                                    process.wait(timeout=5)
-                            output = read_process_output(process)
-                            detail = f"{exc}\n{output}".strip()
-                            raise VerificationError(detail) from exc
-                else:
-                    run_api_smoke_checks(api_base_url, timeout=args.api_timeout)
+                with verification_phase("API smoke"):
+                    if args.start_api:
+                        with managed_api_process(api_base_url, base_env=isolated_env) as process:
+                            try:
+                                run_api_smoke_checks(api_base_url, timeout=args.api_timeout)
+                            except Exception as exc:
+                                if process.poll() is None:
+                                    process.send_signal(signal.SIGTERM)
+                                    try:
+                                        process.wait(timeout=5)
+                                    except subprocess.TimeoutExpired:
+                                        process.kill()
+                                        process.wait(timeout=5)
+                                output = read_process_output(process)
+                                detail = f"{exc}\n{output}".strip()
+                                raise VerificationError(detail) from exc
+                    else:
+                        run_api_smoke_checks(api_base_url, timeout=args.api_timeout)
 
     except VerificationError as exc:
+        if exc.phase:
+            print(f"[FAIL] phase: {exc.phase}")
         print(f"[FAIL] {exc}")
+        if exc.hint:
+            print(f"[HINT] {exc.hint}")
         return 1
 
     print("[OK] Verification suite completed.")

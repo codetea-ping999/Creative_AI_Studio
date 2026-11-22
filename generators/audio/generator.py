@@ -1027,6 +1027,8 @@ def _extract_lineage_metadata(params: dict[str, Any]) -> dict[str, Any]:
         "source_job_id",
         "reference_asset_path",
         "reuse_action",
+        "review_issue_tags",
+        "review_source",
     )
     lineage_payload: dict[str, Any] = {}
     for key in lineage_keys:

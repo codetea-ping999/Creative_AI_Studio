@@ -10,6 +10,8 @@ import {
   type GalleryItemResponse,
   type JobResponse,
 } from "../studio";
+import { jobStatusLabel } from "../lib/jobStatus";
+import { useT } from "../i18n";
 
 type LatestJobPanelProps = {
   latestJob: JobResponse | null;
@@ -26,6 +28,7 @@ export function LatestJobPanel({
   selectedAssetId = null,
   onSelectAsset,
 }: LatestJobPanelProps) {
+  const t = useT();
   const cancelRequestInFlight = useRef(false);
   const [isCancelling, setIsCancelling] = useState(false);
   const orderedJobAssets = [...jobAssets].sort(
@@ -64,18 +67,50 @@ export function LatestJobPanel({
     <section className="section-card section-card--monitor">
       <div className="section-card__header">
         <div>
-          <p className="eyebrow">Latest Job</p>
-          <h2>Run state and output preview</h2>
+          <p className="eyebrow">{t("最新のジョブ")}</p>
+          <h2>{t("進み具合と結果")}</h2>
         </div>
       </div>
       {latestJob ? (
         <div className="monitor-stack">
           <div className="gallery-item__topline">
             <span className={`status-chip status-chip--${latestJob.status}`} role="status">
-              {latestJob.status}
+              {jobStatusLabel(latestJob.status)}
             </span>
             <span className="history-score">{formatPercent(latestJob.progress * 100)}</span>
           </div>
+          {!terminalStatuses.has(latestJob.status) ? (
+            <div className="cast-circle" aria-hidden="true">
+              <svg viewBox="0 0 200 200">
+                <g className="cast-circle__ring--outer">
+                  <circle cx="100" cy="100" r="92" fill="none" stroke="var(--hud-line)" strokeWidth="1" strokeDasharray="2 6" />
+                  <polygon points="100,14 175,143 25,143" fill="none" stroke="var(--hud-rune)" strokeWidth="1" />
+                </g>
+                <g className="cast-circle__ring--inner">
+                  <circle cx="100" cy="100" r="80" fill="none" stroke="var(--hud-line)" strokeWidth="6" strokeDasharray="1 9" />
+                  <polygon points="100,186 25,57 175,57" fill="none" stroke="var(--hud-rune)" strokeWidth="1" />
+                </g>
+                <circle cx="100" cy="100" r="70" fill="none" stroke="var(--border-soft)" strokeWidth="5" />
+                <circle
+                  className="cast-circle__arc"
+                  cx="100"
+                  cy="100"
+                  r="70"
+                  fill="none"
+                  stroke="var(--accent)"
+                  strokeWidth="5"
+                  strokeLinecap="round"
+                  strokeDasharray="440"
+                  strokeDashoffset={440 - 440 * Math.min(1, Math.max(0, latestJob.progress))}
+                  transform="rotate(-90 100 100)"
+                />
+              </svg>
+              <div className="cast-circle__label">
+                {Math.round(Math.min(1, Math.max(0, latestJob.progress)) * 100)}%
+                <small>{t("構築中")}</small>
+              </div>
+            </div>
+          ) : null}
           {!terminalStatuses.has(latestJob.status) ? (
             <button
               type="button"
@@ -86,7 +121,7 @@ export function LatestJobPanel({
               disabled={isCancelling}
               aria-busy={isCancelling}
             >
-              {isCancelling ? "Cancelling job..." : "Cancel job"}
+              {isCancelling ? t("中断しています...") : t("中断する")}
             </button>
           ) : null}
           <StagePreview
@@ -107,11 +142,11 @@ export function LatestJobPanel({
             <div
               className="variation-comparison"
               role="group"
-              aria-label="Generated variations"
+              aria-label={t("作った別案")}
             >
               <div className="variation-comparison__header">
-                <strong>Compare variations</strong>
-                <span>{orderedJobAssets.length} outputs</span>
+                <strong>{t("別案を見比べる")}</strong>
+                <span>{t("{count} 件", { count: orderedJobAssets.length })}</span>
               </div>
               <div className="variation-comparison__grid">
                 {orderedJobAssets.map((asset, index) => {
@@ -134,9 +169,9 @@ export function LatestJobPanel({
                         mediaType={asset.media_type}
                         outputPath={asset.preview_path ?? asset.output_path}
                       />
-                      <span>Variation {variationNumber}</span>
+                      <span>{t("別案 {number}", { number: variationNumber })}</span>
                       <small>
-                        {asset.seed === null ? "Seed unavailable" : `Seed ${asset.seed}`}
+                        {asset.seed === null ? t("シード不明") : t("シード {seed}", { seed: asset.seed })}
                       </small>
                     </button>
                   );
@@ -146,19 +181,19 @@ export function LatestJobPanel({
           ) : null}
           <div className="metadata-grid">
             <div className="metadata-item">
-              <span>Prompt</span>
+              <span>{t("プロンプト")}</span>
               <strong>{latestJob.request.prompt}</strong>
             </div>
             <div className="metadata-item">
-              <span>Project</span>
-              <strong>{latestJob.project_id ?? "Unassigned"}</strong>
+              <span>{t("プロジェクト")}</span>
+              <strong>{latestJob.project_id ?? t("プロジェクトなし")}</strong>
             </div>
             <div className="metadata-item">
-              <span>Quality</span>
+              <span>{t("品質")}</span>
               <strong>{formatScore(extractJobQualityScore(latestJob))}</strong>
             </div>
             <div className="metadata-item">
-              <span>Updated</span>
+              <span>{t("更新")}</span>
               <strong>{formatDate(latestJob.updated_at)}</strong>
             </div>
           </div>
@@ -166,8 +201,8 @@ export function LatestJobPanel({
       ) : (
         <div className="empty-stage">
           <div>
-            <h3>No job selected</h3>
-            <p>Queue a generation or reuse an existing asset to populate the stage.</p>
+            <h3>{t("まだ生成していません")}</h3>
+            <p>{t("上の入力欄から生成すると、進み具合と結果がここに出ます。")}</p>
           </div>
         </div>
       )}

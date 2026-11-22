@@ -381,6 +381,8 @@ Behavior:
 - learned runtime はadapter entrypoint、`pipeline_path` の component設定、weight一式が揃った場合だけ`is_available=true`です
 - `runtime_status` は `ready | missing_files | scaffold` のいずれかです
 - `availability_message` はUIへ表示可能なローカルfile readiness理由で、不足時は不足ファイルを列挙します
+- `supports_negative_prompt` は negative prompt が生成に使われるかどうかです。image で `pipeline_class` が
+  `FluxPipeline` のモデルは `false`、それ以外は `true` です
 
 完全レスポンス:
 
@@ -405,7 +407,8 @@ Behavior:
       "runtime_status": "ready",
       "availability_message": "Diffusers model files are ready.",
       "install_path": "/Users/me/Creative_AI_Studio/models/image/sdxl",
-      "supports_local_install": true
+      "supports_local_install": true,
+      "supports_negative_prompt": true
     }
   ]
 }
@@ -487,6 +490,7 @@ Behavior:
 | 422 | `incomplete_source` | 選んだフォルダに完全なモデルがない（`missing` に不足ファイル） |
 | 422 | `not_supported` | endpoint で動くモデルでコピー先がない |
 | 507 | `insufficient_space` | 空き容量が足りない |
+- `supports_negative_prompt`
 
 ## Projects
 

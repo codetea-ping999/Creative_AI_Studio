@@ -65,8 +65,13 @@ models/
 - `task_type`: `text-to-image` などの用途
 - `provider`: `local`, `huggingface`, `mlx` などの供給元
 - `runtime`: `diffusers`, `transformers`, `mlx` などの実行系
-- `family`: `sdxl`, `flux` など loader が pipeline class を選ぶためのモデル系統
-- `variant`: `fp16` など明示的に読み込む weight variant。不要なモデルでは省略
+- `pipeline_class`: image manifest だけが持つ Diffusers pipeline class。`StableDiffusionXLPipeline`
+  （省略時の既定）か `FluxPipeline`。loader と generator は model id を推測せず、この値から
+  `core/models/image_pipelines.py` の family（img2img の有無、negative prompt に対応するか）を引きます。
+  それ以外の値は manifest の読み込み時に、対応する class 名を挙げて失敗します
+- `dtype`: weight の dtype（`float16` / `bfloat16` / `float32`）。Diffusers loader は
+  `.fp16.` / `.bf16.` の variant ファイルが実在するときだけ `variant` を指定します。
+  FLUX.1-dev のような variant なしの bf16 配布物はそのまま読み込めます
 - `local_path`: ローカル保存先
 - `remote_ref`: 将来の取得元参照
 - `loader`: 呼び出す loader 名
@@ -74,6 +79,26 @@ models/
 - `aliases`: legacy id や互換 id を internal manifest id に解決する追加マッピング
 - `is_default`: デフォルト候補かどうか
 - `enabled`: 利用可否
+
+### Diffusers の dtype 方針（#141）
+
+| weight dtype | cuda | mps | cpu |
+|---|---|---|---|
+| float16 | float16 | float32 | float32 |
+| bfloat16 | bfloat16 | bfloat16 | bfloat16 |
+| float32 | float32 | float32 | float32 |
+
+float16 を MPS / CPU で float32 に上げるのは、SDXL を MPS の半精度で動かすと黒画像や NaN になるためです。
+bfloat16（FLUX.1-dev）は MPS（macOS 14 以降）でそのまま動き、約 12B の transformer を float32 に
+上げるとメモリが倍になるため上げません。M1 Max 実機での読み込み時間・推論時間・メモリの実測は #144〜#146 で行います。
+
+### FLUX と negative prompt
+
+`FluxPipeline` は `negative_prompt` を受け付けません。FLUX のジョブでは generator が
+`negative_prompt` を pipeline に渡さず、metadata に `negative_prompt_applied: false` と
+`negative_prompt_supported: false` を記録します。入力された文字列自体は `negative_prompt` に残るので、
+再利用で SDXL に切り替えれば使われます。`GET /models` は `supports_negative_prompt` を返し、
+Web UI は避けたい要素の欄の下に「使われない」ことを表示します。
 
 ## Public IDs And Aliases
 
@@ -183,10 +208,19 @@ runtime が evict される」といった race を型として塞いでいま�
   `ModelService.resolve_runtime()` の docstring を参照
 - 再発防止は静的 guard で機械的に担保します：
   `tests/test_runtime_surface_guard.py` が AST で `apps/` `bootstrap/`
-  `core/` `generators/` `scripts/` 全体を走査し、bare API 呼び出し・
-  `getattr()` 経由の間接呼び出し・`runtime_cache` / `loader` への
-  直接アクセス・`with` を伴わない generator の runtime 取得を検出します
-  （定義・docstring・同名の無関係 method は誤検知しません）
+  `core/` `generators/` `scripts/` 全体を走査し、bare API 属性の load
+  （local や dict などの container に保存してから呼ぶ形を含む）・定数名の
+  `getattr()` 経由の間接参照・`runtime_cache` / `loader` への直接アクセスと
+  単純な local alias・`with` を伴わない generator の runtime 取得を検出します
+  （定義・docstring・`_resolve_runtime_dtype` のような類似名は誤検知しません）。
+  一方、receiver の型を推論しないため、正確に `resolve_runtime` / `get_runtime`
+  という属性 load は receiver にかかわらず保守的に検出します。production で
+  正当な例外が必要なら、理由を書いた明示的な allowlist を追加します。これは
+  意図的に whole-program dataflow engine ではありません。例えば
+  `getattr(service, method_name)` の可変属性名、container から取り出した値の
+  追跡、関数へ渡す・関数から返す alias、または条件分岐・mutation による一般の
+  dataflow は解決しません。guard をすり抜けるような間接化を production code に
+  導入せず、その必要がある場合は boundary contract の review を要求します
 - 新しい `ModelService.acquire_runtime(model_id, media_type, task_type=None,
   *, wait_timeout=None, wait_checkpoint=None, poll_interval=0.1) -> RuntimeHandle`
   が安全な取得経路です（`wait_checkpoint`/`poll_interval`は後述の

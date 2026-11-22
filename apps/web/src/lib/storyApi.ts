@@ -111,11 +111,11 @@ export type StoryListResponse = {
 
 /** The writing stages a story can be expanded through, in production order. */
 export const storyStages = [
-  { task: "logline", label: "Logline", hint: "前提から候補を出す" },
-  { task: "beat_sheet", label: "Beats", hint: "構成に分解する" },
-  { task: "scene_list", label: "Scenes", hint: "カットに落とす" },
-  { task: "script", label: "Script", hint: "台詞を書く" },
-  { task: "prose", label: "Prose", hint: "本文を書く" },
+  { task: "logline", label: "ログライン", hint: "前提から候補を出す" },
+  { task: "beat_sheet", label: "構成", hint: "構成に分解する" },
+  { task: "scene_list", label: "シーン", hint: "カットに落とす" },
+  { task: "script", label: "台本", hint: "台詞を書く" },
+  { task: "prose", label: "本文", hint: "本文を書く" },
 ] as const;
 
 export type StoryStageTask = (typeof storyStages)[number]["task"];

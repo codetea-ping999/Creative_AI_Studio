@@ -1,7 +1,9 @@
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
+import { LOCALE_STORAGE_KEY } from "./i18n";
+import { LocaleProvider } from "./i18n/LocaleProvider";
 import type { GalleryAssetDetailResponse } from "./studio";
 
 const SOURCE_PROMPT = "時を巻き戻せる少女が雨の駅に立つ";
@@ -81,7 +83,41 @@ function stubStudioApi(asset: GalleryAssetDetailResponse): RecordedRequest[] {
         return json({ status: "ok" });
       }
       if (url.pathname === "/models") {
-        return json({ models: [] });
+        // Only the weight-free storyboard runtime is installed, as on a fresh
+        // checkout: image and audio have nothing usable.
+        const mediaType = url.searchParams.get("media_type");
+        return json({
+          models:
+            mediaType === "video"
+              ? [
+                  {
+                    id: "storyboard-video",
+                    display_name: "Storyboard Video",
+                    media_type: "video",
+                    default_params: {},
+                    tags: [],
+                    is_default: true,
+                    is_available: true,
+                    runtime_status: "ready",
+                    availability_message: "",
+                  },
+                ]
+              : mediaType === "image"
+                ? [
+                    {
+                      id: "sdxl",
+                      display_name: "SDXL Local",
+                      media_type: "image",
+                      default_params: {},
+                      tags: [],
+                      is_default: true,
+                      is_available: false,
+                      runtime_status: "missing_files",
+                      availability_message: "Diffusers model files are missing",
+                    },
+                  ]
+                : [],
+        });
       }
       if (url.pathname === "/catalog/loras") {
         return json({ items: [] });
@@ -162,6 +198,7 @@ describe("Gallery Reuse and rerun", () => {
   afterEach(() => {
     cleanup();
     vi.unstubAllGlobals();
+    window.localStorage.clear();
   });
 
   it("re-runs the selected asset's own request, not the composer's empty draft", async () => {
@@ -174,8 +211,8 @@ describe("Gallery Reuse and rerun", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole("button", { name: /Video workflows/ }));
-    await user.click(await screen.findByRole("button", { name: "Reuse and rerun" }));
+    await user.click(await screen.findByRole("button", { name: "動画" }));
+    await user.click(await screen.findByRole("button", { name: "同じ条件で作り直す" }));
 
     await waitFor(() => {
       expect(findReuseRequest(requests, asset)).toBeDefined();
@@ -187,7 +224,7 @@ describe("Gallery Reuse and rerun", () => {
       project_id: asset.project_id,
     });
     expect(
-      await screen.findByText(`Created a fresh rerun from ${asset.asset_id}.`),
+      await screen.findByText("選んだ成果物と同じ条件で作り直します。"),
     ).toBeTruthy();
   });
 
@@ -197,15 +234,15 @@ describe("Gallery Reuse and rerun", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole("button", { name: /Video workflows/ }));
-    await user.click(await screen.findByRole("button", { name: "Load into composer" }));
-    const promptField = await screen.findByRole("textbox", { name: "Prompt" });
+    await user.click(await screen.findByRole("button", { name: "動画" }));
+    await user.click(await screen.findByRole("button", { name: "入力欄に読み込む" }));
+    const promptField = await screen.findByRole("textbox", { name: "プロンプト" });
     await waitFor(() => {
       expect((promptField as HTMLTextAreaElement).value).toBe(SOURCE_PROMPT);
     });
     await user.clear(promptField);
     await user.type(promptField, "雨上がりの駅");
-    await user.click(screen.getByRole("button", { name: "Reuse and rerun" }));
+    await user.click(screen.getByRole("button", { name: "同じ条件で作り直す" }));
 
     await waitFor(() => {
       expect(findReuseRequest(requests, asset)).toBeDefined();
@@ -215,5 +252,171 @@ describe("Gallery Reuse and rerun", () => {
       prompt: "雨上がりの駅",
       project_id: asset.project_id,
     });
+  });
+});
+
+describe("Studio screens", () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    window.location.hash = "";
+    window.localStorage.clear();
+  });
+
+  it("shows one screen at a time and keeps it in the URL hash", async () => {
+    stubStudioApi(makeVideoAsset());
+    const user = userEvent.setup();
+    render(<App />);
+
+    const nav = await screen.findByRole("navigation", { name: "画面" });
+    expect(within(nav).getByRole("link", { name: /つくる/ }).getAttribute("aria-current")).toBe(
+      "page",
+    );
+    expect(screen.queryByRole("button", { name: "ストーリーを作成" })).toBeNull();
+
+    await user.click(within(nav).getByRole("link", { name: /ストーリー/ }));
+
+    expect(window.location.hash).toBe("#/story");
+    expect(await screen.findByRole("button", { name: "ストーリーを作成" })).toBeTruthy();
+    expect(screen.queryByRole("textbox", { name: "プロンプト" })).toBeNull();
+  });
+
+  it("opens the screen named in the hash on load", async () => {
+    window.location.hash = "#/setup";
+    stubStudioApi(makeVideoAsset());
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { level: 1, name: "準備" })).toBeTruthy();
+    // Project management and theme live on the setup screen; choosing where
+    // new work is saved stays in the top bar on every screen.
+    expect(screen.getByRole("heading", { name: "プロジェクト" })).toBeTruthy();
+    expect(screen.getByRole("group", { name: "画面のテーマ" })).toBeTruthy();
+    expect(screen.getByRole("combobox", { name: "保存先" })).toBeTruthy();
+  });
+
+  it("opens in the 紫電 palette and switches palettes or the plain themes", async () => {
+    window.location.hash = "#/setup";
+    stubStudioApi(makeVideoAsset());
+    const user = userEvent.setup();
+    render(<App />);
+
+    const theme = await screen.findByRole("group", { name: "画面のテーマ" });
+    expect(within(theme).getAllByRole("button")).toHaveLength(10);
+    expect(within(theme).getByRole("button", { name: /紫電/ }).getAttribute("aria-pressed")).toBe("true");
+    const root = document.documentElement;
+    expect(root.dataset.flair).toBe("hud");
+    expect(root.dataset.palette).toBe("shiden");
+    expect(root.dataset.theme).toBe("dark");
+
+    await user.click(within(theme).getByRole("button", { name: /白藍/ }));
+    expect(root.dataset.palette).toBe("hakuai");
+    expect(root.dataset.theme).toBe("light");
+    expect(window.localStorage.getItem("creative-ai-studio.theme")).toBe("hakuai");
+
+    const plain = screen.getByRole("group", { name: "演出なしの標準表示" });
+    await user.click(within(plain).getByRole("button", { name: "ダーク" }));
+    expect(root.dataset.flair).toBeUndefined();
+    expect(root.dataset.palette).toBeUndefined();
+    expect(root.dataset.theme).toBe("dark");
+    expect(window.localStorage.getItem("creative-ai-studio.theme")).toBe("dark");
+  });
+
+  it("switches the interface to English from the setup screen and remembers it", async () => {
+    window.location.hash = "#/setup";
+    stubStudioApi(makeVideoAsset());
+    const user = userEvent.setup();
+    render(
+      <LocaleProvider>
+        <App />
+      </LocaleProvider>,
+    );
+
+    const language = await screen.findByRole("group", { name: "言語" });
+    await user.click(within(language).getByRole("button", { name: "English" }));
+
+    expect(await screen.findByRole("heading", { level: 1, name: "Setup" })).toBeTruthy();
+    expect(screen.getByRole("group", { name: "Language" })).toBeTruthy();
+    expect(
+      within(screen.getByRole("group", { name: "Language" }))
+        .getByRole("button", { name: "English" })
+        .getAttribute("aria-pressed"),
+    ).toBe("true");
+    expect(document.documentElement.lang).toBe("en");
+    expect(window.localStorage.getItem(LOCALE_STORAGE_KEY)).toBe("en");
+
+    await user.click(screen.getByRole("button", { name: "日本語" }));
+    expect(await screen.findByRole("heading", { level: 1, name: "準備" })).toBeTruthy();
+  });
+});
+
+describe("Model readiness", () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    window.location.hash = "";
+    window.localStorage.clear();
+  });
+
+  it("opens on a media type that can generate when nobody chose one", async () => {
+    stubStudioApi(makeVideoAsset());
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /動画/ }).getAttribute("aria-pressed")).toBe(
+        "true",
+      );
+    });
+    expect(screen.getByRole("button", { name: /画像/ }).textContent).toContain("準備が必要");
+  });
+
+  it("replaces the composer with one setup card for a media type without models", async () => {
+    window.localStorage.setItem("creative-ai-studio.media-type", "image");
+    stubStudioApi(makeVideoAsset());
+    const user = userEvent.setup();
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", { name: "画像のモデルがまだ置かれていません" }),
+    ).toBeTruthy();
+    expect(screen.getByText("SDXL Local")).toBeTruthy();
+    expect(screen.queryByRole("textbox", { name: "プロンプト" })).toBeNull();
+
+    await user.click(await screen.findByRole("button", { name: "動画をつくる" }));
+    expect(await screen.findByRole("textbox", { name: "プロンプト" })).toBeTruthy();
+    expect(window.localStorage.getItem("creative-ai-studio.media-type")).toBe("video");
+  });
+
+  it("lists every media type's readiness on the setup screen", async () => {
+    window.location.hash = "#/setup";
+    stubStudioApi(makeVideoAsset());
+    render(<App />);
+
+    const list = await screen.findByRole("heading", { name: "この端末で使えるもの" });
+    const section = list.closest("section") as HTMLElement;
+    await waitFor(() => {
+      expect(within(section).getByText("Storyboard Video")).toBeTruthy();
+    });
+    expect(within(section).getAllByText(/準備が必要/).length).toBe(2);
+    expect(within(section).getByText("未配置のモデル 1 件と配置先")).toBeTruthy();
+  });
+});
+
+describe("Library screen", () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    window.location.hash = "";
+    window.localStorage.clear();
+  });
+
+  it("lists past assets with their detail, apart from the composer", async () => {
+    window.localStorage.setItem("creative-ai-studio.media-type", "video");
+    window.location.hash = "#/library";
+    stubStudioApi(makeVideoAsset());
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "判定・再利用・書き出し" })).toBeTruthy();
+    expect(await screen.findByRole("button", { name: "同じ条件で作り直す" })).toBeTruthy();
+    expect(screen.queryByRole("textbox", { name: "プロンプト" })).toBeNull();
   });
 });

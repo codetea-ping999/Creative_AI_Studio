@@ -11,6 +11,8 @@ export type ModelOption = {
   availabilityMessage: string;
   installPath: string;
   supportsLocalInstall: boolean;
+  /** False when the model's pipeline (e.g. FLUX) cannot apply a negative prompt. */
+  supportsNegativePrompt?: boolean;
 };
 
 export type LoraOption = {
@@ -104,10 +106,6 @@ export type PromptFormProps = {
   statusMessage?: string | null;
   onSubmit?: (values: PromptFormSubmitValues) => void;
   onDraftChange?: (values: Partial<PromptFormSubmitValues>) => void;
-  onInstallLocalModel?: (
-    modelId: string,
-    options?: LocalModelInstallOptions,
-  ) => Promise<LocalModelInstallOutcome>;
 };
 
 export type ImagePreset = {

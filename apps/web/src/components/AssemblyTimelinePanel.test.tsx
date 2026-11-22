@@ -625,7 +625,7 @@ describe("AssemblyTimelinePanel", () => {
       await user.click(retryButton);
 
       const alert = await screen.findByRole("alert");
-      expect(within(alert).getByText(/failed で終了しました/)).toBeTruthy();
+      expect(within(alert).getByText(/「失敗」で終了しました/)).toBeTruthy();
     });
   });
 });

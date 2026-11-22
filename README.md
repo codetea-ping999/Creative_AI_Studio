@@ -93,6 +93,7 @@ opt-in の開発者向け機能です。安定性の約束はありません。
 
 | 機能 | 補足 |
 |---|---|
+| FLUX.1-dev Image | `models/image/flux-1-dev/` に Diffusers 形式の weight が必要。negative prompt は使われません。Apple M1 Max での実測は未実施です |
 | MusicGen（音楽生成） | 実 weight の配置が必要。weight 未配置では利用できません |
 | CogVideoX / learned video | 実 weight の配置が必要。**learned runtime はモデルディレクトリ内の `runtime.py` / `adapter.py` を実行します。信頼できるバンドルのみ `MODELS_ROOT` に置いてください** |
 | 実 TTS（kokoro / VOICEVOX / cloud） | ローカルパッケージまたは別プロセスの endpoint が必要 |

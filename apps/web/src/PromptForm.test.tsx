@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { PromptForm, type ModelOption } from "./components/PromptForm";
@@ -17,6 +17,26 @@ const storyboardModel: ModelOption = {
   availabilityMessage: "Ready",
   installPath: "",
   supportsLocalInstall: false,
+};
+
+const sdxlModel: ModelOption = {
+  id: "sdxl",
+  displayName: "SDXL",
+  defaultParams: { width: 1024, height: 1024, steps: 30, guidance_scale: 7.5 },
+  tags: ["image"],
+  isAvailable: true,
+  isDefault: true,
+  runtimeStatus: "ready",
+  availabilityMessage: "Ready",
+  installPath: "",
+  supportsLocalInstall: false,
+};
+
+const animeModel: ModelOption = {
+  ...sdxlModel,
+  id: "anime-sdxl",
+  displayName: "Anime SDXL",
+  isDefault: false,
 };
 
 afterEach(() => {
@@ -44,6 +64,120 @@ describe("PromptForm", () => {
       expect.objectContaining({
         prompt: "夕暮れの花束, SNS投稿, やわらかい光",
         imageBriefSubject: "夕暮れの花束",
+      }),
+    );
+  });
+
+  it("tells the user a FLUX negative prompt is not applied, and leaves SDXL unchanged", async () => {
+    const user = userEvent.setup();
+    const sdxlModel: ModelOption = {
+      ...storyboardModel,
+      id: "sdxl",
+      displayName: "SDXL",
+      tags: ["image"],
+    };
+    const fluxModel: ModelOption = {
+      ...sdxlModel,
+      id: "flux-1-dev",
+      displayName: "FLUX.1-dev",
+      isDefault: false,
+      supportsNegativePrompt: false,
+    };
+
+    render(<PromptForm mediaType="image" modelOptions={[sdxlModel, fluxModel]} />);
+
+    expect(screen.queryByRole("note")).toBeNull();
+    await user.selectOptions(screen.getByLabelText("モデル"), "flux-1-dev");
+    const note = await screen.findByRole("note");
+    expect(note.textContent).toContain("flux-1-dev");
+    expect(screen.getByLabelText("避けたい要素").getAttribute("aria-describedby")).toBe(
+      "negative-prompt-unsupported",
+    );
+
+    await user.selectOptions(screen.getByLabelText("モデル"), "sdxl");
+    expect(screen.queryByRole("note")).toBeNull();
+  });
+
+  it("applies a production image preset to visible controls and submits user overrides", async () => {
+    const user = userEvent.setup();
+    const handleSubmit = vi.fn();
+
+    render(
+      <PromptForm
+        mediaType="image"
+        modelOptions={[sdxlModel, animeModel]}
+        submitLabel="生成する"
+        onSubmit={handleSubmit}
+      />,
+    );
+
+    await user.type(screen.getByLabelText("1. 主役・内容"), "夕暮れの花束");
+    await user.click(screen.getByRole("button", { name: "ポートレート" }));
+
+    expect(screen.getByRole("button", { name: "ポートレート" }).getAttribute("aria-pressed")).toBe(
+      "true",
+    );
+    expect(screen.getByText(/プリセット「ポートレート」の設定: sdxl \/ 832×1024 \/ 30 ステップ/)).toBeTruthy();
+
+    await user.click(screen.getByRole("tab", { name: "詳細" }));
+    const steps = screen.getByLabelText("ステップ数") as HTMLInputElement;
+    expect(steps.value).toBe("30");
+    await user.clear(steps);
+    await user.type(steps, "12");
+    expect(screen.getByText(/832×1024 \/ 12 ステップ \/ CFG 6.5/)).toBeTruthy();
+
+    await user.click(screen.getByRole("button", { name: "生成する" }));
+
+    expect(handleSubmit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        modelId: "sdxl",
+        width: 832,
+        height: 1024,
+        steps: 12,
+        guidanceScale: 6.5,
+        prompt: expect.stringMatching(/^夕暮れの花束, SNS投稿, やわらかい光, portrait photograph/),
+        negativePrompt: expect.stringContaining("deformed face"),
+      }),
+    );
+  });
+
+  it("switches to the preset model and keeps the current one when it is not installed", async () => {
+    const user = userEvent.setup();
+    const handleSubmit = vi.fn();
+    const { unmount } = render(
+      <PromptForm
+        mediaType="image"
+        modelOptions={[sdxlModel, animeModel]}
+        submitLabel="生成する"
+        onSubmit={handleSubmit}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "アニメ" }));
+    await user.click(screen.getByRole("button", { name: "生成する" }));
+    expect(handleSubmit).toHaveBeenLastCalledWith(
+      expect.objectContaining({ modelId: "anime-sdxl", width: 1024, steps: 28 }),
+    );
+    unmount();
+
+    render(
+      <PromptForm
+        mediaType="image"
+        modelOptions={[sdxlModel, { ...animeModel, isAvailable: false }]}
+        submitLabel="生成する"
+        onSubmit={handleSubmit}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "シネマティック" }));
+    await user.click(screen.getByRole("button", { name: "アニメ" }));
+    expect(screen.getByText(/推奨モデル anime-sdxl が未配置のため/)).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "生成する" }));
+    expect(handleSubmit).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        modelId: "sdxl",
+        width: 1024,
+        height: 1024,
+        prompt: expect.not.stringContaining("cinematic film still"),
       }),
     );
   });
@@ -82,7 +216,7 @@ describe("PromptForm", () => {
     await user.type(screen.getByLabelText("1. 主役・内容"), "夕暮れの花束");
     await user.click(screen.getByRole("button", { name: "プロンプトに反映" }));
 
-    expect((screen.getByLabelText("Prompt") as HTMLTextAreaElement).value).toContain(
+    expect((screen.getByLabelText("プロンプト") as HTMLTextAreaElement).value).toContain(
       "夕暮れの花束",
     );
     expect(screen.getByText("作られる内容の要約")).toBeTruthy();
@@ -115,16 +249,16 @@ describe("PromptForm", () => {
       />,
     );
 
-    await user.selectOptions(screen.getByLabelText("Genre"), "cinematic");
+    await user.selectOptions(screen.getByLabelText("ジャンル"), "cinematic");
     await user.selectOptions(
-      screen.getByLabelText("Structure"),
+      screen.getByLabelText("構成"),
       "intro, development, climax",
     );
-    await user.clear(screen.getByLabelText("Instruments"));
-    await user.type(screen.getByLabelText("Instruments"), "low strings, brass");
-    await user.click(screen.getByRole("tab", { name: "Advanced" }));
-    await user.clear(screen.getByLabelText("Temperature"));
-    await user.type(screen.getByLabelText("Temperature"), "0.8");
+    await user.clear(screen.getByLabelText("楽器"));
+    await user.type(screen.getByLabelText("楽器"), "low strings, brass");
+    await user.click(screen.getByRole("tab", { name: "詳細" }));
+    await user.clear(screen.getByLabelText("ばらつき（Temperature）"));
+    await user.type(screen.getByLabelText("ばらつき（Temperature）"), "0.8");
     await user.clear(screen.getByLabelText("Top K"));
     await user.type(screen.getByLabelText("Top K"), "180");
     await user.clear(screen.getByLabelText("Top P"));
@@ -157,10 +291,10 @@ describe("PromptForm", () => {
       />,
     );
 
-    await user.click(screen.getByRole("tab", { name: "Advanced" }));
-    await user.clear(screen.getByLabelText("Variations"));
-    await user.type(screen.getByLabelText("Variations"), "3");
-    await user.click(screen.getByRole("button", { name: "Generate" }));
+    await user.click(screen.getByRole("tab", { name: "詳細" }));
+    await user.clear(screen.getByLabelText("作る枚数"));
+    await user.type(screen.getByLabelText("作る枚数"), "3");
+    await user.click(screen.getByRole("button", { name: "生成する" }));
 
     expect(handleSubmit).toHaveBeenCalledWith(
       expect.objectContaining({ variationCount: 3 }),
@@ -198,11 +332,11 @@ describe("PromptForm", () => {
       />,
     );
 
-    expect(screen.queryByLabelText("Extend stride (sec)")).toBeNull();
-    await user.selectOptions(screen.getByLabelText("Model"), "musicgen-long-form");
+    expect(screen.queryByLabelText("延長の間隔（秒）")).toBeNull();
+    await user.selectOptions(screen.getByLabelText("モデル"), "musicgen-long-form");
 
-    const duration = screen.getByLabelText("Duration (sec)") as HTMLInputElement;
-    const stride = screen.getByLabelText("Extend stride (sec)") as HTMLInputElement;
+    const duration = screen.getByLabelText("長さ（秒）") as HTMLInputElement;
+    const stride = screen.getByLabelText("延長の間隔（秒）") as HTMLInputElement;
     expect(duration.min).toBe("31");
     expect(duration.max).toBe("120");
     expect(duration.value).toBe("45");
@@ -223,9 +357,9 @@ describe("PromptForm", () => {
       }),
     );
 
-    await user.selectOptions(screen.getByLabelText("Model"), "musicgen-small");
-    expect(screen.queryByLabelText("Extend stride (sec)")).toBeNull();
-    expect((screen.getByLabelText("Duration (sec)") as HTMLInputElement).max).toBe("30");
+    await user.selectOptions(screen.getByLabelText("モデル"), "musicgen-small");
+    expect(screen.queryByLabelText("延長の間隔（秒）")).toBeNull();
+    expect((screen.getByLabelText("長さ（秒）") as HTMLInputElement).max).toBe("30");
   });
 
   it("applies and preserves long-form defaults when it is the first available audio model", async () => {
@@ -258,18 +392,18 @@ describe("PromptForm", () => {
     );
 
     await waitFor(() => {
-      expect((screen.getByLabelText("Model") as HTMLSelectElement).value).toBe(
+      expect((screen.getByLabelText("モデル") as HTMLSelectElement).value).toBe(
         "musicgen-long-form",
       );
     });
-    expect((screen.getByLabelText("Duration (sec)") as HTMLInputElement).value).toBe(
+    expect((screen.getByLabelText("長さ（秒）") as HTMLInputElement).value).toBe(
       "45",
     );
     expect(
-      (screen.getByLabelText("Extend stride (sec)") as HTMLInputElement).value,
+      (screen.getByLabelText("延長の間隔（秒）") as HTMLInputElement).value,
     ).toBe("18");
-    await user.click(screen.getByRole("button", { name: "Dreamy Loop" }));
-    expect((screen.getByLabelText("Duration (sec)") as HTMLInputElement).value).toBe(
+    await user.click(screen.getByRole("button", { name: "夢見心地なループ" }));
+    expect((screen.getByLabelText("長さ（秒）") as HTMLInputElement).value).toBe(
       "45",
     );
   });
@@ -300,14 +434,14 @@ describe("PromptForm", () => {
       />,
     );
 
-    expect((screen.getByLabelText("Mood") as HTMLSelectElement).value).toBe("warm");
-    expect(screen.getByRole("option", { name: "warm (restored)" })).toBeTruthy();
-    expect((screen.getByLabelText("Genre") as HTMLSelectElement).value).toBe("lo-fi");
-    expect(screen.getByRole("option", { name: "lo-fi (restored)" })).toBeTruthy();
-    expect((screen.getByLabelText("Structure") as HTMLSelectElement).value).toBe(
+    expect((screen.getByLabelText("雰囲気") as HTMLSelectElement).value).toBe("warm");
+    expect(screen.getByRole("option", { name: "warm（復元）" })).toBeTruthy();
+    expect((screen.getByLabelText("ジャンル") as HTMLSelectElement).value).toBe("lo-fi");
+    expect(screen.getByRole("option", { name: "lo-fi（復元）" })).toBeTruthy();
+    expect((screen.getByLabelText("構成") as HTMLSelectElement).value).toBe(
       "intro-outro",
     );
-    expect(screen.getByRole("option", { name: "intro-outro (restored)" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "intro-outro（復元）" })).toBeTruthy();
 
     await user.click(screen.getByRole("button", { name: "Create music" }));
 
@@ -361,7 +495,7 @@ describe("PromptForm", () => {
     );
   });
 
-  it("announces why a learned runtime is unavailable", () => {
+  it("names an unavailable runtime and points to the setup screen", () => {
     render(
       <PromptForm
         mediaType="video"
@@ -381,9 +515,9 @@ describe("PromptForm", () => {
       />,
     );
 
-    expect(screen.getByRole("status").textContent).toContain(
-      "CogVideoX-2B: CogVideoX model_index.json is missing.",
-    );
+    const note = screen.getByRole("status").textContent ?? "";
+    expect(note).toContain("未配置: CogVideoX-2B");
+    expect(note).toContain("「準備」画面");
     expect(
       (screen.getByRole("option", { name: /CogVideoX-2B/ }) as HTMLOptionElement)
         .disabled,
@@ -414,7 +548,7 @@ describe("PromptForm", () => {
     );
 
     await waitFor(() => {
-      expect((screen.getByLabelText("Model") as HTMLSelectElement).value).toBe(
+      expect((screen.getByLabelText("モデル") as HTMLSelectElement).value).toBe(
         "storyboard-video",
       );
     });
@@ -549,146 +683,5 @@ describe("studio helpers", () => {
     ).toBe(
       "body.prompt: Field required; body.params.width: Input should be a valid integer",
     );
-  });
-});
-
-describe("PromptForm local model install", () => {
-  const missingSdxl: ModelOption = {
-    ...storyboardModel,
-    id: "ssd-1b",
-    displayName: "SSD-1B Local",
-    isAvailable: false,
-    isDefault: false,
-    runtimeStatus: "missing_files",
-    availabilityMessage: "Diffusers model files are missing: model_index.json",
-    installPath: "/Users/me/Studio/models/image/ssd-1b",
-    supportsLocalInstall: true,
-  };
-
-  it("shows a download link and the install location for models without a guide before", () => {
-    render(<PromptForm mediaType="image" modelOptions={[storyboardModel, missingSdxl]} />);
-
-    expect(screen.getByRole("link", { name: "Download" }).getAttribute("href")).toBe(
-      "https://huggingface.co/segmind/SSD-1B",
-    );
-    expect(screen.getByText("/Users/me/Studio/models/image/ssd-1b")).toBeTruthy();
-  });
-
-  it("picks a folder and reports the outcome", async () => {
-    const user = userEvent.setup();
-    const install = vi.fn().mockResolvedValue({
-      status: "installed",
-      message: "ssd-1b を配置しました。",
-    });
-
-    render(
-      <PromptForm
-        mediaType="image"
-        modelOptions={[storyboardModel, missingSdxl]}
-        onInstallLocalModel={install}
-      />,
-    );
-    await user.click(screen.getByRole("button", { name: "手元のモデルを配置…" }));
-
-    expect(install).toHaveBeenCalledWith("ssd-1b", undefined);
-    const guides = screen.getByLabelText("Model download guides");
-    expect((await within(guides).findByRole("status")).textContent).toContain(
-      "ssd-1b を配置しました。",
-    );
-  });
-
-  it("stays quiet when the folder dialog is cancelled", async () => {
-    const user = userEvent.setup();
-    const install = vi.fn().mockResolvedValue({ status: "cancelled" });
-
-    render(
-      <PromptForm
-        mediaType="image"
-        modelOptions={[storyboardModel, missingSdxl]}
-        onInstallLocalModel={install}
-      />,
-    );
-    await user.click(screen.getByRole("button", { name: "手元のモデルを配置…" }));
-
-    await waitFor(() => {
-      expect(
-        (screen.getByRole("button", { name: "手元のモデルを配置…" }) as HTMLButtonElement)
-          .disabled,
-      ).toBe(false);
-    });
-    expect(screen.queryByRole("alert")).toBeNull();
-  });
-
-  it("asks before replacing existing files and then retries with replace", async () => {
-    const user = userEvent.setup();
-    const install = vi
-      .fn()
-      .mockResolvedValueOnce({
-        status: "needs_replace",
-        message: "配置先にファイルがあります。",
-        sourcePath: "/Users/me/Downloads/ssd-1b",
-      })
-      .mockResolvedValueOnce({ status: "installed", message: "配置しました。" });
-
-    render(
-      <PromptForm
-        mediaType="image"
-        modelOptions={[storyboardModel, missingSdxl]}
-        onInstallLocalModel={install}
-      />,
-    );
-    await user.click(screen.getByRole("button", { name: "手元のモデルを配置…" }));
-    expect((await screen.findByRole("alert")).textContent).toContain("配置先にファイルがあります。");
-
-    await user.click(screen.getByRole("button", { name: "置き換えて配置" }));
-
-    expect(install).toHaveBeenLastCalledWith("ssd-1b", {
-      sourcePath: "/Users/me/Downloads/ssd-1b",
-      replace: true,
-    });
-    const guides = screen.getByLabelText("Model download guides");
-    expect((await within(guides).findByRole("status")).textContent).toContain("配置しました。");
-  });
-
-  it("shows an error message and keeps the button usable", async () => {
-    const user = userEvent.setup();
-    const install = vi.fn().mockResolvedValue({
-      status: "error",
-      message: "The selected folder does not contain a complete model.",
-    });
-
-    render(
-      <PromptForm
-        mediaType="image"
-        modelOptions={[storyboardModel, missingSdxl]}
-        onInstallLocalModel={install}
-      />,
-    );
-    await user.click(screen.getByRole("button", { name: "手元のモデルを配置…" }));
-
-    expect((await screen.findByRole("alert")).textContent).toContain("complete model");
-    expect(
-      (screen.getByRole("button", { name: "手元のモデルを配置…" }) as HTMLButtonElement).disabled,
-    ).toBe(false);
-  });
-
-  it("hides the install button for endpoint models or when no handler is given", () => {
-    const { rerender } = render(
-      <PromptForm
-        mediaType="image"
-        modelOptions={[storyboardModel, missingSdxl]}
-        onInstallLocalModel={vi.fn()}
-      />,
-    );
-    expect(screen.getByRole("button", { name: "手元のモデルを配置…" })).toBeTruthy();
-
-    rerender(
-      <PromptForm
-        mediaType="image"
-        modelOptions={[storyboardModel, { ...missingSdxl, supportsLocalInstall: false }]}
-        onInstallLocalModel={vi.fn()}
-      />,
-    );
-    expect(screen.queryByRole("button", { name: "手元のモデルを配置…" })).toBeNull();
   });
 });

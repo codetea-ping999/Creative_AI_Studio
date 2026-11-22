@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useT } from "../i18n";
 import type {
   LocalModelInstallOptions,
   LocalModelInstallOutcome,
@@ -8,7 +9,7 @@ import type {
 
 type ModelInstallCardProps = {
   model: ModelOption;
-  guide: ModelInstallGuide;
+  guide: ModelInstallGuide | null;
   onInstallLocalModel?: (
     modelId: string,
     options?: LocalModelInstallOptions,
@@ -22,7 +23,9 @@ type InstallState =
   | { kind: "failed"; message: string }
   | { kind: "confirm"; message: string; sourcePath: string };
 
+/** One missing model on the Setup screen: where it goes, and a button to place it. */
 export function ModelInstallCard({ model, guide, onInstallLocalModel }: ModelInstallCardProps) {
+  const t = useT();
   const [state, setState] = useState<InstallState>({ kind: "idle" });
   const canInstall = Boolean(onInstallLocalModel) && model.supportsLocalInstall;
   const isWorking = state.kind === "working";
@@ -45,52 +48,59 @@ export function ModelInstallCard({ model, guide, onInstallLocalModel }: ModelIns
   }
 
   return (
-    <div className="download-guide" aria-busy={isWorking}>
-      <div className="download-guide__body">
-        <strong>{model.displayName}</strong>
-        <p>{guide.note}</p>
-        {model.installPath ? (
-          <p className="download-guide__path">
-            配置先: <code>{model.installPath}</code>
+    <li className="setup-install" aria-busy={isWorking}>
+      <div className="setup-install__row">
+        <div>
+          <strong>{model.displayName}</strong>
+          {guide ? <p>{t(guide.note)}</p> : null}
+          {model.installPath ? (
+            <p className="setup-missing__files">
+              {t("配置先")}: <code>{model.installPath}</code>
+            </p>
+          ) : null}
+          <p className="setup-missing__files">
+            {model.availabilityMessage || t("必要なモデルファイルが見つかりません。")}
           </p>
-        ) : null}
-      </div>
-      <div className="download-guide__actions">
-        <a href={guide.url} target="_blank" rel="noreferrer">
-          Download
-        </a>
-        {canInstall ? (
-          <button
-            type="button"
-            className="secondary-button"
-            disabled={isWorking}
-            onClick={() => {
-              void run();
-            }}
-          >
-            {isWorking ? "配置中…" : "手元のモデルを配置…"}
-          </button>
-        ) : null}
+        </div>
+        <div className="setup-install__actions">
+          {guide ? (
+            <a className="secondary-button" href={guide.url} target="_blank" rel="noreferrer">
+              {t("取得先を開く")}
+            </a>
+          ) : null}
+          {canInstall ? (
+            <button
+              type="button"
+              className="secondary-button"
+              disabled={isWorking}
+              onClick={() => {
+                void run();
+              }}
+            >
+              {isWorking ? t("配置中…") : t("手元のモデルを配置…")}
+            </button>
+          ) : null}
+        </div>
       </div>
       {isWorking ? (
-        <p className="download-guide__status" role="status">
-          コピーして確認しています。モデルが大きいと数分かかります。
+        <p className="setup-install__status" role="status">
+          {t("コピーして確認しています。モデルが大きいと数分かかります。")}
         </p>
       ) : null}
       {state.kind === "done" ? (
-        <p className="download-guide__status" role="status">
+        <p className="setup-install__status" role="status">
           ✓ {state.message}
         </p>
       ) : null}
       {state.kind === "failed" ? (
-        <p className="download-guide__status download-guide__status--error" role="alert">
+        <p className="setup-install__status setup-install__status--error" role="alert">
           ⚠ {state.message}
         </p>
       ) : null}
       {state.kind === "confirm" ? (
-        <div className="download-guide__status" role="alert">
+        <div className="setup-install__status" role="alert">
           <p>{state.message}</p>
-          <div className="download-guide__actions">
+          <div className="setup-install__actions">
             <button
               type="button"
               className="secondary-button"
@@ -98,18 +108,18 @@ export function ModelInstallCard({ model, guide, onInstallLocalModel }: ModelIns
                 void run({ sourcePath: state.sourcePath, replace: true });
               }}
             >
-              置き換えて配置
+              {t("置き換えて配置")}
             </button>
             <button
               type="button"
               className="secondary-button"
               onClick={() => setState({ kind: "idle" })}
             >
-              キャンセル
+              {t("キャンセル")}
             </button>
           </div>
         </div>
       ) : null}
-    </div>
+    </li>
   );
 }

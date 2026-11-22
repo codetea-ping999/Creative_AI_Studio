@@ -57,6 +57,7 @@ export type ModelSummary = {
   availability_message?: string;
   install_path?: string | null;
   supports_local_install?: boolean;
+  supports_negative_prompt?: boolean;
 };
 
 export type ModelsResponse = {
@@ -304,9 +305,9 @@ export const defaultSubmitValues: Record<MediaType, PromptFormSubmitValues> = {
 };
 
 export const mediaTypeLabels: Record<MediaType, string> = {
-  image: "Image",
-  audio: "Audio",
-  video: "Video",
+  image: "画像",
+  audio: "音声",
+  video: "動画",
 };
 
 export function normalizeModelOption(item: ModelSummary): ModelOption {
@@ -321,6 +322,7 @@ export function normalizeModelOption(item: ModelSummary): ModelOption {
     availabilityMessage: item.availability_message ?? "",
     installPath: item.install_path ?? "",
     supportsLocalInstall: item.supports_local_install ?? false,
+    supportsNegativePrompt: item.supports_negative_prompt ?? true,
   };
 }
 
@@ -337,7 +339,7 @@ export function normalizeLoraOption(
 
 export function formatDate(value: string | null | undefined): string {
   if (!value) {
-    return "n/a";
+    return "—";
   }
 
   const parsed = new Date(value);
@@ -345,11 +347,11 @@ export function formatDate(value: string | null | undefined): string {
 }
 
 export function formatScore(value: number | null | undefined): string {
-  return typeof value === "number" ? value.toFixed(1) : "n/a";
+  return typeof value === "number" ? value.toFixed(1) : "—";
 }
 
 export function formatPercent(value: number | null | undefined): string {
-  return typeof value === "number" ? `${value.toFixed(1)}%` : "n/a";
+  return typeof value === "number" ? `${value.toFixed(1)}%` : "—";
 }
 
 export function isAudioAsset(pathValue: string | null | undefined): boolean {

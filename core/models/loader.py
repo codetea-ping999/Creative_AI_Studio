@@ -17,6 +17,7 @@ from core.model_readiness import (
     missing_transformers_files,
 )
 
+from .image_pipelines import resolve_image_pipeline_family
 from .manifest import ModelManifest
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -36,12 +37,16 @@ class DiffusersImageLoader(BaseModelLoader):
     def load(self, manifest: ModelManifest) -> dict[str, Any]:
         try:
             import torch
-            from diffusers import StableDiffusionXLImg2ImgPipeline, StableDiffusionXLPipeline
+            import diffusers
         except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
             raise RuntimeError(
                 "Diffusers runtime dependencies are missing. "
                 "Install torch, diffusers, transformers, accelerate, and safetensors."
             ) from exc
+
+        # The pipeline class comes from the manifest (#140), never from the model id.
+        family = resolve_image_pipeline_family(manifest.pipeline_class)
+        pipeline_cls = self._diffusers_class(diffusers, family.pipeline_class)
 
         local_path = self._resolve_local_path(manifest)
         device = self._resolve_device(torch)
@@ -50,7 +55,7 @@ class DiffusersImageLoader(BaseModelLoader):
         load_dtype = self._resolve_load_dtype(requested_dtype, runtime_dtype)
         variant = self._resolve_variant(manifest, Path(local_path))
 
-        pipeline = StableDiffusionXLPipeline.from_pretrained(
+        pipeline = pipeline_cls.from_pretrained(
             local_path,
             torch_dtype=load_dtype,
             variant=variant,
@@ -58,7 +63,8 @@ class DiffusersImageLoader(BaseModelLoader):
         )
         pipeline.set_progress_bar_config(disable=True)
         pipeline.to(device=device, dtype=runtime_dtype)
-        pipeline.enable_attention_slicing()
+        if hasattr(pipeline, "enable_attention_slicing"):
+            pipeline.enable_attention_slicing()
         if hasattr(pipeline, "vae") and hasattr(pipeline.vae, "enable_slicing"):
             pipeline.vae.enable_slicing()
         elif hasattr(pipeline, "enable_vae_slicing"):
@@ -70,12 +76,14 @@ class DiffusersImageLoader(BaseModelLoader):
         # .components)` wraps the *same* already-loaded unet/vae/text
         # encoders/tokenizers/scheduler in the img2img calling convention
         # rather than loading the model a second time, so this shares GPU/CPU
-        # memory with `pipeline` instead of duplicating it.
-        img2img_pipeline = StableDiffusionXLImg2ImgPipeline(**pipeline.components)
-        # diffusers' stub for this constructor loses the method mypy can see
-        # directly on `StableDiffusionXLPipeline`'s `.from_pretrained(...)`
-        # result above; both classes inherit it from the same base pipeline.
-        img2img_pipeline.set_progress_bar_config(disable=True)  # type: ignore[attr-defined]
+        # memory with `pipeline` instead of duplicating it. A family without a
+        # declared img2img class (FLUX) gets None, so the generator reports the
+        # reference as not applied instead of calling an unsupported path.
+        img2img_pipeline: Any = None
+        if family.img2img_pipeline_class is not None:
+            img2img_cls = self._diffusers_class(diffusers, family.img2img_pipeline_class)
+            img2img_pipeline = img2img_cls(**pipeline.components)
+            img2img_pipeline.set_progress_bar_config(disable=True)
 
         return {
             "stub": False,
@@ -95,8 +103,20 @@ class DiffusersImageLoader(BaseModelLoader):
             "default_params": dict(manifest.default_params),
             "path_exists": True,
             "pipeline": pipeline,
+            "pipeline_class": family.pipeline_class,
+            "supports_negative_prompt": family.supports_negative_prompt,
             "img2img_pipeline": img2img_pipeline,
         }
+
+    @staticmethod
+    def _diffusers_class(diffusers_module: Any, class_name: str) -> Any:
+        pipeline_cls = getattr(diffusers_module, class_name, None)
+        if pipeline_cls is None:
+            raise RuntimeError(
+                f"The installed diffusers package has no {class_name}. "
+                "Upgrade diffusers (see requirements.txt) to load this model."
+            )
+        return pipeline_cls
 
     def _resolve_local_path(self, manifest: ModelManifest) -> str:
         if not manifest.local_path:
@@ -132,6 +152,11 @@ class DiffusersImageLoader(BaseModelLoader):
             return torch.bfloat16
         if raw_dtype in {"float32", "fp32"}:
             return torch.float32
+        if raw_dtype:
+            raise ValueError(
+                f"Manifest {manifest.id!r}: unsupported diffusers dtype {manifest.dtype!r}. "
+                "Use float16, bfloat16, or float32."
+            )
         return torch.float16
 
     def _resolve_runtime_dtype(
@@ -140,6 +165,16 @@ class DiffusersImageLoader(BaseModelLoader):
         device: str,
         torch: Any,
     ) -> Any:
+        """Pick the dtype the pipeline runs in on ``device`` (#141).
+
+        - float16 weights run in float32 on cpu and mps: SDXL in half precision on
+          Apple MPS produces black/NaN images, and cpu has no fast fp16 path.
+        - bfloat16 weights (FLUX.1-dev) stay bfloat16 on cuda and mps; MPS supports
+          bfloat16 on macOS 14+, and upcasting the ~12B FLUX transformer to float32
+          would double its memory. On cpu they also stay bfloat16 for the same reason.
+        - float32 is always kept.
+        """
+
         if device in {"cpu", "mps"} and requested_dtype == torch.float16:
             return torch.float32
         return requested_dtype

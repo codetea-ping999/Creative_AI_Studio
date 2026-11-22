@@ -15,6 +15,10 @@ import {
   type BatchTemplate,
 } from "../lib/batchApi";
 import { createOutputUrl } from "../studioClient";
+import { jobStatusLabel } from "../lib/jobStatus";
+import { useLocale, useT } from "../i18n";
+import { isGifAsset } from "../studio";
+import { MotionSafeGif } from "./MediaPreview";
 
 export type MatrixPanelProps = {
   /** Model used for the sweep; empty falls back to the API default. */
@@ -29,17 +33,6 @@ type LoadState = "loading" | "ready" | "error";
 type ItemFilter = "all" | "succeeded" | "failed" | "promoted" | "rated";
 type QuickRating = "" | "keep" | "maybe" | "reject";
 
-const statusLabels: Record<string, string> = {
-  pending: "待機",
-  queued: "待機",
-  preparing: "準備中",
-  running: "生成中",
-  postprocessing: "仕上げ中",
-  succeeded: "完了",
-  partial: "一部完了",
-  failed: "失敗",
-  cancelled: "中断",
-};
 
 const ratingLabels: Record<QuickRating, string> = {
   "": "未評価",
@@ -48,14 +41,13 @@ const ratingLabels: Record<QuickRating, string> = {
   reject: "除外",
 };
 
-function statusLabel(status: string): string {
-  return statusLabels[status] ?? status;
-}
+const statusLabel = jobStatusLabel;
 
 function MatrixLoadingGrid() {
+  const t = useT();
   return (
     <div className="matrix-loading-grid" role="status" aria-busy="true">
-      <span className="matrix-loading-grid__label">比較結果を待っています…</span>
+      <span className="matrix-loading-grid__label">{t("比較結果を待っています…")}</span>
       {Array.from({ length: 6 }, (_, index) => (
         <span key={index} className="matrix-loading-cell" aria-hidden="true" />
       ))}
@@ -70,8 +62,10 @@ function MatrixInspector({
   item: BatchItem;
   onClose: () => void;
 }) {
+  const t = useT();
   const headingRef = useRef<HTMLHeadingElement>(null);
-  const previewUrl = createOutputUrl(item.preview_path ?? item.output_path);
+  const previewPath = item.preview_path ?? item.output_path;
+  const previewUrl = createOutputUrl(previewPath);
 
   useEffect(() => {
     headingRef.current?.focus();
@@ -81,27 +75,35 @@ function MatrixInspector({
     <section className="matrix-inspector" aria-labelledby="matrix-inspector-heading">
       <div className="matrix-inspector__header">
         <div>
-          <p className="eyebrow">Preview</p>
+          <p className="eyebrow">{t("プレビュー")}</p>
           <h3 id="matrix-inspector-heading" ref={headingRef} tabIndex={-1}>
             {item.label}
           </h3>
         </div>
         <button type="button" className="secondary-button" onClick={onClose}>
-          閉じる
+          {t("閉じる")}
         </button>
       </div>
       <div className="matrix-inspector__content">
         <div className="matrix-inspector__media">
           {previewUrl ? (
-            <img src={previewUrl} alt={`${item.label} の拡大プレビュー`} />
+            isGifAsset(previewPath) ? (
+              <MotionSafeGif
+                key={previewUrl}
+                src={previewUrl}
+                alt={t("{label} の拡大プレビュー", { label: item.label })}
+              />
+            ) : (
+              <img src={previewUrl} alt={t("{label} の拡大プレビュー", { label: item.label })} />
+            )
           ) : (
-            <span>プレビューはありません</span>
+            <span>{t("プレビューはありません")}</span>
           )}
         </div>
         <dl className="matrix-axis-detail">
           <div>
-            <dt>スコア</dt>
-            <dd>{item.score !== null ? item.score.toFixed(1) : "未採点"}</dd>
+            <dt>{t("スコア")}</dt>
+            <dd>{item.score !== null ? item.score.toFixed(1) : t("未採点")}</dd>
           </div>
           {Object.entries(item.axis_values).map(([axis, value]) => (
             <div key={axis}>
@@ -134,55 +136,63 @@ function MatrixCell({
   onPreview: () => void;
   onInspectItem?: (item: BatchItem) => void;
 }) {
-  const previewUrl = createOutputUrl(item.preview_path ?? item.output_path);
+  const t = useT();
+  const previewPath = item.preview_path ?? item.output_path;
+  const previewUrl = createOutputUrl(previewPath);
   const canInspect = item.status === "succeeded";
 
   return (
     <li
       className={`matrix-cell ${item.promoted ? "is-promoted" : ""}`}
-      aria-label={`${item.label}、${statusLabel(item.status)}${
-        item.promoted ? "、採用済み" : ""
-      }`}
+      aria-label={
+        item.promoted
+          ? t("{label}、{status}、採用済み", { label: item.label, status: t(statusLabel(item.status)) })
+          : t("{label}、{status}", { label: item.label, status: t(statusLabel(item.status)) })
+      }
     >
       <button
         type="button"
         className="matrix-cell__thumb"
         onClick={onPreview}
         disabled={!previewUrl || !canInspect}
-        aria-label={`${item.label}を拡大表示`}
+        aria-label={t("{label}を拡大表示", { label: item.label })}
       >
         {previewUrl && canInspect ? (
-          <img
-            src={previewUrl}
-            alt={item.label}
-            loading="lazy"
-            decoding="async"
-          />
+          isGifAsset(previewPath) ? (
+            <MotionSafeGif key={previewUrl} src={previewUrl} alt={item.label} />
+          ) : (
+            <img
+              src={previewUrl}
+              alt={item.label}
+              loading="lazy"
+              decoding="async"
+            />
+          )
         ) : (
           <span className="matrix-cell__placeholder">
             {item.status === "failed"
-              ? "生成に失敗"
+              ? t("生成に失敗")
               : item.status === "cancelled"
-                ? "中断済み"
-                : `${statusLabel(item.status)}…`}
+                ? t("中断済み")
+                : `${t(statusLabel(item.status))}…`}
           </span>
         )}
       </button>
       <div className="matrix-cell__body">
         <div className="matrix-cell__heading">
           <strong className="matrix-cell__label">{item.label}</strong>
-          <span className="history-score" aria-label="ヒューリスティックスコア">
-            {item.score !== null ? item.score.toFixed(1) : "未採点"}
+          <span className="history-score" aria-label={t("ヒューリスティックスコア")}>
+            {item.score !== null ? item.score.toFixed(1) : t("未採点")}
           </span>
         </div>
         <div className="matrix-cell__meta">
           <span className={`status-chip status-chip--${item.status}`}>
-            {statusLabel(item.status)}
+            {t(statusLabel(item.status))}
           </span>
-          {isBest ? <span className="matrix-tag">最高スコア</span> : null}
-          {item.promoted ? <span className="matrix-tag">採用済み</span> : null}
+          {isBest ? <span className="matrix-tag">{t("最高スコア")}</span> : null}
+          {item.promoted ? <span className="matrix-tag">{t("採用済み")}</span> : null}
         </div>
-        <dl className="matrix-axis-values" aria-label="生成軸">
+        <dl className="matrix-axis-values" aria-label={t("生成軸")}>
           {Object.entries(item.axis_values).map(([axis, value]) => (
             <div key={axis}>
               <dt>{axis}</dt>
@@ -196,15 +206,15 @@ function MatrixCell({
           </p>
         ) : null}
         <label className="matrix-rating">
-          <span>クイック評価</span>
+          <span>{t("クイック評価")}</span>
           <select
             value={rating}
             onChange={(event) => onRatingChange(event.target.value as QuickRating)}
-            aria-label={`${item.label}のクイック評価`}
+            aria-label={t("{label}のクイック評価", { label: item.label })}
           >
             {Object.entries(ratingLabels).map(([value, label]) => (
               <option key={value || "unrated"} value={value}>
-                {label}
+                {t(label)}
               </option>
             ))}
           </select>
@@ -217,7 +227,7 @@ function MatrixCell({
             disabled={!canInspect || item.promoted || isPromoting}
             aria-busy={isPromoting}
           >
-            {isPromoting ? "採用中…" : item.promoted ? "採用済み" : "採用"}
+            {isPromoting ? t("採用中…") : item.promoted ? t("採用済み") : t("採用")}
           </button>
           {onInspectItem ? (
             <button
@@ -226,7 +236,7 @@ function MatrixCell({
               onClick={() => onInspectItem(item)}
               disabled={!canInspect}
             >
-              ジョブ詳細
+              {t("ジョブ詳細")}
             </button>
           ) : null}
         </div>
@@ -241,6 +251,8 @@ export function MatrixPanel({
   pollIntervalMs = 2500,
   onInspectItem,
 }: MatrixPanelProps) {
+  const t = useT();
+  const { locale } = useLocale();
   const [templates, setTemplates] = useState<BatchTemplate[]>([]);
   const [recentBatches, setRecentBatches] = useState<Batch[]>([]);
   const [loadState, setLoadState] = useState<LoadState>("loading");
@@ -358,7 +370,7 @@ export function MatrixPanel({
       setFilter("all");
       setPreviewItem(null);
       setNotice(
-        `${created.aggregate.total} 件の生成を開始しました。完了した項目から比較できます。`,
+        t("{count} 件の生成を開始しました。完了した項目から比較できます。", { count: created.aggregate.total }),
       );
       setRecentBatches((current) => [
         created,
@@ -378,7 +390,7 @@ export function MatrixPanel({
     try {
       const next = await cancelBatch(batch.id);
       setBatch(next);
-      setNotice("未完了の生成を中断しました。完了済みの比較結果は残ります。");
+      setNotice(t("未完了の生成を中断しました。完了済みの比較結果は残ります。"));
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
@@ -396,7 +408,7 @@ export function MatrixPanel({
       setFilter("all");
       setPreviewItem(null);
       setNotice(
-        `${next.stage_names[next.stage_index] ?? "次の段階"}を開始しました。`,
+        t("{stage}を開始しました。", { stage: next.stage_names[next.stage_index] ?? t("次の段階") }),
       );
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -412,7 +424,7 @@ export function MatrixPanel({
     try {
       const next = await promoteBatchItem(batch.id, item.id);
       setBatch(next);
-      setNotice(`「${item.label}」を採用候補にしました。`);
+      setNotice(t("「{label}」を採用候補にしました。", { label: item.label }));
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
@@ -428,11 +440,11 @@ export function MatrixPanel({
     <section className="section-card matrix-panel" aria-labelledby="matrix-panel-heading">
       <div className="section-card__header matrix-panel__header">
         <div>
-          <p className="eyebrow">Matrix</p>
-          <h2 id="matrix-panel-heading">多重生成して比較する</h2>
+          <p className="eyebrow">{t("比較")}</p>
+          <h2 id="matrix-panel-heading">{t("多重生成して比較する")}</h2>
         </div>
         <p className="section-footnote">
-          固定軸を一括生成し、スコアと目視評価から仕上げ候補を選びます。
+          {t("固定軸を一括生成し、スコアと目視評価から仕上げ候補を選びます。")}
         </p>
       </div>
 
@@ -446,7 +458,7 @@ export function MatrixPanel({
               void (batch ? refresh(batch.id) : loadSources())
             }
           >
-            再試行
+            {t("再試行")}
           </button>
         </div>
       ) : null}
@@ -457,20 +469,20 @@ export function MatrixPanel({
       {loadState === "loading" ? (
         <div className="surface-loading" role="status" aria-busy="true">
           <span className="surface-loading__bar" aria-hidden="true" />
-          <span>比較プリセットを読み込んでいます…</span>
+          <span>{t("比較プリセットを読み込んでいます…")}</span>
         </div>
       ) : loadState === "ready" && templates.length === 0 ? (
         <div className="empty-stage matrix-empty-stage">
           <div>
-            <h3>利用できるプリセットがありません</h3>
-            <p>パターンカタログを確認してから再読み込みしてください。</p>
+            <h3>{t("利用できるプリセットがありません")}</h3>
+            <p>{t("パターンカタログを確認してから再読み込みしてください。")}</p>
           </div>
         </div>
       ) : (
         <div className="matrix-composer">
           <div className="field-grid">
             <label className="field-group">
-              <span>比較プリセット</span>
+              <span>{t("比較プリセット")}</span>
               <select
                 value={templateName}
                 onChange={(event) => setTemplateName(event.target.value)}
@@ -478,18 +490,18 @@ export function MatrixPanel({
               >
                 {templates.map((entry) => (
                   <option key={entry.name} value={entry.name} disabled={Boolean(entry.error)}>
-                    {entry.name}{entry.error ? "（利用不可）" : ""}
+                    {entry.name}{entry.error ? t("（利用不可）") : ""}
                   </option>
                 ))}
               </select>
             </label>
             <label className="field-group field-group--full">
-              <span>お題</span>
+              <span>{t("お題")}</span>
               <input
                 type="text"
                 value={prompt}
                 onChange={(event) => setPrompt(event.target.value)}
-                placeholder="例: acme coffee roasters のロゴ"
+                placeholder={t("例: acme coffee roasters のロゴ")}
                 disabled={isSubmitting}
                 aria-describedby="matrix-plan-summary"
               />
@@ -502,29 +514,31 @@ export function MatrixPanel({
               className={`matrix-plan ${selectedTemplate.error ? "is-error" : ""}`}
             >
               <div>
-                <span>生成予定</span>
-                <strong>{plannedItems || "—"} 件</strong>
+                <span>{t("生成予定")}</span>
+                <strong>{t("{count} 件", { count: plannedItems || "—" })}</strong>
               </div>
               <p>{selectedTemplate.description}</p>
               {selectedTemplate.axes?.length ? (
-                <dl className="matrix-template-axes" aria-label="プリセットの固定軸">
+                <dl className="matrix-template-axes" aria-label={t("プリセットの固定軸")}>
                   {selectedTemplate.axes.map((axis) => (
                     <div key={axis.name}>
                       <dt>{axis.name}</dt>
-                      <dd>{axis.value_count} 値</dd>
+                      <dd>{t("{count} 値", { count: axis.value_count })}</dd>
                     </div>
                   ))}
                 </dl>
               ) : null}
               {selectedTemplate.stages && selectedTemplate.stages.length > 1 ? (
                 <p>
-                  1 段階目は {plannedItems} 件。上位
-                  {selectedTemplate.stages[0].keep_top_n ?? "指定"}件だけを
-                  {selectedTemplate.stages[1].name} へ進めます。
+                  {t("1 段階目は {count} 件。上位 {top} 件だけを {next} へ進めます。", {
+                    count: plannedItems,
+                    top: selectedTemplate.stages[0].keep_top_n ?? t("指定"),
+                    next: selectedTemplate.stages[1].name,
+                  })}
                 </p>
               ) : null}
               {selectedTemplate.error ? (
-                <p role="alert">利用不可: {selectedTemplate.error}</p>
+                <p role="alert">{t("利用不可: {error}", { error: selectedTemplate.error })}</p>
               ) : null}
             </div>
           ) : null}
@@ -543,19 +557,19 @@ export function MatrixPanel({
               aria-describedby="matrix-plan-summary"
             >
               {isSubmitting
-                ? "起動中…"
+                ? t("起動中…")
                 : plannedItems > 0
-                  ? `${plannedItems} 件を生成`
-                  : "生成"}
+                  ? t("{count} 件を生成", { count: plannedItems })
+                  : t("生成")}
             </button>
-            {!prompt.trim() ? <span>比較したいお題を入力してください。</span> : null}
+            {!prompt.trim() ? <span>{t("比較したいお題を入力してください。")}</span> : null}
           </div>
         </div>
       )}
 
       {recentBatches.length > 0 ? (
         <label className="field-group matrix-history-select">
-          <span>保存済みの比較を再開</span>
+          <span>{t("保存済みの比較を再開")}</span>
           <select
             value={batch?.id ?? ""}
             onChange={(event) => {
@@ -568,11 +582,11 @@ export function MatrixPanel({
               if (nextId) void refresh(nextId);
             }}
           >
-            <option value="">新しい比較を開始</option>
+            <option value="">{t("新しい比較を開始")}</option>
             {recentBatches.map((entry) => (
               <option key={entry.id} value={entry.id}>
-                {entry.name} — {statusLabel(entry.status)} —{" "}
-                {new Date(entry.updated_at).toLocaleString("ja-JP")}
+                {entry.name} — {t(statusLabel(entry.status))} —{" "}
+                {new Date(entry.updated_at).toLocaleString(locale === "en" ? "en-US" : "ja-JP")}
               </option>
             ))}
           </select>
@@ -583,9 +597,9 @@ export function MatrixPanel({
         loadState === "ready" && templates.length > 0 ? (
           <div className="empty-stage matrix-empty-stage">
             <div>
-              <h3>比較結果はまだありません</h3>
+              <h3>{t("比較結果はまだありません")}</h3>
               <p>
-                プリセットとお題を決めて実行すると、比較グリッドが表示されます。完了した結果から最大30件を一覧比較できます。
+                {t("プリセットとお題を決めて実行すると、比較グリッドが表示されます。完了した結果から最大30件を一覧比較できます。")}
               </p>
             </div>
           </div>
@@ -595,9 +609,9 @@ export function MatrixPanel({
           <div className="matrix-progress" role="status" aria-live="polite">
             <div className="matrix-progress__copy">
               <span className={`status-chip status-chip--${batch.status}`}>
-                {statusLabel(batch.status)}
+                {t(statusLabel(batch.status))}
               </span>
-              <strong>{batchProgressLabel(batch)}</strong>
+              <strong>{batchProgressLabel(batch, t)}</strong>
               <span>
                 Stage {batch.stage_index + 1} / {batch.stage_names.length}
               </span>
@@ -614,19 +628,19 @@ export function MatrixPanel({
             <progress
               value={doneCount}
               max={Math.max(batch.aggregate.total, 1)}
-              aria-label={`バッチ進捗 ${doneCount}/${batch.aggregate.total}`}
+              aria-label={t("バッチ進捗 {done}/{total}", { done: doneCount, total: batch.aggregate.total })}
             />
             <dl className="matrix-progress__metrics">
               <div>
-                <dt>成功</dt>
+                <dt>{t("成功")}</dt>
                 <dd>{batch.aggregate.succeeded}</dd>
               </div>
               <div>
-                <dt>失敗</dt>
+                <dt>{t("失敗")}</dt>
                 <dd>{batch.aggregate.failed}</dd>
               </div>
               <div>
-                <dt>平均</dt>
+                <dt>{t("平均")}</dt>
                 <dd>
                   {batch.aggregate.average_score !== null
                     ? batch.aggregate.average_score.toFixed(1)
@@ -643,7 +657,7 @@ export function MatrixPanel({
                   disabled={isAdvancing}
                   aria-busy={isAdvancing}
                 >
-                  {isAdvancing ? "仕上げ開始中…" : "上位候補を仕上げる"}
+                  {isAdvancing ? t("仕上げ開始中…") : t("上位候補を仕上げる")}
                 </button>
               ) : null}
               {!terminalBatchStatuses.has(batch.status) ? (
@@ -654,7 +668,7 @@ export function MatrixPanel({
                   disabled={isCancelling}
                   aria-busy={isCancelling}
                 >
-                  {isCancelling ? "中断中…" : "中断する"}
+                  {isCancelling ? t("中断中…") : t("中断する")}
                 </button>
               ) : null}
             </div>
@@ -667,21 +681,21 @@ export function MatrixPanel({
           {items.length > 0 ? (
             <div className="matrix-toolbar">
               <label className="field-group">
-                <span>表示する結果</span>
+                <span>{t("表示する結果")}</span>
                 <select
                   value={filter}
                   onChange={(event) => setFilter(event.target.value as ItemFilter)}
                 >
-                  <option value="all">すべて（{items.length}）</option>
-                  <option value="succeeded">完了</option>
-                  <option value="failed">失敗</option>
-                  <option value="promoted">採用済み</option>
-                  <option value="rated">評価済み</option>
+                  <option value="all">{t("すべて（{count}）", { count: items.length })}</option>
+                  <option value="succeeded">{t("完了")}</option>
+                  <option value="failed">{t("失敗")}</option>
+                  <option value="promoted">{t("採用済み")}</option>
+                  <option value="rated">{t("評価済み")}</option>
                 </select>
               </label>
               <p>
-                {filteredItems.length} / {items.length} 件を表示
-                <span>クイック評価はこの画面を開いている間だけ保持されます。</span>
+                {t("{shown} / {total} 件を表示", { shown: filteredItems.length, total: items.length })}
+                <span>{t("クイック評価はこの画面を開いている間だけ保持されます。")}</span>
               </p>
             </div>
           ) : null}
@@ -691,26 +705,26 @@ export function MatrixPanel({
           ) : items.length === 0 ? (
             <div className="empty-stage matrix-empty-stage">
               <div>
-                <h3>この段階の結果はありません</h3>
-                <p>すべて失敗または中断された場合は、お題やモデルを見直してください。</p>
+                <h3>{t("この段階の結果はありません")}</h3>
+                <p>{t("すべて失敗または中断された場合は、お題やモデルを見直してください。")}</p>
               </div>
             </div>
           ) : filteredItems.length === 0 ? (
             <div className="empty-stage matrix-empty-stage">
               <div>
-                <h3>条件に合う結果がありません</h3>
-                <p>別の表示条件を選ぶと、生成済みの結果を確認できます。</p>
+                <h3>{t("条件に合う結果がありません")}</h3>
+                <p>{t("別の表示条件を選ぶと、生成済みの結果を確認できます。")}</p>
                 <button
                   type="button"
                   className="secondary-button"
                   onClick={() => setFilter("all")}
                 >
-                  すべて表示
+                  {t("すべて表示")}
                 </button>
               </div>
             </div>
           ) : (
-            <ul className="matrix-grid" aria-label="生成結果の比較">
+            <ul className="matrix-grid" aria-label={t("生成結果の比較")}>
               {filteredItems.map((item) => (
                 <MatrixCell
                   key={item.id}

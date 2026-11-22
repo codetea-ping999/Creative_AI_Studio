@@ -11,6 +11,7 @@ import {
   type GalleryAssetDetailResponse,
   type ProjectResponse,
 } from "../studio";
+import { useT } from "../i18n";
 
 export type FeedbackFormValues = {
   qualityRating: number;
@@ -69,6 +70,7 @@ export function AssetDetailPanel({
   onBindProject,
   onSubmitFeedback,
 }: AssetDetailPanelProps) {
+  const t = useT();
   const [isQuickReviewOpen, setIsQuickReviewOpen] = useState(false);
   const [quickReviewIssueTags, setQuickReviewIssueTags] = useState<QuickReviewIssueTag[]>([]);
   const [feedbackQuality, setFeedbackQuality] = useState("4");
@@ -142,7 +144,7 @@ export function AssetDetailPanel({
           outputPath={playsVideo ? detail.output_path : detail.preview_path}
           posterPath={playsVideo ? detail.preview_path : null}
           title={detail.prompt}
-          subtitle={detail.project_name || "Unassigned"}
+          subtitle={detail.project_name || t("プロジェクトなし")}
         />
         <div className="asset-actions">
           <button
@@ -153,7 +155,7 @@ export function AssetDetailPanel({
             }}
             disabled={isFeedbackBusy || isAssetBusy}
           >
-            採用
+            {t("採用")}
           </button>
           <button
             type="button"
@@ -162,7 +164,7 @@ export function AssetDetailPanel({
             disabled={isFeedbackBusy || isAssetBusy}
             aria-expanded={isQuickReviewOpen}
           >
-            少し直す
+            {t("少し直す")}
           </button>
           <button
             type="button"
@@ -172,13 +174,13 @@ export function AssetDetailPanel({
             }}
             disabled={isFeedbackBusy || isAssetBusy}
           >
-            作り直す
+            {t("作り直す")}
           </button>
         </div>
         {isQuickReviewOpen ? (
           <fieldset className="quick-review-panel">
-            <legend>どこを直しますか？</legend>
-            <p>選んだ修正理由を保存し、その内容を反映した派生案を作ります。</p>
+            <legend>{t("どこを直しますか？")}</legend>
+            <p>{t("選んだ修正理由を保存し、その内容を反映した派生案を作ります。")}</p>
             <div className="quick-review-options">
               {getQuickReviewIssueOptions(detail.media_type).map((option) => {
                 const isSelected = quickReviewIssueTags.includes(option.id);
@@ -193,7 +195,7 @@ export function AssetDetailPanel({
                       onChange={() => toggleQuickReviewIssueTag(option.id)}
                       disabled={isFeedbackBusy || isAssetBusy}
                     />
-                    <span>{option.label}</span>
+                    <span>{t(option.label)}</span>
                   </label>
                 );
               })}
@@ -205,7 +207,7 @@ export function AssetDetailPanel({
                 onClick={closeQuickReview}
                 disabled={isFeedbackBusy || isAssetBusy}
               >
-                キャンセル
+                {t("キャンセル")}
               </button>
               <button
                 type="button"
@@ -215,7 +217,7 @@ export function AssetDetailPanel({
                 }}
                 disabled={isFeedbackBusy || isAssetBusy || quickReviewIssueTags.length === 0}
               >
-                選んだ内容で再生成
+                {t("選んだ内容で再生成")}
               </button>
             </div>
           </fieldset>
@@ -227,7 +229,7 @@ export function AssetDetailPanel({
             onClick={onReuse}
             disabled={isAssetBusy}
           >
-            Reuse and rerun
+            {t("同じ条件で作り直す")}
           </button>
           <button
             type="button"
@@ -235,7 +237,7 @@ export function AssetDetailPanel({
             onClick={onLoadIntoComposer}
             disabled={isAssetBusy}
           >
-            Load into composer
+            {t("入力欄に読み込む")}
           </button>
           <button
             type="button"
@@ -243,7 +245,7 @@ export function AssetDetailPanel({
             onClick={onExport}
             disabled={isAssetBusy}
           >
-            Export asset
+            {t("書き出す")}
           </button>
         </div>
         {detail.media_type === "audio" ? (
@@ -255,7 +257,7 @@ export function AssetDetailPanel({
               disabled={isAssetBusy || !canConditionMelody}
               aria-describedby="melody-conditioning-help"
             >
-              Use as melody reference
+              {t("メロディの参照に使う")}
             </button>
             <p id="melody-conditioning-help" className="section-footnote">
               {melodyConditioningMessage}
@@ -265,18 +267,18 @@ export function AssetDetailPanel({
         <div className="form-section">
           <div className="form-section__header">
             <div>
-              <p className="eyebrow">Project Binding</p>
-              <h3>Move the source job and asset between projects</h3>
+              <p className="eyebrow">{t("プロジェクト")}</p>
+              <h3>{t("この成果物を入れるプロジェクト")}</h3>
             </div>
           </div>
           <label className="field-group field-group--full">
-            <span>Asset project</span>
+            <span>{t("プロジェクト")}</span>
             <select
               value={assetProjectId}
               onChange={(event) => onAssetProjectIdChange(event.target.value)}
               disabled={isAssetBusy}
             >
-              <option value="">Unassigned</option>
+              <option value="">{t("プロジェクトなし")}</option>
               {projects.map((project) => (
                 <option key={project.id} value={project.id}>
                   {project.name}
@@ -290,7 +292,7 @@ export function AssetDetailPanel({
             onClick={onBindProject}
             disabled={isAssetBusy}
           >
-            Update asset project
+            {t("プロジェクトを変更")}
           </button>
         </div>
       </div>
@@ -298,29 +300,29 @@ export function AssetDetailPanel({
       <div className="monitor-stack">
         <div className="metadata-grid">
           <div className="metadata-item">
-            <span>Asset</span>
+            <span>{t("成果物 ID")}</span>
             <strong>{detail.asset_id}</strong>
           </div>
           <div className="metadata-item">
-            <span>Model</span>
+            <span>{t("モデル")}</span>
             <strong>{detail.model_id}</strong>
           </div>
           <div className="metadata-item">
-            <span>Created</span>
+            <span>{t("作成")}</span>
             <strong>{formatDate(detail.created_at)}</strong>
           </div>
           <div className="metadata-item">
-            <span>Updated</span>
+            <span>{t("更新")}</span>
             <strong>{formatDate(detail.updated_at)}</strong>
           </div>
           <div className="metadata-item">
-            <span>Quality</span>
+            <span>{t("品質")}</span>
             <strong>
               {formatScore(detail.quality_score_calibrated ?? detail.quality_score)}
             </strong>
           </div>
           <div className="metadata-item">
-            <span>Semantic</span>
+            <span>{t("内容の一致")}</span>
             <strong>
               {formatScore(
                 detail.semantic_alignment_score_calibrated ?? detail.semantic_alignment_score,
@@ -328,7 +330,7 @@ export function AssetDetailPanel({
             </strong>
           </div>
           <div className="metadata-item">
-            <span>Creative</span>
+            <span>{t("表現")}</span>
             <strong>
               {formatScore(
                 detail.creative_alignment_score_calibrated ?? detail.creative_alignment_score,
@@ -336,7 +338,7 @@ export function AssetDetailPanel({
             </strong>
           </div>
           <div className="metadata-item">
-            <span>Feedback</span>
+            <span>{t("評価")}</span>
             <strong>{detail.feedback_count}</strong>
           </div>
         </div>
@@ -344,28 +346,28 @@ export function AssetDetailPanel({
         <div className="form-section">
           <div className="form-section__header">
             <div>
-              <p className="eyebrow">Lineage</p>
-              <h3>Trace reuse and export state</h3>
+              <p className="eyebrow">{t("来歴")}</p>
+              <h3>{t("元にした成果物と書き出し")}</h3>
             </div>
           </div>
           <div className="asset-chip-row">
-            <span className="form-section__mode">reuse {detail.reuse_count}</span>
-            <span className="form-section__mode">export {detail.export_count}</span>
-            <span className="form-section__mode">feedback {detail.feedback_count}</span>
+            <span className="form-section__mode">{t("再利用 {count}", { count: detail.reuse_count })}</span>
+            <span className="form-section__mode">{t("書き出し {count}", { count: detail.export_count })}</span>
+            <span className="form-section__mode">{t("評価 {count}", { count: detail.feedback_count })}</span>
           </div>
           <div className="asset-list">
             <div className="asset-path">
-              <span>Parent Asset</span>
-              <code>{detail.parent_asset_id ?? "none"}</code>
+              <span>{t("元の成果物")}</span>
+              <code>{detail.parent_asset_id ?? t("なし")}</code>
             </div>
             <div className="asset-path">
-              <span>Lineage</span>
-              <code>{detail.lineage.length > 0 ? detail.lineage.join(", ") : "none"}</code>
+              <span>{t("来歴")}</span>
+              <code>{detail.lineage.length > 0 ? detail.lineage.join(", ") : t("なし")}</code>
             </div>
             <div className="asset-path">
-              <span>Exports</span>
+              <span>{t("書き出し")}</span>
               <code>
-                {detail.export_paths.length > 0 ? detail.export_paths.join(", ") : "none"}
+                {detail.export_paths.length > 0 ? detail.export_paths.join(", ") : t("なし")}
               </code>
             </div>
           </div>
@@ -374,13 +376,13 @@ export function AssetDetailPanel({
         <form className="form-section" onSubmit={(event) => void handleFeedbackSubmit(event)}>
           <div className="form-section__header">
             <div>
-              <p className="eyebrow">Human Feedback</p>
-              <h3>Record review signal for calibration and reuse decisions</h3>
+              <p className="eyebrow">{t("詳しい評価")}</p>
+              <h3>{t("点数とメモを残す")}</h3>
             </div>
           </div>
           <div className="field-grid field-grid--controls">
             <label className="field-group">
-              <span>Quality</span>
+              <span>{t("品質")}</span>
               <select
                 value={feedbackQuality}
                 onChange={(event) => setFeedbackQuality(event.target.value)}
@@ -394,7 +396,7 @@ export function AssetDetailPanel({
               </select>
             </label>
             <label className="field-group">
-              <span>Semantic</span>
+              <span>{t("内容の一致")}</span>
               <select
                 value={feedbackSemantic}
                 onChange={(event) => setFeedbackSemantic(event.target.value)}
@@ -408,7 +410,7 @@ export function AssetDetailPanel({
               </select>
             </label>
             <label className="field-group">
-              <span>Creative</span>
+              <span>{t("表現")}</span>
               <select
                 value={feedbackCreative}
                 onChange={(event) => setFeedbackCreative(event.target.value)}
@@ -430,7 +432,7 @@ export function AssetDetailPanel({
                 onChange={(event) => setFeedbackReuseIntent(event.target.checked)}
                 disabled={isFeedbackBusy}
               />
-              Reuse candidate
+              {t("再利用の候補")}
             </label>
             <label>
               <input
@@ -439,35 +441,38 @@ export function AssetDetailPanel({
                 onChange={(event) => setFeedbackExportReady(event.target.checked)}
                 disabled={isFeedbackBusy}
               />
-              Export ready
+              {t("書き出してよい")}
             </label>
           </div>
           <label className="field-group field-group--full">
-            <span>Issue tags</span>
+            <span>{t("気になる点（カンマ区切り）")}</span>
             <input
               type="text"
               value={feedbackIssueTags}
               onChange={(event) => setFeedbackIssueTags(event.target.value)}
-              placeholder="composition, lighting"
+              placeholder={t("例：構図, 光")}
               disabled={isFeedbackBusy}
             />
           </label>
           <label className="field-group field-group--full">
-            <span>Comments</span>
+            <span>{t("メモ")}</span>
             <textarea
               rows={3}
               value={feedbackComments}
               onChange={(event) => setFeedbackComments(event.target.value)}
-              placeholder="What should change before production use?"
+              placeholder={t("使う前に直したいところ")}
               disabled={isFeedbackBusy}
             />
           </label>
           <button type="submit" className="dock-submit" disabled={isFeedbackBusy}>
-            {isFeedbackBusy ? "Saving..." : "Save feedback"}
+            {isFeedbackBusy ? t("保存中...") : t("評価を保存")}
           </button>
         </form>
 
-        <pre>{JSON.stringify(detail.request_snapshot, null, 2)}</pre>
+        <details className="request-snapshot">
+          <summary>{t("送信した設定（JSON）")}</summary>
+          <pre>{JSON.stringify(detail.request_snapshot, null, 2)}</pre>
+        </details>
       </div>
     </div>
   );

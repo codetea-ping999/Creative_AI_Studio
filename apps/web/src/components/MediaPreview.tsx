@@ -10,6 +10,7 @@ import {
 import { usePrefersReducedMotion } from "../hooks/usePrefersReducedMotion";
 import { excerptFromMarkdown, useTextAssetContent } from "../lib/textAssetPreview";
 import { renderMarkdownLite } from "../lib/markdownLite";
+import { useT } from "../i18n";
 
 type StagePreviewProps = {
   mediaType: GalleryMediaType;
@@ -27,6 +28,7 @@ export function StagePreview({
   subtitle,
   posterPath = null,
 }: StagePreviewProps) {
+  const t = useT();
   const src = createOutputUrl(outputPath);
 
   if (!src) {
@@ -34,8 +36,8 @@ export function StagePreview({
       <div className="stage-surface">
         <div className="empty-stage">
           <div>
-            <h3>Preview unavailable</h3>
-            <p>{outputPath ?? "No output path was returned by the API."}</p>
+            <h3>{t("プレビューを表示できません")}</h3>
+            <p>{outputPath ?? t("出力ファイルの場所が返ってきませんでした。")}</p>
           </div>
         </div>
       </div>
@@ -47,7 +49,7 @@ export function StagePreview({
       <div className="stage-surface stage-surface--audio">
         <div className="audio-preview">
           <div className="audio-preview__header">
-            <p className="eyebrow">Audio Preview</p>
+            <p className="eyebrow">{t("音声")}</p>
             <strong>{title}</strong>
             <p className="sidebar-copy">{subtitle}</p>
           </div>
@@ -91,6 +93,7 @@ function VideoStagePreview({
   poster: string | null;
   title: string;
 }) {
+  const t = useT();
   const [failed, setFailed] = useState(false);
   const [posterFailed, setPosterFailed] = useState(false);
 
@@ -103,8 +106,8 @@ function VideoStagePreview({
         <div className="stage-surface">
           <div className="empty-stage">
             <div>
-              <h3>Video unavailable</h3>
-              <p role="alert">The video could not be loaded.</p>
+              <h3>{t("動画を表示できません")}</h3>
+              <p role="alert">{t("動画を読み込めませんでした。")}</p>
             </div>
           </div>
         </div>
@@ -116,7 +119,7 @@ function VideoStagePreview({
           <img src={poster} alt={title} onError={() => setPosterFailed(true)} />
         </div>
         <p className="error-banner" role="alert">
-          The video could not be loaded. Showing its still frame instead.
+          {t("動画を読み込めなかったため、静止画を表示しています。")}
         </p>
       </>
     );
@@ -144,7 +147,7 @@ function VideoStagePreview({
  * preview, so the first frame is drawn to a canvas. `allowPlayback` adds an
  * explicit control to opt into the animation.
  */
-function MotionSafeGif({
+export function MotionSafeGif({
   src,
   alt,
   allowPlayback = false,
@@ -153,6 +156,7 @@ function MotionSafeGif({
   alt: string;
   allowPlayback?: boolean;
 }) {
+  const t = useT();
   const prefersReducedMotion = usePrefersReducedMotion();
   const [isPlaying, setIsPlaying] = useState(false);
 
@@ -173,7 +177,7 @@ function MotionSafeGif({
           className="secondary-button stage-surface__motion-toggle"
           onClick={() => setIsPlaying((current) => !current)}
         >
-          {isPlaying ? "Show still frame" : "Play animation"}
+          {isPlaying ? t("止める") : t("再生する")}
         </button>
       ) : null}
     </>
@@ -193,6 +197,7 @@ function GifStillFrame({
   alt: string;
   variant: "stage" | "thumbnail";
 }) {
+  const t = useT();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [isNearViewport, setIsNearViewport] = useState(
     () => typeof IntersectionObserver === "undefined",
@@ -252,8 +257,8 @@ function GifStillFrame({
           !
         </span>
         <div>
-          <strong>Preview frame unavailable</strong>
-          <p>The GIF could not be loaded or decoded.</p>
+          <strong>{t("プレビューを表示できません")}</strong>
+          <p>{t("GIF を読み込めませんでした。")}</p>
         </div>
       </div>
     ) : (
@@ -261,7 +266,7 @@ function GifStillFrame({
         <span className="media-still-error__mark" aria-hidden="true">
           !
         </span>
-        <span>No preview</span>
+        <span>{t("プレビューなし")}</span>
       </div>
     );
   }
@@ -282,22 +287,23 @@ function TextStagePreview({
   title: string;
   subtitle: string;
 }) {
+  const t = useT();
   const { content, isLoading } = useTextAssetContent(src);
   return (
     <div className="stage-surface stage-surface--text">
       <div className="text-preview">
         <div className="text-preview__header">
-          <p className="eyebrow">Text Preview</p>
+          <p className="eyebrow">{t("文章")}</p>
           <strong>{title}</strong>
           <p className="sidebar-copy">{subtitle}</p>
         </div>
         <div className="text-preview__body">
           {isLoading ? (
-            <p className="markdown-lite__paragraph">Loading…</p>
+            <p className="markdown-lite__paragraph">{t("読み込み中…")}</p>
           ) : content ? (
             renderMarkdownLite(content)
           ) : (
-            <p className="markdown-lite__paragraph">Preview unavailable.</p>
+            <p className="markdown-lite__paragraph">{t("プレビューを表示できません。")}</p>
           )}
         </div>
       </div>
@@ -311,12 +317,13 @@ type OutputThumbnailProps = {
 };
 
 export function OutputThumbnail({ mediaType, outputPath }: OutputThumbnailProps) {
+  const t = useT();
   const src = createOutputUrl(outputPath);
 
   if (!src) {
     return (
       <div className="gallery-item__thumb is-audio">
-        <span className="gallery-item__audio-badge">None</span>
+        <span className="gallery-item__audio-badge">{t("なし")}</span>
       </div>
     );
   }
@@ -324,7 +331,7 @@ export function OutputThumbnail({ mediaType, outputPath }: OutputThumbnailProps)
   if (mediaType === "audio" || isAudioAsset(outputPath)) {
     return (
       <div className="gallery-item__thumb is-audio">
-        <span className="gallery-item__audio-badge">Audio</span>
+        <span className="gallery-item__audio-badge">{t("音声")}</span>
       </div>
     );
   }
@@ -357,11 +364,12 @@ export function OutputThumbnail({ mediaType, outputPath }: OutputThumbnailProps)
 }
 
 function TextThumbnail({ src }: { src: string }) {
+  const t = useT();
   const { content, isLoading } = useTextAssetContent(src);
   return (
     <div className="gallery-item__thumb gallery-item__thumb--text">
       <p className="gallery-item__text-excerpt">
-        {isLoading ? "Loading…" : content ? excerptFromMarkdown(content) : "No preview"}
+        {isLoading ? t("読み込み中…") : content ? excerptFromMarkdown(content) : t("プレビューなし")}
       </p>
     </div>
   );

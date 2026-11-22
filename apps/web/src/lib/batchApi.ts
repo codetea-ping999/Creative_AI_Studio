@@ -1,4 +1,5 @@
 import { requestJson } from "../studioClient";
+import { translate, type Translate } from "../i18n";
 
 export type BatchTemplate = {
   name: string;
@@ -136,12 +137,21 @@ export function currentStageItems(batch: Batch | null): BatchItem[] {
     });
 }
 
-export function batchProgressLabel(batch: Batch | null): string {
+export function batchProgressLabel(
+  batch: Batch | null,
+  t: Translate = (text, vars) => translate("ja", text, vars),
+): string {
   if (!batch) {
     return "";
   }
   const { succeeded, failed, cancelled, total } = batch.aggregate;
   const done = succeeded + failed + cancelled;
   const stage = batch.stage_names[batch.stage_index] ?? "stage";
-  return `${stage}: ${done}/${total} 完了 (成功 ${succeeded} / 失敗 ${failed})`;
+  return t("{stage}: {done}/{total} 完了 (成功 {succeeded} / 失敗 {failed})", {
+    stage,
+    done,
+    total,
+    succeeded,
+    failed,
+  });
 }
