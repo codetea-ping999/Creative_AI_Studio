@@ -250,11 +250,20 @@ class ImageGenerator(BaseGenerator):
         torch_dtype: object = None
         image_provider_id = ""
         collected_variations: list[dict[str, Any]] = []
+        negative_prompt_applied = bool(resolved_prompt.negative_prompt)
+        negative_prompt_supported = True
 
         with self._acquire_runtime(requested_model_id, context) as handle:
             manifest = handle.manifest
             runtime_obj = handle.runtime
             pipeline = runtime_obj["pipeline"]
+            # FluxPipeline has no negative_prompt argument (#142): the runtime says so,
+            # and the prompt is recorded as not applied instead of being passed through.
+            negative_prompt_supported = bool(runtime_obj.get("supports_negative_prompt", True))
+            applied_negative_prompt = (
+                resolved_prompt.negative_prompt if negative_prompt_supported else None
+            )
+            negative_prompt_applied = bool(applied_negative_prompt)
 
             cancelled_before_mutation, mutation_probe_error = safe_is_cancelled(context)
             if not cancelled_before_mutation and mutation_probe_error is None:
@@ -320,7 +329,7 @@ class ImageGenerator(BaseGenerator):
                 )
                 request_spec = ImageGenerationSpec(
                     prompt=resolved_prompt.prompt,
-                    negative_prompt=resolved_prompt.negative_prompt,
+                    negative_prompt=applied_negative_prompt,
                     width=width,
                     height=height,
                     seed=base_seed,
@@ -424,7 +433,11 @@ class ImageGenerator(BaseGenerator):
 
                     common_generation_kwargs = {
                         "prompt": resolved_prompt.prompt,
-                        "negative_prompt": resolved_prompt.negative_prompt,
+                        **(
+                            {"negative_prompt": applied_negative_prompt}
+                            if negative_prompt_supported
+                            else {}
+                        ),
                         "guidance_scale": guidance_scale,
                         "num_inference_steps": num_inference_steps,
                         **(
@@ -604,7 +617,7 @@ class ImageGenerator(BaseGenerator):
                 semantic_report = evaluate_image_semantics(
                     output_path,
                     resolved_prompt.prompt,
-                    resolved_prompt.negative_prompt,
+                    resolved_prompt.negative_prompt if negative_prompt_supported else None,
                 )
                 enrich_quality_report(quality_report, semantic_report)
                 # Codex P2 finding "Image cancellation during
@@ -673,6 +686,10 @@ class ImageGenerator(BaseGenerator):
                 "task_type": self.task_type,
                 "prompt": resolved_prompt.prompt,
                 "negative_prompt": resolved_prompt.negative_prompt,
+                # False when no negative prompt was given, or when the model's pipeline
+                # (FLUX) cannot take one -- the supplied text above is kept for reuse.
+                "negative_prompt_applied": negative_prompt_applied,
+                "negative_prompt_supported": negative_prompt_supported,
                 "requested_prompt": request.prompt,
                 "prompt_composition": resolved_prompt.composition,
                 "reference_asset_ids": resolved_prompt.reference_asset_ids,

@@ -65,8 +65,13 @@ models/
 - `task_type`: `text-to-image` などの用途
 - `provider`: `local`, `huggingface`, `mlx` などの供給元
 - `runtime`: `diffusers`, `transformers`, `mlx` などの実行系
-- `family`: `sdxl`, `flux` など loader が pipeline class を選ぶためのモデル系統
-- `variant`: `fp16` など明示的に読み込む weight variant。不要なモデルでは省略
+- `pipeline_class`: image manifest だけが持つ Diffusers pipeline class。`StableDiffusionXLPipeline`
+  （省略時の既定）か `FluxPipeline`。loader と generator は model id を推測せず、この値から
+  `core/models/image_pipelines.py` の family（img2img の有無、negative prompt に対応するか）を引きます。
+  それ以外の値は manifest の読み込み時に、対応する class 名を挙げて失敗します
+- `dtype`: weight の dtype（`float16` / `bfloat16` / `float32`）。Diffusers loader は
+  `.fp16.` / `.bf16.` の variant ファイルが実在するときだけ `variant` を指定します。
+  FLUX.1-dev のような variant なしの bf16 配布物はそのまま読み込めます
 - `local_path`: ローカル保存先
 - `remote_ref`: 将来の取得元参照
 - `loader`: 呼び出す loader 名
@@ -74,6 +79,26 @@ models/
 - `aliases`: legacy id や互換 id を internal manifest id に解決する追加マッピング
 - `is_default`: デフォルト候補かどうか
 - `enabled`: 利用可否
+
+### Diffusers の dtype 方針（#141）
+
+| weight dtype | cuda | mps | cpu |
+|---|---|---|---|
+| float16 | float16 | float32 | float32 |
+| bfloat16 | bfloat16 | bfloat16 | bfloat16 |
+| float32 | float32 | float32 | float32 |
+
+float16 を MPS / CPU で float32 に上げるのは、SDXL を MPS の半精度で動かすと黒画像や NaN になるためです。
+bfloat16（FLUX.1-dev）は MPS（macOS 14 以降）でそのまま動き、約 12B の transformer を float32 に
+上げるとメモリが倍になるため上げません。M1 Max 実機での読み込み時間・推論時間・メモリの実測は #144〜#146 で行います。
+
+### FLUX と negative prompt
+
+`FluxPipeline` は `negative_prompt` を受け付けません。FLUX のジョブでは generator が
+`negative_prompt` を pipeline に渡さず、metadata に `negative_prompt_applied: false` と
+`negative_prompt_supported: false` を記録します。入力された文字列自体は `negative_prompt` に残るので、
+再利用で SDXL に切り替えれば使われます。`GET /models` は `supports_negative_prompt` を返し、
+Web UI は避けたい要素の欄の下に「使われない」ことを表示します。
 
 ## Public IDs And Aliases
 

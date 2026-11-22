@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from apps.api.dependencies import get_services
 from bootstrap import ApplicationServices
 from core.models import ModelManifest, evaluate_manifest_readiness
+from core.models.image_pipelines import resolve_image_pipeline_family
 from core.schemas.generation import MediaType
 
 router = APIRouter(prefix="/models", tags=["models"])
@@ -30,6 +31,7 @@ class ModelSummary(BaseModel):
     is_available: bool = False
     runtime_status: str = Field(min_length=1)
     availability_message: str = ""
+    supports_negative_prompt: bool = True
 
 
 class ModelsResponse(BaseModel):
@@ -55,6 +57,11 @@ def _serialize_manifest(manifest: ModelManifest) -> ModelSummary:
         is_available=readiness.is_ready,
         runtime_status=readiness.status,
         availability_message=readiness.message,
+        supports_negative_prompt=(
+            resolve_image_pipeline_family(manifest.pipeline_class).supports_negative_prompt
+            if manifest.media_type == "image"
+            else True
+        ),
     )
 
 

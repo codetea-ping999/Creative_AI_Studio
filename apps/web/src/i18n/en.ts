@@ -100,6 +100,8 @@ export const en: Record<string, string> = {
   "やわらかい光": "Soft light",
   "アニマティック": "Animatic",
   "アニメ風の人物": "Anime portrait",
+  "このモデル（{model}）は避けたい要素に対応していないため、入力しても生成には使われません。":
+    "This model ({model}) does not support a negative prompt, so anything entered here is not used.",
   "ポートレート": "Portrait",
   "アニメ": "Anime",
   "シネマティック": "Cinematic",

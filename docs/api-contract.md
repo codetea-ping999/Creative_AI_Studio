@@ -379,6 +379,8 @@ Behavior:
 - learned runtime はadapter entrypoint、`pipeline_path` の component設定、weight一式が揃った場合だけ`is_available=true`です
 - `runtime_status` は `ready | missing_files | scaffold` のいずれかです
 - `availability_message` はUIへ表示可能なローカルfile readiness理由で、不足時は不足ファイルを列挙します
+- `supports_negative_prompt` は negative prompt が生成に使われるかどうかです。image で `pipeline_class` が
+  `FluxPipeline` のモデルは `false`、それ以外は `true` です
 
 完全レスポンス:
 
@@ -401,7 +403,8 @@ Behavior:
       "is_default": true,
       "is_available": true,
       "runtime_status": "ready",
-      "availability_message": "Diffusers model files are ready."
+      "availability_message": "Diffusers model files are ready.",
+      "supports_negative_prompt": true
     }
   ]
 }
@@ -417,6 +420,7 @@ UI の最小利用項目:
 - `is_default`
 - `runtime_status`
 - `availability_message`
+- `supports_negative_prompt`
 
 ## Projects
 

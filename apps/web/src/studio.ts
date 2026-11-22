@@ -55,6 +55,7 @@ export type ModelSummary = {
   is_default: boolean;
   runtime_status?: string;
   availability_message?: string;
+  supports_negative_prompt?: boolean;
 };
 
 export type ModelsResponse = {
@@ -302,6 +303,7 @@ export function normalizeModelOption(item: ModelSummary): ModelOption {
     isDefault: item.is_default,
     runtimeStatus: item.runtime_status ?? (item.is_available ? "ready" : "missing_files"),
     availabilityMessage: item.availability_message ?? "",
+    supportsNegativePrompt: item.supports_negative_prompt ?? true,
   };
 }
 

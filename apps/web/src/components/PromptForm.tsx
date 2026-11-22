@@ -180,6 +180,23 @@ export function PromptForm({
     createInitialState(initialValues),
   );
   const [controlMode, setControlMode] = useState<ControlMode>("quick");
+  const negativePromptUnsupported =
+    mediaType === "image" &&
+    modelOptions.find((option) => option.id === formValues.modelId)?.supportsNegativePrompt ===
+      false;
+  const renderNegativePromptNote = () =>
+    negativePromptUnsupported ? (
+      <small
+        id="negative-prompt-unsupported"
+        className="field-help field-group--full"
+        role="note"
+      >
+        {t(
+          "このモデル（{model}）は避けたい要素に対応していないため、入力しても生成には使われません。",
+          { model: formValues.modelId },
+        )}
+      </small>
+    ) : null;
   const [activeImagePreset, setActiveImagePreset] = useState<{
     preset: ImagePresetSpec;
     modelFallback: boolean;
@@ -485,17 +502,21 @@ export function PromptForm({
 
       {(controlMode === "advanced" || mediaType === "video") &&
       (mediaType === "image" || mediaType === "video") ? (
-        <label className="field-group field-group--full">
-          <span>{t("避けたい要素")}</span>
-          <textarea
-            name="negativePrompt"
-            rows={4}
-            placeholder={t("例：ぼやけ、余分な人物、文字")}
-            value={formValues.negativePrompt}
-            onChange={(event) => setFieldValue("negativePrompt", event.target.value)}
-            disabled={disabled}
-          />
-        </label>
+        <>
+          <label className="field-group field-group--full">
+            <span>{t("避けたい要素")}</span>
+            <textarea
+              name="negativePrompt"
+              rows={4}
+              placeholder={t("例：ぼやけ、余分な人物、文字")}
+              value={formValues.negativePrompt}
+              onChange={(event) => setFieldValue("negativePrompt", event.target.value)}
+              disabled={disabled}
+              aria-describedby={negativePromptUnsupported ? "negative-prompt-unsupported" : undefined}
+            />
+          </label>
+          {renderNegativePromptNote()}
+        </>
       ) : null}
     </section>
   );
@@ -560,8 +581,10 @@ export function PromptForm({
             onChange={(event) => setFieldValue("negativePrompt", event.target.value)}
             placeholder={t("例：文字、ぼやけ、余分な人物")}
             disabled={disabled}
+            aria-describedby={negativePromptUnsupported ? "negative-prompt-unsupported" : undefined}
           />
         </label>
+        {renderNegativePromptNote()}
         <div className="simple-brief__summary">
           <div>
             <span>{t("作られる内容の要約")}</span>

@@ -146,6 +146,7 @@ class ModelsApiTests(unittest.TestCase):
                         "is_available": True,
                         "runtime_status": "ready",
                         "availability_message": "Diffusers model files are ready.",
+                        "supports_negative_prompt": True,
                     }
                 ]
             },
