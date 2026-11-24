@@ -19,6 +19,21 @@ class FolderPickerUnavailableError(RuntimeError):
     """No native folder chooser can be opened on this machine."""
 
 
+class FolderPickerFailedError(RuntimeError):
+    """The folder chooser was started but failed for a reason other than Cancel."""
+
+
+#: AppleScript error numbers: -128 is the user pressing Cancel, -1743 is macOS
+#: refusing to let this process send Apple Events to the frontmost app.
+_MACOS_USER_CANCELED = "(-128)"
+_MACOS_NOT_AUTHORIZED = "(-1743)"
+_MACOS_AUTOMATION_HINT = (
+    "Allow it in System Settings > Privacy & Security > Automation: turn on the "
+    "frontmost app (for example your browser) under the app that runs the API "
+    "(Terminal, iTerm or Python), then try again."
+)
+
+
 def _clean_prompt(prompt: str) -> str:
     # The prompt is interpolated into AppleScript / PowerShell source, so keep it
     # to plain text.
@@ -69,7 +84,8 @@ def build_picker_command(platform: str, prompt: str = DEFAULT_PROMPT) -> list[st
 def pick_folder(prompt: str = DEFAULT_PROMPT, *, platform: str | None = None) -> str | None:
     """Show the native chooser and return the selected path, or ``None`` if cancelled."""
 
-    command = build_picker_command(platform or sys.platform, prompt)
+    platform = platform or sys.platform
+    command = build_picker_command(platform, prompt)
     try:
         completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
             command,
@@ -86,17 +102,42 @@ def pick_folder(prompt: str = DEFAULT_PROMPT, *, platform: str | None = None) ->
     except subprocess.TimeoutExpired:
         return None
 
-    # osascript exits 1 on Cancel, zenity exits 1, PowerShell prints nothing.
     if completed.returncode != 0:
-        return None
+        if _is_cancel(platform, completed):
+            return None
+        raise FolderPickerFailedError(_failure_message(platform, completed))
     selected = completed.stdout.strip()
     if not selected:
+        # PowerShell prints nothing when the dialog is cancelled.
         return None
     return selected
 
 
+def _is_cancel(platform: str, completed: subprocess.CompletedProcess[str]) -> bool:
+    if platform == "darwin":
+        return _MACOS_USER_CANCELED in (completed.stderr or "")
+    if platform.startswith("win"):
+        return False
+    # zenity and kdialog both exit 1 when the dialog is cancelled or closed.
+    return completed.returncode == 1
+
+
+def _failure_message(platform: str, completed: subprocess.CompletedProcess[str]) -> str:
+    detail = (completed.stderr or "").strip().splitlines()
+    tail = detail[-1] if detail else f"exit status {completed.returncode}"
+    if platform == "darwin":
+        if _MACOS_NOT_AUTHORIZED in (completed.stderr or ""):
+            return (
+                "macOS did not allow the API to open the folder chooser. "
+                + _MACOS_AUTOMATION_HINT
+            )
+        return f"The folder chooser could not be opened ({tail}). " + _MACOS_AUTOMATION_HINT
+    return f"The folder chooser could not be opened ({tail})."
+
+
 __all__ = [
     "DEFAULT_PROMPT",
+    "FolderPickerFailedError",
     "FolderPickerUnavailableError",
     "build_picker_command",
     "pick_folder",

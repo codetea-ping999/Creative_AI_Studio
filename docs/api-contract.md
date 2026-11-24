@@ -417,7 +417,9 @@ Behavior:
 - `install_path`: loader がモデルを読むディレクトリの絶対パスです。learned runtime では
   `pipeline_path`（weight の置き場所）を返します。endpoint で動くモデルは `null` です
 - `supports_local_install`: `install_path` があり、`POST /models/{model_id}/install` で
-  ファイルを置ける場合に `true` です
+  ファイルを置ける場合に `true` です。置く前に中身を確認できる runtime（`diffusers` /
+  `transformers` / `audiocraft` / `learned` / `llama_cpp` / `kokoro`）だけが対象で、`template` や
+  `procedural` のように確認できるファイルがない runtime は `false` です
 
 UI の最小利用項目:
 
@@ -440,9 +442,19 @@ Linux は `zenity` または `kdialog`）を開き、選ばれたフォルダを
 { "path": "/Users/me/Downloads/stable-diffusion-xl-base-1.0" }
 ```
 
-- キャンセルされたときは `{ "path": null }` を返します
-- フォルダ選択を開けない環境（Linux で `zenity` も `kdialog` も無い場合など）は `501` です
-- ループバック（`127.0.0.1` / `::1`）からのリクエストだけを受け付けます。それ以外は `403` です
+- キャンセルされたときは `{ "path": null }` を返します。macOS ではダイアログの「キャンセル」
+  （AppleScript のエラー `-128`）だけをキャンセルとして扱います
+- フォルダ選択を開けない環境（Linux で `zenity` も `kdialog` も無い場合など）は `501`
+  （`picker_unavailable`）です
+- ダイアログを開こうとして失敗した場合は `500`（`picker_failed`）です。macOS で
+  「オートメーション」の許可がない場合（エラー `-1743`）は、システム設定 > プライバシーと
+  セキュリティ > オートメーションで許可する案内を `message` に入れます
+- 次の 3 つをすべて満たすリクエストだけを受け付けます。満たさない場合は `403` です。
+  `POST /models/{model_id}/install` も同じです
+  - 接続元アドレスがループバック（`127.0.0.1` / `::1` / `::ffff:127.0.0.1`）
+  - `Host` ヘッダーが `localhost` / `127.0.0.1` / `[::1]`（ポート付き可）。DNS リバインディング対策です
+  - `Origin` ヘッダーがある場合、CORS で許可している Studio UI のオリジンか、API 自身のオリジン。
+    ほかのサイトを開いているブラウザからダイアログを開かれたり、コピーさせられたりしないためです
 
 ### POST /models/{model_id}/install
 
@@ -454,14 +466,31 @@ Linux は `zenity` または `kdialog`）を開き、選ばれたフォルダを
 
 Behavior:
 
+- `supports_local_install` が `false` のモデルは `422`（`not_supported`）です
 - コピーする前に、選んだフォルダ自体が `core/model_readiness.py` の条件を満たすか確認します。
   選んだフォルダが親フォルダ（Hugging Face のキャッシュの `snapshots/<hash>` を含むフォルダなど）
-  でも、2 階層下までは完全なモデルを探します
-- コピーは配置先の隣の一時フォルダへ行い、readiness を確認してから移動します。途中で失敗しても
-  配置先には何も残りません。Hugging Face のキャッシュのシンボリックリンクは実体をコピーします
-- 配置先にすでにファイルがある場合は `409`（`destination_not_empty`）です。`replace: true` を
-  付けると、既存のフォルダを `<名前>.replaced-<日時>` へ移してから配置します（削除はしません）
-- 配置が成功すると、そのモデルの読み込み済み runtime を解放します
+  でも、2 階層下までは完全なモデルを探します。条件を満たさないフォルダは何もコピーしません
+  - `llama_cpp`: フォルダ直下に `.gguf` がちょうど 1 つ（`default_params.model_file` があればそのファイル）。
+    コピーするのはその `.gguf` だけです
+  - `kokoro`: `config.json` と `.pth` が 1 つ。コピーするのはこの 2 つと `voices/`、`*.pt` だけです
+- 隠しファイル・フォルダ（`.git`、`.cache` など）と `*.py` はコピーしません。どの runtime も
+  weight のフォルダからコードを読み込まないためで、開発サーバーの `--reload` がコピー中に
+  再起動することも防ぎます。フォルダのリンクが自分の親を指してループしている場合は `422` です
+- コピーは配置先の隣の一時フォルダ（`.<名前>.import-<id>`）へ行い、readiness を確認してから
+  配置先へ移します。途中で失敗した場合は、移した項目を元に戻して一時フォルダを消すので、配置先は
+  元のままです。API の停止で残った一時フォルダは、次に API が起動したときに消えます。
+  Hugging Face のキャッシュのシンボリックリンクは実体をコピーします
+- リポジトリに含まれている配置先のファイル（`README*`、`LICENSE*`、`.gitattributes`、git が
+  管理している `model_index.json` など）は「空」として扱い、移動も上書きもしません。モデルの
+  weight はその隣に置きます。選んだモデルの `model_index.json` が、リポジトリの
+  `model_index.json` と違うコンポーネント（`_class_name` と各コンポーネントの指定。`_diffusers_version`
+  などの `_` で始まる値は比べません）を持つ場合は、混ぜずに `409`（`incompatible_tracked_file`）にします
+- それ以外のファイルが配置先にある場合は `409`（`destination_not_empty`）です。`replace: true` を
+  付けると、それらを `<名前>.replaced-<日時>` へ移してから配置します（削除はしません。
+  リポジトリのファイルは移しません）。`.replaced-*` と `.import-*` は `.gitignore` に入っています
+- 配置が成功すると、そのモデルの読み込み済み runtime を解放します。モデルが使用中で解放できない
+  場合は `restart_required: true` を返します。API を再起動するまで、前のファイルで読み込んだ
+  runtime が使われます
 
 レスポンス:
 
@@ -474,7 +503,8 @@ Behavior:
   "copied_bytes": 6938078334,
   "is_available": true,
   "runtime_status": "ready",
-  "availability_message": "Diffusers model files are ready."
+  "availability_message": "Diffusers model files are ready.",
+  "restart_required": false
 }
 ```
 
@@ -482,13 +512,14 @@ Behavior:
 
 | status | `code` | 内容 |
 | --- | --- | --- |
-| 403 | なし | ループバック以外からのリクエスト |
+| 403 | なし | ループバック以外、`Host` がループバック名でない、または許可していない `Origin` |
 | 404 | なし | モデルが見つからない |
 | 409 | `destination_not_empty` | 配置先にファイルがある（`replace: true` で置き換え） |
 | 409 | `install_in_progress` | 別の配置が実行中 |
-| 422 | `invalid_source` | 相対パス、存在しない、ファイル、配置先と重なる |
+| 409 | `incompatible_tracked_file` | リポジトリの `model_index.json` と選んだモデルの構成が違う |
+| 422 | `invalid_source` | 相対パス、存在しない、ファイル、配置先と重なる、フォルダのリンクがループ |
 | 422 | `incomplete_source` | 選んだフォルダに完全なモデルがない（`missing` に不足ファイル） |
-| 422 | `not_supported` | endpoint で動くモデルでコピー先がない |
+| 422 | `not_supported` | endpoint で動くモデル、または中身を確認できない runtime |
 | 507 | `insufficient_space` | 空き容量が足りない |
 - `supports_negative_prompt`
 

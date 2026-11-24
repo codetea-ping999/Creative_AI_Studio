@@ -2,27 +2,44 @@
 
 The Studio can be pointed at a folder chosen in Finder / Explorer. The folder is
 validated with the same readiness rules the loaders use (``core/model_readiness``)
-*before* anything is copied into the models directory, then copied into a staging
-directory next to the destination and moved into place, so a failed or interrupted
-copy never leaves a half-written model where the loader looks.
+*before* anything is copied into the models directory. Only runtimes whose files
+readiness can really check accept a folder (``supports_local_install``), so an
+arbitrary folder is never copied.
+
+Files are copied into a staging directory next to the destination, re-checked,
+and then moved into place entry by entry. Anything that fails part-way is rolled
+back: moved entries go back where they were and the staging directory is removed.
+
+Some install locations ship placeholder files checked into the repository
+(``README.md``, ``LICENSE.md``, ``.gitattributes``, a tracked ``model_index.json``).
+Those count as "empty", are never moved or overwritten, and the model's weights
+are placed alongside them. A tracked ``model_index.json`` is kept; if the chosen
+model's own ``model_index.json`` describes different components the import fails
+instead of mixing two pipelines.
 """
 
 from __future__ import annotations
 
+import fnmatch
+import json
 import os
 import shutil
+import subprocess
 import threading
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from core.model_readiness import (
+    STATUS_INVALID_CONFIGURATION,
     ModelReadiness,
     evaluate_readiness,
+    llama_cpp_model_file,
     resolve_repo_path,
+    supports_local_install,
 )
 
 #: How many directory levels below the chosen folder are searched when the folder
@@ -30,8 +47,19 @@ from core.model_readiness import (
 _SEARCH_DEPTH = 2
 #: Free space kept in reserve on top of the model size.
 _DISK_MARGIN_BYTES = 256 * 1024 * 1024
+#: Files that are never copied: hidden entries (``.git``, ``.cache``, ``.DS_Store``)
+#: and Python sources. No supported runtime loads code from the weights folder, and
+#: a ``.py`` file under ``models/`` would also restart the ``--reload`` dev server
+#: in the middle of a copy.
+_IGNORED_PATTERNS: tuple[str, ...] = (".*", "__pycache__", "*.py", "*.pyc")
+#: Placeholder files that may ship in an install location and count as "empty".
+_PLACEHOLDER_PATTERNS: tuple[str, ...] = ("README*", "LICENSE*", ".gitattributes")
+_MODEL_INDEX = "model_index.json"
+_STAGING_MARKER = ".import-"
 
 _IMPORT_LOCK = threading.Lock()
+
+TrackedFilesLookup = Callable[[Path], frozenset[str]]
 
 
 class ModelInstallError(Exception):
@@ -63,6 +91,11 @@ class IncompleteSourceError(ModelInstallError):
 class DestinationNotEmptyError(ModelInstallError):
     status_code = 409
     code = "destination_not_empty"
+
+
+class IncompatibleTrackedFileError(ModelInstallError):
+    status_code = 409
+    code = "incompatible_tracked_file"
 
 
 class InsufficientSpaceError(ModelInstallError):
@@ -105,6 +138,40 @@ def install_destination(
     return resolve_repo_path(value, repo_root=repo_root)
 
 
+def local_install_destination(
+    runtime: str,
+    local_path: str | None,
+    default_params: Mapping[str, Any] | None,
+    *,
+    repo_root: Path | None = None,
+) -> Path | None:
+    """``install_destination`` for runtimes whose files can be validated, else ``None``."""
+
+    if not supports_local_install(runtime):
+        return None
+    return install_destination(runtime, local_path, default_params, repo_root=repo_root)
+
+
+def git_tracked_files(directory: Path) -> frozenset[str]:
+    """Paths (relative to ``directory``) that git tracks there; empty without git."""
+
+    if not directory.is_dir():
+        return frozenset()
+    try:
+        completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
+            ["git", "-C", str(directory), "ls-files", "-z", "--", "."],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return frozenset()
+    if completed.returncode != 0:
+        return frozenset()
+    names = completed.stdout.decode("utf-8", errors="surrogateescape").split("\0")
+    return frozenset(name for name in names if name)
+
+
 def _readiness_for(
     *,
     runtime: str,
@@ -133,6 +200,14 @@ def _readiness_for(
     )
 
 
+def _is_ignored(name: str) -> bool:
+    return any(fnmatch.fnmatch(name, pattern) for pattern in _IGNORED_PATTERNS)
+
+
+def _is_placeholder_name(name: str) -> bool:
+    return any(fnmatch.fnmatch(name, pattern) for pattern in _PLACEHOLDER_PATTERNS)
+
+
 def _candidate_directories(source: Path) -> list[Path]:
     """``source`` first, then its sub-directories breadth-first (bounded depth)."""
 
@@ -155,15 +230,92 @@ def _candidate_directories(source: Path) -> list[Path]:
     return found
 
 
-def _directory_size(root: Path) -> int:
+def _selected_entries(
+    runtime: str, model_root: Path, default_params: Mapping[str, Any] | None
+) -> list[Path] | None:
+    """Relative paths to copy, or ``None`` to copy the whole folder.
+
+    The llama.cpp loader only opens one GGUF file, so only that file is copied;
+    a folder such as ``~/Downloads`` that happens to hold one ``.gguf`` must not
+    be copied wholesale. Kokoro needs its config, its weight and the voice packs.
+    """
+
+    params = default_params or {}
+    if runtime == "llama_cpp":
+        model_file = llama_cpp_model_file(model_root, params)
+        return [model_file.relative_to(model_root)] if model_file is not None else []
+    if runtime == "kokoro":
+        entries = [Path("config.json")]
+        entries += [path.relative_to(model_root) for path in sorted(model_root.glob("*.pth"))]
+        entries += [path.relative_to(model_root) for path in sorted(model_root.glob("*.pt"))]
+        if (model_root / "voices").is_dir():
+            entries.append(Path("voices"))
+        return entries
+    return None
+
+
+def _walk_files(root: Path) -> Iterable[Path]:
+    """Files under ``root`` (following links), skipping ignored names.
+
+    Raises :class:`InvalidSourceError` on a folder link that loops back to one of
+    its parents, before anything is copied.
+    """
+
+    stack = [root]
+    while stack:
+        directory = stack.pop()
+        real = os.path.realpath(directory)
+        try:
+            entries = sorted(directory.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if _is_ignored(entry.name):
+                continue
+            if entry.is_dir():
+                target = os.path.realpath(entry)
+                if real == target or real.startswith(target + os.sep):
+                    raise InvalidSourceError(
+                        "The selected folder contains a folder link that loops back on "
+                        f"itself: {entry}"
+                    )
+                stack.append(entry)
+            elif entry.is_file():
+                yield entry
+
+
+def _selection_size(model_root: Path, selection: list[Path] | None) -> int:
+    roots = [model_root] if selection is None else [model_root / item for item in selection]
     total = 0
-    for current, _dirs, files in os.walk(root, followlinks=True):
-        for name in files:
+    for item in roots:
+        if item.is_file():
+            files: Iterable[Path] = [item]
+        else:
+            files = _walk_files(item)
+        for path in files:
             try:
-                total += (Path(current) / name).stat().st_size
+                total += path.stat().st_size
             except OSError:
                 continue
     return total
+
+
+def _copy_selection(model_root: Path, staging: Path, selection: list[Path] | None) -> None:
+    ignore = shutil.ignore_patterns(*_IGNORED_PATTERNS)
+    if selection is None:
+        # symlinks=False copies the real files, which matters for Hugging Face cache
+        # folders where every file is a link into ``blobs/``.
+        shutil.copytree(model_root, staging, symlinks=False, ignore=ignore)
+        return
+    staging.mkdir(parents=True)
+    for item in selection:
+        source = model_root / item
+        target = staging / item
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_dir():
+            shutil.copytree(source, target, symlinks=False, ignore=ignore)
+        else:
+            shutil.copy2(source, target)
 
 
 def _is_within(path: Path, parent: Path) -> bool:
@@ -204,7 +356,12 @@ def locate_model_root(
         )
         if readiness.is_ready:
             return candidate, readiness
-        if first_failure is None:
+        # Prefer a failure that explains itself (e.g. "more than one .gguf in
+        # snapshots/<hash>") over the chosen folder's plain "files are missing".
+        if first_failure is None or (
+            readiness.status == STATUS_INVALID_CONFIGURATION
+            and first_failure.status != STATUS_INVALID_CONFIGURATION
+        ):
             first_failure = readiness
     assert first_failure is not None
     raise IncompleteSourceError(
@@ -223,6 +380,7 @@ def install_from_local_folder(
     manifest_id: str | None,
     replace: bool = False,
     repo_root: Path | None = None,
+    tracked_files: TrackedFilesLookup = git_tracked_files,
 ) -> InstallResult:
     """Copy a complete model folder into the manifest's model directory."""
 
@@ -230,6 +388,11 @@ def install_from_local_folder(
     if destination is None:
         raise InstallNotSupportedError(
             "This model is served from an endpoint, so there are no local files to place."
+        )
+    if not supports_local_install(runtime):
+        raise InstallNotSupportedError(
+            f"Files for the {runtime!r} runtime cannot be checked before they are placed, "
+            "so they cannot be placed from a folder. Copy them by hand instead."
         )
 
     raw = Path(source_path).expanduser()
@@ -274,9 +437,75 @@ def install_from_local_folder(
             manifest_id=manifest_id,
             replace=replace,
             repo_root=repo_root,
+            tracked_files=tracked_files,
         )
     finally:
         _IMPORT_LOCK.release()
+
+
+def _protected_entries(destination: Path, tracked: frozenset[str]) -> set[str]:
+    """Top-level names in ``destination`` that must stay where they are."""
+
+    protected: set[str] = set()
+    if not destination.is_dir():
+        return protected
+    tracked_tops = {Path(name).parts[0] for name in tracked if Path(name).parts}
+    for entry in destination.iterdir():
+        if entry.name in tracked_tops or (entry.is_file() and _is_placeholder_name(entry.name)):
+            protected.add(entry.name)
+    return protected
+
+
+def _model_index_signature(path: Path) -> dict[str, Any] | None:
+    """The parts of a ``model_index.json`` that decide which files a pipeline loads."""
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return {
+        key: value
+        for key, value in payload.items()
+        if key == "_class_name" or not key.startswith("_")
+    }
+
+
+def _reconcile_with_protected(
+    staging: Path, destination: Path, protected: set[str]
+) -> None:
+    """Drop staged copies of protected files, refusing an incompatible ``model_index.json``."""
+
+    for name in sorted(protected):
+        staged = staging / name
+        if not staged.exists() and not staged.is_symlink():
+            continue
+        kept = destination / name
+        if staged.is_dir() or kept.is_dir():
+            raise IncompatibleTrackedFileError(
+                f"The install location keeps a folder named {name!r} that is part of the "
+                "repository, and the selected model has one too. Place this model by hand."
+            )
+        if name == _MODEL_INDEX:
+            ours = _model_index_signature(kept)
+            theirs = _model_index_signature(staged)
+            if ours is None or theirs is None or ours != theirs:
+                raise IncompatibleTrackedFileError(
+                    f"The selected model's {_MODEL_INDEX} lists different components than "
+                    f"the one kept in {destination}. The repository's file is kept, so this "
+                    "model cannot be placed here. Check that you chose the right model."
+                )
+        staged.unlink()
+
+
+def _unique_sibling(destination: Path, suffix: str) -> Path:
+    candidate = destination.with_name(f"{destination.name}{suffix}")
+    counter = 1
+    while candidate.exists():
+        candidate = destination.with_name(f"{destination.name}{suffix}-{counter}")
+        counter += 1
+    return candidate
 
 
 def _copy_into_place(
@@ -290,15 +519,23 @@ def _copy_into_place(
     manifest_id: str | None,
     replace: bool,
     repo_root: Path | None,
+    tracked_files: TrackedFilesLookup,
 ) -> InstallResult:
-    destination_has_files = destination.exists() and any(destination.iterdir())
-    if destination_has_files and not replace:
+    tracked = tracked_files(destination)
+    protected = _protected_entries(destination, tracked)
+    existing = (
+        sorted(entry.name for entry in destination.iterdir() if entry.name not in protected)
+        if destination.is_dir()
+        else []
+    )
+    if existing and not replace:
         raise DestinationNotEmptyError(
             f"The install location already has files: {destination}. "
             "Confirm to move them aside and place the selected model."
         )
 
-    size = _directory_size(model_root)
+    selection = _selected_entries(runtime, model_root, default_params)
+    size = _selection_size(model_root, selection)
     destination.parent.mkdir(parents=True, exist_ok=True)
     free = shutil.disk_usage(destination.parent).free
     if free < size + _DISK_MARGIN_BYTES:
@@ -307,11 +544,13 @@ def _copy_into_place(
             f"and {free / 2**30:.1f} GiB is free."
         )
 
-    staging = destination.parent / f".{destination.name}.import-{uuid.uuid4().hex[:8]}"
+    staging = destination.parent / f".{destination.name}{_STAGING_MARKER}{uuid.uuid4().hex[:8]}"
+    created_destination = False
+    replaced_to: Path | None = None
+    moved_aside: list[str] = []
+    placed: list[str] = []
     try:
-        # symlinks=False copies the real files, which matters for Hugging Face cache
-        # folders where every file is a link into ``blobs/``.
-        shutil.copytree(model_root, staging, symlinks=False)
+        _copy_selection(model_root, staging, selection)
         readiness = _readiness_for(
             runtime=runtime,
             local_path=local_path,
@@ -326,30 +565,49 @@ def _copy_into_place(
                 "The copied files did not pass the readiness check: " + readiness.message,
                 readiness.missing,
             )
+        _reconcile_with_protected(staging, destination, protected)
 
-        replaced_to: Path | None = None
-        if destination.exists():
-            if destination_has_files:
-                replaced_to = destination.with_name(
-                    f"{destination.name}.replaced-{time.strftime('%Y%m%d-%H%M%S')}"
-                )
-                destination.rename(replaced_to)
-            else:
-                destination.rmdir()
-        staging.rename(destination)
+        if not destination.exists():
+            destination.mkdir()
+            created_destination = True
+        if existing:
+            replaced_to = _unique_sibling(
+                destination, f".replaced-{time.strftime('%Y%m%d-%H%M%S')}"
+            )
+            replaced_to.mkdir()
+            for name in existing:
+                (destination / name).rename(replaced_to / name)
+                moved_aside.append(name)
+        for entry in sorted(staging.iterdir()):
+            entry.rename(destination / entry.name)
+            placed.append(entry.name)
+
+        final = _readiness_for(
+            runtime=runtime,
+            local_path=local_path,
+            remote_ref=remote_ref,
+            default_params=default_params,
+            manifest_id=manifest_id,
+            candidate=destination,
+            repo_root=repo_root,
+        )
+        if not final.is_ready:
+            raise IncompleteSourceError(
+                "The placed files did not pass the readiness check: " + final.message,
+                final.missing,
+            )
     except BaseException:
-        shutil.rmtree(staging, ignore_errors=True)
+        _roll_back(
+            destination=destination,
+            staging=staging,
+            placed=placed,
+            replaced_to=replaced_to,
+            moved_aside=moved_aside,
+            created_destination=created_destination,
+        )
         raise
+    shutil.rmtree(staging, ignore_errors=True)
 
-    final = _readiness_for(
-        runtime=runtime,
-        local_path=local_path,
-        remote_ref=remote_ref,
-        default_params=default_params,
-        manifest_id=manifest_id,
-        candidate=destination,
-        repo_root=repo_root,
-    )
     return InstallResult(
         destination=destination,
         source=model_root,
@@ -359,8 +617,65 @@ def _copy_into_place(
     )
 
 
+def _roll_back(
+    *,
+    destination: Path,
+    staging: Path,
+    placed: list[str],
+    replaced_to: Path | None,
+    moved_aside: list[str],
+    created_destination: bool,
+) -> None:
+    """Undo a partial placement: the destination ends up exactly as it was."""
+
+    for name in reversed(placed):
+        target = destination / name
+        try:
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+        except OSError:
+            pass
+    if replaced_to is not None:
+        for name in reversed(moved_aside):
+            try:
+                (replaced_to / name).rename(destination / name)
+            except OSError:
+                pass
+        try:
+            replaced_to.rmdir()
+        except OSError:
+            pass
+    if created_destination:
+        try:
+            destination.rmdir()
+        except OSError:
+            pass
+    shutil.rmtree(staging, ignore_errors=True)
+
+
+def remove_stale_staging(destinations: Iterable[Path]) -> list[Path]:
+    """Delete staging folders an interrupted import left next to ``destinations``.
+
+    Called once when the API starts, before any import can run in this process.
+    """
+
+    removed: list[Path] = []
+    for destination in destinations:
+        parent = destination.parent
+        if not parent.is_dir():
+            continue
+        for stale in parent.glob(f".{destination.name}{_STAGING_MARKER}*"):
+            if stale.is_dir() and not stale.is_symlink():
+                shutil.rmtree(stale, ignore_errors=True)
+                removed.append(stale)
+    return removed
+
+
 __all__ = [
     "DestinationNotEmptyError",
+    "IncompatibleTrackedFileError",
     "IncompleteSourceError",
     "InsufficientSpaceError",
     "InstallBusyError",
@@ -368,7 +683,10 @@ __all__ = [
     "InstallResult",
     "InvalidSourceError",
     "ModelInstallError",
+    "git_tracked_files",
     "install_destination",
     "install_from_local_folder",
+    "local_install_destination",
     "locate_model_root",
+    "remove_stale_staging",
 ]

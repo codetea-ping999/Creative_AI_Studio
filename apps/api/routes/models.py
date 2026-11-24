@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from apps.api.dependencies import get_services
 from bootstrap import ApplicationServices
 from core.model_install import install_destination
+from core.model_readiness import supports_local_install
 from core.models import ModelManifest, evaluate_manifest_readiness
 from core.models.image_pipelines import resolve_image_pipeline_family
 from core.schemas.generation import MediaType
@@ -34,9 +35,17 @@ class ModelSummary(BaseModel):
     availability_message: str = ""
     install_path: str | None = Field(
         default=None,
-        description="Directory the model files belong in, when the model is served from local files.",
+        description=(
+            "Directory the model files belong in, when the model is served from local files."
+        ),
     )
-    supports_local_install: bool = False
+    supports_local_install: bool = Field(
+        default=False,
+        description=(
+            "True when a downloaded folder can be checked and placed with "
+            "POST /models/{model_id}/install."
+        ),
+    )
     supports_negative_prompt: bool = True
 
 
@@ -69,7 +78,9 @@ def _serialize_manifest(manifest: ModelManifest) -> ModelSummary:
         runtime_status=readiness.status,
         availability_message=readiness.message,
         install_path=str(destination) if destination is not None else None,
-        supports_local_install=destination is not None,
+        supports_local_install=(
+            destination is not None and supports_local_install(manifest.runtime)
+        ),
         supports_negative_prompt=(
             resolve_image_pipeline_family(manifest.pipeline_class).supports_negative_prompt
             if manifest.media_type == "image"

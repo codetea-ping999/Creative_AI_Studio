@@ -53,7 +53,9 @@ v1.1.0 は Studio の画面を用途ごとに分け直したリリースです�
 
 - モデルが無いときの案内カードに、モデルの配置先を表示し、手元にあるモデルのフォルダを
   Finder（Mac）／エクスプローラー（Windows）で選んで配置する「手元のモデルを配置…」を追加。
-  選んだフォルダは、コピー前に利用可能かを確認し、一時フォルダ経由で配置します。
+  選んだフォルダは、コピー前に利用可能かを確認し、一時フォルダ経由で配置します。確認できない
+  フォルダはコピーせず、リポジトリにある `README.md` や `model_index.json` は動かしません。
+  ほかのサイトを開いているブラウザからは使えないよう、`Host` と `Origin` も確認します。
   `POST /models/pick-folder` と `POST /models/{model_id}/install` を追加し、`GET /models` に
   `install_path` と `supports_local_install` を追加しました。
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import unittest
 from pathlib import Path
@@ -9,14 +10,20 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from core import folder_picker
+from core import model_install
 from core.model_install import (
     DestinationNotEmptyError,
+    IncompatibleTrackedFileError,
     IncompleteSourceError,
+    InstallBusyError,
     InstallNotSupportedError,
+    InsufficientSpaceError,
     InvalidSourceError,
     install_destination,
     install_from_local_folder,
+    remove_stale_staging,
 )
+from core.models import RuntimeBusyError
 from tests.test_api_models import (
     _COGVIDEOX_INDEX,
     _DIFFUSERS_INDEX,
@@ -26,10 +33,24 @@ from tests.test_api_models import (
 )
 
 if IMPORT_ERROR is None:
+    from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
     from apps.api.main import create_app
     from bootstrap import create_application_services
+
+    def _local_client(app: FastAPI, host: str = "127.0.0.1") -> TestClient:
+        """A client that looks like the user's own browser talking to a loopback API."""
+
+        return TestClient(app, base_url="http://127.0.0.1:8000", client=(host, 50000))
+
+
+def _completed(stdout: str, code: int, stderr: str = "") -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess([], code, stdout=stdout, stderr=stderr)
+
+
+def _no_tracked_files(_directory: Path) -> frozenset[str]:
+    return frozenset()
 
 
 def _diffusers_kwargs(destination: Path) -> dict[str, object]:
@@ -39,6 +60,7 @@ def _diffusers_kwargs(destination: Path) -> dict[str, object]:
         "remote_ref": None,
         "default_params": {},
         "manifest_id": "sdxl-local",
+        "tracked_files": _no_tracked_files,
     }
 
 
@@ -192,6 +214,349 @@ class InstallFromLocalFolderTests(unittest.TestCase):
             )
 
 
+def _kwargs(runtime: str, destination: Path, **params: object) -> dict[str, object]:
+    return {
+        "runtime": runtime,
+        "local_path": str(destination),
+        "remote_ref": None,
+        "default_params": dict(params),
+        "manifest_id": f"{runtime}-local",
+        "tracked_files": _no_tracked_files,
+    }
+
+
+def _listing(directory: Path) -> list[str]:
+    return sorted(str(p.relative_to(directory)) for p in directory.rglob("*"))
+
+
+class ValidatedRuntimeTests(unittest.TestCase):
+    """B1: only folders that pass a real readiness check are ever copied."""
+
+    def _personal_folder(self, root: Path) -> Path:
+        folder = root / "Documents"
+        (folder / "taxes").mkdir(parents=True)
+        (folder / "taxes" / "2025.pdf").write_text("secret", encoding="utf-8")
+        (folder / "notes.txt").write_text("private", encoding="utf-8")
+        return folder
+
+    def test_arbitrary_folder_is_refused_for_gguf_and_kokoro(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            folder = self._personal_folder(root)
+            for runtime in ("llama_cpp", "kokoro"):
+                destination = root / "models" / runtime
+                with self.subTest(runtime=runtime):
+                    with self.assertRaises(IncompleteSourceError):
+                        install_from_local_folder(
+                            source_path=str(folder), **_kwargs(runtime, destination)
+                        )
+                    self.assertFalse(destination.exists())
+
+    def test_runtimes_without_file_checks_cannot_receive_files(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            folder = self._personal_folder(root)
+            for runtime in ("template", "procedural"):
+                destination = root / "models" / runtime
+                with self.subTest(runtime=runtime):
+                    with self.assertRaises(InstallNotSupportedError):
+                        install_from_local_folder(
+                            source_path=str(folder), **_kwargs(runtime, destination)
+                        )
+                    self.assertFalse(destination.exists())
+
+    def test_gguf_copies_only_the_weight_file(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            downloads = self._personal_folder(root)
+            (downloads / "qwen-q4_k_m.gguf").write_bytes(b"gguf")
+            destination = root / "models" / "qwen-writer"
+
+            result = install_from_local_folder(
+                source_path=str(downloads), **_kwargs("llama_cpp", destination)
+            )
+
+            self.assertTrue(result.readiness.is_ready)
+            self.assertEqual(_listing(destination), ["qwen-q4_k_m.gguf"])
+
+    def test_gguf_in_a_hugging_face_cache_uses_the_snapshot_not_the_blobs(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache = root / "hub" / "models--Qwen--Writer-GGUF"
+            blob = cache / "blobs" / "0123abcd"
+            blob.parent.mkdir(parents=True)
+            blob.write_bytes(b"gguf-bytes")
+            snapshot = cache / "snapshots" / "deadbeef"
+            snapshot.mkdir(parents=True)
+            (snapshot / "writer.gguf").symlink_to(blob)
+            destination = root / "models" / "qwen-writer"
+
+            result = install_from_local_folder(
+                source_path=str(cache), **_kwargs("llama_cpp", destination)
+            )
+
+            self.assertEqual(result.source, snapshot.resolve())
+            self.assertEqual(_listing(destination), ["writer.gguf"])
+            self.assertFalse((destination / "writer.gguf").is_symlink())
+            self.assertEqual((destination / "writer.gguf").read_bytes(), b"gguf-bytes")
+
+    def test_more_than_one_gguf_is_refused_with_the_reason(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "gguf"
+            source.mkdir()
+            (source / "a.gguf").write_bytes(b"a")
+            (source / "b.gguf").write_bytes(b"b")
+
+            with self.assertRaises(IncompleteSourceError) as raised:
+                install_from_local_folder(
+                    source_path=str(source), **_kwargs("llama_cpp", root / "models" / "q")
+                )
+
+            self.assertIn("More than one .gguf", str(raised.exception))
+
+    def test_kokoro_copies_config_weight_and_voices(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "Kokoro-82M"
+            (source / "voices").mkdir(parents=True)
+            (source / "config.json").write_text("{}", encoding="utf-8")
+            (source / "kokoro-v1_0.pth").write_bytes(b"pth")
+            (source / "voices" / "jf_alpha.pt").write_bytes(b"pt")
+            (source / "samples").mkdir()
+            (source / "samples" / "demo.wav").write_bytes(b"wav")
+            destination = root / "models" / "kokoro-tts"
+
+            result = install_from_local_folder(
+                source_path=str(source), **_kwargs("kokoro", destination)
+            )
+
+            self.assertTrue(result.readiness.is_ready)
+            self.assertEqual(
+                _listing(destination),
+                ["config.json", "kokoro-v1_0.pth", "voices", "voices/jf_alpha.pt"],
+            )
+
+
+def _tracked_placeholders(_directory: Path) -> frozenset[str]:
+    return frozenset({"README.md", "model_index.json"})
+
+
+class RepositoryPlaceholderTests(unittest.TestCase):
+    """B2: files the repository ships in an install location stay where they are."""
+
+    def test_readme_and_license_count_as_empty_and_are_kept(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = _write_diffusers_pipeline(root / "downloads" / "sdxl", _DIFFUSERS_INDEX)
+            (source / "README.md").write_text("upstream readme", encoding="utf-8")
+            destination = root / "models" / "sdxl"
+            destination.mkdir(parents=True)
+            (destination / "README.md").write_text("repo readme", encoding="utf-8")
+            (destination / "LICENSE.md").write_text("repo license", encoding="utf-8")
+
+            result = install_from_local_folder(
+                source_path=str(source), **_diffusers_kwargs(destination)
+            )
+
+            self.assertIsNone(result.replaced_to)
+            self.assertTrue(result.readiness.is_ready)
+            self.assertEqual((destination / "README.md").read_text(), "repo readme")
+            self.assertEqual((destination / "LICENSE.md").read_text(), "repo license")
+            self.assertTrue((destination / "unet").is_dir())
+
+    def _tracked_destination(self, root: Path, index: dict[str, object]) -> Path:
+        destination = root / "models" / "sdxl"
+        destination.mkdir(parents=True)
+        (destination / "README.md").write_text("repo readme", encoding="utf-8")
+        (destination / "model_index.json").write_text(
+            json.dumps(index, indent=2), encoding="utf-8"
+        )
+        return destination
+
+    def test_tracked_model_index_is_kept_when_it_describes_the_same_pipeline(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = _write_diffusers_pipeline(
+                root / "downloads" / "sdxl",
+                {**_DIFFUSERS_INDEX, "_diffusers_version": "0.30.0"},
+            )
+            destination = self._tracked_destination(
+                root, {**_DIFFUSERS_INDEX, "_diffusers_version": "0.19.0"}
+            )
+            tracked_text = (destination / "model_index.json").read_text()
+
+            result = install_from_local_folder(
+                source_path=str(source),
+                **{**_diffusers_kwargs(destination), "tracked_files": _tracked_placeholders},
+            )
+
+            self.assertIsNone(result.replaced_to)
+            self.assertTrue(result.readiness.is_ready)
+            self.assertEqual((destination / "model_index.json").read_text(), tracked_text)
+
+    def test_incompatible_tracked_model_index_fails_and_changes_nothing(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = _write_diffusers_pipeline(root / "downloads" / "cog", _COGVIDEOX_INDEX)
+            destination = self._tracked_destination(root, _DIFFUSERS_INDEX)
+            before = _listing(destination)
+
+            with self.assertRaises(IncompatibleTrackedFileError):
+                install_from_local_folder(
+                    source_path=str(source),
+                    **{**_diffusers_kwargs(destination), "tracked_files": _tracked_placeholders},
+                )
+
+            self.assertEqual(_listing(destination), before)
+            self.assertEqual(sorted(p.name for p in destination.parent.iterdir()), ["sdxl"])
+
+    def test_replace_moves_old_weights_but_never_tracked_files(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = _write_diffusers_pipeline(root / "downloads" / "sdxl", _DIFFUSERS_INDEX)
+            destination = self._tracked_destination(root, _DIFFUSERS_INDEX)
+            (destination / "unet").mkdir()
+            (destination / "unet" / "old.safetensors").write_bytes(b"old")
+            kwargs = {**_diffusers_kwargs(destination), "tracked_files": _tracked_placeholders}
+
+            with self.assertRaises(DestinationNotEmptyError):
+                install_from_local_folder(source_path=str(source), **kwargs)
+            result = install_from_local_folder(source_path=str(source), replace=True, **kwargs)
+
+            assert result.replaced_to is not None
+            self.assertEqual(_listing(result.replaced_to), ["unet", "unet/old.safetensors"])
+            self.assertEqual((destination / "README.md").read_text(), "repo readme")
+            self.assertFalse((destination / "unet" / "old.safetensors").exists())
+            self.assertTrue(result.readiness.is_ready)
+
+
+class FailurePathTests(unittest.TestCase):
+    """S2 / S7: a failure part-way leaves the install location exactly as it was."""
+
+    def test_failed_move_puts_the_replaced_files_back(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = _write_diffusers_pipeline(root / "downloads" / "sdxl", _DIFFUSERS_INDEX)
+            destination = root / "models" / "sdxl"
+            destination.mkdir(parents=True)
+            (destination / "partial.bin").write_bytes(b"old")
+            real_rename = Path.rename
+
+            def failing_rename(self: Path, target: Path) -> Path:
+                if self.parent.name.startswith(".sdxl.import-") and self.name == "vae":
+                    raise OSError("simulated failure while moving into place")
+                return real_rename(self, target)
+
+            with patch.object(Path, "rename", failing_rename):
+                with self.assertRaises(OSError):
+                    install_from_local_folder(
+                        source_path=str(source), replace=True, **_diffusers_kwargs(destination)
+                    )
+
+            self.assertEqual(_listing(destination), ["partial.bin"])
+            self.assertEqual((destination / "partial.bin").read_bytes(), b"old")
+            self.assertEqual(sorted(p.name for p in destination.parent.iterdir()), ["sdxl"])
+
+    def test_interrupted_copy_leaves_no_staging_folder(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = _write_diffusers_pipeline(root / "downloads" / "sdxl", _DIFFUSERS_INDEX)
+            destination = root / "models" / "sdxl"
+
+            def copy_then_fail(src: Path, dst: Path, **_: object) -> None:
+                Path(dst).mkdir(parents=True)
+                (Path(dst) / "half.bin").write_bytes(b"half")
+                raise OSError(28, "No space left on device")
+
+            with patch.object(model_install.shutil, "copytree", copy_then_fail):
+                with self.assertRaises(OSError):
+                    install_from_local_folder(
+                        source_path=str(source), **_diffusers_kwargs(destination)
+                    )
+
+            self.assertFalse(destination.exists())
+            self.assertEqual(list(destination.parent.iterdir()), [])
+
+    def test_not_enough_disk_space_is_refused_before_copying(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = _write_diffusers_pipeline(root / "downloads" / "sdxl", _DIFFUSERS_INDEX)
+            destination = root / "models" / "sdxl"
+            usage = model_install.shutil.disk_usage(root)
+
+            with patch.object(
+                model_install.shutil, "disk_usage", return_value=usage._replace(free=0)
+            ):
+                with self.assertRaises(InsufficientSpaceError):
+                    install_from_local_folder(
+                        source_path=str(source), **_diffusers_kwargs(destination)
+                    )
+
+            self.assertFalse(destination.exists())
+
+    def test_a_second_import_while_one_runs_is_busy(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = _write_diffusers_pipeline(root / "downloads" / "sdxl", _DIFFUSERS_INDEX)
+            self.assertTrue(model_install._IMPORT_LOCK.acquire(blocking=False))
+            try:
+                with self.assertRaises(InstallBusyError):
+                    install_from_local_folder(
+                        source_path=str(source), **_diffusers_kwargs(root / "models" / "sdxl")
+                    )
+            finally:
+                model_install._IMPORT_LOCK.release()
+
+    def test_a_folder_link_loop_is_refused_before_copying(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = _write_diffusers_pipeline(root / "downloads" / "sdxl", _DIFFUSERS_INDEX)
+            (source / "unet" / "loop").symlink_to(source)
+            destination = root / "models" / "sdxl"
+
+            with self.assertRaises(InvalidSourceError):
+                install_from_local_folder(
+                    source_path=str(source), **_diffusers_kwargs(destination)
+                )
+
+            self.assertFalse(destination.parent.exists())
+
+    def test_hidden_entries_and_python_files_are_not_copied(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = _write_diffusers_pipeline(root / "downloads" / "sdxl", _DIFFUSERS_INDEX)
+            (source / ".git").mkdir()
+            (source / ".git" / "HEAD").write_text("ref", encoding="utf-8")
+            (source / "pipeline.py").write_text("import os", encoding="utf-8")
+            (source / "unet" / "convert.py").write_text("import os", encoding="utf-8")
+            destination = root / "models" / "sdxl"
+
+            install_from_local_folder(source_path=str(source), **_diffusers_kwargs(destination))
+
+            listing = _listing(destination)
+            self.assertFalse([name for name in listing if name.endswith(".py")], listing)
+            self.assertNotIn(".git", listing)
+
+    def test_stale_staging_folders_are_removed(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            destination = root / "models" / "sdxl"
+            destination.mkdir(parents=True)
+            stale = root / "models" / ".sdxl.import-1234abcd"
+            stale.mkdir()
+            (stale / "half.bin").write_bytes(b"half")
+            other = root / "models" / ".other.import-1234abcd"
+            other.mkdir()
+
+            removed = remove_stale_staging([destination])
+
+            self.assertEqual(removed, [stale])
+            self.assertFalse(stale.exists())
+            self.assertTrue(other.exists())
+            self.assertTrue(destination.exists())
+
+
 class FolderPickerTests(unittest.TestCase):
     def test_builds_the_native_command_for_each_platform(self) -> None:
         mac = folder_picker.build_picker_command("darwin")
@@ -212,16 +577,40 @@ class FolderPickerTests(unittest.TestCase):
                 folder_picker.build_picker_command("linux")
 
     def test_returns_the_selected_path_and_none_when_cancelled(self) -> None:
-        def run(stdout: str, code: int) -> subprocess.CompletedProcess[str]:
-            return subprocess.CompletedProcess([], code, stdout=stdout, stderr="")
-
-        selected = run("/Users/a/model/\n", 0)
+        selected = _completed("/Users/a/model/\n", 0)
         with patch.object(folder_picker.subprocess, "run", return_value=selected):
             self.assertEqual(folder_picker.pick_folder(platform="darwin"), "/Users/a/model/")
-        with patch.object(folder_picker.subprocess, "run", return_value=run("", 1)):
+        cancelled = _completed("", 1, "execution error: User canceled. (-128)")
+        with patch.object(folder_picker.subprocess, "run", return_value=cancelled):
             self.assertIsNone(folder_picker.pick_folder(platform="darwin"))
-        with patch.object(folder_picker.subprocess, "run", return_value=run("", 0)):
+        with patch.object(folder_picker.subprocess, "run", return_value=_completed("", 0)):
             self.assertIsNone(folder_picker.pick_folder(platform="win32"))
+        with patch.object(
+            folder_picker.subprocess, "run", return_value=_completed("", 1)
+        ), patch.object(folder_picker.shutil, "which", return_value="/usr/bin/zenity"):
+            self.assertIsNone(folder_picker.pick_folder(platform="linux"))
+
+    def test_macos_permission_denial_is_an_error_with_a_hint(self) -> None:
+        denied = _completed(
+            "", 1, "execution error: Not authorized to send Apple events to Safari. (-1743)"
+        )
+        with patch.object(folder_picker.subprocess, "run", return_value=denied):
+            with self.assertRaises(folder_picker.FolderPickerFailedError) as raised:
+                folder_picker.pick_folder(platform="darwin")
+        self.assertIn("Automation", str(raised.exception))
+
+    def test_other_failures_are_errors_not_cancels(self) -> None:
+        cases = {
+            "darwin": _completed("", 1, "execution error: some other failure (-1708)"),
+            "win32": _completed("", 1, "Add-Type : failed"),
+            "linux": _completed("", 5, "zenity: cannot open display"),
+        }
+        for platform, completed in cases.items():
+            with self.subTest(platform=platform), patch.object(
+                folder_picker.subprocess, "run", return_value=completed
+            ), patch.object(folder_picker.shutil, "which", return_value="/usr/bin/zenity"):
+                with self.assertRaises(folder_picker.FolderPickerFailedError):
+                    folder_picker.pick_folder(platform=platform)
 
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"missing dependency: {IMPORT_ERROR}")
@@ -250,7 +639,7 @@ class ModelInstallApiTests(unittest.TestCase):
             db_path=root / "jobs.db",
             output_dir=root / "outputs" / "images",
         )
-        return TestClient(create_app(services, start_job_runner=False))
+        return _local_client(create_app(services, start_job_runner=False))
 
     def test_install_makes_the_model_available(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -328,6 +717,135 @@ class ModelInstallApiTests(unittest.TestCase):
         self.assertEqual(chosen.json(), {"path": "/Users/a/sdxl"})
         self.assertEqual(cancelled.json(), {"path": None})
         self.assertEqual(unavailable.status_code, 501)
+
+    def _picker_status(self, client: TestClient, **headers: str) -> tuple[int, bool]:
+        with patch("apps.api.routes.model_install.pick_folder", return_value="/x") as picker:
+            response = client.post("/models/pick-folder", headers=headers)
+        return response.status_code, picker.called
+
+    def test_other_web_pages_are_refused(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = self._client(root, root / "models" / "sdxl")
+            body = {"source_path": str(root), "media_type": "image"}
+
+            self.assertEqual(
+                self._picker_status(client, origin="https://evil.example"), (403, False)
+            )
+            self.assertEqual(self._picker_status(client, origin="null"), (403, False))
+            installed = client.post(
+                "/models/custom-sdxl/install",
+                json=body,
+                headers={"origin": "https://evil.example"},
+            )
+            self.assertEqual(installed.status_code, 403)
+
+    def test_dns_rebinding_host_is_refused(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = self._client(root, root / "models" / "sdxl")
+
+            self.assertEqual(
+                self._picker_status(client, host="rebind.evil.example:8000"), (403, False)
+            )
+            self.assertEqual(
+                self._picker_status(
+                    client,
+                    host="rebind.evil.example:8000",
+                    origin="http://rebind.evil.example:8000",
+                ),
+                (403, False),
+            )
+
+    def test_studio_ui_origins_and_loopback_hosts_are_allowed(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = self._client(root, root / "models" / "sdxl")
+            allowed: list[dict[str, str]] = [
+                {},
+                {"origin": "http://localhost:5173"},
+                {"origin": "http://127.0.0.1:5173"},
+                {"origin": "tauri://localhost"},
+                {"origin": "http://127.0.0.1:8000"},  # UI served by the API itself
+                {"host": "localhost:8000", "origin": "http://localhost:8000"},
+                {"host": "[::1]:8000"},
+            ]
+            for headers in allowed:
+                with self.subTest(headers=headers):
+                    self.assertEqual(self._picker_status(client, **headers), (200, True))
+            mapped = _local_client(client.app, host="::ffff:127.0.0.1")
+            self.assertEqual(self._picker_status(mapped), (200, True))
+            # Starlette's default test client address is not an IP and is refused.
+            unknown = TestClient(client.app, base_url="http://127.0.0.1:8000")
+            self.assertEqual(self._picker_status(unknown), (403, False))
+
+    def test_picker_failure_is_reported_with_its_hint(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = self._client(root, root / "models" / "sdxl")
+            with patch(
+                "apps.api.routes.model_install.pick_folder",
+                side_effect=folder_picker.FolderPickerFailedError("allow Automation"),
+            ):
+                response = client.post("/models/pick-folder")
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json()["detail"]["code"], "picker_failed")
+        self.assertIn("Automation", response.json()["detail"]["message"])
+
+    def test_busy_model_reports_restart_required(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = _write_diffusers_pipeline(root / "downloads" / "sdxl", _DIFFUSERS_INDEX)
+            client = self._client(root, root / "models" / "sdxl")
+            services = client.app.state.services
+            with patch.object(
+                services.model_service, "unload_model", side_effect=RuntimeBusyError("busy")
+            ):
+                response = client.post(
+                    "/models/custom-sdxl/install",
+                    json={"source_path": str(source), "media_type": "image"},
+                )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["restart_required"])
+
+    def test_models_without_file_checks_do_not_offer_local_install(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest_root = root / "manifests"
+            _write_manifest(
+                manifest_root / "text" / "template.json",
+                {
+                    "id": "template-writer-local",
+                    "public_id": "template-writer",
+                    "display_name": "Template",
+                    "media_type": "text",
+                    "task_type": "story",
+                    "provider": "local",
+                    "runtime": "template",
+                    "local_path": str(root / "models" / "template-writer"),
+                    "loader": "template_text_loader",
+                    "default_params": {},
+                    "is_default": True,
+                    "enabled": True,
+                },
+            )
+            services = create_application_services(
+                manifest_root=manifest_root,
+                db_path=root / "jobs.db",
+                output_dir=root / "outputs" / "images",
+            )
+            client = _local_client(create_app(services, start_job_runner=False))
+            model = client.get("/models", params={"media_type": "text"}).json()["models"][0]
+            refused = client.post(
+                "/models/template-writer/install",
+                json={"source_path": str(root), "media_type": "text"},
+            )
+
+        self.assertFalse(model["supports_local_install"])
+        self.assertEqual(refused.status_code, 422)
+        self.assertEqual(refused.json()["detail"]["code"], "not_supported")
 
 
 if __name__ == "__main__":

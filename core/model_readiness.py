@@ -60,6 +60,14 @@ _AUDIOCRAFT_T5_FILES: tuple[str, ...] = (
     "spiece.model",
 )
 
+#: Runtimes whose local files this module can actually validate. Only these may
+#: receive files through ``POST /models/{model_id}/install``: for any other runtime
+#: an existing directory is all readiness can check, so an arbitrary folder would
+#: pass and be copied wholesale.
+LOCAL_INSTALL_RUNTIMES: frozenset[str] = frozenset(
+    {"diffusers", "transformers", "audiocraft", "learned", "llama_cpp", "kokoro"}
+)
+
 
 class ManifestLike(Protocol):
     """Structural view of the manifest fields readiness rules depend on."""
@@ -169,7 +177,84 @@ def evaluate_readiness(
         return audiocraft_model_readiness(model_root)
     if runtime == "learned":
         return _learned_runtime_readiness(model_root, params, repo_root=repo_root)
+    if runtime == "llama_cpp":
+        return llama_cpp_model_readiness(model_root, params)
+    if runtime == "kokoro":
+        return kokoro_model_readiness(model_root)
     return ModelReadiness(STATUS_READY, "Local runtime files are ready.")
+
+
+def supports_local_install(runtime: str) -> bool:
+    """Whether files for ``runtime`` can be validated before they are placed."""
+
+    return runtime in LOCAL_INSTALL_RUNTIMES
+
+
+def llama_cpp_model_file(model_root: Path, params: Mapping[str, Any]) -> Path | None:
+    """The GGUF file the llama.cpp loader would open, or ``None`` if it is ambiguous.
+
+    Mirrors ``LlamaCppTextLoader._resolve_model_file``: a ``.gguf`` path is used as
+    is, ``default_params.model_file`` names a file inside the directory, otherwise
+    exactly one ``*.gguf`` must sit directly in the directory.
+    """
+
+    if model_root.is_file():
+        return model_root if model_root.suffix == ".gguf" else None
+    configured = params.get("model_file")
+    if isinstance(configured, str) and configured.strip():
+        candidate = model_root / configured.strip()
+        return candidate if candidate.is_file() else None
+    gguf_files = sorted(path for path in model_root.glob("*.gguf") if path.is_file())
+    return gguf_files[0] if len(gguf_files) == 1 else None
+
+
+def llama_cpp_model_readiness(model_root: Path, params: Mapping[str, Any]) -> ModelReadiness:
+    """Check that the llama.cpp loader will find exactly one GGUF weight file."""
+
+    if llama_cpp_model_file(model_root, params) is not None:
+        return ModelReadiness(STATUS_READY, "GGUF model file is ready.")
+    configured = params.get("model_file")
+    if isinstance(configured, str) and configured.strip():
+        return ModelReadiness(
+            STATUS_MISSING_FILES,
+            f"Configured GGUF model_file is missing: {configured.strip()}",
+            (configured.strip(),),
+        )
+    count = len(list(model_root.glob("*.gguf"))) if model_root.is_dir() else 0
+    if count > 1:
+        return ModelReadiness(
+            STATUS_INVALID_CONFIGURATION,
+            "More than one .gguf file is in the model folder; keep one or set "
+            "default_params.model_file.",
+        )
+    return ModelReadiness(
+        STATUS_MISSING_FILES,
+        "No .gguf weight file is directly in the model folder.",
+        ("*.gguf",),
+    )
+
+
+def kokoro_model_readiness(model_root: Path) -> ModelReadiness:
+    """Check for the Kokoro ``config.json`` and its single ``.pth`` weight file."""
+
+    missing: list[str] = []
+    if not (model_root / "config.json").is_file():
+        missing.append("config.json")
+    weights = [path for path in model_root.glob("*.pth") if path.is_file()]
+    if not weights:
+        missing.append("*.pth")
+    if missing:
+        return ModelReadiness(
+            STATUS_MISSING_FILES,
+            "Kokoro model files are missing: " + ", ".join(missing),
+            tuple(missing),
+        )
+    if len(weights) > 1:
+        return ModelReadiness(
+            STATUS_INVALID_CONFIGURATION,
+            "More than one .pth weight file is in the Kokoro model folder; keep one.",
+        )
+    return ModelReadiness(STATUS_READY, "Kokoro model files are ready.")
 
 
 def _voicevox_readiness(remote_ref: str | None) -> ModelReadiness:
@@ -564,6 +649,8 @@ def _missing_tokenizer_assets(
 
 
 __all__ = [
+    "LOCAL_INSTALL_RUNTIMES",
+    "STATUS_INVALID_CONFIGURATION",
     "STATUS_MISSING_FILES",
     "STATUS_READY",
     "STATUS_SCAFFOLD",
@@ -574,8 +661,12 @@ __all__ = [
     "evaluate_manifest_payload",
     "evaluate_manifest_readiness",
     "evaluate_readiness",
+    "kokoro_model_readiness",
+    "llama_cpp_model_file",
+    "llama_cpp_model_readiness",
     "missing_diffusers_files",
     "missing_transformers_files",
     "resolve_repo_path",
+    "supports_local_install",
     "transformers_model_readiness",
 ]
