@@ -570,12 +570,18 @@ function App() {
       const moved = result.replaced_to
         ? t("もとのファイルは {path} に移しました。", { path: result.replaced_to })
         : "";
-      const message = result.is_available
-        ? t("{id} を配置しました。使えるようになりました。", { id: modelId }) + moved
-        : t("{id} を配置しましたが、まだ使えません: {reason}", {
-            id: modelId,
-            reason: result.availability_message,
-          });
+      const restart = result.restart_required
+        ? t("このモデルは使用中だったため、新しいファイルは API を再起動すると使われます。")
+        : "";
+      const message =
+        (result.is_available
+          ? t("{id} を配置しました。使えるようになりました。", { id: modelId })
+          : t("{id} を配置しましたが、まだ使えません: {reason}", {
+              id: modelId,
+              reason: result.availability_message,
+            })) +
+        moved +
+        restart;
       return { status: "installed", message };
     } catch (error) {
       if (error instanceof ApiError && error.code === "destination_not_empty") {

@@ -61,6 +61,11 @@ export function ModelInstallCard({ model, guide, onInstallLocalModel }: ModelIns
           <p className="setup-missing__files">
             {model.availabilityMessage || t("必要なモデルファイルが見つかりません。")}
           </p>
+          {canInstall ? (
+            <p className="setup-install__trust">
+              {t("信頼できる配布元から入手したモデルだけを配置してください。")}
+            </p>
+          ) : null}
         </div>
         <div className="setup-install__actions">
           {guide ? (

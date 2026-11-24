@@ -131,4 +131,30 @@ describe("SetupPanel local model install", () => {
     openMissing();
     expect(screen.queryByRole("button", { name: "手元のモデルを配置…" })).toBeNull();
   });
+
+  it("warns to place only trusted models next to the install button", () => {
+    const trust = "信頼できる配布元から入手したモデルだけを配置してください。";
+    const { unmount } = renderPanel(vi.fn());
+    openMissing();
+    expect(screen.getByText(trust)).toBeTruthy();
+    unmount();
+
+    renderPanel(vi.fn(), { ...missingSsd, supportsLocalInstall: false });
+    openMissing();
+    expect(screen.queryByText(trust)).toBeNull();
+  });
+
+  it("shows why the folder chooser failed", async () => {
+    const user = userEvent.setup();
+    const install = vi.fn().mockResolvedValue({
+      status: "error",
+      message: "macOS did not allow the API to open the folder chooser. Allow it in System Settings.",
+    });
+    renderPanel(install);
+    openMissing();
+
+    await user.click(screen.getByRole("button", { name: "手元のモデルを配置…" }));
+
+    expect((await screen.findByRole("alert")).textContent).toContain("System Settings");
+  });
 });

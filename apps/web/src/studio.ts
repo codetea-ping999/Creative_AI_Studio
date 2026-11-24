@@ -77,6 +77,7 @@ export type InstallModelResponse = {
   is_available: boolean;
   runtime_status: string;
   availability_message: string;
+  restart_required?: boolean;
 };
 
 export type LoraCatalogResponse = {

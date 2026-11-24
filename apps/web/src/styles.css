@@ -1590,8 +1590,14 @@ pre,
   gap: 12px;
 }
 
+.setup-install__row > div:first-child {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
 .setup-install__actions {
   display: flex;
+  flex: 0 0 auto;
   flex-wrap: wrap;
   gap: 8px;
 }
@@ -1602,7 +1608,17 @@ pre,
 }
 
 .setup-install__status--error {
-  color: var(--color-danger, #b3261e);
+  color: var(--danger);
+}
+
+.setup-install__trust {
+  color: var(--text-soft);
+  font-size: 0.78rem;
+}
+
+.setup-install code,
+.setup-install .setup-missing__files {
+  overflow-wrap: anywhere;
 }
 
 @media (max-width: 640px) {
