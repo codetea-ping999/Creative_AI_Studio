@@ -28,9 +28,11 @@ if str(ROOT) not in sys.path:
 
 from core.model_readiness import evaluate_manifest_payload
 from scripts.check_local_setup import (
-    MIN_NODE_20_VERSION,
-    MIN_NODE_22_VERSION,
-    MIN_PYTHON_VERSION,
+    ToolchainClassification,
+    classify_node_version,
+    classify_python_version,
+    meets_node_floor,
+    meets_python_floor,
 )
 
 
@@ -87,10 +89,6 @@ def _check(name: str, status: str, summary: str, *details: str) -> DoctorCheck:
     return DoctorCheck(name, status, summary, tuple(details))
 
 
-def _version_text(version: Sequence[int]) -> str:
-    return ".".join(str(part) for part in version)
-
-
 def parse_version(text: str) -> tuple[int, int, int] | None:
     """Extract a version without retaining arbitrary command output."""
 
@@ -102,11 +100,24 @@ def parse_version(text: str) -> tuple[int, int, int] | None:
 
 
 def is_supported_python(version: tuple[int, int, int]) -> bool:
-    return version >= (*MIN_PYTHON_VERSION, 0)
+    """True when the version meets the supported floor (canonical or not)."""
+
+    return meets_python_floor(version)
 
 
 def is_supported_node(version: tuple[int, int, int]) -> bool:
-    return (version[0] == 20 and version >= MIN_NODE_20_VERSION) or version >= MIN_NODE_22_VERSION
+    """True when the version meets the supported floor (canonical or not)."""
+
+    return meets_node_floor(version)
+
+
+def _policy_status(classification: ToolchainClassification) -> str:
+    return {"OK": PASS, "WARN": WARN, "FAIL": FAIL}[classification.level]
+
+
+def _system_python_version() -> tuple[int, int, int]:
+    major, minor, micro = sys.version_info[:3]
+    return major, minor, micro
 
 
 def parse_worktree_count(output: str) -> int:
@@ -172,8 +183,7 @@ def _version_check(
     name: str,
     result: CommandResult,
     *,
-    supported: Callable[[tuple[int, int, int]], bool] | None = None,
-    requirement: str | None = None,
+    classify: Callable[[tuple[int, int, int]], ToolchainClassification] | None = None,
 ) -> DoctorCheck:
     problem = _result_problem(result)
     if problem:
@@ -181,9 +191,10 @@ def _version_check(
     version = parse_version(result.stdout)
     if version is None:
         return _check(name, FAIL, "version output could not be parsed")
-    if supported is not None and not supported(version):
-        return _check(name, FAIL, f"installed version is unsupported (requires {requirement})")
-    return _check(name, PASS, "version is supported" if supported else "version is available")
+    if classify is None:
+        return _check(name, PASS, "version is available")
+    classification = classify(version)
+    return _check(name, _policy_status(classification), f"version is {classification.summary}")
 
 
 def _git_checks(run: CommandRunner) -> list[DoctorCheck]:
@@ -238,13 +249,12 @@ def _venv_python(root: Path) -> Path:
 
 def _python_checks(root: Path, run: CommandRunner) -> list[DoctorCheck]:
     executable = _venv_python(root)
-    system_version = tuple(sys.version_info[:3])
+    system_version = _system_python_version()
+    system_policy = classify_python_version(system_version)
     system_check = _check(
         "System Python",
-        PASS if is_supported_python(system_version) else FAIL,
-        "system Python is supported"
-        if is_supported_python(system_version)
-        else "system Python is unsupported",
+        _policy_status(system_policy),
+        f"system Python is {system_policy.summary}",
     )
     if not executable.is_file():
         return [
@@ -266,11 +276,9 @@ def _python_checks(root: Path, run: CommandRunner) -> list[DoctorCheck]:
                 "not checked because repository venv is missing",
             ),
         ]
-    requirement = f"Python {_version_text(MIN_PYTHON_VERSION)}+"
     venv_version_result = run((str(executable), "--version"))
     version = _version_check(
-        "Python virtual environment", venv_version_result,
-        supported=is_supported_python, requirement=requirement,
+        "Python virtual environment", venv_version_result, classify=classify_python_version,
     )
     venv_version = parse_version(venv_version_result.stdout)
     alignment = _check(
@@ -310,17 +318,8 @@ def _python_checks(root: Path, run: CommandRunner) -> list[DoctorCheck]:
 
 
 def _node_checks(root: Path, run: CommandRunner) -> list[DoctorCheck]:
-    requirement = (
-        f"Node {_version_text(MIN_NODE_20_VERSION)}+ on Node 20 or "
-        f"{_version_text(MIN_NODE_22_VERSION)}+ on Node 22+"
-    )
     checks = [
-        _version_check(
-            "Node.js",
-            run(("node", "--version")),
-            supported=is_supported_node,
-            requirement=requirement,
-        ),
+        _version_check("Node.js", run(("node", "--version")), classify=classify_node_version),
         _version_check("npm", run(("npm", "--version"))),
     ]
     if not (root / "apps" / "web" / "node_modules").is_dir():
