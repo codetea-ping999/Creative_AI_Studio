@@ -12,12 +12,14 @@ from apps.api.dependencies import get_services
 from bootstrap import ApplicationServices
 from core.folder_picker import (
     FolderPickerFailedError,
+    FolderPickerTimeoutError,
     FolderPickerUnavailableError,
     pick_folder,
 )
 from core.model_install import (
     IncompleteSourceError,
     ModelInstallError,
+    ModelInUseError,
     install_from_local_folder,
 )
 from core.models import RuntimeBusyError
@@ -142,6 +144,11 @@ def pick_model_folder() -> PickFolderResponse:
             status_code=status.HTTP_501_NOT_IMPLEMENTED,
             detail={"code": "picker_unavailable", "message": str(exc)},
         ) from exc
+    except FolderPickerTimeoutError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail={"code": "picker_timeout", "message": str(exc)},
+        ) from exc
     except FolderPickerFailedError as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -167,6 +174,17 @@ def install_model_from_folder(
     except Exception as exc:  # resolver raises its own not-found errors
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
+    def refuse_while_in_use() -> None:
+        # Runs after the copy is verified and before any file moves: a pipeline
+        # that is loading or generating must not see old and new files mixed.
+        try:
+            services.model_service.unload_model(manifest.public_model_id)
+        except RuntimeBusyError as exc:
+            raise ModelInUseError(
+                "This model is loading or generating right now. Wait for it to finish, "
+                "then place the files again."
+            ) from exc
+
     try:
         result = install_from_local_folder(
             source_path=payload.source_path,
@@ -176,6 +194,7 @@ def install_model_from_folder(
             default_params=manifest.default_params,
             manifest_id=manifest.id,
             replace=payload.replace,
+            before_swap=refuse_while_in_use,
         )
     except ModelInstallError as exc:
         detail: dict[str, object] = {"code": exc.code, "message": str(exc)}
@@ -191,7 +210,8 @@ def install_model_from_folder(
 
     restart_required = False
     try:
-        # A runtime cached from the previous files must not outlive them.
+        # A job could have loaded the model in the moment between the check above
+        # and the files moving; that runtime must not outlive the old files.
         services.model_service.unload_model(manifest.public_model_id)
     except RuntimeBusyError:
         restart_required = True

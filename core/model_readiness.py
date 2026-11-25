@@ -21,7 +21,7 @@ import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, Protocol
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -200,12 +200,32 @@ def llama_cpp_model_file(model_root: Path, params: Mapping[str, Any]) -> Path | 
 
     if model_root.is_file():
         return model_root if model_root.suffix == ".gguf" else None
+    configured = _configured_model_file(params)
+    if configured is not None:
+        if not _is_relative_inside(configured):
+            return None
+        candidate = model_root / configured
+        return candidate if candidate.is_file() else None
+    # The loader globs ``*.gguf`` without filtering, so a folder named ``x.gguf``
+    # next to the weight also makes it ambiguous.
+    matches = sorted(model_root.glob("*.gguf"))
+    if len(matches) == 1 and matches[0].is_file():
+        return matches[0]
+    return None
+
+
+def _configured_model_file(params: Mapping[str, Any]) -> str | None:
     configured = params.get("model_file")
     if isinstance(configured, str) and configured.strip():
-        candidate = model_root / configured.strip()
-        return candidate if candidate.is_file() else None
-    gguf_files = sorted(path for path in model_root.glob("*.gguf") if path.is_file())
-    return gguf_files[0] if len(gguf_files) == 1 else None
+        return configured.strip()
+    return None
+
+
+def _is_relative_inside(value: str) -> bool:
+    """A relative path that stays inside its folder (no absolute path, no ``..``)."""
+
+    candidate = PurePath(value)
+    return not candidate.is_absolute() and ".." not in candidate.parts and bool(candidate.parts)
 
 
 def llama_cpp_model_readiness(model_root: Path, params: Mapping[str, Any]) -> ModelReadiness:
@@ -213,12 +233,18 @@ def llama_cpp_model_readiness(model_root: Path, params: Mapping[str, Any]) -> Mo
 
     if llama_cpp_model_file(model_root, params) is not None:
         return ModelReadiness(STATUS_READY, "GGUF model file is ready.")
-    configured = params.get("model_file")
-    if isinstance(configured, str) and configured.strip():
+    configured = _configured_model_file(params)
+    if configured is not None:
+        if not _is_relative_inside(configured):
+            return ModelReadiness(
+                STATUS_INVALID_CONFIGURATION,
+                "default_params.model_file must be a file name inside the model folder: "
+                f"{configured}",
+            )
         return ModelReadiness(
             STATUS_MISSING_FILES,
-            f"Configured GGUF model_file is missing: {configured.strip()}",
-            (configured.strip(),),
+            f"Configured GGUF model_file is missing: {configured}",
+            (configured,),
         )
     count = len(list(model_root.glob("*.gguf"))) if model_root.is_dir() else 0
     if count > 1:

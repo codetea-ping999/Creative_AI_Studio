@@ -59,7 +59,15 @@ _STAGING_MARKER = ".import-"
 
 _IMPORT_LOCK = threading.Lock()
 
-TrackedFilesLookup = Callable[[Path], frozenset[str]]
+#: Returns the paths git tracks in a directory, or ``None`` when that is unknown.
+TrackedFilesLookup = Callable[[Path], "frozenset[str] | None"]
+#: Called after the copy is verified and right before anything in the install
+#: location moves; raise :class:`ModelInUseError` to stop while nothing changed.
+BeforeSwapHook = Callable[[], None]
+#: A staging folder without a live owner is removed at startup only once it is
+#: this old, so another API process sharing ``models/`` keeps its import.
+_STALE_STAGING_SECONDS = 60 * 60
+_OWNER_FILE = ".import-owner"
 
 
 class ModelInstallError(Exception):
@@ -108,6 +116,13 @@ class InstallBusyError(ModelInstallError):
     code = "install_in_progress"
 
 
+class ModelInUseError(ModelInstallError):
+    """The model is loading or generating, so its files must not change now."""
+
+    status_code = 409
+    code = "model_in_use"
+
+
 @dataclass(frozen=True)
 class InstallResult:
     destination: Path
@@ -152,11 +167,23 @@ def local_install_destination(
     return install_destination(runtime, local_path, default_params, repo_root=repo_root)
 
 
-def git_tracked_files(directory: Path) -> frozenset[str]:
-    """Paths (relative to ``directory``) that git tracks there; empty without git."""
+def _inside_git_checkout(directory: Path) -> bool:
+    return any((parent / ".git").exists() for parent in (directory, *directory.parents))
+
+
+def git_tracked_files(directory: Path) -> frozenset[str] | None:
+    """Paths (relative to ``directory``) that git tracks there.
+
+    Returns ``None`` when that cannot be known: a release artifact made with
+    ``git archive`` has no ``.git``, and git may not be installed. ``git`` is not
+    run at all outside a checkout, because on macOS without the Command Line
+    Tools that pops up an installer dialog.
+    """
 
     if not directory.is_dir():
         return frozenset()
+    if not _inside_git_checkout(directory):
+        return None
     try:
         completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
             ["git", "-C", str(directory), "ls-files", "-z", "--", "."],
@@ -165,9 +192,9 @@ def git_tracked_files(directory: Path) -> frozenset[str]:
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
-        return frozenset()
+        return None
     if completed.returncode != 0:
-        return frozenset()
+        return None
     names = completed.stdout.decode("utf-8", errors="surrogateescape").split("\0")
     return frozenset(name for name in names if name)
 
@@ -246,19 +273,45 @@ def _selected_entries(
         return [model_file.relative_to(model_root)] if model_file is not None else []
     if runtime == "kokoro":
         entries = [Path("config.json")]
-        entries += [path.relative_to(model_root) for path in sorted(model_root.glob("*.pth"))]
-        entries += [path.relative_to(model_root) for path in sorted(model_root.glob("*.pt"))]
+        for pattern in ("*.pth", "*.pt"):
+            entries += [
+                path.relative_to(model_root)
+                for path in sorted(model_root.glob(pattern))
+                if path.is_file()
+            ]
         if (model_root / "voices").is_dir():
             entries.append(Path("voices"))
         return entries
     return None
 
 
-def _walk_files(root: Path) -> Iterable[Path]:
+def _allowed_link_roots(model_root: Path) -> tuple[str, ...]:
+    """Where links inside ``model_root`` may point: the folder itself and, for a
+    Hugging Face cache snapshot (``<repo>/snapshots/<hash>``), that repo's ``blobs/``."""
+
+    roots = [os.path.realpath(model_root)]
+    if model_root.parent.name == "snapshots":
+        roots.append(os.path.realpath(model_root.parent.parent / "blobs"))
+    return tuple(roots)
+
+
+def _check_link(entry: Path, allowed: tuple[str, ...]) -> None:
+    if not entry.is_symlink():
+        return
+    target = os.path.realpath(entry)
+    if not any(target == root or target.startswith(root + os.sep) for root in allowed):
+        raise InvalidSourceError(
+            f"The selected folder links to files outside it ({entry} -> {target}). "
+            "Copy the real files into the model folder and try again."
+        )
+
+
+def _walk_files(root: Path, allowed: tuple[str, ...]) -> Iterable[Path]:
     """Files under ``root`` (following links), skipping ignored names.
 
-    Raises :class:`InvalidSourceError` on a folder link that loops back to one of
-    its parents, before anything is copied.
+    Raises :class:`InvalidSourceError`, before anything is copied, on a link that
+    points outside the model folder (other than a Hugging Face cache's ``blobs/``)
+    or on a folder link that loops back to one of its parents.
     """
 
     stack = [root]
@@ -272,6 +325,7 @@ def _walk_files(root: Path) -> Iterable[Path]:
         for entry in entries:
             if _is_ignored(entry.name):
                 continue
+            _check_link(entry, allowed)
             if entry.is_dir():
                 target = os.path.realpath(entry)
                 if real == target or real.startswith(target + os.sep):
@@ -286,12 +340,15 @@ def _walk_files(root: Path) -> Iterable[Path]:
 
 def _selection_size(model_root: Path, selection: list[Path] | None) -> int:
     roots = [model_root] if selection is None else [model_root / item for item in selection]
+    allowed = _allowed_link_roots(model_root)
     total = 0
     for item in roots:
+        if item is not model_root:
+            _check_link(item, allowed)
         if item.is_file():
             files: Iterable[Path] = [item]
         else:
-            files = _walk_files(item)
+            files = _walk_files(item, allowed)
         for path in files:
             try:
                 total += path.stat().st_size
@@ -305,9 +362,10 @@ def _copy_selection(model_root: Path, staging: Path, selection: list[Path] | Non
     if selection is None:
         # symlinks=False copies the real files, which matters for Hugging Face cache
         # folders where every file is a link into ``blobs/``.
-        shutil.copytree(model_root, staging, symlinks=False, ignore=ignore)
+        shutil.copytree(
+            model_root, staging, symlinks=False, ignore=ignore, dirs_exist_ok=True
+        )
         return
-    staging.mkdir(parents=True)
     for item in selection:
         source = model_root / item
         target = staging / item
@@ -381,8 +439,13 @@ def install_from_local_folder(
     replace: bool = False,
     repo_root: Path | None = None,
     tracked_files: TrackedFilesLookup = git_tracked_files,
+    before_swap: BeforeSwapHook | None = None,
 ) -> InstallResult:
-    """Copy a complete model folder into the manifest's model directory."""
+    """Copy a complete model folder into the manifest's model directory.
+
+    ``before_swap`` runs once the copy is verified, right before anything in the
+    install location moves; the API uses it to refuse while the model is in use.
+    """
 
     destination = install_destination(runtime, local_path, default_params, repo_root=repo_root)
     if destination is None:
@@ -438,20 +501,29 @@ def install_from_local_folder(
             replace=replace,
             repo_root=repo_root,
             tracked_files=tracked_files,
+            before_swap=before_swap,
         )
     finally:
         _IMPORT_LOCK.release()
 
 
-def _protected_entries(destination: Path, tracked: frozenset[str]) -> set[str]:
-    """Top-level names in ``destination`` that must stay where they are."""
+def _protected_entries(destination: Path, tracked: frozenset[str] | None) -> set[str]:
+    """Top-level names in ``destination`` that must stay where they are.
+
+    Placeholder names (``README*``, ``LICENSE*``, ``.gitattributes``) always count.
+    When git cannot say what the repository ships (a release artifact has no
+    ``.git``), a ``model_index.json`` is assumed to be the shipped one too.
+    """
 
     protected: set[str] = set()
     if not destination.is_dir():
         return protected
-    tracked_tops = {Path(name).parts[0] for name in tracked if Path(name).parts}
+    known = tracked if tracked is not None else frozenset()
+    tracked_tops = {Path(name).parts[0] for name in known if Path(name).parts}
     for entry in destination.iterdir():
         if entry.name in tracked_tops or (entry.is_file() and _is_placeholder_name(entry.name)):
+            protected.add(entry.name)
+        elif tracked is None and entry.name == _MODEL_INDEX and entry.is_file():
             protected.add(entry.name)
     return protected
 
@@ -473,10 +545,26 @@ def _model_index_signature(path: Path) -> dict[str, Any] | None:
 
 
 def _reconcile_with_protected(
-    staging: Path, destination: Path, protected: set[str]
-) -> None:
-    """Drop staged copies of protected files, refusing an incompatible ``model_index.json``."""
+    staging: Path,
+    destination: Path,
+    protected: set[str],
+    *,
+    tracked: frozenset[str] | None,
+    replacing: bool,
+) -> list[str]:
+    """Settle files that both the install location and the new model have.
 
+    - ``model_index.json``: the kept one wins; a different pipeline is refused.
+    - ``README*`` / ``LICENSE*`` / ``.gitattributes`` that git does not track,
+      while a previous model is being replaced: they belong to that model, so
+      they are returned to be moved aside with it and the new model's copy is
+      used (a licence must not be mixed up with another model's weights).
+    - anything else protected: the kept one wins and the staged copy is dropped.
+    """
+
+    known = tracked if tracked is not None else frozenset()
+    tracked_tops = {Path(name).parts[0] for name in known if Path(name).parts}
+    swap: list[str] = []
     for name in sorted(protected):
         staged = staging / name
         if not staged.exists() and not staged.is_symlink():
@@ -496,7 +584,11 @@ def _reconcile_with_protected(
                     f"the one kept in {destination}. The repository's file is kept, so this "
                     "model cannot be placed here. Check that you chose the right model."
                 )
+        elif replacing and _is_placeholder_name(name) and name not in tracked_tops:
+            swap.append(name)
+            continue
         staged.unlink()
+    return swap
 
 
 def _unique_sibling(destination: Path, suffix: str) -> Path:
@@ -520,6 +612,7 @@ def _copy_into_place(
     replace: bool,
     repo_root: Path | None,
     tracked_files: TrackedFilesLookup,
+    before_swap: BeforeSwapHook | None,
 ) -> InstallResult:
     tracked = tracked_files(destination)
     protected = _protected_entries(destination, tracked)
@@ -550,6 +643,8 @@ def _copy_into_place(
     moved_aside: list[str] = []
     placed: list[str] = []
     try:
+        staging.mkdir()
+        _write_owner(staging)
         _copy_selection(model_root, staging, selection)
         readiness = _readiness_for(
             runtime=runtime,
@@ -565,7 +660,11 @@ def _copy_into_place(
                 "The copied files did not pass the readiness check: " + readiness.message,
                 readiness.missing,
             )
-        _reconcile_with_protected(staging, destination, protected)
+        swap = _reconcile_with_protected(
+            staging, destination, protected, tracked=tracked, replacing=bool(existing)
+        )
+        if before_swap is not None:
+            before_swap()
 
         if not destination.exists():
             destination.mkdir()
@@ -575,10 +674,12 @@ def _copy_into_place(
                 destination, f".replaced-{time.strftime('%Y%m%d-%H%M%S')}"
             )
             replaced_to.mkdir()
-            for name in existing:
+            for name in [*existing, *swap]:
                 (destination / name).rename(replaced_to / name)
                 moved_aside.append(name)
         for entry in sorted(staging.iterdir()):
+            if entry.name == _OWNER_FILE:
+                continue
             entry.rename(destination / entry.name)
             placed.append(entry.name)
 
@@ -655,23 +756,65 @@ def _roll_back(
     shutil.rmtree(staging, ignore_errors=True)
 
 
-def remove_stale_staging(destinations: Iterable[Path]) -> list[Path]:
+def _write_owner(staging: Path) -> None:
+    (staging / _OWNER_FILE).write_text(f"{os.getpid()}\n", encoding="utf-8")
+
+
+def _owner_is_alive(staging: Path) -> bool | None:
+    """Whether the process that created ``staging`` still runs; ``None`` if unknown."""
+
+    try:
+        pid = int((staging / _OWNER_FILE).read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+    if pid == os.getpid():
+        return False  # this process is starting up, so it has no import running
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+    return True
+
+
+def remove_stale_staging(
+    destinations: Iterable[Path],
+    *,
+    now: float | None = None,
+) -> list[Path]:
     """Delete staging folders an interrupted import left next to ``destinations``.
 
-    Called once when the API starts, before any import can run in this process.
+    Called once when the API starts. Another API process may share ``models/``
+    (``make verify`` starts a second one), so a staging folder is removed only
+    when the process that wrote it is gone, or, if that cannot be told, when it
+    has not changed for an hour.
     """
 
+    current = time.time() if now is None else now
     removed: list[Path] = []
     for destination in destinations:
         parent = destination.parent
         if not parent.is_dir():
             continue
         for stale in parent.glob(f".{destination.name}{_STAGING_MARKER}*"):
-            if stale.is_dir() and not stale.is_symlink():
-                shutil.rmtree(stale, ignore_errors=True)
-                removed.append(stale)
+            if not stale.is_dir() or stale.is_symlink():
+                continue
+            alive = _owner_is_alive(stale)
+            if alive:
+                continue
+            if alive is None:
+                try:
+                    age = current - stale.stat().st_mtime
+                except OSError:
+                    continue
+                if age < _STALE_STAGING_SECONDS:
+                    continue
+            shutil.rmtree(stale, ignore_errors=True)
+            removed.append(stale)
     return removed
-
 
 __all__ = [
     "DestinationNotEmptyError",
@@ -682,6 +825,7 @@ __all__ = [
     "InstallNotSupportedError",
     "InstallResult",
     "InvalidSourceError",
+    "ModelInUseError",
     "ModelInstallError",
     "git_tracked_files",
     "install_destination",

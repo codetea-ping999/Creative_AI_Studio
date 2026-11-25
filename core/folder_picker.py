@@ -12,7 +12,10 @@ import subprocess
 import sys
 
 DEFAULT_PROMPT = "Choose the folder that contains the downloaded model"
+#: How long the dialog may stay open. AppleScript's own Apple Event timeout
+#: (120 s by default) is raised to match, and the subprocess gets a little more.
 PICKER_TIMEOUT_SECONDS = 600
+_SUBPROCESS_GRACE_SECONDS = 30
 
 
 class FolderPickerUnavailableError(RuntimeError):
@@ -23,10 +26,19 @@ class FolderPickerFailedError(RuntimeError):
     """The folder chooser was started but failed for a reason other than Cancel."""
 
 
-#: AppleScript error numbers: -128 is the user pressing Cancel, -1743 is macOS
-#: refusing to let this process send Apple Events to the frontmost app.
+class FolderPickerTimeoutError(RuntimeError):
+    """The folder chooser stayed open longer than ``PICKER_TIMEOUT_SECONDS``."""
+
+
+#: AppleScript error numbers: -128 is the user pressing Cancel, -1712 is the Apple
+#: Event timing out (the dialog stayed open too long), and -1743 is macOS refusing
+#: to let this process send Apple Events to the frontmost app.
 _MACOS_USER_CANCELED = "(-128)"
+_MACOS_TIMED_OUT = "(-1712)"
 _MACOS_NOT_AUTHORIZED = "(-1743)"
+_TIMEOUT_MESSAGE = (
+    "The folder chooser was open too long and closed. Press the button again."
+)
 _MACOS_AUTOMATION_HINT = (
     "Allow it in System Settings > Privacy & Security > Automation: turn on the "
     "frontmost app (for example your browser) under the app that runs the API "
@@ -42,9 +54,11 @@ def _clean_prompt(prompt: str) -> str:
 
 def _macos_command(prompt: str) -> list[str]:
     script = (
+        f"with timeout of {PICKER_TIMEOUT_SECONDS} seconds\n"
         "tell application (path to frontmost application as text)\n"
         f'POSIX path of (choose folder with prompt "{prompt}")\n'
-        "end tell"
+        "end tell\n"
+        "end timeout"
     )
     return ["osascript", "-e", script]
 
@@ -92,19 +106,21 @@ def pick_folder(prompt: str = DEFAULT_PROMPT, *, platform: str | None = None) ->
             capture_output=True,
             text=True,
             encoding="utf-8",
-            timeout=PICKER_TIMEOUT_SECONDS,
+            timeout=PICKER_TIMEOUT_SECONDS + _SUBPROCESS_GRACE_SECONDS,
             check=False,
         )
     except FileNotFoundError as exc:
         raise FolderPickerUnavailableError(
             f"The folder chooser is not available on this machine: {command[0]}"
         ) from exc
-    except subprocess.TimeoutExpired:
-        return None
+    except subprocess.TimeoutExpired as exc:
+        raise FolderPickerTimeoutError(_TIMEOUT_MESSAGE) from exc
 
     if completed.returncode != 0:
         if _is_cancel(platform, completed):
             return None
+        if platform == "darwin" and _MACOS_TIMED_OUT in (completed.stderr or ""):
+            raise FolderPickerTimeoutError(_TIMEOUT_MESSAGE)
         raise FolderPickerFailedError(_failure_message(platform, completed))
     selected = completed.stdout.strip()
     if not selected:
@@ -125,19 +141,17 @@ def _is_cancel(platform: str, completed: subprocess.CompletedProcess[str]) -> bo
 def _failure_message(platform: str, completed: subprocess.CompletedProcess[str]) -> str:
     detail = (completed.stderr or "").strip().splitlines()
     tail = detail[-1] if detail else f"exit status {completed.returncode}"
-    if platform == "darwin":
-        if _MACOS_NOT_AUTHORIZED in (completed.stderr or ""):
-            return (
-                "macOS did not allow the API to open the folder chooser. "
-                + _MACOS_AUTOMATION_HINT
-            )
-        return f"The folder chooser could not be opened ({tail}). " + _MACOS_AUTOMATION_HINT
+    if platform == "darwin" and _MACOS_NOT_AUTHORIZED in (completed.stderr or ""):
+        # Only a refused Apple Event is a permission problem worth sending the
+        # user to System Settings for.
+        return "macOS did not allow the API to open the folder chooser. " + _MACOS_AUTOMATION_HINT
     return f"The folder chooser could not be opened ({tail})."
 
 
 __all__ = [
     "DEFAULT_PROMPT",
     "FolderPickerFailedError",
+    "FolderPickerTimeoutError",
     "FolderPickerUnavailableError",
     "build_picker_command",
     "pick_folder",

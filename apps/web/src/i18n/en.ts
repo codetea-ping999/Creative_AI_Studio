@@ -612,6 +612,8 @@ export const en: Record<string, string> = {
   "手元のモデルを配置…": "Place a model from this computer…",
   "コピーして確認しています。モデルが大きいと数分かかります。": "Copying and verifying. Large models can take a few minutes.",
   "置き換えて配置": "Replace and place",
+  "時間切れになりました。もう一度押してください。": "The folder chooser timed out. Press the button again.",
+  "このモデルは読み込み中か生成中です。終わってからもう一度配置してください。": "This model is loading or generating. Place the files again when it finishes.",
   "信頼できる配布元から入手したモデルだけを配置してください。": "Only place models you got from a source you trust.",
   "このモデルは使用中だったため、新しいファイルは API を再起動すると使われます。": " The model was in use, so restart the API to use the new files.",
   "もとのファイルは {path} に移しました。": " The previous files were moved to {path}.",

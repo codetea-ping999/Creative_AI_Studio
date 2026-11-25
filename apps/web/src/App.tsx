@@ -587,6 +587,15 @@ function App() {
       if (error instanceof ApiError && error.code === "destination_not_empty") {
         return { status: "needs_replace", message: error.message, sourcePath };
       }
+      if (error instanceof ApiError && error.code === "picker_timeout") {
+        return { status: "error", message: t("時間切れになりました。もう一度押してください。") };
+      }
+      if (error instanceof ApiError && error.code === "model_in_use") {
+        return {
+          status: "error",
+          message: t("このモデルは読み込み中か生成中です。終わってからもう一度配置してください。"),
+        };
+      }
       return {
         status: "error",
         message: error instanceof Error ? error.message : String(error),

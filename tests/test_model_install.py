@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -19,6 +21,7 @@ from core.model_install import (
     InstallNotSupportedError,
     InsufficientSpaceError,
     InvalidSourceError,
+    ModelInUseError,
     install_destination,
     install_from_local_folder,
     remove_stale_staging,
@@ -85,9 +88,10 @@ class InstallFromLocalFolderTests(unittest.TestCase):
     def test_copies_a_complete_model_and_follows_symlinks(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            source = _write_diffusers_pipeline(root / "downloads" / "sdxl", _DIFFUSERS_INDEX)
+            repo = root / "hub" / "models--stabilityai--sdxl"
+            source = _write_diffusers_pipeline(repo / "snapshots" / "abc123", _DIFFUSERS_INDEX)
             # Hugging Face cache layout: the snapshot files are links into blobs/.
-            blob = root / "blobs" / "weights"
+            blob = repo / "blobs" / "weights"
             blob.parent.mkdir()
             blob.write_bytes(b"real-bytes")
             linked = source / "unet" / "model.safetensors"
@@ -549,12 +553,244 @@ class FailurePathTests(unittest.TestCase):
             other = root / "models" / ".other.import-1234abcd"
             other.mkdir()
 
-            removed = remove_stale_staging([destination])
+            fresh = remove_stale_staging([destination])
+            removed = remove_stale_staging([destination], now=time.time() + 2 * 3600)
 
+            self.assertEqual(fresh, [], "a recent folder without an owner may still be in use")
             self.assertEqual(removed, [stale])
             self.assertFalse(stale.exists())
             self.assertTrue(other.exists())
             self.assertTrue(destination.exists())
+
+
+def _git_unknown(_directory: Path) -> frozenset[str] | None:
+    return None
+
+
+class ReleaseArtifactTests(unittest.TestCase):
+    """Without ``.git`` (``git archive`` releases) the shipped files are still kept."""
+
+    def _shipped_destination(self, root: Path) -> Path:
+        destination = root / "models" / "sdxl"
+        destination.mkdir(parents=True)
+        (destination / "README.md").write_text("repo readme", encoding="utf-8")
+        (destination / "LICENSE.md").write_text("repo license", encoding="utf-8")
+        (destination / "model_index.json").write_text(
+            json.dumps({**_DIFFUSERS_INDEX, "_diffusers_version": "0.19.0"}), encoding="utf-8"
+        )
+        return destination
+
+    def test_shipped_model_index_counts_as_empty_and_is_kept(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = _write_diffusers_pipeline(root / "downloads" / "sdxl", _DIFFUSERS_INDEX)
+            destination = self._shipped_destination(root)
+            shipped = (destination / "model_index.json").read_text()
+
+            result = install_from_local_folder(
+                source_path=str(source),
+                **{**_diffusers_kwargs(destination), "tracked_files": _git_unknown},
+            )
+
+            self.assertIsNone(result.replaced_to)
+            self.assertTrue(result.readiness.is_ready)
+            self.assertEqual((destination / "model_index.json").read_text(), shipped)
+
+    def test_replace_keeps_the_shipped_model_index(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = _write_diffusers_pipeline(root / "downloads" / "sdxl", _DIFFUSERS_INDEX)
+            destination = self._shipped_destination(root)
+            (destination / "unet").mkdir()
+            (destination / "unet" / "old.safetensors").write_bytes(b"old")
+
+            result = install_from_local_folder(
+                source_path=str(source),
+                replace=True,
+                **{**_diffusers_kwargs(destination), "tracked_files": _git_unknown},
+            )
+
+            assert result.replaced_to is not None
+            self.assertNotIn("model_index.json", _listing(result.replaced_to))
+            self.assertTrue((destination / "model_index.json").is_file())
+
+    def test_git_is_not_run_outside_a_checkout(self) -> None:
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "models" / "sdxl"
+            directory.mkdir(parents=True)
+            with patch.object(model_install.subprocess, "run") as run:
+                self.assertIsNone(model_install.git_tracked_files(directory))
+            run.assert_not_called()
+
+    def test_missing_git_binary_means_unknown(self) -> None:
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "models" / "sdxl"
+            directory.mkdir(parents=True)
+            (Path(tmp) / ".git").mkdir()
+            with patch.object(model_install.subprocess, "run", side_effect=FileNotFoundError):
+                self.assertIsNone(model_install.git_tracked_files(directory))
+
+
+class FollowUpReviewTests(unittest.TestCase):
+    def test_stale_staging_with_a_live_owner_is_kept(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            destination = root / "models" / "sdxl"
+            destination.mkdir(parents=True)
+            live = root / "models" / ".sdxl.import-aaaaaaaa"
+            live.mkdir()
+            (live / ".import-owner").write_text(f"{os.getppid()}\n", encoding="utf-8")
+            dead = root / "models" / ".sdxl.import-bbbbbbbb"
+            dead.mkdir()
+            (dead / ".import-owner").write_text("999999999\n", encoding="utf-8")
+
+            with patch.object(model_install.os, "kill") as kill:
+                kill.side_effect = lambda pid, _sig: (
+                    None if pid == os.getppid() else (_ for _ in ()).throw(ProcessLookupError())
+                )
+                removed = remove_stale_staging([destination], now=time.time() + 2 * 3600)
+
+            self.assertEqual(removed, [dead])
+            self.assertTrue(live.exists())
+
+    def test_staging_records_its_owner_and_it_is_not_placed(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = _write_diffusers_pipeline(root / "downloads" / "sdxl", _DIFFUSERS_INDEX)
+            destination = root / "models" / "sdxl"
+            seen: list[str] = []
+
+            def look_at_staging() -> None:
+                for staging in destination.parent.glob(".sdxl.import-*"):
+                    seen.append((staging / ".import-owner").read_text().strip())
+
+            install_from_local_folder(
+                source_path=str(source),
+                **{**_diffusers_kwargs(destination), "before_swap": look_at_staging},
+            )
+
+            self.assertEqual(seen, [str(os.getpid())])
+            self.assertFalse((destination / ".import-owner").exists())
+
+    def test_before_swap_refusal_changes_nothing(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = _write_diffusers_pipeline(root / "downloads" / "sdxl", _DIFFUSERS_INDEX)
+            destination = root / "models" / "sdxl"
+            destination.mkdir(parents=True)
+            (destination / "old.safetensors").write_bytes(b"old")
+
+            def busy() -> None:
+                raise ModelInUseError("in use")
+
+            with self.assertRaises(ModelInUseError):
+                install_from_local_folder(
+                    source_path=str(source),
+                    replace=True,
+                    **{**_diffusers_kwargs(destination), "before_swap": busy},
+                )
+
+            self.assertEqual(_listing(destination.parent), ["sdxl", "sdxl/old.safetensors"])
+
+    def test_model_file_must_stay_inside_the_folder(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "outside.gguf").write_bytes(b"gguf")
+            source = root / "model"
+            source.mkdir()
+            for model_file in ("../outside.gguf", str(root / "outside.gguf")):
+                with self.subTest(model_file=model_file):
+                    with self.assertRaises(IncompleteSourceError):
+                        install_from_local_folder(
+                            source_path=str(source),
+                            **_kwargs("llama_cpp", root / "models" / "q", model_file=model_file),
+                        )
+
+    def test_a_gguf_named_folder_makes_the_choice_ambiguous_like_the_loader(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "model"
+            (source / "extra.gguf").mkdir(parents=True)
+            (source / "writer.gguf").write_bytes(b"gguf")
+
+            with self.assertRaises(IncompleteSourceError) as raised:
+                install_from_local_folder(
+                    source_path=str(source), **_kwargs("llama_cpp", root / "models" / "q")
+                )
+
+            self.assertIn("More than one .gguf", str(raised.exception))
+
+    def test_kokoro_ignores_a_folder_named_like_a_voice_pack(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "Kokoro-82M"
+            source.mkdir()
+            (source / "config.json").write_text("{}", encoding="utf-8")
+            (source / "kokoro.pth").write_bytes(b"pth")
+            (source / "backup.pt").mkdir()
+            (source / "backup.pt" / "big.bin").write_bytes(b"x")
+            destination = root / "models" / "kokoro"
+
+            install_from_local_folder(source_path=str(source), **_kwargs("kokoro", destination))
+
+            self.assertEqual(_listing(destination), ["config.json", "kokoro.pth"])
+
+    def test_links_outside_the_model_folder_are_refused(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            secret = root / "secret.safetensors"
+            secret.write_bytes(b"not a model")
+            source = _write_diffusers_pipeline(root / "downloads" / "sdxl", _DIFFUSERS_INDEX)
+            weight = source / "unet" / "model.safetensors"
+            weight.unlink()
+            weight.symlink_to(secret)
+            destination = root / "models" / "sdxl"
+
+            with self.assertRaises(InvalidSourceError):
+                install_from_local_folder(
+                    source_path=str(source), **_diffusers_kwargs(destination)
+                )
+
+            self.assertFalse(destination.parent.exists())
+
+    def test_replacing_a_model_moves_its_own_licence_aside(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = _write_diffusers_pipeline(root / "downloads" / "sdxl", _DIFFUSERS_INDEX)
+            (source / "LICENSE.md").write_text("new licence", encoding="utf-8")
+            destination = root / "models" / "sdxl"
+            destination.mkdir(parents=True)
+            (destination / "LICENSE.md").write_text("old licence", encoding="utf-8")
+            (destination / "old.safetensors").write_bytes(b"old")
+
+            result = install_from_local_folder(
+                source_path=str(source), replace=True, **_diffusers_kwargs(destination)
+            )
+
+            assert result.replaced_to is not None
+            self.assertEqual((destination / "LICENSE.md").read_text(), "new licence")
+            self.assertEqual((result.replaced_to / "LICENSE.md").read_text(), "old licence")
+
+    def test_a_tracked_licence_is_never_moved(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = _write_diffusers_pipeline(root / "downloads" / "sdxl", _DIFFUSERS_INDEX)
+            (source / "LICENSE.md").write_text("new licence", encoding="utf-8")
+            destination = root / "models" / "sdxl"
+            destination.mkdir(parents=True)
+            (destination / "LICENSE.md").write_text("repo licence", encoding="utf-8")
+            (destination / "old.safetensors").write_bytes(b"old")
+
+            install_from_local_folder(
+                source_path=str(source),
+                replace=True,
+                **{
+                    **_diffusers_kwargs(destination),
+                    "tracked_files": lambda _d: frozenset({"LICENSE.md"}),
+                },
+            )
+
+            self.assertEqual((destination / "LICENSE.md").read_text(), "repo licence")
 
 
 class FolderPickerTests(unittest.TestCase):
@@ -609,8 +845,38 @@ class FolderPickerTests(unittest.TestCase):
             with self.subTest(platform=platform), patch.object(
                 folder_picker.subprocess, "run", return_value=completed
             ), patch.object(folder_picker.shutil, "which", return_value="/usr/bin/zenity"):
-                with self.assertRaises(folder_picker.FolderPickerFailedError):
+                with self.assertRaises(folder_picker.FolderPickerFailedError) as raised:
                     folder_picker.pick_folder(platform=platform)
+                # Only a refused Apple Event (-1743) points at Automation settings.
+                self.assertNotIn("Automation", str(raised.exception))
+
+    def test_macos_apple_event_timeout_is_a_timeout_not_a_permission_problem(self) -> None:
+        timed_out = _completed(
+            "",
+            1,
+            "72:152: execution error: Safariでエラーが起きました: "
+            "AppleEventがタイムアウトしました。 (-1712)",
+        )
+        with patch.object(folder_picker.subprocess, "run", return_value=timed_out):
+            with self.assertRaises(folder_picker.FolderPickerTimeoutError) as raised:
+                folder_picker.pick_folder(platform="darwin")
+        self.assertNotIn("Automation", str(raised.exception))
+
+    def test_a_hung_picker_process_is_a_timeout(self) -> None:
+        with patch.object(
+            folder_picker.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(["osascript"], 630),
+        ):
+            with self.assertRaises(folder_picker.FolderPickerTimeoutError):
+                folder_picker.pick_folder(platform="darwin")
+
+    def test_macos_script_waits_as_long_as_the_server(self) -> None:
+        script = folder_picker.build_picker_command("darwin")[-1]
+        timeout_line = f"with timeout of {folder_picker.PICKER_TIMEOUT_SECONDS} seconds"
+        self.assertTrue(script.startswith(timeout_line), script)
+        self.assertTrue(script.rstrip().endswith("end timeout"), script)
+        self.assertLess(script.index(timeout_line), script.index("choose folder"))
 
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"missing dependency: {IMPORT_ERROR}")
@@ -799,8 +1065,11 @@ class ModelInstallApiTests(unittest.TestCase):
             source = _write_diffusers_pipeline(root / "downloads" / "sdxl", _DIFFUSERS_INDEX)
             client = self._client(root, root / "models" / "sdxl")
             services = client.app.state.services
+            # The check before the swap passes; a job loads the model right after.
             with patch.object(
-                services.model_service, "unload_model", side_effect=RuntimeBusyError("busy")
+                services.model_service,
+                "unload_model",
+                side_effect=[None, RuntimeBusyError("busy")],
             ):
                 response = client.post(
                     "/models/custom-sdxl/install",
@@ -809,6 +1078,41 @@ class ModelInstallApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200, response.text)
         self.assertTrue(response.json()["restart_required"])
+
+    def test_model_in_use_is_refused_before_any_file_moves(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = _write_diffusers_pipeline(root / "downloads" / "sdxl", _DIFFUSERS_INDEX)
+            destination = root / "models" / "sdxl"
+            destination.mkdir(parents=True)
+            (destination / "old.safetensors").write_bytes(b"old")
+            client = self._client(root, destination)
+            services = client.app.state.services
+            with patch.object(
+                services.model_service, "unload_model", side_effect=RuntimeBusyError("busy")
+            ):
+                response = client.post(
+                    "/models/custom-sdxl/install",
+                    json={"source_path": str(source), "media_type": "image", "replace": True},
+                )
+            listing = _listing(destination.parent)
+
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(response.json()["detail"]["code"], "model_in_use")
+        self.assertEqual(listing, ["sdxl", "sdxl/old.safetensors"])
+
+    def test_picker_timeout_is_its_own_error(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = self._client(root, root / "models" / "sdxl")
+            with patch(
+                "apps.api.routes.model_install.pick_folder",
+                side_effect=folder_picker.FolderPickerTimeoutError("open too long"),
+            ):
+                response = client.post("/models/pick-folder")
+
+        self.assertEqual(response.status_code, 504)
+        self.assertEqual(response.json()["detail"]["code"], "picker_timeout")
 
     def test_models_without_file_checks_do_not_offer_local_install(self) -> None:
         with TemporaryDirectory() as tmp:
