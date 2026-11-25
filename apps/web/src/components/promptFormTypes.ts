@@ -88,6 +88,9 @@ export type LocalModelInstallOptions = {
   replace?: boolean;
 };
 
+/** "picking": waiting for the user in the OS folder dialog; "installing": copying. */
+export type LocalModelInstallPhase = "picking" | "installing";
+
 export type LocalModelInstallOutcome =
   | { status: "installed"; message: string }
   | { status: "cancelled" }

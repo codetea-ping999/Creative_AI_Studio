@@ -53,9 +53,22 @@ def _clean_prompt(prompt: str) -> str:
 
 
 def _macos_command(prompt: str) -> list[str]:
+    # The chooser is shown by the app the user is looking at (usually the browser
+    # running the Studio UI), because osascript itself has no window to put it in
+    # front of. ``path to frontmost application`` is read once, before anything
+    # else, and works from a background osascript: osascript is not a GUI app, so
+    # it never becomes the frontmost application itself.
+    #
+    # ``activate`` brings that app (and so the dialog) to the front; without it the
+    # dialog can open behind other windows and look as if nothing happened. It is
+    # sent to the same app the dialog already needs, so it asks for no extra
+    # Automation permission. Asking "System Events" for the frontmost process
+    # instead would add a second Automation prompt, so it is not used.
     script = (
         f"with timeout of {PICKER_TIMEOUT_SECONDS} seconds\n"
-        "tell application (path to frontmost application as text)\n"
+        "set targetApp to (path to frontmost application as text)\n"
+        "tell application targetApp\n"
+        "activate\n"
         f'POSIX path of (choose folder with prompt "{prompt}")\n'
         "end tell\n"
         "end timeout"

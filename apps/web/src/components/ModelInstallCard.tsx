@@ -3,6 +3,7 @@ import { useT } from "../i18n";
 import type {
   LocalModelInstallOptions,
   LocalModelInstallOutcome,
+  LocalModelInstallPhase,
   ModelInstallGuide,
   ModelOption,
 } from "./promptFormTypes";
@@ -13,12 +14,14 @@ type ModelInstallCardProps = {
   onInstallLocalModel?: (
     modelId: string,
     options?: LocalModelInstallOptions,
+    onPhase?: (phase: LocalModelInstallPhase) => void,
   ) => Promise<LocalModelInstallOutcome>;
 };
 
 type InstallState =
   | { kind: "idle" }
-  | { kind: "working" }
+  | { kind: "picking" }
+  | { kind: "installing" }
   | { kind: "done"; message: string }
   | { kind: "failed"; message: string }
   | { kind: "confirm"; message: string; sourcePath: string };
@@ -28,14 +31,17 @@ export function ModelInstallCard({ model, guide, onInstallLocalModel }: ModelIns
   const t = useT();
   const [state, setState] = useState<InstallState>({ kind: "idle" });
   const canInstall = Boolean(onInstallLocalModel) && model.supportsLocalInstall;
-  const isWorking = state.kind === "working";
+  const isWorking = state.kind === "picking" || state.kind === "installing";
 
   async function run(options?: LocalModelInstallOptions): Promise<void> {
     if (!onInstallLocalModel) {
       return;
     }
-    setState({ kind: "working" });
-    const outcome = await onInstallLocalModel(model.id, options);
+    // A known folder (replace after confirming) skips the folder dialog.
+    setState({ kind: options?.sourcePath ? "installing" : "picking" });
+    const outcome = await onInstallLocalModel(model.id, options, (phase) => {
+      setState({ kind: phase });
+    });
     if (outcome.status === "cancelled") {
       setState({ kind: "idle" });
     } else if (outcome.status === "installed") {
@@ -87,7 +93,14 @@ export function ModelInstallCard({ model, guide, onInstallLocalModel }: ModelIns
           ) : null}
         </div>
       </div>
-      {isWorking ? (
+      {state.kind === "picking" ? (
+        <p className="setup-install__status" role="status">
+          {t(
+            "フォルダ選択の画面で、モデルのフォルダを選んでください。見当たらない場合は、ほかのウィンドウの後ろや Dock を確認してください。",
+          )}
+        </p>
+      ) : null}
+      {state.kind === "installing" ? (
         <p className="setup-install__status" role="status">
           {t("コピーして確認しています。モデルが大きいと数分かかります。")}
         </p>

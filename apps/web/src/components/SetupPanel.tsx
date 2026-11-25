@@ -1,6 +1,10 @@
 import type { MediaType, ModelOption } from "./PromptForm";
 import { ModelInstallCard } from "./ModelInstallCard";
-import type { LocalModelInstallOptions, LocalModelInstallOutcome } from "./promptFormTypes";
+import type {
+  LocalModelInstallOptions,
+  LocalModelInstallOutcome,
+  LocalModelInstallPhase,
+} from "./promptFormTypes";
 import { getInstallGuide } from "../lib/modelInstallGuide";
 import {
   formatPercent,
@@ -22,6 +26,7 @@ type SetupPanelProps = {
     media: MediaType,
     modelId: string,
     options?: LocalModelInstallOptions,
+    onPhase?: (phase: LocalModelInstallPhase) => void,
   ) => Promise<LocalModelInstallOutcome>;
 };
 
@@ -112,7 +117,8 @@ export function SetupPanel({
                           guide={getInstallGuide(media, model)}
                           onInstallLocalModel={
                             onInstallLocalModel
-                              ? (modelId, options) => onInstallLocalModel(media, modelId, options)
+                              ? (modelId, options, onPhase) =>
+                                  onInstallLocalModel(media, modelId, options, onPhase)
                               : undefined
                           }
                         />

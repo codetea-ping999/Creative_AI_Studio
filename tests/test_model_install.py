@@ -878,6 +878,15 @@ class FolderPickerTests(unittest.TestCase):
         self.assertTrue(script.rstrip().endswith("end timeout"), script)
         self.assertLess(script.index(timeout_line), script.index("choose folder"))
 
+    def test_macos_script_brings_the_dialog_to_the_front(self) -> None:
+        lines = folder_picker.build_picker_command("darwin")[-1].splitlines()
+        tell = next(i for i, line in enumerate(lines) if line.startswith("tell application"))
+        activate = lines.index("activate")
+        choose = next(i for i, line in enumerate(lines) if "choose folder" in line)
+        self.assertLess(tell, activate)
+        self.assertLess(activate, choose)
+        self.assertNotIn("System Events", "\n".join(lines))
+
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"missing dependency: {IMPORT_ERROR}")
 class ModelInstallApiTests(unittest.TestCase):

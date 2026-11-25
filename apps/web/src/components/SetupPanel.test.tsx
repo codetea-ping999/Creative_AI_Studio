@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SetupPanel } from "./SetupPanel";
@@ -63,7 +63,7 @@ describe("SetupPanel local model install", () => {
 
     await user.click(screen.getByRole("button", { name: "手元のモデルを配置…" }));
 
-    expect(install).toHaveBeenCalledWith("image", "ssd-1b", undefined);
+    expect(install).toHaveBeenCalledWith("image", "ssd-1b", undefined, expect.any(Function));
     expect((await screen.findByRole("status")).textContent).toContain("配置しました。");
   });
 
@@ -100,10 +100,12 @@ describe("SetupPanel local model install", () => {
     expect((await screen.findByRole("alert")).textContent).toContain("配置先にファイルがあります。");
     await user.click(screen.getByRole("button", { name: "置き換えて配置" }));
 
-    expect(install).toHaveBeenLastCalledWith("image", "ssd-1b", {
-      sourcePath: "/Users/me/Downloads/ssd-1b",
-      replace: true,
-    });
+    expect(install).toHaveBeenLastCalledWith(
+      "image",
+      "ssd-1b",
+      { sourcePath: "/Users/me/Downloads/ssd-1b", replace: true },
+      expect.any(Function),
+    );
     expect((await screen.findByRole("status")).textContent).toContain("置き換えました。");
   });
 
@@ -156,5 +158,70 @@ describe("SetupPanel local model install", () => {
     await user.click(screen.getByRole("button", { name: "手元のモデルを配置…" }));
 
     expect((await screen.findByRole("alert")).textContent).toContain("System Settings");
+  });
+
+  it("asks the user to look for the folder dialog, then reports the copy", async () => {
+    const picking =
+      "フォルダ選択の画面で、モデルのフォルダを選んでください。見当たらない場合は、ほかのウィンドウの後ろや Dock を確認してください。";
+    const copying = "コピーして確認しています。モデルが大きいと数分かかります。";
+    const user = userEvent.setup();
+    let reportPhase: ((phase: "picking" | "installing") => void) | undefined;
+    let finish: ((value: { status: "installed"; message: string }) => void) | undefined;
+    const install = vi.fn(
+      (
+        _media: string,
+        _id: string,
+        _options: unknown,
+        onPhase?: (phase: "picking" | "installing") => void,
+      ) => {
+        reportPhase = onPhase;
+        return new Promise<{ status: "installed"; message: string }>((resolve) => {
+          finish = resolve;
+        });
+      },
+    );
+    renderPanel(install);
+    openMissing();
+
+    await user.click(screen.getByRole("button", { name: "手元のモデルを配置…" }));
+
+    expect(screen.getByRole("status").textContent).toBe(picking);
+    expect(screen.queryByText(copying)).toBeNull();
+    expect(screen.getByRole("button", { name: "配置中…" })).toHaveProperty("disabled", true);
+
+    act(() => reportPhase?.("installing"));
+    expect(screen.getByRole("status").textContent).toBe(copying);
+    expect(screen.queryByText(picking)).toBeNull();
+
+    await act(async () => finish?.({ status: "installed", message: "配置しました。" }));
+    expect(screen.getByRole("status").textContent).toContain("配置しました。");
+  });
+
+  it("goes straight to copying when replacing a folder that was already chosen", async () => {
+    const copying = "コピーして確認しています。モデルが大きいと数分かかります。";
+    const user = userEvent.setup();
+    let finish: ((value: { status: "installed"; message: string }) => void) | undefined;
+    const install = vi
+      .fn()
+      .mockResolvedValueOnce({
+        status: "needs_replace",
+        message: "配置先にファイルがあります。",
+        sourcePath: "/Users/me/Downloads/ssd-1b",
+      })
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finish = resolve;
+          }),
+      );
+    renderPanel(install);
+    openMissing();
+
+    await user.click(screen.getByRole("button", { name: "手元のモデルを配置…" }));
+    await user.click(await screen.findByRole("button", { name: "置き換えて配置" }));
+
+    expect(screen.getByRole("status").textContent).toBe(copying);
+    await act(async () => finish?.({ status: "installed", message: "置き換えました。" }));
+    expect(screen.getByRole("status").textContent).toContain("置き換えました。");
   });
 });

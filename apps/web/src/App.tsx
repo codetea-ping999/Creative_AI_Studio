@@ -16,6 +16,7 @@ import {
 import type {
   LocalModelInstallOptions,
   LocalModelInstallOutcome,
+  LocalModelInstallPhase,
 } from "./components/promptFormTypes";
 import { AssemblyTimelinePanel } from "./components/AssemblyTimelinePanel";
 import { CastOverlay, type CastCue } from "./components/CastOverlay";
@@ -542,6 +543,7 @@ function App() {
     media: MediaType,
     modelId: string,
     options?: LocalModelInstallOptions,
+    onPhase?: (phase: LocalModelInstallPhase) => void,
   ): Promise<LocalModelInstallOutcome> {
     let sourcePath = options?.sourcePath ?? "";
     try {
@@ -554,6 +556,7 @@ function App() {
         }
         sourcePath = picked.path;
       }
+      onPhase?.("installing");
       const result = await requestJson<InstallModelResponse>(
         `/models/${encodeURIComponent(modelId)}/install`,
         {
