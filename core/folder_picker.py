@@ -30,19 +30,12 @@ class FolderPickerTimeoutError(RuntimeError):
     """The folder chooser stayed open longer than ``PICKER_TIMEOUT_SECONDS``."""
 
 
-#: AppleScript error numbers: -128 is the user pressing Cancel, -1712 is the Apple
-#: Event timing out (the dialog stayed open too long), and -1743 is macOS refusing
-#: to let this process send Apple Events to the frontmost app.
+#: AppleScript error numbers: -128 is the user pressing Cancel, and -1712 is the
+#: Apple Event timing out (the dialog stayed open too long).
 _MACOS_USER_CANCELED = "(-128)"
 _MACOS_TIMED_OUT = "(-1712)"
-_MACOS_NOT_AUTHORIZED = "(-1743)"
 _TIMEOUT_MESSAGE = (
     "The folder chooser was open too long and closed. Press the button again."
-)
-_MACOS_AUTOMATION_HINT = (
-    "Allow it in System Settings > Privacy & Security > Automation: turn on the "
-    "frontmost app (for example your browser) under the app that runs the API "
-    "(Terminal, iTerm or Python), then try again."
 )
 
 
@@ -53,24 +46,14 @@ def _clean_prompt(prompt: str) -> str:
 
 
 def _macos_command(prompt: str) -> list[str]:
-    # The chooser is shown by the app the user is looking at (usually the browser
-    # running the Studio UI), because osascript itself has no window to put it in
-    # front of. ``path to frontmost application`` is read once, before anything
-    # else, and works from a background osascript: osascript is not a GUI app, so
-    # it never becomes the frontmost application itself.
-    #
-    # ``activate`` brings that app (and so the dialog) to the front; without it the
-    # dialog can open behind other windows and look as if nothing happened. It is
-    # sent to the same app the dialog already needs, so it asks for no extra
-    # Automation permission. Asking "System Events" for the frontmost process
-    # instead would add a second Automation prompt, so it is not used.
+    # osascript shows the chooser itself and ``tell me to activate`` brings it to
+    # the front. Asking the frontmost app (the browser running the Studio UI) to
+    # show it instead left the chooser invisible in Safari. Not sending events to
+    # another app also means macOS asks for no Automation permission.
     script = (
         f"with timeout of {PICKER_TIMEOUT_SECONDS} seconds\n"
-        "set targetApp to (path to frontmost application as text)\n"
-        "tell application targetApp\n"
-        "activate\n"
+        "tell me to activate\n"
         f'POSIX path of (choose folder with prompt "{prompt}")\n'
-        "end tell\n"
         "end timeout"
     )
     return ["osascript", "-e", script]
@@ -134,7 +117,7 @@ def pick_folder(prompt: str = DEFAULT_PROMPT, *, platform: str | None = None) ->
             return None
         if platform == "darwin" and _MACOS_TIMED_OUT in (completed.stderr or ""):
             raise FolderPickerTimeoutError(_TIMEOUT_MESSAGE)
-        raise FolderPickerFailedError(_failure_message(platform, completed))
+        raise FolderPickerFailedError(_failure_message(completed))
     selected = completed.stdout.strip()
     if not selected:
         # PowerShell prints nothing when the dialog is cancelled.
@@ -151,13 +134,9 @@ def _is_cancel(platform: str, completed: subprocess.CompletedProcess[str]) -> bo
     return completed.returncode == 1
 
 
-def _failure_message(platform: str, completed: subprocess.CompletedProcess[str]) -> str:
+def _failure_message(completed: subprocess.CompletedProcess[str]) -> str:
     detail = (completed.stderr or "").strip().splitlines()
     tail = detail[-1] if detail else f"exit status {completed.returncode}"
-    if platform == "darwin" and _MACOS_NOT_AUTHORIZED in (completed.stderr or ""):
-        # Only a refused Apple Event is a permission problem worth sending the
-        # user to System Settings for.
-        return "macOS did not allow the API to open the folder chooser. " + _MACOS_AUTOMATION_HINT
     return f"The folder chooser could not be opened ({tail})."
 
 

@@ -826,15 +826,6 @@ class FolderPickerTests(unittest.TestCase):
         ), patch.object(folder_picker.shutil, "which", return_value="/usr/bin/zenity"):
             self.assertIsNone(folder_picker.pick_folder(platform="linux"))
 
-    def test_macos_permission_denial_is_an_error_with_a_hint(self) -> None:
-        denied = _completed(
-            "", 1, "execution error: Not authorized to send Apple events to Safari. (-1743)"
-        )
-        with patch.object(folder_picker.subprocess, "run", return_value=denied):
-            with self.assertRaises(folder_picker.FolderPickerFailedError) as raised:
-                folder_picker.pick_folder(platform="darwin")
-        self.assertIn("Automation", str(raised.exception))
-
     def test_other_failures_are_errors_not_cancels(self) -> None:
         cases = {
             "darwin": _completed("", 1, "execution error: some other failure (-1708)"),
@@ -845,10 +836,8 @@ class FolderPickerTests(unittest.TestCase):
             with self.subTest(platform=platform), patch.object(
                 folder_picker.subprocess, "run", return_value=completed
             ), patch.object(folder_picker.shutil, "which", return_value="/usr/bin/zenity"):
-                with self.assertRaises(folder_picker.FolderPickerFailedError) as raised:
+                with self.assertRaises(folder_picker.FolderPickerFailedError):
                     folder_picker.pick_folder(platform=platform)
-                # Only a refused Apple Event (-1743) points at Automation settings.
-                self.assertNotIn("Automation", str(raised.exception))
 
     def test_macos_apple_event_timeout_is_a_timeout_not_a_permission_problem(self) -> None:
         timed_out = _completed(
@@ -858,9 +847,8 @@ class FolderPickerTests(unittest.TestCase):
             "AppleEventがタイムアウトしました。 (-1712)",
         )
         with patch.object(folder_picker.subprocess, "run", return_value=timed_out):
-            with self.assertRaises(folder_picker.FolderPickerTimeoutError) as raised:
+            with self.assertRaises(folder_picker.FolderPickerTimeoutError):
                 folder_picker.pick_folder(platform="darwin")
-        self.assertNotIn("Automation", str(raised.exception))
 
     def test_a_hung_picker_process_is_a_timeout(self) -> None:
         with patch.object(
@@ -878,14 +866,13 @@ class FolderPickerTests(unittest.TestCase):
         self.assertTrue(script.rstrip().endswith("end timeout"), script)
         self.assertLess(script.index(timeout_line), script.index("choose folder"))
 
-    def test_macos_script_brings_the_dialog_to_the_front(self) -> None:
+    def test_macos_script_shows_its_own_chooser_in_front(self) -> None:
         lines = folder_picker.build_picker_command("darwin")[-1].splitlines()
-        tell = next(i for i, line in enumerate(lines) if line.startswith("tell application"))
-        activate = lines.index("activate")
+        activate = lines.index("tell me to activate")
         choose = next(i for i, line in enumerate(lines) if "choose folder" in line)
-        self.assertLess(tell, activate)
         self.assertLess(activate, choose)
-        self.assertNotIn("System Events", "\n".join(lines))
+        # No other app is told to do anything, so no Automation permission is needed.
+        self.assertEqual([line for line in lines if line.startswith("tell ")], [lines[activate]])
 
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"missing dependency: {IMPORT_ERROR}")
@@ -1060,13 +1047,13 @@ class ModelInstallApiTests(unittest.TestCase):
             client = self._client(root, root / "models" / "sdxl")
             with patch(
                 "apps.api.routes.model_install.pick_folder",
-                side_effect=folder_picker.FolderPickerFailedError("allow Automation"),
+                side_effect=folder_picker.FolderPickerFailedError("chooser failed"),
             ):
                 response = client.post("/models/pick-folder")
 
         self.assertEqual(response.status_code, 500)
         self.assertEqual(response.json()["detail"]["code"], "picker_failed")
-        self.assertIn("Automation", response.json()["detail"]["message"])
+        self.assertIn("chooser failed", response.json()["detail"]["message"])
 
     def test_busy_model_reports_restart_required(self) -> None:
         with TemporaryDirectory() as tmp:
