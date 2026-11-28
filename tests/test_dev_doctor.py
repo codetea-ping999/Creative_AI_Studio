@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import redirect_stderr
+from contextlib import ExitStack, redirect_stderr
 import io
 import json
 from pathlib import Path
@@ -12,7 +12,12 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from scripts import dev_doctor
+from scripts import check_local_setup, dev_doctor
+
+
+CANONICAL_PYTHON = check_local_setup.canonical_python_version()
+CANONICAL_NODE = check_local_setup.canonical_node_version()
+CANONICAL_PYTHON_VERSION = (CANONICAL_PYTHON[0], CANONICAL_PYTHON[1], 1)
 
 
 class DevDoctorTests(unittest.TestCase):
@@ -31,6 +36,42 @@ class DevDoctorTests(unittest.TestCase):
         self.assertFalse(dev_doctor.is_supported_node((20, 18, 99)))
         self.assertTrue(dev_doctor.is_supported_node((22, 12, 0)))
         self.assertFalse(dev_doctor.is_supported_node((22, 11, 99)))
+
+    def test_toolchain_policy_maps_to_doctor_statuses(self) -> None:
+        def venv_status(version: str) -> str:
+            check = dev_doctor._version_check(
+                "Python virtual environment",
+                dev_doctor.CommandResult(0, f"Python {version}\n"),
+                classify=check_local_setup.classify_python_version,
+            )
+            return check.status
+
+        def node_status(version: str) -> str:
+            check = dev_doctor._version_check(
+                "Node.js",
+                dev_doctor.CommandResult(0, f"v{version}\n"),
+                classify=check_local_setup.classify_node_version,
+            )
+            return check.status
+
+        canonical_python = ".".join(str(part) for part in CANONICAL_PYTHON_VERSION)
+        self.assertEqual(venv_status(canonical_python), dev_doctor.PASS)
+        self.assertEqual(venv_status("3.10.0"), dev_doctor.WARN)
+        self.assertEqual(venv_status("3.9.18"), dev_doctor.FAIL)
+        self.assertEqual(node_status(f"{CANONICAL_NODE[0]}.0.0"), dev_doctor.PASS)
+        self.assertEqual(node_status("20.19.0"), dev_doctor.WARN)
+        self.assertEqual(node_status("26.0.0"), dev_doctor.WARN)
+        self.assertEqual(node_status("18.20.0"), dev_doctor.FAIL)
+
+    def test_non_canonical_system_python_warns(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch("scripts.dev_doctor._system_python_version", return_value=(3, 10, 0)):
+                checks = dev_doctor._python_checks(root, lambda argv: self.fail(argv))
+
+        system = next(check for check in checks if check.name == "System Python")
+        self.assertEqual(system.status, dev_doctor.WARN)
+        self.assertIn("not canonical", system.summary)
 
     def test_status_classification_has_stable_exit_codes(self) -> None:
         passing = dev_doctor.DoctorCheck("check", dev_doctor.PASS, "ok")
@@ -63,7 +104,7 @@ class DevDoctorTests(unittest.TestCase):
                 commands.append(tuple(argv))
                 return self._successful_result(root, argv)
 
-            with patch("scripts.dev_doctor._port_is_listening", return_value=False):
+            with self._canonical_host():
                 report = dev_doctor.build_report(root, runner=runner)
 
         rendered = json.loads(json.dumps(report, sort_keys=True))
@@ -87,7 +128,7 @@ class DevDoctorTests(unittest.TestCase):
                     return dev_doctor.CommandResult(1, stderr="dependency conflict")
                 return self._successful_result(root, argv)
 
-            with patch("scripts.dev_doctor._port_is_listening", return_value=False):
+            with self._canonical_host():
                 report = dev_doctor.build_report(root, runner=runner)
 
         dependency = next(
@@ -153,6 +194,18 @@ class DevDoctorTests(unittest.TestCase):
         self.assertEqual(context.exception.code, 2)
 
     @staticmethod
+    def _canonical_host() -> ExitStack:
+        stack = ExitStack()
+        stack.enter_context(patch("scripts.dev_doctor._port_is_listening", return_value=False))
+        stack.enter_context(
+            patch(
+                "scripts.dev_doctor._system_python_version",
+                return_value=CANONICAL_PYTHON_VERSION,
+            )
+        )
+        return stack
+
+    @staticmethod
     def _prepare_repo(root: Path) -> None:
         (root / "venv" / "bin").mkdir(parents=True)
         (root / "venv" / "bin" / "python").touch()
@@ -181,7 +234,7 @@ class DevDoctorTests(unittest.TestCase):
             ("git", "worktree", "list", "--porcelain"): "worktree /repo\nHEAD abc\n",
             ("git", "worktree", "prune", "--dry-run"): "",
             (str(root / "venv" / "bin" / "python"), "--version"):
-                f"Python {sys.version_info.major}.{sys.version_info.minor}.0\n",
+                f"Python {CANONICAL_PYTHON[0]}.{CANONICAL_PYTHON[1]}.0\n",
             (str(root / "venv" / "bin" / "python"), "-m", "pip", "--version"): "pip 24.0\n",
             (str(root / "venv" / "bin" / "python"), "-m", "pip", "check"):
                 "No broken requirements found.\n",
@@ -191,12 +244,14 @@ class DevDoctorTests(unittest.TestCase):
                 "-c",
                 "import fastapi, pydantic; print('runtime-import-ok')",
             ): "runtime-import-ok\n",
-            ("node", "--version"): "v20.19.0\n",
+            ("node", "--version"): f"v{CANONICAL_NODE[0]}.0.0\n",
             ("npm", "--version"): "10.8.0\n",
             ("npm", "--prefix", str(root / "apps" / "web"), "ls", "--depth=0", "--json"): "{}",
             ("cargo", "--version"): "cargo 1.88.0\n",
             ("rustc", "--version"): "rustc 1.88.0\n",
             ("cargo", "tauri", "--version"): "tauri-cli 2.0.0\n",
+            # Only queried on macOS; harmless elsewhere.
+            ("xcodebuild", "-version"): "Xcode 16.0\nBuild version 16A242d\n",
         }
         command = tuple(argv)
         if command in responses:

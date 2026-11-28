@@ -85,33 +85,36 @@ print_warning() {
 # ステップ 1: 前提条件確認
 print_step "前提条件を確認しています..."
 
+# バージョン方針（推奨: .python-version / .nvmrc、最低バージョン）は
+# scripts/check_local_setup.py だけが持つ。ここでは venv 作成前なので
+# システムの python3 で --toolchain-only を実行して判定を委ねる。
+SETUP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TOOLCHAIN_CHECK="${SETUP_ROOT}/scripts/check_local_setup.py"
+
 if ! command -v python3 &> /dev/null; then
-    fail_setup "Python 3.10 以上が必要ですが、Python 3 が見つかりません" "command -v python3"
+    fail_setup "Python 3 が見つかりません（対応バージョンは .python-version と scripts/check_local_setup.py を参照）" "command -v python3"
 fi
 if ! PYTHON_VERSION=$(python3 --version); then
     fail_setup "Python 3 のバージョンを取得できません" "python3 --version"
 fi
-if ! python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)'; then
-    fail_setup "Python 3.10 以上が必要です（検出: ${PYTHON_VERSION}）" "python3 version check"
-fi
-print_success "Python 3 は インストール済み (${PYTHON_VERSION})"
 
 if ! command -v node &> /dev/null; then
-    fail_setup "Node.js 20.19 以上、または 22.12 以上が必要です" "command -v node"
+    fail_setup "Node.js が見つかりません（対応バージョンは .nvmrc と scripts/check_local_setup.py を参照）" "command -v node"
 fi
 if ! NODE_VERSION=$(node --version); then
     fail_setup "Node.js のバージョンを取得できません" "node --version"
 fi
-if ! node -e '
-  const [major, minor] = process.versions.node.split(".").map(Number);
-  const supported =
-    (major === 20 && minor >= 19) ||
-    (major === 22 && minor >= 12) ||
-    major > 22;
-  process.exit(supported ? 0 : 1);
-'; then
-    fail_setup "Node.js 20.19 以上、または 22.12 以上が必要です（検出: ${NODE_VERSION}）" "node version check"
+
+if ! TOOLCHAIN_REPORT=$(python3 "$TOOLCHAIN_CHECK" --toolchain-only \
+        --python-version "$PYTHON_VERSION" --node-version "$NODE_VERSION" 2>&1); then
+    printf '%s\n' "$TOOLCHAIN_REPORT" >&2
+    fail_setup "Python / Node.js のバージョンが対応範囲外です（検出: ${PYTHON_VERSION} / Node.js ${NODE_VERSION}）" "toolchain version check"
 fi
+printf '%s\n' "$TOOLCHAIN_REPORT"
+if [[ "$TOOLCHAIN_REPORT" == *"[WARN]"* ]]; then
+    print_warning "推奨バージョン以外で続行します（推奨: .python-version / .nvmrc）"
+fi
+print_success "Python 3 は インストール済み (${PYTHON_VERSION})"
 print_success "Node.js はインストール済み (${NODE_VERSION})"
 
 echo ""
@@ -139,7 +142,7 @@ run_quiet "ネットワーク接続を確認し、venv を有効にして pip in
     pip install --upgrade pip setuptools wheel
 print_success "pip をアップグレードしました"
 
-run_quiet "上のエラーで失敗したパッケージを確認してください。Python のバージョンが 3.10 以上か、ビルドに必要なツール（コンパイラなど）が入っているかを確認し、venv を有効にして pip install -r requirements.txt を再実行してください" \
+run_quiet "上のエラーで失敗したパッケージを確認してください。Python のバージョンが対応範囲か（python3 scripts/check_local_setup.py --toolchain-only）、ビルドに必要なツール（コンパイラなど）が入っているかを確認し、venv を有効にして pip install -r requirements.txt を再実行してください" \
     pip install -r requirements.txt
 print_success "requirements.txt からパッケージをインストールしました"
 

@@ -30,8 +30,13 @@ Project -> Template Story -> Procedural Visual / Storyboard -> Gallery / Reuse -
 
 ## すぐに起動
 
-前提は Python 3.10 以上と、Node.js 20.19 以上または 22.12 以上です。
-`./setup.sh` と `scripts/check_local_setup.py` は未対応バージョンを開始前に検出します。
+推奨（canonical）バージョンは [`.python-version`](.python-version)（Python 3.12）と
+[`.nvmrc`](.nvmrc)（Node.js 24 LTS）が唯一の定義元です。Python 3.10 / 3.11 と
+Node.js 20.19+ / 22.12+ は移行用に引き続き動作しますが WARN になり、Python 3.10 未満と
+Node.js 20.19 未満（および 21.x / 22.12 未満の 22.x）は未対応です。
+`./setup.sh`、`scripts/check_local_setup.py`、`make doctor` は同じ判定を使い、
+未対応バージョンを開始前に検出します（バージョンだけ確認する場合は
+`python3 scripts/check_local_setup.py --toolchain-only`）。
 
 依存関係と `.env` を準備した後は、次の 1 コマンドで API と Web UI を起動します。
 
@@ -349,8 +354,8 @@ loopback port を使います。既存の `data/`、`outputs/`、起動中の 80
 
 #### 前提条件
 
-- Python 3.10 以上
-- Node.js 20.19 以上、または 22.12 以上
+- Python: 推奨は `.python-version`（3.12）。3.10 / 3.11 は移行用に WARN で継続
+- Node.js: 推奨は `.nvmrc`（24 LTS）。20.19+ / 22.12+ は WARN で継続
 - npm
 
 #### ステップ 1: Python 環境の構築

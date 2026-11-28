@@ -6,14 +6,30 @@ Creative AI Studio のローカル開発環境セットアップ手順です。
 
 ## 前提
 
-- Python 3.10 以上
-- Node.js 20.19 以上、または 22.12 以上
+- Python: 推奨は [`.python-version`](../.python-version)（3.12）
+- Node.js: 推奨は [`.nvmrc`](../.nvmrc)（24 LTS）
 - `npm`
 - Git で clone したリポジトリ直下を作業ルートとして使うこと
 
+### バージョン方針
+
+推奨（canonical）バージョンの定義元は `.python-version` と `.nvmrc` だけです。
+対応する最低バージョンは `scripts/check_local_setup.py` だけが持ちます。
+`./setup.sh`、`scripts/check_local_setup.py`、`make doctor` はどれも同じ分類を使います。
+
+| ツール | PASS | WARN（セットアップは継続） | FAIL |
+| --- | --- | --- | --- |
+| Python | 推奨 minor（3.12） | 3.10 / 3.11（移行用にサポート、推奨外）、3.13 以降（未検証） | 3.10 未満 |
+| Node.js | 推奨 major（24.x） | 20.19+ / 22.12+（推奨外）、25 以降（未検証） | 20.19 未満、21.x、22.12 未満の 22.x |
+
 `torch~=2.10.0` は Python 3.10 以上、Web のロック済み Vite は
-Node.js 20.19 以上または 22.12 以上を必要とします。`./setup.sh` と
-`scripts/check_local_setup.py` は未対応バージョンを明示して終了します。
+Node.js 20.19 以上または 22.12 以上を必要とするため、これが最低ラインです。
+`nvm use` / `pyenv install` などのバージョンマネージャーは `.nvmrc` / `.python-version`
+をそのまま読めます。バージョンだけを確認するには次を実行します。
+
+```bash
+python3 scripts/check_local_setup.py --toolchain-only
+```
 
 ## Git とローカル生成物の扱い
 

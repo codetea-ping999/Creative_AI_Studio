@@ -3,29 +3,187 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple, Sequence
 
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from core.model_readiness import (  # noqa: E402  (path bootstrap above)
-    STATUS_SCAFFOLD,
-    evaluate_manifest_payload,
-    resolve_repo_path,
-)
+# This module must stay importable by a bare system ``python3`` before the
+# repository venv exists: ``setup.sh`` runs ``--toolchain-only`` first so an
+# old interpreter is rejected with a clear message.  Keep repository imports
+# lazy and stdlib-only.
 
-SKIP_RUNTIME_FILES = "--skip-runtime-files" in sys.argv
+# --- Toolchain version policy -------------------------------------------------
+# Canonical versions live only in ``.python-version`` / ``.nvmrc``.  The floors
+# below are the single place for the oldest still-supported versions.
+PYTHON_VERSION_FILE = ROOT / ".python-version"
+NODE_VERSION_FILE = ROOT / ".nvmrc"
 MIN_PYTHON_VERSION = (3, 10)
 MIN_NODE_20_VERSION = (20, 19, 0)
 MIN_NODE_22_VERSION = (22, 12, 0)
+
+CANONICAL = "canonical"
+SUPPORTED = "supported"
+UNTESTED = "untested"
+UNSUPPORTED = "unsupported"
+VERSION_TEXT_RE = re.compile(r"(?<!\d)(\d+)\.(\d+)(?:\.(\d+))?")
+
+
+class ToolchainClassification(NamedTuple):
+    """How one installed toolchain version relates to the repository policy.
+
+    A ``NamedTuple`` (not a dataclass) so the module also works when loaded
+    from a file path without being registered in ``sys.modules``.
+    """
+
+    tool: str
+    version: tuple[int, int, int]
+    status: str
+    canonical: str
+    requirement: str
+
+    @property
+    def is_blocking(self) -> bool:
+        return self.status == UNSUPPORTED
+
+    @property
+    def level(self) -> str:
+        """``OK`` for canonical, ``FAIL`` for unsupported, otherwise ``WARN``."""
+
+        if self.status == CANONICAL:
+            return "OK"
+        return "FAIL" if self.is_blocking else "WARN"
+
+    @property
+    def summary(self) -> str:
+        if self.status == CANONICAL:
+            return f"canonical {self.canonical}"
+        if self.status == SUPPORTED:
+            return f"supported for migration, not canonical; canonical is {self.canonical}"
+        if self.status == UNTESTED:
+            return f"newer than canonical {self.canonical}; untested"
+        return f"unsupported; requires {self.requirement}, canonical is {self.canonical}"
+
+
+def _format_version(version: Sequence[int]) -> str:
+    return ".".join(str(part) for part in version)
+
+
+def parse_version_text(text: str) -> tuple[int, int, int] | None:
+    """Extract ``major.minor[.patch]`` from ``Python X.Y.Z`` / ``vX.Y.Z`` style text."""
+
+    match = VERSION_TEXT_RE.search(text)
+    if match is None:
+        return None
+    major, minor, patch = match.groups()
+    return int(major), int(minor), int(patch or 0)
+
+
+def read_canonical_version(path: Path) -> tuple[int, ...]:
+    """Read a numeric version pin such as ``X.Y`` or ``X`` (optional ``v`` prefix)."""
+
+    text = path.read_text(encoding="utf-8").strip()
+    match = re.fullmatch(r"v?(\d+(?:\.\d+)*)", text)
+    if match is None:
+        raise ValueError(f"{path.name} must contain a numeric version, got {text!r}")
+    return tuple(int(part) for part in match.group(1).split("."))
+
+
+def canonical_python_version() -> tuple[int, ...]:
+    """Canonical ``(major, minor)`` read from ``.python-version``."""
+
+    return read_canonical_version(PYTHON_VERSION_FILE)[:2]
+
+
+def canonical_node_version() -> tuple[int, ...]:
+    """Canonical ``(major,)`` read from ``.nvmrc``."""
+
+    return read_canonical_version(NODE_VERSION_FILE)[:1]
+
+
+def python_requirement() -> str:
+    return f"Python {_format_version(MIN_PYTHON_VERSION)}+"
+
+
+def node_requirement() -> str:
+    return (
+        f"Node.js {_format_version(MIN_NODE_20_VERSION[:2])}+ "
+        f"or {_format_version(MIN_NODE_22_VERSION[:2])}+"
+    )
+
+
+def meets_python_floor(version: Sequence[int]) -> bool:
+    return tuple(version[:3]) >= (*MIN_PYTHON_VERSION, 0)
+
+
+def meets_node_floor(version: Sequence[int]) -> bool:
+    current = tuple(version[:3])
+    on_node_20_line = current[0] == MIN_NODE_20_VERSION[0] and current >= MIN_NODE_20_VERSION
+    return on_node_20_line or current >= MIN_NODE_22_VERSION
+
+
+def _pad(version: Sequence[int]) -> tuple[int, int, int]:
+    padded = (tuple(version) + (0, 0, 0))[:3]
+    return padded[0], padded[1], padded[2]
+
+
+def classify_python_version(
+    version: Sequence[int],
+    canonical: Sequence[int] | None = None,
+) -> ToolchainClassification:
+    """Classify Python as canonical (OK), supported/untested (WARN) or unsupported (FAIL)."""
+
+    current = _pad(version)
+    pinned = tuple(canonical if canonical is not None else canonical_python_version())[:2]
+    if not meets_python_floor(current):
+        status = UNSUPPORTED
+    elif current[:2] == pinned:
+        status = CANONICAL
+    elif current[:2] > pinned:
+        status = UNTESTED
+    else:
+        status = SUPPORTED
+    return ToolchainClassification(
+        "Python", current, status, f"Python {_format_version(pinned)}", python_requirement()
+    )
+
+
+def classify_node_version(
+    version: Sequence[int],
+    canonical: Sequence[int] | None = None,
+) -> ToolchainClassification:
+    """Classify Node.js as canonical (OK), supported/untested (WARN) or unsupported (FAIL)."""
+
+    current = _pad(version)
+    pinned = tuple(canonical if canonical is not None else canonical_node_version())[:1]
+    if not meets_node_floor(current):
+        status = UNSUPPORTED
+    elif current[:1] == pinned:
+        status = CANONICAL
+    elif current[:1] > pinned:
+        status = UNTESTED
+    else:
+        status = SUPPORTED
+    return ToolchainClassification(
+        "Node.js", current, status, f"Node.js {_format_version(pinned)}.x", node_requirement()
+    )
+
+
+def _report_toolchain(classification: ToolchainClassification, version_text: str) -> bool:
+    print(
+        f"[{classification.level}] {classification.tool} version: {version_text} "
+        f"({classification.summary})"
+    )
+    return not classification.is_blocking
 
 
 def _resolve_path(value: str | Path) -> Path:
@@ -46,32 +204,24 @@ def _manifest_root() -> Path:
     return _resolve_path(configured) if configured else _models_root() / "manifests"
 
 
-def _check_python_version(version_info: tuple[int, ...] = sys.version_info) -> bool:
+def _check_python_version(version_info: Sequence[int] | None = None) -> bool:
+    """Report the Python policy level; only an unsupported version blocks."""
+
+    if version_info is None:
+        version_info = (sys.version_info.major, sys.version_info.minor, sys.version_info.micro)
     version = tuple(version_info[:3])
-    supported = version >= (*MIN_PYTHON_VERSION, 0)
-    status = "OK" if supported else "FAIL"
-    minimum = ".".join(str(part) for part in MIN_PYTHON_VERSION)
-    current = ".".join(str(part) for part in version)
-    print(f"[{status}] Python version: {current} (required: {minimum}+)")
-    return supported
+    return _report_toolchain(classify_python_version(version), _format_version(version))
 
 
 def _check_node_version(version_text: str) -> bool:
+    """Report the Node.js policy level; only an unsupported version blocks."""
+
     match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", version_text.strip())
     if match is None:
         print(f"[FAIL] Node.js version could not be parsed: {version_text!r}")
         return False
-
     version = tuple(int(part) for part in match.groups())
-    supported = (
-        version[0] == 20 and version >= MIN_NODE_20_VERSION
-    ) or version >= MIN_NODE_22_VERSION
-    status = "OK" if supported else "FAIL"
-    print(
-        f"[{status}] Node.js version: {version_text.strip()} "
-        "(required: 20.19+ or 22.12+)"
-    )
-    return supported
+    return _report_toolchain(classify_node_version(version), version_text.strip())
 
 
 def _check_node_runtime() -> bool:
@@ -83,12 +233,34 @@ def _check_node_runtime() -> bool:
             text=True,
         )
     except FileNotFoundError:
-        print("[FAIL] Node.js executable was not found (required: 20.19+ or 22.12+)")
+        print(f"[FAIL] Node.js executable was not found (required: {node_requirement()})")
         return False
     if completed.returncode != 0:
         print(f"[FAIL] Node.js version check failed: {completed.stderr.strip()}")
         return False
     return _check_node_version(completed.stdout)
+
+
+def check_toolchain(
+    python_version_text: str | None = None,
+    node_version_text: str | None = None,
+) -> bool:
+    """Check only the Python/Node.js policy; ``None`` inspects the live toolchain."""
+
+    if python_version_text is None:
+        python_ok = _check_python_version()
+    else:
+        version = parse_version_text(python_version_text)
+        if version is None:
+            print(f"[FAIL] Python version could not be parsed: {python_version_text!r}")
+            python_ok = False
+        else:
+            python_ok = _check_python_version(version)
+    node_ok = (
+        _check_node_runtime() if node_version_text is None
+        else _check_node_version(node_version_text)
+    )
+    return python_ok and node_ok
 
 
 def _check_path(path: Path, label: str, *, required: bool = True) -> bool:
@@ -172,6 +344,12 @@ def _relative_to_root(path: Path) -> str:
 def _check_runtime_model_files(manifest_root: Path | None = None) -> bool:
     """Report runtime file readiness with the same rules `GET /models` uses."""
 
+    from core.model_readiness import (
+        STATUS_SCAFFOLD,
+        evaluate_manifest_payload,
+        resolve_repo_path,
+    )
+
     manifest_root = manifest_root or _manifest_root()
     success = True
     for manifest_path in sorted(manifest_root.rglob("*.json")):
@@ -216,7 +394,35 @@ def _is_required_model(payload: dict[str, Any]) -> bool:
     return not (isinstance(tags, list) and "experimental" in tags)
 
 
-def main() -> int:
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Validate the local development setup.")
+    parser.add_argument(
+        "--skip-runtime-files", action="store_true", help="do not inspect model runtime files"
+    )
+    parser.add_argument(
+        "--toolchain-only",
+        action="store_true",
+        help="only classify Python/Node.js against .python-version and .nvmrc",
+    )
+    parser.add_argument(
+        "--python-version",
+        help="classify this Python version text instead of the running interpreter",
+    )
+    parser.add_argument(
+        "--node-version",
+        help="classify this Node.js version text instead of running `node --version`",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    if args.toolchain_only:
+        if check_toolchain(args.python_version, args.node_version):
+            return 0
+        print("[FAIL] Toolchain versions are unsupported. Review the lines above.")
+        return 1
+
     print("Creative AI Studio local setup check")
     print(f"Repository: {ROOT}")
 
@@ -236,8 +442,7 @@ def main() -> int:
     )
     checks = [
         _check_path(Path(sys.executable), "Python executable"),
-        _check_python_version(),
-        _check_node_runtime(),
+        check_toolchain(args.python_version, args.node_version),
         _check_path(ROOT / "venv", "Python virtual environment", required=False),
         _check_path(ROOT / ".env", "Root environment file", required=False),
         _check_path(ROOT / "apps" / "web" / ".env", "Web environment file", required=False),
@@ -250,7 +455,7 @@ def main() -> int:
         _check_path(ROOT / "apps" / "web" / "node_modules", "Web dependencies", required=False),
     ]
     checks.append(_check_manifest_files())
-    if SKIP_RUNTIME_FILES:
+    if args.skip_runtime_files:
         print("[WARN] Runtime file checks skipped by --skip-runtime-files")
     else:
         checks.append(_check_runtime_model_files())

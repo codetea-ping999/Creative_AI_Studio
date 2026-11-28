@@ -10,10 +10,22 @@ Please be respectful and constructive in all interactions. We are committed to p
 
 ### Prerequisites
 
-- Python 3.9 or higher
-- Node.js 18 or higher
-- npm or yarn
+- Python: canonical version in [`.python-version`](.python-version) (currently 3.12)
+- Node.js: canonical major in [`.nvmrc`](.nvmrc) (currently 24 LTS)
+- npm (bundled with Node.js; the Web UI uses `package-lock.json`, so do not use yarn or pnpm)
 - Git
+
+The canonical versions live only in `.python-version` and `.nvmrc`; the
+supported floors live only in `scripts/check_local_setup.py`. Both
+`./setup.sh` and `make doctor` classify your toolchain against them:
+
+| Toolchain | PASS | WARN (setup continues) | FAIL |
+| --- | --- | --- | --- |
+| Python | canonical minor | 3.10 / 3.11 (supported for migration, not canonical); newer than canonical (untested) | below 3.10 |
+| Node.js | canonical major | 20.19+ / 22.12+ (not canonical); newer major than canonical (untested) | below 20.19, or 21.x / 22.0–22.11 |
+
+Check only the toolchain with
+`python3 scripts/check_local_setup.py --toolchain-only`.
 
 ### Setting Up Development Environment
 
