@@ -15,6 +15,8 @@ const storyboardModel: ModelOption = {
   isDefault: true,
   runtimeStatus: "ready",
   availabilityMessage: "Ready",
+  installPath: "",
+  supportsLocalInstall: false,
 };
 
 const sdxlModel: ModelOption = {
@@ -26,6 +28,8 @@ const sdxlModel: ModelOption = {
   isDefault: true,
   runtimeStatus: "ready",
   availabilityMessage: "Ready",
+  installPath: "",
+  supportsLocalInstall: false,
 };
 
 const animeModel: ModelOption = {

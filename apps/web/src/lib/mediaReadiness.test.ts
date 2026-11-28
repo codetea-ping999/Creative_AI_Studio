@@ -12,6 +12,8 @@ function model(isAvailable: boolean): ModelOption {
     isDefault: true,
     runtimeStatus: isAvailable ? "ready" : "missing_files",
     availabilityMessage: "",
+    installPath: "",
+    supportsLocalInstall: false,
   };
 }
 

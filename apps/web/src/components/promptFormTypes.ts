@@ -9,6 +9,8 @@ export type ModelOption = {
   isDefault: boolean;
   runtimeStatus: string;
   availabilityMessage: string;
+  installPath: string;
+  supportsLocalInstall: boolean;
   /** False when the model's pipeline (e.g. FLUX) cannot apply a negative prompt. */
   supportsNegativePrompt?: boolean;
 };
@@ -80,6 +82,20 @@ export type PromptFormSubmitValues = {
   cameraMotion: string;
   visualStyle: string;
 };
+
+export type LocalModelInstallOptions = {
+  sourcePath?: string;
+  replace?: boolean;
+};
+
+/** "picking": waiting for the user in the OS folder dialog; "installing": copying. */
+export type LocalModelInstallPhase = "picking" | "installing";
+
+export type LocalModelInstallOutcome =
+  | { status: "installed"; message: string }
+  | { status: "cancelled" }
+  | { status: "needs_replace"; message: string; sourcePath: string }
+  | { status: "error"; message: string };
 
 export type PromptFormProps = {
   formId?: string;

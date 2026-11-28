@@ -71,3 +71,8 @@ models/image/sdxl/unet
 models/image/sdxl/vae
 models/image/anime-sdxl/
 models/image/flux-1-dev/
+
+# Placing a model from a local folder (POST /models/{model_id}/install):
+# the previous files moved aside on replace, and an interrupted import.
+models/**/*.replaced-*/
+models/**/.*.import-*/

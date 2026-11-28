@@ -13,6 +13,11 @@ import {
   type ModelOption,
   type PromptFormSubmitValues,
 } from "./components/PromptForm";
+import type {
+  LocalModelInstallOptions,
+  LocalModelInstallOutcome,
+  LocalModelInstallPhase,
+} from "./components/promptFormTypes";
 import { AssemblyTimelinePanel } from "./components/AssemblyTimelinePanel";
 import { CastOverlay, type CastCue } from "./components/CastOverlay";
 import { RankBadge } from "./components/RankBadge";
@@ -59,8 +64,10 @@ import {
   type ProjectResponse,
   type RefreshStudioOptions,
   type ReuseAssetResponse,
+  type InstallModelResponse,
+  type PickFolderResponse,
 } from "./studio";
-import { requestJson } from "./studioClient";
+import { ApiError, requestJson } from "./studioClient";
 import { useJobPolling } from "./hooks/useJobPolling";
 import {
   studioViewDescriptions,
@@ -529,6 +536,73 @@ function App() {
     const isReachable = await loadReadiness();
     if (isReachable) {
       await Promise.all(startingMediaOrder.map((media) => loadModels(media)));
+    }
+  }
+
+  async function handleInstallLocalModel(
+    media: MediaType,
+    modelId: string,
+    options?: LocalModelInstallOptions,
+    onPhase?: (phase: LocalModelInstallPhase) => void,
+  ): Promise<LocalModelInstallOutcome> {
+    let sourcePath = options?.sourcePath ?? "";
+    try {
+      if (!sourcePath) {
+        const picked = await requestJson<PickFolderResponse>("/models/pick-folder", {
+          method: "POST",
+        });
+        if (!picked.path) {
+          return { status: "cancelled" };
+        }
+        sourcePath = picked.path;
+      }
+      onPhase?.("installing");
+      const result = await requestJson<InstallModelResponse>(
+        `/models/${encodeURIComponent(modelId)}/install`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            source_path: sourcePath,
+            media_type: media,
+            replace: options?.replace ?? false,
+          }),
+        },
+      );
+      await loadModels(media);
+      const moved = result.replaced_to
+        ? t("もとのファイルは {path} に移しました。", { path: result.replaced_to })
+        : "";
+      const restart = result.restart_required
+        ? t("このモデルは使用中だったため、新しいファイルは API を再起動すると使われます。")
+        : "";
+      const message =
+        (result.is_available
+          ? t("{id} を配置しました。使えるようになりました。", { id: modelId })
+          : t("{id} を配置しましたが、まだ使えません: {reason}", {
+              id: modelId,
+              reason: result.availability_message,
+            })) +
+        moved +
+        restart;
+      return { status: "installed", message };
+    } catch (error) {
+      if (error instanceof ApiError && error.code === "destination_not_empty") {
+        return { status: "needs_replace", message: error.message, sourcePath };
+      }
+      if (error instanceof ApiError && error.code === "picker_timeout") {
+        return { status: "error", message: t("時間切れになりました。もう一度押してください。") };
+      }
+      if (error instanceof ApiError && error.code === "model_in_use") {
+        return {
+          status: "error",
+          message: t("このモデルは読み込み中か生成中です。終わってからもう一度配置してください。"),
+        };
+      }
+      return {
+        status: "error",
+        message: error instanceof Error ? error.message : String(error),
+      };
     }
   }
 
@@ -1526,6 +1600,7 @@ function App() {
                 void handleReadinessRetry();
               }}
               isRetrying={Object.values(modelLoadState).includes("loading")}
+              onInstallLocalModel={handleInstallLocalModel}
             />
 
             <section className="section-card section-card--projects">

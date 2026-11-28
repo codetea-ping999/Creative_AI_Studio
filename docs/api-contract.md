@@ -17,6 +17,8 @@ http://127.0.0.1:8000
 | System | `GET` | `/version` | 実行中のリリース版数（`VERSION` と一致） |
 | System | `GET` | `/openapi.json` | 開発時の契約確認 |
 | Models | `GET` | `/models` | メディア別モデル一覧 |
+| Models | `POST` | `/models/pick-folder` | Finder / エクスプローラーでモデルのフォルダを選ぶ（API を動かしているマシンだけ） |
+| Models | `POST` | `/models/{model_id}/install` | 手元にあるモデルのフォルダを配置先へコピーして readiness を確認 |
 | Catalog | `GET` | `/catalog/loras` | LoRA 候補一覧 |
 | Projects | `GET` | `/projects` | プロジェクト一覧 / filter |
 | Projects | `POST` | `/projects` | プロジェクト作成 |
@@ -404,11 +406,20 @@ Behavior:
       "is_available": true,
       "runtime_status": "ready",
       "availability_message": "Diffusers model files are ready.",
+      "install_path": "/Users/me/Creative_AI_Studio/models/image/sdxl",
+      "supports_local_install": true,
       "supports_negative_prompt": true
     }
   ]
 }
 ```
+
+- `install_path`: loader がモデルを読むディレクトリの絶対パスです。learned runtime では
+  `pipeline_path`（weight の置き場所）を返します。endpoint で動くモデルは `null` です
+- `supports_local_install`: `install_path` があり、`POST /models/{model_id}/install` で
+  ファイルを置ける場合に `true` です。置く前に中身を確認できる runtime（`diffusers` /
+  `transformers` / `audiocraft` / `learned` / `llama_cpp` / `kokoro`）だけが対象で、`template` や
+  `procedural` のように確認できるファイルがない runtime は `false` です
 
 UI の最小利用項目:
 
@@ -420,6 +431,117 @@ UI の最小利用項目:
 - `is_default`
 - `runtime_status`
 - `availability_message`
+- `install_path` / `supports_local_install`（モデルが無いときの案内と「手元のモデルを配置」ボタン）
+
+### POST /models/pick-folder
+
+API を動かしているマシンの OS 標準のフォルダ選択（macOS は Finder、Windows はエクスプローラー、
+Linux は `zenity` または `kdialog`）を開き、選ばれたフォルダを返します。
+
+```json
+{ "path": "/Users/me/Downloads/stable-diffusion-xl-base-1.0" }
+```
+
+- キャンセルされたときは `{ "path": null }` を返します。macOS ではダイアログの「キャンセル」
+  （AppleScript のエラー `-128`）だけをキャンセルとして扱います
+- フォルダ選択を開けない環境（Linux で `zenity` も `kdialog` も無い場合など）は `501`
+  （`picker_unavailable`）です
+- ダイアログは最大 600 秒開いたままにできます（macOS では AppleScript の
+  `with timeout of 600 seconds` で、既定の 120 秒の Apple Event タイムアウトを延ばしています）。
+  それを過ぎた場合（macOS のエラー `-1712` を含む）は `504`（`picker_timeout`）で、UI は
+  「時間切れになりました。もう一度押してください。」と表示します
+- ダイアログを開こうとして失敗した場合は `500`（`picker_failed`）です。macOS では
+  `osascript` 自身がダイアログを出し、ほかのアプリは操作しないため、「オートメーション」の
+  許可は使いません
+- 次の 3 つをすべて満たすリクエストだけを受け付けます。満たさない場合は `403` です。
+  `POST /models/{model_id}/install` も同じです
+  - 接続元アドレスがループバック（`127.0.0.1` / `::1` / `::ffff:127.0.0.1`）
+  - `Host` ヘッダーが `localhost` / `127.0.0.1` / `[::1]`（ポート付き可）。DNS リバインディング対策です
+  - `Origin` ヘッダーがある場合、CORS で許可している Studio UI のオリジンか、API 自身のオリジン。
+    ほかのサイトを開いているブラウザからダイアログを開かれたり、コピーさせられたりしないためです
+
+### POST /models/{model_id}/install
+
+選んだフォルダを manifest の配置先（`GET /models` の `install_path`）へコピーします。
+
+```json
+{ "source_path": "/Users/me/Downloads/stable-diffusion-xl-base-1.0", "media_type": "image", "replace": false }
+```
+
+Behavior:
+
+- `supports_local_install` が `false` のモデルは `422`（`not_supported`）です
+- コピーする前に、選んだフォルダ自体が `core/model_readiness.py` の条件を満たすか確認します。
+  選んだフォルダが親フォルダ（Hugging Face のキャッシュの `snapshots/<hash>` を含むフォルダなど）
+  でも、2 階層下までは完全なモデルを探します。条件を満たさないフォルダは何もコピーしません
+  - `llama_cpp`: フォルダ直下に `*.gguf` に一致するものがちょうど 1 つで、それがファイル
+    （loader と同じく、`x.gguf` という名前のフォルダも数えます）。`default_params.model_file` が
+    あればそのファイルで、絶対パスや `..` を含む指定は受け付けません。コピーするのはその `.gguf` だけです
+  - `kokoro`: `config.json` と `.pth` が 1 つ。コピーするのはこの 2 つと `voices/`、`*.pt`
+    ファイルだけです
+- 隠しファイル・フォルダ（`.git`、`.cache` など）と `*.py` はコピーしません。どの runtime も
+  weight のフォルダからコードを読み込まないためで、開発サーバーの `--reload` がコピー中に
+  再起動することも防ぎます。フォルダのリンクが自分の親を指してループしている場合と、リンクが
+  選んだモデルのフォルダの外を指している場合（Hugging Face のキャッシュで `snapshots/<hash>` から
+  同じリポジトリの `blobs/` を指すものは除く）は `422`（`invalid_source`）です
+- コピーは配置先の隣の一時フォルダ（`.<名前>.import-<id>`）へ行い、readiness を確認してから
+  配置先へ移します。途中で失敗した場合は、移した項目を元に戻して一時フォルダを消すので、配置先は
+  元のままです。一時フォルダには作成したプロセスの PID を書いた `.import-owner` を置きます。
+  API の停止で残った一時フォルダは、次に API が起動したときに、作成したプロセスが終わっている
+  場合（PID が分からない場合は 1 時間以上更新がない場合）だけ消します。`make verify` のように
+  `models/` を共有する別の API が配置中の一時フォルダは消しません。
+  Hugging Face のキャッシュのシンボリックリンクは実体をコピーします
+- リポジトリに含まれている配置先のファイル（`README*`、`LICENSE*`、`.gitattributes`、git が
+  管理している `model_index.json` など）は「空」として扱い、移動も上書きもしません。モデルの
+  weight はその隣に置きます。`.git` がない配布物（`git archive` で作ったリリース）では git に
+  問い合わせられないので、配置先にある `model_index.json` もリポジトリのものとして扱います。
+  `.git` がないときは `git` コマンドを実行しません（macOS で Command Line Tools のインストール
+  ダイアログが出るのを避けるためです）。選んだモデルの `model_index.json` が、リポジトリの
+  `model_index.json` と違うコンポーネント（`_class_name` と各コンポーネントの指定。`_diffusers_version`
+  などの `_` で始まる値は比べません）を持つ場合は、混ぜずに `409`（`incompatible_tracked_file`）にします
+- それ以外のファイルが配置先にある場合は `409`（`destination_not_empty`）です。`replace: true` を
+  付けると、それらを `<名前>.replaced-<日時>` へ移してから配置します（削除はしません。
+  リポジトリのファイルは移しません）。ただし、git が管理していない `README*` / `LICENSE*` /
+  `.gitattributes` は前のモデルのものなので、新しいモデルが同じ名前のファイルを持っていれば、
+  前のモデルの weight と一緒に移して新しいほうを置きます（ライセンスを取り違えないためです）。
+  `.replaced-*` と `.import-*` は `.gitignore` に入っています
+- コピーと確認が終わり、配置先のファイルを動かす直前に、そのモデルの読み込み済み runtime を
+  解放します。モデルが読み込み中か生成中で解放できない場合は、何も動かさずに `409`
+  （`model_in_use`）を返します。古いファイルと新しいファイルが混ざった状態で読み込まれないためです
+- 配置後にもう一度 runtime を解放します。その間にジョブがモデルを読み込み始めていて解放できない
+  場合は `restart_required: true` を返します。API を再起動するまで、そのとき読み込んだ runtime が
+  使われます
+
+レスポンス:
+
+```json
+{
+  "model_id": "sdxl",
+  "destination": "/Users/me/Creative_AI_Studio/models/image/sdxl",
+  "source": "/Users/me/Downloads/stable-diffusion-xl-base-1.0",
+  "replaced_to": null,
+  "copied_bytes": 6938078334,
+  "is_available": true,
+  "runtime_status": "ready",
+  "availability_message": "Diffusers model files are ready.",
+  "restart_required": false
+}
+```
+
+エラーは `detail` に `code` と `message` を持ちます。
+
+| status | `code` | 内容 |
+| --- | --- | --- |
+| 403 | なし | ループバック以外、`Host` がループバック名でない、または許可していない `Origin` |
+| 404 | なし | モデルが見つからない |
+| 409 | `destination_not_empty` | 配置先にファイルがある（`replace: true` で置き換え） |
+| 409 | `install_in_progress` | 別の配置が実行中 |
+| 409 | `incompatible_tracked_file` | リポジトリの `model_index.json` と選んだモデルの構成が違う |
+| 409 | `model_in_use` | モデルが読み込み中か生成中（何も動かしていない） |
+| 422 | `invalid_source` | 相対パス、存在しない、ファイル、配置先と重なる、リンクがループ・フォルダの外を指す |
+| 422 | `incomplete_source` | 選んだフォルダに完全なモデルがない（`missing` に不足ファイル） |
+| 422 | `not_supported` | endpoint で動くモデル、または中身を確認できない runtime |
+| 507 | `insufficient_space` | 空き容量が足りない |
 - `supports_negative_prompt`
 
 ## Projects

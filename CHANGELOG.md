@@ -55,8 +55,19 @@ v1.1.0 はまだ公開していません。rc.1 より後の変更は [Unrelease
 - API が、パッケージ版 Desktop Shell の WebView の origin（`tauri://localhost`、`http://tauri.localhost`）を
   CORS で許可するようにしました（#385、#409）。Desktop Shell 自体は引き続きリリース成果物に含めません。
 
+### Added
+
+- モデルが無いときの案内カードに、モデルの配置先を表示し、手元にあるモデルのフォルダを
+  Finder（Mac）／エクスプローラー（Windows）で選んで配置する「手元のモデルを配置…」を追加。
+  選んだフォルダは、コピー前に利用可能かを確認し、一時フォルダ経由で配置します。確認できない
+  フォルダはコピーせず、リポジトリにある `README.md` や `model_index.json` は動かしません。
+  ほかのサイトを開いているブラウザからは使えないよう、`Host` と `Origin` も確認します。
+  `POST /models/pick-folder` と `POST /models/{model_id}/install` を追加し、`GET /models` に
+  `install_path` と `supports_local_install` を追加しました。
+
 ### Fixed
 
+- `ssd-1b` と `musicgen-long-form` が未配置のとき、ダウンロード先の案内が表示されない問題を修正。
 - procedural storyboard（`storyboard-video`）のフレームで日本語が □（豆腐）になる問題を修正。
   既定フォントで描けない文字を含む行は CJK 対応のシステムフォントで描画します。
   `STORYBOARD_FONT_PATH` で任意のフォントを指定できます（#449）。

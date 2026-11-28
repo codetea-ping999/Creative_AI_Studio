@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 
 from bootstrap import ApplicationServices, create_application_services
 from core.jobs.startup_recovery import run_startup_recovery
+from core.model_install import local_install_destination, remove_stale_staging
 from apps.api.routes.agent import router as agent_router
 from apps.api.routes.batches import router as batches_router
 from apps.api.routes.bible import router as bible_router
@@ -20,6 +21,7 @@ from apps.api.routes.generate import router as generate_router
 from apps.api.routes.health import router as health_router
 from apps.api.routes.jobs import router as jobs_router
 from apps.api.routes.metrics import router as metrics_router
+from apps.api.routes.model_install import router as model_install_router
 from apps.api.routes.models import router as models_router
 from apps.api.routes.projects import router as projects_router
 from apps.api.routes.stories import router as stories_router
@@ -54,6 +56,26 @@ def _release_after_workers_stop(
     for worker in workers:
         worker.join()
     ownership.release()
+
+
+def _remove_stale_model_import_staging(services: ApplicationServices) -> None:
+    """Delete staging folders a model import left behind when the API was stopped."""
+
+    try:
+        destinations = [
+            destination
+            for manifest in services.model_service.list_models()
+            if (
+                destination := local_install_destination(
+                    manifest.runtime, manifest.local_path, manifest.default_params
+                )
+            )
+            is not None
+        ]
+        for stale in remove_stale_staging(destinations):
+            logger.info("Removed an interrupted model import: %s", stale)
+    except Exception:  # cleanup must never stop the API from starting
+        logger.exception("Could not clean up interrupted model imports")
 
 
 def _local_web_origins() -> list[str]:
@@ -172,6 +194,8 @@ def create_app(
                     len(recovery_report.requeued),
                 )
 
+            _remove_stale_model_import_staging(resolved_services)
+
             if start_job_runner:
                 stop_event = Event()
                 worker = Thread(
@@ -242,9 +266,12 @@ def create_app(
         app.state.services = resolved_services
     app.state.agent_protocol = AgentProtocol()
 
+    allowed_origins = [*_local_web_origins(), *_tauri_webview_origins()]
+    # Routes that act on the API host's files check Origin against the same list.
+    app.state.allowed_origins = tuple(allowed_origins)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[*_local_web_origins(), *_tauri_webview_origins()],
+        allow_origins=allowed_origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -259,6 +286,7 @@ def create_app(
     app.include_router(jobs_router)
     app.include_router(projects_router)
     app.include_router(models_router)
+    app.include_router(model_install_router)
     app.include_router(metrics_router)
     app.include_router(catalog_router)
     app.include_router(gallery_router)

@@ -55,11 +55,29 @@ export type ModelSummary = {
   is_default: boolean;
   runtime_status?: string;
   availability_message?: string;
+  install_path?: string | null;
+  supports_local_install?: boolean;
   supports_negative_prompt?: boolean;
 };
 
 export type ModelsResponse = {
   models: ModelSummary[];
+};
+
+export type PickFolderResponse = {
+  path: string | null;
+};
+
+export type InstallModelResponse = {
+  model_id: string;
+  destination: string;
+  source: string;
+  replaced_to: string | null;
+  copied_bytes: number;
+  is_available: boolean;
+  runtime_status: string;
+  availability_message: string;
+  restart_required?: boolean;
 };
 
 export type LoraCatalogResponse = {
@@ -303,6 +321,8 @@ export function normalizeModelOption(item: ModelSummary): ModelOption {
     isDefault: item.is_default,
     runtimeStatus: item.runtime_status ?? (item.is_available ? "ready" : "missing_files"),
     availabilityMessage: item.availability_message ?? "",
+    installPath: item.install_path ?? "",
+    supportsLocalInstall: item.supports_local_install ?? false,
     supportsNegativePrompt: item.supports_negative_prompt ?? true,
   };
 }

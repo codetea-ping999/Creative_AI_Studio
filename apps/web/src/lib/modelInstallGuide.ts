@@ -8,6 +8,13 @@ export function getInstallGuide(
   const normalizedId = modelOption.id.toLowerCase();
 
   if (mediaType === "image") {
+    if (normalizedId.includes("ssd-1b")) {
+      return {
+        label: "SSD-1B",
+        url: "https://huggingface.co/segmind/SSD-1B",
+        note: "SSD-1B を取得して `models/image/ssd-1b` に配置します。",
+      };
+    }
     if (normalizedId.includes("anime-sdxl")) {
       return {
         label: "Anime SDXL checkpoint",
@@ -25,6 +32,13 @@ export function getInstallGuide(
   }
 
   if (mediaType === "audio") {
+    if (normalizedId.includes("musicgen-long-form")) {
+      return {
+        label: "MusicGen Long-form (AudioCraft)",
+        url: "https://huggingface.co/facebook/musicgen-small",
+        note: "`scripts/download_models.py --with-long-form` で取得し、`models/audio/musicgen-long-form` に配置します。",
+      };
+    }
     if (normalizedId.includes("musicgen-melody")) {
       return {
         label: "MusicGen Melody",

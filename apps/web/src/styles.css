@@ -1578,6 +1578,55 @@ pre,
   font-size: 0.74rem !important;
 }
 
+.setup-install {
+  display: block !important;
+  padding: 10px 0 0;
+}
+
+.setup-install__row {
+  display: flex;
+  justify-content: space-between;
+  align-items: start;
+  gap: 12px;
+}
+
+.setup-install__row > div:first-child {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.setup-install__actions {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.setup-install__status {
+  margin: 8px 0 0;
+  font-size: 0.82rem;
+}
+
+.setup-install__status--error {
+  color: var(--danger);
+}
+
+.setup-install__trust {
+  color: var(--text-soft);
+  font-size: 0.78rem;
+}
+
+.setup-install code,
+.setup-install .setup-missing__files {
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 640px) {
+  .setup-install__row {
+    flex-direction: column;
+  }
+}
+
 .setup-stats {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));

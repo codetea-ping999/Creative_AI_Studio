@@ -89,3 +89,26 @@ describe("requestJson", () => {
     }
   });
 });
+
+describe("requestJson structured errors", () => {
+  it("surfaces the message and code of an object detail", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({ detail: { code: "destination_not_empty", message: "files exist" } }),
+          { status: 409 },
+        ),
+      ),
+    );
+    const { ApiError, requestJson } = await import("./studioClient");
+
+    const failure = await requestJson("/models/x/install").catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(ApiError);
+    expect((failure as InstanceType<typeof ApiError>).message).toBe("files exist");
+    expect((failure as InstanceType<typeof ApiError>).code).toBe("destination_not_empty");
+    expect((failure as InstanceType<typeof ApiError>).status).toBe(409);
+    vi.unstubAllGlobals();
+  });
+});

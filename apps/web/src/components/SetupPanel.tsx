@@ -1,4 +1,10 @@
 import type { MediaType, ModelOption } from "./PromptForm";
+import { ModelInstallCard } from "./ModelInstallCard";
+import type {
+  LocalModelInstallOptions,
+  LocalModelInstallOutcome,
+  LocalModelInstallPhase,
+} from "./promptFormTypes";
 import { getInstallGuide } from "../lib/modelInstallGuide";
 import {
   formatPercent,
@@ -16,6 +22,12 @@ type SetupPanelProps = {
   galleryStats: GalleryStatsResponse | null;
   onRetry: () => void;
   isRetrying: boolean;
+  onInstallLocalModel?: (
+    media: MediaType,
+    modelId: string,
+    options?: LocalModelInstallOptions,
+    onPhase?: (phase: LocalModelInstallPhase) => void,
+  ) => Promise<LocalModelInstallOutcome>;
 };
 
 const setupOrder: MediaType[] = ["video", "image", "audio"];
@@ -46,6 +58,7 @@ export function SetupPanel({
   galleryStats,
   onRetry,
   isRetrying,
+  onInstallLocalModel,
 }: SetupPanelProps) {
   const t = useT();
   return (
@@ -97,31 +110,19 @@ export function SetupPanel({
                       {t("未配置のモデル {count} 件と配置先", { count: missing.length })}
                     </summary>
                     <ul className="setup-missing">
-                      {missing.map((model) => {
-                        const guide = getInstallGuide(media, model);
-                        return (
-                          <li key={model.id}>
-                            <div>
-                              <strong>{model.displayName}</strong>
-                              {guide ? <p>{t(guide.note)}</p> : null}
-                              <p className="setup-missing__files">
-                                {model.availabilityMessage ||
-                                  t("必要なモデルファイルが見つかりません。")}
-                              </p>
-                            </div>
-                            {guide ? (
-                              <a
-                                className="secondary-button"
-                                href={guide.url}
-                                target="_blank"
-                                rel="noreferrer"
-                              >
-                                {t("取得先を開く")}
-                              </a>
-                            ) : null}
-                          </li>
-                        );
-                      })}
+                      {missing.map((model) => (
+                        <ModelInstallCard
+                          key={model.id}
+                          model={model}
+                          guide={getInstallGuide(media, model)}
+                          onInstallLocalModel={
+                            onInstallLocalModel
+                              ? (modelId, options, onPhase) =>
+                                  onInstallLocalModel(media, modelId, options, onPhase)
+                              : undefined
+                          }
+                        />
+                      ))}
                     </ul>
                   </details>
                 ) : null}
