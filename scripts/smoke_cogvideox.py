@@ -49,6 +49,10 @@ def main() -> int:
     if result.status != "succeeded" or output_path.suffix.lower() != ".mp4":
         raise RuntimeError(f"Unexpected CogVideoX smoke result: {result.model_dump(mode='json')}")
     print(f"[OK] CogVideoX MP4 generated: {output_path}")
+    print(f"     device: {result.metadata.get('device', 'unknown')}")
+    fallback_reason = result.metadata.get("cpu_fallback_reason")
+    if fallback_reason:
+        print(f"     MPS failed, finished on CPU instead: {fallback_reason}")
     return 0
 
 

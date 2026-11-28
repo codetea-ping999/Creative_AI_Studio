@@ -53,9 +53,13 @@ def load_runtime(manifest: dict[str, Any]) -> dict[str, Any]:
 
     try:
         pipeline.to(device)
-    except (RuntimeError, NotImplementedError):
+    except (RuntimeError, NotImplementedError, TypeError) as exc:
+        if isinstance(exc, TypeError) and not _is_mps_float64_error(exc):
+            raise
         device = "cpu"
         pipeline.to(device)
+    if device == "mps":
+        _cast_scheduler_float64_to_float32(torch, pipeline)
 
     def renderer(**kwargs: Any) -> dict[str, Any]:
         output_dir = Path(kwargs.pop("output_dir"))
@@ -74,9 +78,10 @@ def load_runtime(manifest: dict[str, Any]) -> dict[str, Any]:
             # Stops inference between denoising steps rather than waiting for
             # all of them: GenerationCancelled raised here propagates straight
             # out of pipeline(...) (it is a plain Exception, not one of the
-            # RuntimeError/NotImplementedError types the MPS fallback below
-            # retries on), through renderer(), and up to JobRunner, which
-            # treats it as a successful cancellation rather than a failure.
+            # RuntimeError/NotImplementedError/MPS-float64 TypeError types the
+            # MPS fallback below retries on), through renderer(), and up to
+            # JobRunner, which treats it as a successful cancellation rather
+            # than a failure.
             def _on_step_end(pipe, step_index, timestep, callback_kwargs):
                 raise_if_cancelled()
                 return callback_kwargs
@@ -85,8 +90,10 @@ def load_runtime(manifest: dict[str, Any]) -> dict[str, Any]:
 
         try:
             result = pipeline(**generation_kwargs)
-        except (RuntimeError, NotImplementedError) as exc:
+        except (RuntimeError, NotImplementedError, TypeError) as exc:
             if device != "mps":
+                raise
+            if isinstance(exc, TypeError) and not _is_mps_float64_error(exc):
                 raise
             pipeline.to("cpu")
             generation_kwargs.pop("generator", None)
@@ -163,6 +170,33 @@ def _resolve_dtype(torch: Any, requested: str, device: str) -> Any:
         "float32": torch.float32,
         "fp32": torch.float32,
     }.get(requested.lower(), torch.float16)
+
+
+def _is_mps_float64_error(exc: BaseException) -> bool:
+    # PyTorch reports MPS's missing float64 support as a TypeError ("Cannot
+    # convert a MPS Tensor to float64 dtype ..."). Other TypeErrors are real
+    # bugs and must not be masked by the CPU retry.
+    message = str(exc)
+    return "MPS" in message and "float64" in message
+
+
+def _cast_scheduler_float64_to_float32(torch: Any, pipeline: Any) -> None:
+    """Keep scheduler tables MPS-compatible.
+
+    CogVideoX-2b's CogVideoXDDIMScheduler builds its "scaled_linear" betas in
+    float64, so ``alphas_cumprod[timestep]`` with an MPS timestep tries to move
+    a float64 table onto MPS, which has no float64 support. float32 keeps the
+    same schedule within the precision the float16 latents use anyway.
+    """
+
+    scheduler = getattr(pipeline, "scheduler", None)
+    tensor_type = getattr(torch, "Tensor", None)
+    float64 = getattr(torch, "float64", None)
+    if scheduler is None or tensor_type is None or float64 is None:
+        return
+    for name, value in list(vars(scheduler).items()):
+        if isinstance(value, tensor_type) and value.dtype == float64:
+            setattr(scheduler, name, value.to(torch.float32))
 
 
 def _normalize_generation_kwargs(values: dict[str, Any]) -> dict[str, Any]:

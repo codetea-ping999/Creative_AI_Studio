@@ -13,7 +13,7 @@ The release artifact ships no Python packages and no `node_modules`: it carries
 installed by the operator at install time; the web packages below are build-time
 dependencies, some of which are compiled into `apps/web/dist`.
 
-## Python (77 packages)
+## Python (78 packages)
 
 | Package | Version | License |
 |---|---|---|
@@ -78,6 +78,7 @@ dependencies, some of which are compiled into `apps/web/dist`.
 | [regex](https://github.com/mrabarnett/mrab-regex) | 2026.9.10 | Apache-2.0 AND CNRI-Python |
 | [requests](https://github.com/psf/requests) | 2.34.2 | Apache Software License |
 | [safetensors](https://github.com/huggingface/safetensors) | 0.8.0 | Apache Software License |
+| [sentencepiece](https://github.com/google/sentencepiece) | 0.2.2 | Apache-2.0 |
 | [starlette](https://github.com/Kludex/starlette) | 1.6.0 | BSD-3-Clause |
 | [sympy](https://sympy.org) | 1.14.0 | BSD License |
 | [tokenizers](https://github.com/huggingface/tokenizers) | 0.22.2 | Apache Software License |
